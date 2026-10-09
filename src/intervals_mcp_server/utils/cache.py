@@ -5,11 +5,11 @@ The athlete profile, sport settings, custom item definitions and the gear catalo
 cached so that every activity listing does not refetch them. Entries expire after a TTL,
 so changes made in the Intervals.icu web app show up without a restart, and the tools
 that change the cached data drop the affected entries. Keys combine the athlete id with
-a fingerprint of the API key, so a call with another account's key never sees the first
+a partition per API key, so a call with another account's key never sees the first
 account's data.
 """
 
-import hashlib
+import itertools
 import time
 from typing import Any, Generic, TypeVar
 
@@ -17,14 +17,25 @@ V = TypeVar("V")
 
 DEFAULT_KEY = "default"
 
+# Other API keys passed as tool arguments get their own cache partition ("key1", "key2" ...).
+# Slot names are never reused, so a partition can never be handed to another key.
+_KEY_SLOTS: dict[str, str] = {}
+_SLOT_NUMBERS = itertools.count(1)
+_MAX_KEY_SLOTS = 32
+
 
 def cache_key(athlete_id: Any, api_key: str | None = None) -> tuple[str, str]:
-    """(athlete id, API key fingerprint); the configured key and None share one entry."""
+    """(athlete id, API key partition); the configured key and None share one partition."""
     from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
 
     if not api_key or api_key == get_config().api_key:
         return str(athlete_id), DEFAULT_KEY
-    return str(athlete_id), hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    slot = _KEY_SLOTS.get(api_key)
+    if slot is None:
+        if len(_KEY_SLOTS) >= _MAX_KEY_SLOTS:
+            _KEY_SLOTS.clear()  # old partitions simply expire; their names are not reused
+        slot = _KEY_SLOTS[api_key] = f"key{next(_SLOT_NUMBERS)}"
+    return str(athlete_id), slot
 
 
 class TTLCache(Generic[V]):

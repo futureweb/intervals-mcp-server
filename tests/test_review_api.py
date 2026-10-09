@@ -243,6 +243,16 @@ def test_caches_expire_and_are_keyed_by_api_key(monkeypatch):
     assert len(calls) == 3
 
 
+def test_cache_partitions_per_api_key_are_never_reused(monkeypatch):
+    monkeypatch.setattr(cache_module, "_MAX_KEY_SLOTS", 2)
+    cache_module._KEY_SLOTS.clear()
+    first = cache_module.cache_key("i1", "key-a")
+    assert cache_module.cache_key("i1", "key-a") == first and cache_module.cache_key("i1", None) == ("i1", "default")
+    seen = {first[1], cache_module.cache_key("i1", "key-b")[1]}
+    after_reset = cache_module.cache_key("i1", "key-c")[1]  # the slot table was full and is reset
+    assert after_reset not in seen and cache_module.cache_key("i1", "key-a")[1] not in seen | {after_reset}
+
+
 def test_failed_gear_fetch_is_not_cached_and_is_reported(monkeypatch):
     gear_module._GEAR_RAW_CACHE.clear()
     answers = [{"error": True, "status_code": 429, "message": "429 Too Many Requests"}, [{"id": "b1", "name": "Bike"}]]
