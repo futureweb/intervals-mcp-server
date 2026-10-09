@@ -92,7 +92,8 @@ def test_get_activity_details_lists_custom_fields(monkeypatch):
     assert "- EPOC [EPOC]: 129.58348 ml/kg" in result
     assert "- Training Effect [TrainingEffectSelect]: 2 (Base)" in result
     assert "- Flight Time [FlightTime]: no value" in result
-    assert "- Sweat loss [Sweatloss]: 0 ml (0: may be absent in source file)" in result
+    assert "- Sweat loss [Sweatloss]: 0 ml" in result
+    assert "Zero values in device-file fields" in result
     assert "Other Fields:" not in result
 
 

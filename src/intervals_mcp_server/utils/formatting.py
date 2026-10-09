@@ -5,6 +5,7 @@ This module contains formatting functions for handling data from the Intervals.i
 """
 
 import json
+from datetime import datetime
 from typing import Any
 
 from intervals_mcp_server.utils.types import WorkoutDoc
@@ -683,6 +684,31 @@ Description: {event_desc}"""
     return text
 
 
+_EVENT_RENDERED_KEYS = {
+    "id", "start_date_local", "end_date_local", "category", "type", "name", "description",
+    "moving_time", "distance", "icu_training_load", "paired_activity_id", "indoor", "tags",
+    "updated", "workout_doc", "athlete_id", "uid", "created_by_id", "calendar_id", "color",
+    "attachments", "push_errors", "plan_applied", "plan_athlete_id", "plan_folder_id",
+    "plan_workout_id", "external_id", "oauth_client_id", "shared_event_id", "structure_read_only",
+    "hide_from_athlete", "not_on_fitness_chart", "show_as_note", "show_on_ctl_line", "for_week",
+    "athlete_cannot_edit", "entered",
+}
+
+
+def _event_other_scalar_fields(event: dict[str, Any]) -> list[str]:
+    """Non-empty scalar event fields not rendered elsewhere (e.g. training availability settings)."""
+    parts: list[str] = []
+    for key, value in event.items():
+        if key in _EVENT_RENDERED_KEYS or value is None or value == "" or isinstance(value, (dict, list)):
+            if isinstance(value, list) and value and key not in _EVENT_RENDERED_KEYS:
+                parts.append(f"{key}={json.dumps(value, ensure_ascii=False)}")
+            continue
+        if value is False:
+            continue
+        parts.append(f"{key}={value}")
+    return parts
+
+
 def _format_workout_doc(doc: dict[str, Any]) -> str:
     """Render a workout_doc (duration, steps, zone times) as text."""
     lines: list[str] = ["", "Workout Document:"]
@@ -711,12 +737,6 @@ def _format_workout_doc(doc: dict[str, Any]) -> str:
             lines.append("Planned Time in Zones: " + ", ".join(parts))
     return "\n".join(lines)
 
-    # Only shown when the event carries the flag; it is null on most events.
-    if event.get("indoor") is not None:
-        summary += f"\nIndoor: {event['indoor']}"
-
-    return summary
-
 
 def format_event_details(event: dict[str, Any]) -> str:
     """Format detailed event information into a readable string."""
@@ -737,6 +757,9 @@ Description: {event.get("description", "No description")}"""
         event_details += f"\nTags: {', '.join(str(t) for t in event['tags'])}"
     if event.get("updated"):
         event_details += f"\nUpdated: {event['updated']}"
+    other = _event_other_scalar_fields(event)
+    if other:
+        event_details += "\nOther fields: " + ", ".join(other)
     if isinstance(event.get("workout_doc"), dict):
         event_details += _format_workout_doc(event["workout_doc"])
 
@@ -781,7 +804,10 @@ Calendar: {cal.get("name", "N/A")}"""
 
 def format_activity_message(message: dict[str, Any]) -> str:
     """Format an activity message/note into a readable string."""
-    created = message.get("created", "Unknown")
+    # Prefer the local timestamp when the API provides it; say which one is shown.
+    created_local = message.get("created_local")
+    created = created_local or message.get("created", "Unknown")
+    zone = " (local)" if created_local else (" (UTC)" if message.get("created") else "")
     if isinstance(created, str) and len(created) > 10:
         try:
             dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
@@ -790,7 +816,7 @@ def format_activity_message(message: dict[str, Any]) -> str:
             pass
 
     return f"""Author: {message.get("name", "Unknown")}
-Date: {created}
+Date: {created}{zone}
 Type: {message.get("type", "TEXT")}
 Content: {message.get("content", "")}"""
 

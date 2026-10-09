@@ -12,6 +12,8 @@ from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_STREAM,
     INPUT_FIELD,
     INTERVAL_FIELD,
+    apply_units_overrides,
+    custom_fields_json,
     format_custom_activity_fields,
     format_custom_field_lines,
     format_field_value,
@@ -19,6 +21,7 @@ from intervals_mcp_server.utils.custom_fields import (
     index_custom_items,
     is_missing,
     select_label,
+    value_status,
 )
 from tests.sample_data import ACTIVITY_WITH_CUSTOM_FIELDS, CUSTOM_ITEMS_DATA
 
@@ -92,9 +95,14 @@ def test_format_field_value_units_label_and_zero_marker():
     assert format_field_value(defs["EPOC"], 129.58348) == "129.58348 ml/kg"
     assert format_field_value(defs["TrainingEffectSelect"], 2.0) == "2 (Base)"
     assert format_field_value(defs["FlightTime"], float("nan")) == "no value"
-    assert format_field_value(defs["Sweatloss"], 0.0) == "0 ml (0: may be absent in source file)"
-    # A 0 in a field that is not filled from the device file is not marked.
+    # Zeros are reported as stored; the ambiguity is flagged per field via value_status.
+    assert format_field_value(defs["Sweatloss"], 0.0) == "0 ml"
     assert format_field_value(defs["FlightTime"], 0) == "0"
+    payload = {"Sweatloss": 0.0, "FlightTime": float("nan"), "EPOC": 1.5}
+    assert value_status(defs["Sweatloss"], payload, "Sweatloss") == "zero"
+    assert value_status(defs["FlightTime"], payload, "FlightTime") == "missing"
+    assert value_status(defs["EPOC"], payload, "EPOC") == "value"
+    assert value_status(defs["AerobicEffect"], payload, "AerobicEffect") == "absent"
 
 
 def test_format_custom_field_lines_only_present_fields():
@@ -117,8 +125,10 @@ def test_format_custom_activity_fields_section():
     assert "- EPOC [EPOC]: 129.58348 ml/kg" in text
     assert "- Training Effect [TrainingEffectSelect]: 2 (Base)" in text
     assert "- Flight Time [FlightTime]: no value" in text
-    assert "- Sweat loss [Sweatloss]: 0 ml (0: may be absent in source file)" in text
+    assert "- Sweat loss [Sweatloss]: 0 ml" in text
     assert "Defined but not present" not in text
+    assert "Zero values in device-file fields" in text
+    assert text.index("Zero values") < text.index("Sweatloss", text.index("Zero values"))
     assert "Note:" in text
 
 
@@ -131,3 +141,37 @@ def test_format_custom_activity_fields_absent_and_empty():
     assert "Defined but not present on this activity: AerobicEffect, FlightTime, Sweatloss, TrainingEffectSelect" in text
     assert "none of the 5 defined" in format_custom_activity_fields({"x": 1}, defs)
     assert "no custom activity field definitions" in format_custom_activity_fields({"x": 1}, {})
+
+
+def test_custom_fields_json_statuses_and_sources():
+    """
+    The JSON view classifies every defined field (value, zero, missing, absent) and names its source.
+    """
+    defs = index_custom_items(CUSTOM_ITEMS_DATA)[ACTIVITY_FIELD]
+    rows = {row["code"]: row for row in custom_fields_json(ACTIVITY_WITH_CUSTOM_FIELDS, defs)}
+    assert rows["EPOC"] == {
+        "code": "EPOC", "name": "EPOC", "value": 129.58348, "units": "ml/kg",
+        "units_source": "definition", "label": None, "status": "value", "zero_ambiguous": False,
+        "source": "fit:178", "item_type": "ACTIVITY_FIELD", "value_type": "numeric",
+    }
+    assert rows["TrainingEffectSelect"]["label"] == "Base"
+    assert rows["TrainingEffectSelect"]["source"] == "manual/input"
+    assert rows["FlightTime"]["status"] == "missing"
+    assert rows["FlightTime"]["value"] is None
+    assert rows["Sweatloss"]["status"] == "zero"
+    assert rows["Sweatloss"]["zero_ambiguous"] is True
+    absent = custom_fields_json({}, defs)
+    assert all(row["status"] == "absent" and row["value"] is None for row in absent)
+
+
+def test_apply_units_overrides_marks_source():
+    """
+    Operator-configured units replace the definition units and are marked as overrides.
+    """
+    index = index_custom_items(CUSTOM_ITEMS_DATA)
+    apply_units_overrides(index, {"Stamina": "%", "EPOC": "ml/kg"})
+    assert index[ACTIVITY_STREAM]["Stamina"]["units"] == "%"
+    assert index[ACTIVITY_STREAM]["Stamina"]["units_source"] == "override"
+    assert index[ACTIVITY_FIELD]["EPOC"]["units_source"] == "override"
+    assert "units_source" not in index[ACTIVITY_FIELD]["AerobicEffect"]
+    assert apply_units_overrides(index, {}) is index

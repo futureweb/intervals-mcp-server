@@ -313,8 +313,10 @@ async def get_activity_details(
     if not isinstance(activity_data, dict):
         return f"Invalid activity format for activity {activity_id}."
 
-    # Resolve gear name (uses configured athlete_id via ATHLETE_ID env var)
-    await resolve_gear_for_activity(activity_data, api_key=api_key)
+    # Resolve gear name against the activity owner's catalog (falls back to ATHLETE_ID)
+    await resolve_gear_for_activity(
+        activity_data, athlete_id=activity_data.get("icu_athlete_id"), api_key=api_key
+    )
 
     custom_field_defs: CustomFieldDefs | None = None
     if include_custom_fields:

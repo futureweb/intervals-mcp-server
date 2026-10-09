@@ -95,7 +95,6 @@ from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-
     get_events,
 )
 from intervals_mcp_server.tools.gear import get_gear_list  # pylint: disable=wrong-import-position  # noqa: E402
-from intervals_mcp_server.tools.wellness import get_wellness_data  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.workout_library import (  # pylint: disable=wrong-import-position  # noqa: E402
     add_event_from_library,
     delete_library_workout,
