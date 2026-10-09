@@ -428,11 +428,17 @@ class Step:  # pylint: disable=too-many-instance-attributes
             if not nested and self.cooldown:
                 val += "\nCooldown\n"
 
-            val += ""
+            # Intervals.icu's builder syntax: "- [cue text] [duration or distance] [target] [cadence]";
+            # any text before the first duration is the step's cue, text after the target could be
+            # read as part of it (upstream mvilanova/intervals-mcp-server#132).
+            if self.duration is not None or self.distance is not None:
+                val += "- "  # a step without duration or distance stays a plain text line
+            if self.text is not None:
+                val += f"{self.text} "
             if self.duration is not None:
-                val += f"- {self._format_duration()} "
+                val += f"{self._format_duration()} "
             elif self.distance is not None:
-                val += f"- {self._format_distance()} "
+                val += f"{self._format_distance()} "
 
             if self.freeride:
                 val += "freeride "
@@ -453,8 +459,8 @@ class Step:  # pylint: disable=too-many-instance-attributes
                 val += f"{self.pace} "
             if self.cadence is not None:
                 val += f"{self.cadence} "
-        if self.text is not None:
-            val += f"{self.text} "
+        if self.reps is not None and self.text is not None:
+            val += f"{self.text} "  # repeat header label: "10x Main"
         if self.reps is not None and self.steps is not None:
             for step in self.steps:
                 # Using _to_str instead of __str__ because we need the nested=True arg;

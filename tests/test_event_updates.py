@@ -105,5 +105,32 @@ def test_absolute_pace_in_event_description(monkeypatch):
     calls = _capture(monkeypatch)
     doc = WorkoutDoc.from_dict({"steps": [{"duration": 2700, "pace": {"value": 335, "units": "MINS_KM"}, "text": "steady"}]})
     asyncio.run(add_or_update_event(name="Tempo run", workout_type="Run", workout_doc=doc, start_date="2026-10-14"))
-    assert "- 45m 5:35/km Pace steady" in calls[0]["data"]["description"]
+    assert "- steady 45m 5:35/km Pace" in calls[0]["data"]["description"]  # cue text first (upstream #132)
     assert str(Step.from_dict({"duration": 60, "pace": {"start": 100, "end": 110, "units": "SECS_100M"}})).strip() == "- 1m 1:40-1:50/100m Pace"
+
+
+def test_step_label_comes_first_like_the_native_builder():
+    """Upstream mvilanova/intervals-mcp-server#132: a leaf step's text is the cue before the duration/distance,
+    as in Intervals.icu's builder ('- Sprint 40mtr intensity=active Z5 HR'); preview, validation and the
+    execution plan parser keep working."""
+    from intervals_mcp_server.utils.execution import plan_steps  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.utils.workout_validation import validate_workout_doc  # pylint: disable=import-outside-toplevel
+
+    doc = {"description": "test", "steps": [
+        {"reps": 10, "text": "Main", "steps": [
+            {"text": "Sprint", "distance": 40, "hr": {"value": 5, "units": "hr_zone"}, "intensity": "active"},
+            {"text": "Rest", "duration": 30, "intensity": "rest"},
+        ]},
+        {"text": "Easy", "duration": 600, "warmup": True, "power": {"value": 55, "units": "%ftp"}},
+        {"text": "just a note"},
+    ]}
+    text = str(WorkoutDoc.from_dict(doc))
+    assert "10x Main \n- Sprint 40mtr intensity=active Z5 HR \n- Rest 30s intensity=rest \n" in text
+    assert "Warmup\n- Easy 10m 55% ftp" in text
+    assert "\njust a note " in text and "- just a note" not in text  # no duration: stays a plain text line
+    assert "40mtr intensity=active Z5 HR Sprint" not in text
+    result = validate_workout_doc(doc, "Run")
+    assert "- Sprint 40mtr intensity=active Z5 HR" in result["preview"]
+    planned = plan_steps(doc["steps"], {"ftp": 250, "lthr": 165, "hr_zones": [133, 147, 153, 164, 169, 174, 188]})
+    assert [p["text"] for p in planned][:2] == ["Sprint", "Rest"] and planned[0]["distance"] == 40
+    assert planned[1]["duration"] == 30

@@ -448,6 +448,9 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
             {"freeride": true, "power": {"value": 80, "units": "%ftp"}}
         Comments and Labels: Add descriptive text to label steps:
             {"text": "Warmup"}
+            A step's text becomes the cue at the start of its line, as in Intervals.icu's builder:
+            {"text": "Sprint", "distance": 40, "hr": {"value": 5, "units": "hr_zone"}} -> "- Sprint 40mtr Z5 HR".
+            Keep durations or distances (e.g. "10m") out of the text; they would be read as the step's.
 
     How to use steps:
     - Set distance or duration as appropriate for step

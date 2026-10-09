@@ -389,7 +389,7 @@ def test_get_library_workout_pace_hr_and_unsupported_nesting(monkeypatch):
                  {"reps": 4, "steps": [{"duration": 60, "hr": {"value": 90, "units": "%lthr"}}, {"duration": 60, "text": "easy"}]}]
     _patch(monkeypatch, lambda url, method: _library_workout(run_steps, type="Run", target="PACE"))
     text = asyncio.run(get_library_workout("77"))
-    assert "- 1km 95%-100% Pace" in text and "4x" in text and "- 1m 90% LTHR" in text and "- 1m easy" in text
+    assert "- 1km 95%-100% Pace" in text and "4x" in text and "- 1m 90% LTHR" in text and "- easy 1m" in text
     nested = [{"reps": 2, "steps": [{"reps": 2, "steps": [{"duration": 60, "power": {"value": 100, "units": "%ftp"}}]}]}]
     _patch(monkeypatch, lambda url, method: _library_workout(nested))
     raw = asyncio.run(get_library_workout("77"))
