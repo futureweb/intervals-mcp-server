@@ -15,7 +15,7 @@ RIDE_TYPES = ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide", "EBikeRid
 SWIM_TYPES = ("Swim", "OpenWaterSwim")
 POWER_UNITS = {"w", "%ftp", "power_zone", "%mmp"}
 HR_UNITS = {"%hr", "%lthr", "hr_zone"}
-PACE_UNITS = {"%pace", "pace_zone", "MINS_KM", "MINS_MILE", "SECS_100M", "SECS_500M"}
+PACE_UNITS = {"%pace", "pace_zone", "MINS_KM", "MINS_MILE", "SECS_100M", "SECS_100Y", "SECS_500M"}
 PLAUSIBLE = {
     "w": (0, 2500),
     "%ftp": (20, 250),
