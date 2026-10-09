@@ -59,6 +59,7 @@ def normalize_custom_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "fit_source": content.get("fit_session_field") or content.get("fit_record_field"),
         "has_script": bool(content.get("script")),
         "aggregate": content.get("aggregate"),
+        "updated": item.get("updated"),
     }
 
 

@@ -418,3 +418,140 @@ PLAN_EVENTS = [
 LIBRARY_WORKOUT = {"id": 77, "name": "SST 3x12", "type": "Ride", "folder_id": 301129, "moving_time": 4080, "icu_training_load": 70,
                    "description": "- 10m 55%\n3x\n- 12m 90%\n- 4m 50%", "workout_doc": {"steps": EVENT_DATA["workout_doc"]["steps"]}}
 GEAR_WITH_REMINDER = [dict(GEAR_DATA[0], reminders=[{"id": 1, "name": "Chain wax", "distance": 400000, "distance_used": 250000, "percent_used": 62.5, "last_reset": "2026-08-01"}])] + GEAR_DATA[1:]
+
+
+# ---------------------------------------------------- phase 6: data quality, fueling, context
+FUELING_ITEMS = CUSTOM_ITEMS_DATA + [
+    {"id": 30, "type": "ACTIVITY_FIELD", "name": "Fluid intake", "content": {"code": "FluidIntake", "type": "numeric", "units": "L"}},
+    {"id": 31, "type": "ACTIVITY_FIELD", "name": "Sodium", "content": {"code": "SodiumMg", "type": "numeric", "units": "mg"}},
+    {"id": 32, "type": "ACTIVITY_FIELD", "name": "Performance Condition", "updated": "2025-01-01T00:00:00Z",
+     "content": {"code": "PerformanceCondition", "type": "numeric", "fit_session_field": "140.17"}},
+    {"id": 33, "type": "ACTIVITY_FIELD", "name": "Stamina at start",
+     "content": {"code": "Staminaatstart", "type": "numeric", "units": "%", "fit_session_field": "205"}},
+    {"id": 34, "type": "ACTIVITY_FIELD", "name": "Stamina at end",
+     "content": {"code": "Staminaatend", "type": "numeric", "units": "%", "fit_session_field": "206"}},
+    {"id": 35, "type": "ACTIVITY_FIELD", "name": "New Metric", "updated": "2026-10-09T12:00:00Z",
+     "content": {"code": "NewMetric", "type": "numeric", "fit_session_field": "250"}},
+    {"id": 36, "type": "ACTIVITY_STREAM", "name": "Carbs eaten", "content": {"code": "CarbsEaten", "type": "numeric", "units": "g"}},
+]
+FUELING_SPORT_SETTINGS = [dict(SPORT_SETTINGS_DATA[0], activity_field_ids=[2, 3, 5, 32, 33, 34, 35]), SPORT_SETTINGS_DATA[1]]
+
+FUELING_INTERVALS = [
+    {"type": "WORK", "label": "Warmup", "start_index": 0, "end_index": 200, "start_time": 0, "end_time": 200, "elapsed_time": 200,
+     "average_watts": 150, "wbal_start": 20000, "wbal_end": 19800},
+    {"type": "WORK", "label": None, "start_index": 200, "end_index": 300, "start_time": 200, "end_time": 300, "elapsed_time": 100,
+     "average_watts": 330, "wbal_start": 19800, "wbal_end": 9000},
+    {"type": "RECOVERY", "label": None, "start_index": 300, "end_index": 600, "start_time": 300, "end_time": 700, "elapsed_time": 400,
+     "average_watts": 140, "wbal_start": 9000, "wbal_end": 19900},
+    {"type": "WORK", "label": None, "start_index": 600, "end_index": 650, "start_time": 700, "end_time": 750, "elapsed_time": 50,
+     "average_watts": 450, "wbal_start": 19900, "wbal_end": 4000},
+    {"type": "RECOVERY", "label": None, "start_index": 650, "end_index": 1200, "start_time": 750, "end_time": 1300, "elapsed_time": 550,
+     "average_watts": 160, "wbal_start": 4000, "wbal_end": 19500},
+]
+
+FUELING_ACTIVITY: dict[str, Any] = {
+    "id": "i50", "name": "Long ride", "type": "Ride", "icu_athlete_id": "i1",
+    "start_date_local": "2026-10-08T09:00:00", "start_date": "2026-10-08T07:00:00Z",
+    "elapsed_time": 7400, "moving_time": 7200, "icu_recording_time": 7250, "coasting_time": 300,
+    "distance": 60000.0, "total_elevation_gain": 800.0, "icu_ftp": 234, "icu_intensity": 72.0, "icu_training_load": 150,
+    "icu_average_watts": 180, "icu_weighted_avg_watts": 195, "icu_weight": 75.0, "average_heartrate": 140, "max_heartrate": 170,
+    "carbs_used": 300, "carbs_ingested": 120, "calories": 1800, "icu_joules": 1500000,
+    "Sweatloss": 1400.0, "FluidIntake": 1.0, "SodiumMg": 800.0, "PerformanceCondition": 0.0, "Staminaatstart": 100.0,
+    "Staminaatend": 55.0, "EPOC": 150.0,
+    "average_weather_temp": 18.0, "min_weather_temp": 15.0, "max_weather_temp": 21.0, "average_feels_like": 17.0,
+    "min_feels_like": 14.0, "max_feels_like": 20.0, "average_wind_speed": 2.5, "average_wind_gust": 5.0, "prevailing_wind_deg": 225,
+    "headwind_percent": 40.0, "tailwind_percent": 35.0, "average_clouds": 50, "max_rain": 0.5, "max_snow": 0.0,
+    "average_temp": 22.0, "min_temp": 16, "max_temp": 30, "has_weather": True,
+    "icu_w_prime": 20000, "icu_pm_w_prime": 21000, "icu_max_wbal_depletion": 16000, "icu_joules_above_ftp": 40000,
+    "source": "GARMIN_CONNECT", "external_id": "123456789", "strava_id": "987", "file_type": "fit",
+    "created": "2026-10-08T09:05:00Z", "icu_sync_date": "2026-10-08T12:00:00Z", "analyzed": "2026-10-08T12:00:00Z",
+    "recording_stops": [599], "icu_lap_count": 3, "icu_intervals_edited": True, "icu_median_time_delta": 1,
+    "device_name": "Edge 1040", "power_meter": None, "power_field_names": ["power"], "device_watts": True, "has_heartrate": True,
+    "route_id": 77, "stream_types": ["time", "watts", "heartrate", "latlng", "Stamina"],
+    "icu_intervals": FUELING_INTERVALS,
+}
+
+
+def _fueling_streams():
+    """1200 samples, a 100 s recording gap after sample 599; W′bal dips below 50 % twice; HR with gaps and zeros."""
+    time = list(range(600)) + list(range(700, 1300))
+    w_bal = [9000 if 200 <= i < 300 else 4000 if 600 <= i < 650 else 20000 for i in range(1200)]
+    heartrate = [None if i < 30 else 0 if i < 45 else 140 for i in range(1200)]
+    return [
+        {"type": "time", "custom": False, "data": time},
+        {"type": "watts", "custom": False, "data": [200] * 1200},
+        {"type": "heartrate", "custom": False, "data": heartrate},
+        {"type": "latlng", "custom": False, "data": [47.0] * 1200, "data2": [12.0] * 1200},
+        {"type": "Stamina", "custom": True, "data": [100 - i / 30 for i in range(1200)]},
+        {"type": "w_bal", "custom": False, "data": w_bal},
+    ]
+
+
+FUELING_STREAMS = _fueling_streams()
+
+STRAVA_STUB = {"id": "i77", "icu_athlete_id": "i1", "start_date_local": "2026-10-01T10:00:00", "type": "Ride", "name": "Morning Ride",
+               "source": "STRAVA", "_note": "STRAVA activities are not available via the API"}
+
+
+def _listed(aid, day, kind="Ride", **extra):
+    base = {"id": aid, "name": f"{kind} {aid}", "type": kind, "start_date_local": f"{day}T09:00:00", "start_date": f"{day}T07:00:00Z",
+            "elapsed_time": 7000, "moving_time": 6800, "source": "GARMIN_CONNECT", "stream_types": ["time", "watts", "heartrate", "secondary_power", "Stamina"],
+            "PerformanceCondition": 2.0, "Sweatloss": 1000.0}
+    base.update(extra)
+    return base
+
+
+# Recent activities (list with a field selection) for the audit: the reference, three earlier rides
+# with a second power stream and Performance Condition, and a run.
+AUDIT_LIST = [
+    {k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"},
+    _listed("i51", "2026-10-05"), _listed("i52", "2026-10-02"), _listed("i53", "2026-09-28", power_meter="Assioma"),
+    _listed("i54", "2026-09-30", "Run", stream_types=["time", "heartrate"]),
+]
+# A Garmin Connect copy of i50 that Intervals.icu filters as a duplicate (not in the list).
+DUPLICATE_ACTIVITY = {**{k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"}, "id": "i55", "source": "GARMIN_CONNECT",
+                      "external_id": "123456789", "icu_training_load": None, "icu_intervals": []}
+AUDIT_LIST_WITH_UPLOAD = [dict(AUDIT_LIST[0], source="UPLOAD", external_id="123456789_ACTIVITY.fit")] + AUDIT_LIST[1:]
+
+# Activities on route 77 (list with route_id): the reference, two comparable earlier rides, a longer
+# variant, a run on the same route and a later ride.
+ROUTE_LIST = [
+    {k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"},
+    _listed("i40", "2026-09-20", moving_time=7500, distance=60500.0, total_elevation_gain=790.0, icu_average_watts=170,
+            icu_weighted_avg_watts=185, icu_weight=76.0, average_heartrate=138, average_weather_temp=12.0, headwind_percent=30.0,
+            Staminaatstart=100.0, Staminaatend=60.0),
+    _listed("i41", "2026-08-10", "GravelRide", moving_time=7000, distance=59500.0, total_elevation_gain=820.0, icu_average_watts=190,
+            icu_weighted_avg_watts=200, icu_weight=76.0, average_heartrate=145, average_weather_temp=25.0),
+    _listed("i42", "2026-07-01", moving_time=9000, distance=80000.0, total_elevation_gain=1100.0, icu_average_watts=160),
+    _listed("i43", "2026-06-01", "Run", moving_time=20000, distance=60000.0),
+    _listed("i60", "2026-10-09", moving_time=7100, distance=60000.0),
+]
+
+
+def _fueling_period():
+    """Long sessions with logged, zero and missing intake (period mode of get_fueling_analysis)."""
+    rows = []
+    specs = [  # id, day, type, moving s, IF %, carbs used, ingested, sweat ml
+        ("p1", "2026-09-01", "Ride", 5400, 60.0, 200, 40, 600.0),
+        ("p2", "2026-09-05", "Ride", 9000, 70.0, 350, 150, 1500.0),
+        ("p3", "2026-09-10", "GravelRide", 12600, 78.0, 500, 240, 2500.0),
+        ("p4", "2026-09-15", "Ride", 16200, 72.0, 600, 320, 3000.0),
+        ("p5", "2026-09-20", "Ride", 7200, 88.0, 330, 0, 900.0),
+        ("p6", "2026-09-25", "Ride", 6000, 66.0, 230, None, None),
+        ("p7", "2026-09-26", "Ride", 3000, 90.0, 120, 20, 300.0),
+        ("p8", "2026-09-28", "Run", 6000, 75.0, None, 30, 1200.0),
+    ]
+    for aid, day, kind, moving, intensity, used, ingested, sweat in specs:
+        row: dict[str, Any] = {"id": aid, "name": f"{kind} {aid}", "type": kind, "start_date_local": f"{day}T09:00:00", "moving_time": moving,
+                               "elapsed_time": moving + 100, "icu_intensity": intensity, "calories": moving / 4, "icu_joules": moving * 200}
+        if used is not None:
+            row["carbs_used"] = used
+        if ingested is not None:
+            row["carbs_ingested"] = ingested
+        if sweat is not None:
+            row["Sweatloss"] = sweat
+        rows.append(row)
+    return rows
+
+
+FUELING_PERIOD = _fueling_period()

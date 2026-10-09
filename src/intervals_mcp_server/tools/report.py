@@ -17,11 +17,22 @@ from intervals_mcp_server.tools.activities import _compact_details, _compact_int
 from intervals_mcp_server.tools.analysis import PACE_SPORTS, _get_event, _threshold_context, tolerances_from_args  # pylint: disable=protected-access
 from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
+from intervals_mcp_server.tools.data_audit import expected_field_codes
 from intervals_mcp_server.tools.gear import resolve_gear_for_activity
+from intervals_mcp_server.utils.activity_context import (
+    MAX_ROUTE_HISTORY,
+    ROUTE_FIELDS,
+    route_history,
+    route_history_lines,
+    weather_summary,
+    wprime_summary,
+)
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, is_missing
 from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
+from intervals_mcp_server.utils.fueling import activity_fueling
 from intervals_mcp_server.utils.power_compare import compare_power_streams as compute_power_comparison
+from intervals_mcp_server.utils.provenance import STRAVA_STUB_NOTE, freshness, is_strava_stub, provenance_notes, source_summary
 from intervals_mcp_server.utils.segments import detect_segments
 from intervals_mcp_server.utils.sports import hms, utc_offset
 from intervals_mcp_server.utils.streams import find_stream, gear_units_note, numeric_values
@@ -202,8 +213,9 @@ def _key_findings(  # pylint: disable=too-many-arguments,too-many-positional-arg
 def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     activity: dict[str, Any], available: list[str], streams: list[dict[str, Any]], intervals: list[dict[str, Any]],
     power: dict[str, Any] | None, stream_defs: dict[str, Any], execution: dict[str, Any] | None,
+    provenance: list[str] | None = None,
 ) -> list[str]:
-    notes: list[str] = []
+    notes: list[str] = list(provenance or [])
     if not activity.get("device_name"):
         notes.append("device unknown (no device data in the file)")
     if "watts" in available and not activity.get("power_meter"):
@@ -216,8 +228,6 @@ def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-ar
         notes.append("no streams returned by Intervals.icu (file not retained?)")
     if not intervals:
         notes.append("no intervals detected by Intervals.icu")
-    if activity.get("icu_intervals_edited"):
-        notes.append("intervals were edited (Intervals.icu will not regenerate them)")
     if activity.get("compliance") == 0 and not activity.get("paired_event_id"):
         notes.append("compliance 0 only means the activity is not paired with a planned workout")
     for stream in streams:
@@ -233,6 +243,27 @@ def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-ar
     return notes
 
 
+async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str | None, field_defs: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+    """Earlier activities on the activity's Intervals.icu route (one list request, one for the route name)."""
+    route_id = activity.get("route_id")
+    if not route_id or not athlete_id:
+        return None, 0
+    pairs = start_end_pairs(field_defs)
+    codes = sorted({code for start, end, _ in pairs for code in (start, end)})
+    result = await make_intervals_request(
+        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        params={"oldest": "2000-01-01", "newest": str(activity.get("start_date_local") or "")[:10], "route_id": route_id,
+                "limit": MAX_ROUTE_HISTORY + 1, "fields": ",".join([ROUTE_FIELDS, *codes])},
+    )
+    candidates = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
+    history = route_history(activity, candidates, pairs)
+    route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}", api_key=api_key)
+    history["route_name"] = route.get("name") if isinstance(route, dict) and "error" not in route else None
+    if isinstance(result, dict) and "error" in result:
+        history["error"] = result.get("message")
+    return history, 2
+
+
 @tool("read")
 async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,too-many-return-statements
     activity_id: str,
@@ -244,6 +275,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     duration_tolerance_pct: float | None = None,
     start_tolerance_s: float | None = None,
     pause_tolerance_s: float | None = None,
+    include_route_history: bool = False,
 ) -> str:
     """Complete compact analysis of one activity in a single call (overview, plan vs execution, power meters, climbs)
 
@@ -258,7 +290,12 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     for activities without intervals (or on request); and data-quality notes (unknown sensors,
     gear streams whose values are gear positions rather than tooth counts, counter and
     other-sport streams left out). Use the specialised tools for the full detail of any
-    section. Read-only.
+    section. The overview carries a fueling line (carbs used/ingested per hour, sweat loss,
+    energy), weather (temperature, feels-like, wind, head/tailwind share) and W′ balance (max
+    depletion, time below 75/50/25 % of W′ from the w_bal stream); the data-quality notes name
+    the source, upload/analysis times, recording stops and zero placeholders (full audit:
+    get_activity_data_audit). include_route_history adds earlier activities on the same
+    Intervals.icu route (time, power, W/kg, HR, weather, stamina; two extra requests). Read-only.
 
     Args:
         activity_id: The Intervals.icu activity ID
@@ -275,6 +312,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
             short (optional, default 10; see analyze_workout_execution)
         start_tolerance_s: Plan timeline shift in seconds before a step is flagged (optional, default 120)
         pause_tolerance_s: Recording pause per step in seconds before it is flagged (optional, default 60)
+        include_route_history: Compare with earlier activities on the same route (optional, default False)
     """
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
@@ -285,11 +323,18 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     activity = result[0] if isinstance(result, list) and result else result
     if not isinstance(activity, dict) or not activity:
         return f"No details found for activity {activity_id}."
+    if is_strava_stub(activity):
+        if output_format.strip().lower() == "json":
+            return json.dumps({"activity": {k: activity.get(k) for k in ("id", "name", "type", "start_date_local", "source")},
+                               "strava_stub": True, "notes": [STRAVA_STUB_NOTE], "api_calls": 1}, ensure_ascii=False, default=str)
+        return f"== Overview\n{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')})\n== Data quality\n- {STRAVA_STUB_NOTE}"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
     await resolve_gear_for_activity(activity, athlete_id=athlete_id or None, api_key=api_key)
     index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key) if athlete_id else {}
     field_defs, stream_defs, interval_defs = (index.get(t, {}) for t in (ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD))
     assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    sport = str(activity.get("type") or "")
+    expected = (await expected_field_codes(athlete_id, api_key, field_defs, [sport])).get(sport) if athlete_id and sport else assigned
 
     intervals_result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
     intervals_payload = intervals_result if isinstance(intervals_result, dict) and "error" not in intervals_result else {}
@@ -297,10 +342,16 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
 
     available = [str(t) for t in (activity.get("stream_types") or [])]
     wanted = [t for t in CORE_STREAMS if t in available or t == "time"] + [t for t in available if t in stream_defs]
+    if "watts" in available:
+        wanted.append("w_bal")  # computed by Intervals.icu on request; silently omitted without W′ data
     streams_result = await make_intervals_request(
         url=f"/activity/{activity_id}/streams", api_key=api_key, params={"types": ",".join(wanted)}
     )
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
+    w_bal = find_stream(streams, "w_bal")
+    streams = [s for s in streams if s.get("type") != "w_bal"]
+    time_stream = find_stream(streams, "time")
+    wprime = wprime_summary(activity, intervals, (w_bal or {}).get("data"), (time_stream or {}).get("data"))
 
     steps: Any = None
     plan_source = ""
@@ -319,7 +370,9 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     power = _power_check(streams)
     want_climbs = include_climbs if include_climbs is not None else (not intervals or (activity.get("total_elevation_gain") or 0) > 500)
     climbs = _climb_summary(streams, activity.get("type"), None if detail_level == "full" else MAX_CLIMBS) if want_climbs and streams else None
-    notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution)
+    notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution,
+                           provenance_notes(activity, field_defs, expected, intervals))
+    route, route_calls = await _route_history(activity, athlete_id, api_key, field_defs) if include_route_history else (None, 0)
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)
 
     if output_format.strip().lower() == "json":
@@ -344,17 +397,27 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
             "intervals": interval_rows,
             "power_check": power,
             "climbs": climbs,
+            "fueling": activity_fueling(activity, field_defs),
+            "weather": weather_summary(activity),
+            "w_prime": wprime,
+            "provenance": {**source_summary(activity), "freshness": freshness(activity, field_defs, expected)},
+            "route_history": route,
             "notes": notes,
-            "api_calls": 3 + (1 if plan_source.startswith("event") else 0),
+            "api_calls": 3 + (1 if plan_source.startswith("event") else 0) + route_calls,
         }
         return json.dumps(payload, ensure_ascii=False, default=str)
 
-    overview = _compact_details(activity, field_defs, None if detail_level == "full" else assigned)
+    overview = _compact_details(activity, field_defs, None if detail_level == "full" else assigned, wprime)
     sections = ["== Overview", overview]
+    route_lines = route_history_lines(route, detail_level) if route else (
+        ["No Intervals.icu route for this activity (routes need GPS)"] if include_route_history else [])
     if detail_level == "compact":
         if findings:
             sections.append("== Key findings")
             sections.extend(f"- {finding}" for finding in findings)
+        if route_lines:
+            sections.append("== Same route")
+            sections.extend(route_lines[:3])
         if notes:
             sections.append("== Data quality")
             sections.extend(f"- {n}" for n in notes)
@@ -383,6 +446,9 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     if climbs:
         sections.append("== Climbs")
         sections.extend(_format_climbs(climbs))
+    if route_lines:
+        sections.append("== Same route")
+        sections.extend(route_lines)
     if notes:
         sections.append("== Data quality")
         sections.extend(f"- {n}" for n in notes)

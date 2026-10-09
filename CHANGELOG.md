@@ -9,6 +9,42 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (phase 6: data quality, fueling, context)
+- `get_activity_data_audit` (new, read-only): provenance and data quality of one activity - source and
+  file (Garmin Connect sync with the Garmin activity id, upload of a Garmin export, the Garmin
+  Intervals Bridge's upload mode, Strava stubs that the API returns empty), upload delay after the end
+  and analysis time (re-analysed later), custom fields defined after the last analysis, filtered
+  duplicates (not in the activity list while a listed activity starts within 2 min, same Garmin
+  activity named), recording stops and gaps, FIT laps vs Intervals.icu intervals and what manual
+  interval edits mean, device and sensor identity (power meter name/serial, battery, estimated power,
+  HR sensor not exposed), streams usual on recent activities of the sport but missing, per-stream
+  coverage (dropouts, zeros, empty streams, streams not returned), the sport's custom fields with
+  value / zero placeholder / no value / absent and the device-file fields the bridge could fill.
+  Without `activity_id`: per-sport coverage of a period (sources, power, HR, GPS, weather, custom
+  streams, expected fields). Three requests for one activity, one for a period.
+- `get_fueling_analysis` (new, read-only): carbs used (Intervals.icu estimate) and ingested in g and
+  g/h, ingested share of used, kcal and kJ, fluid intake, sodium and sweat loss from custom fields
+  found by units and name (no vendor list); intake per hour only when a custom stream carries it.
+  Period mode for sessions of at least `min_minutes`: per sport family, duration and intensity
+  bucket with sample sizes, logging coverage (logged, stored 0, not logged) and Spearman
+  correlations; notes that used vs ingested is no 1:1 energy deficit; no targets.
+- `get_activity_report` and `get_activity_details`: fueling line, weather line (temperature range,
+  feels-like, wind in km/h from the m/s Intervals.icu stores, compass direction, head/tailwind share,
+  clouds, rain in mm/h, device sensor next to the weather) and W′ balance (W′ and power-model W′, max
+  depletion, lowest W′bal; in the report from the `w_bal` stream, requested with the other streams at
+  no extra cost: time below 75/50/25 % of W′, dips below 50 %, the interval that ended lowest); JSON
+  sections `fueling`, `weather`, `w_prime`, `provenance`. The report's data-quality notes name the
+  source and freshness, recording stops, manual interval edits, zero placeholders and fields defined
+  after the analysis; Strava stubs get a clear message instead of an empty analysis.
+- `get_activity_report(include_route_history=True)`: earlier activities on the same Intervals.icu
+  route (activity list filtered by `route_id`, bounded to 15, plus the route name; two requests) with
+  time, power, W/kg, HR, weather and start/end pairs such as stamina; rank by moving time and
+  differences to the median of comparable activities (same sport family, distance within 5 %,
+  elevation gain within 10 %).
+- `get_durability(temperature_source=...)`: the heat filter can use the activity's weather or
+  feels-like temperature instead of the device sensor; sessions list device and weather temperature.
+- Fixed: the activity summary printed the wind speed (stored in m/s) as km/h.
+
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list
   (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count

@@ -27,7 +27,16 @@ from intervals_mcp_server.utils.custom_fields import (
     format_custom_field_lines,
     is_missing,
 )
+from intervals_mcp_server.utils.activity_context import weather_line, weather_summary, wprime_line, wprime_summary
 from intervals_mcp_server.utils.execution import plan_position, plan_steps, planned_step_map, planned_step_text
+from intervals_mcp_server.utils.fueling import activity_fueling, fueling_line
+from intervals_mcp_server.utils.provenance import (
+    STRAVA_STUB_NOTE,
+    freshness,
+    freshness_text,
+    is_strava_stub,
+    source_summary,
+)
 from intervals_mcp_server.utils.sports import cadence_spm, cadence_text, format_local_start, format_start_times, hms, start_times
 from intervals_mcp_server.utils.formatting import (
     format_activity_details,
@@ -71,8 +80,28 @@ DETAIL_LEVELS = ("summary", "compact")
 DETAIL_LEVELS_3 = ("compact", "standard", "full")
 
 
-def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None) -> str:
-    """Token-efficient activity view: key numbers, thresholds, assigned custom fields, data quality."""
+def context_lines(activity: dict[str, Any], defs: CustomFieldDefs, wprime: dict[str, Any] | None = None) -> list[str]:
+    """Fueling line and one line with weather and W′ balance (only what the activity carries).
+
+    ``wprime`` is a precomputed W′ summary (e.g. with the w_bal stream); default from the payload.
+    """
+    lines = []
+    fueling = fueling_line(activity_fueling(activity, defs))
+    if fueling:
+        lines.append(fueling)
+    context = [text for text in (weather_line(weather_summary(activity)),
+                                 wprime_line(wprime if wprime is not None else wprime_summary(activity))) if text]
+    if context:
+        lines.append(" | ".join(context))
+    return lines
+
+
+def _compact_details(
+    activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None, wprime: dict[str, Any] | None = None
+) -> str:
+    """Token-efficient activity view: key numbers, thresholds, fueling, weather and W′, assigned custom fields, data quality."""
+    if is_strava_stub(activity):
+        return f"{activity.get('name', 'Unnamed')} ({activity.get('id')}) {format_local_start(activity)}\n{STRAVA_STUB_NOTE}"
     gear = activity.get("_resolved_gear_name") or (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("_resolved_gear_name")
     lines = [
         f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_local_start(activity)}",
@@ -89,10 +118,13 @@ def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: 
         f"device {activity.get('device_name') or 'unknown'}, power meter {activity.get('power_meter') or 'unknown'}"
         + (f", power fields {', '.join(str(p) for p in activity['power_field_names'])}" if activity.get("power_field_names") else ""),
     ]
+    lines.extend(context_lines(activity, defs, wprime))
     custom = format_custom_field_lines(activity, defs, prefix="", only=assigned)
     if custom:
         lines.append("Custom fields" + (" (assigned to this sport)" if assigned is not None else "") + ": " + "; ".join(custom[:14]) + (" ..." if len(custom) > 14 else ""))
     quality = []
+    if activity.get("source"):
+        quality.append(source_summary(activity)["label"])
     if activity.get("icu_intervals_edited"):
         quality.append("intervals edited")
     if activity.get("icu_sync_error"):
@@ -615,6 +647,10 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
                     "times": start_times(activity_data),
                     "gear_name": activity_data.get("_resolved_gear_name"),
                     "custom_fields": custom_fields_json(activity_data, custom_field_defs or {}, assigned),
+                    "fueling": activity_fueling(activity_data, custom_field_defs or {}),
+                    "weather": weather_summary(activity_data),
+                    "w_prime": wprime_summary(activity_data),
+                    "provenance": {**source_summary(activity_data), "freshness": freshness(activity_data)},
                     "detail_level": detail_level,
                     "thresholds": {
                         k: activity_data.get(k)
@@ -630,12 +666,20 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
 
     if detail_level == "compact":
         return _compact_details(activity_data, custom_field_defs or {}, assigned)
-    return format_activity_details(
+    view = format_activity_details(
         activity_data,
         custom_field_defs=custom_field_defs,
         include_all_fields=include_all_fields or detail_level == "full",
         assigned=assigned,
     )
+    extra = context_lines(activity_data, custom_field_defs or {})
+    if activity_data.get("source"):
+        extra.append(f"Source: {source_summary(activity_data)['text']}; {freshness_text(freshness(activity_data))}")
+    if is_strava_stub(activity_data):
+        extra.insert(0, STRAVA_STUB_NOTE)
+    if extra:
+        view += "\nFueling, weather, W′ and source:\n" + "\n".join(f"- {line}" for line in extra) + "\n"
+    return view
 
 
 def _interval_stream_metrics(

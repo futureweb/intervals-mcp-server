@@ -91,7 +91,7 @@ shows up in the tools automatically:
 
 | Restored by the bridge | Where the MCP shows it |
 | --- | --- |
-| Training effect, EPOC, Garmin training load, recovery time, VO₂max, performance condition, stamina start/end, sweat loss, temperatures | `get_activity_details`, `get_activity_report`, `get_training_summary`, `get_training_load` (device loads apart from the Intervals.icu load) |
+| Training effect, EPOC, Garmin training load, recovery time, VO₂max, performance condition, stamina start/end, sweat loss, temperatures | `get_activity_details`, `get_activity_report`, `get_training_summary`, `get_training_load` (device loads apart from the Intervals.icu load), `get_fueling_analysis` (sweat loss per hour), `get_activity_data_audit` (which fields still hold a zero placeholder or no value) |
 | Stamina and potential stamina, second power meter, grade-adjusted speed, gear selection, running dynamics streams | `get_activity_streams`, `get_activity_intervals`, `analyze_workout_execution`, `analyze_climbs`, `compare_power_streams` |
 | Night SpO₂, respiration, sleeping HR, HRV details, Body Battery, sleep stages and stress, readiness, nutrition | `get_wellness_data`, `get_recovery_snapshot`, `get_wellness_trends`, `get_nutrition_summary` |
 
@@ -108,7 +108,8 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 
 | Tool | What it does |
 | --- | --- |
-| `get_activity_report` | Complete analysis in one call: overview, plan vs execution or intervals, second power meter check, climbs, data-quality notes; `detail_level` compact (core numbers and key findings, about 2k characters), standard or full |
+| `get_activity_report` | Complete analysis in one call: overview with fueling (carbs used/ingested per hour, sweat loss, energy), weather (temperature, feels-like, wind, head/tailwind share) and W′ balance (max depletion, time below 75/50/25 % of W′), plan vs execution or intervals, second power meter check, climbs, data-quality notes (source, upload and analysis times, recording stops, zero placeholders); `include_route_history` compares earlier activities on the same Intervals.icu route (time, power, W/kg, HR, weather, stamina); `detail_level` compact (core numbers and key findings, about 2k characters), standard or full |
+| `get_activity_data_audit` | Provenance and data quality of one activity: source and file (Garmin sync, Garmin export or bridge upload, Strava stub), upload and analysis times, filtered duplicates, recording stops and gaps, FIT laps vs intervals and manual edits, device and sensor identity, streams usual for the sport but missing, per-stream coverage, custom fields with value / zero placeholder / none and what the Garmin Intervals Bridge could fill; without an activity, the per-sport data coverage of a period |
 | `analyze_workout_execution` | Planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina). Steps are capped at their planned duration, longer intervals are split for the analysis, and riding beyond the plan is reported separately with its load and extra efforts. Tolerances for start shift, pauses and step length; `planned_workout_doc` for deleted events; matching events suggested read-only |
 | `analyze_climbs` | Climbs, descents and pauses with power, NP, HR, VAM and custom streams per segment; grade smoothed over a distance window (raw grade optional), grade confidence high/medium/low per segment (no grade below the minimum horizontal distance, raw included), real pauses vs slow movement, sport profiles for riding, running and hiking, data-quality flags |
 | `compare_power_streams` | Sample-aligned comparison of two power meters: offset, power bands, stable windows, drift, lag |
@@ -120,7 +121,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output |
-| `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units |
+| `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units, fueling, weather, W′ balance and source/freshness |
 | `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream, optionally the planned step type next to the Intervals.icu type |
 | `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging |
 | `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description |
@@ -136,7 +137,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
 | `get_training_load` | Acute and chronic load, acute:chronic ratio, Foster monotony and strain (rest days as 0), deload-like weeks, per sport with the primary sport, ISO week table, CTL/ATL/form/ramp; device loads kept separate; reference ranges with sources, no verdict |
 | `get_intensity_distribution` | Three-zone distribution from power, HR or pace zones (mapping by zone count), polarization index after Treff et al. 2019, class, hard sessions and days, drift between the halves, per sport and week, zone coverage, a caveat when totals mix power and HR zones |
-| `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out |
+| `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out; heat filter on the device sensor or the activity's weather / feels-like temperature (`temperature_source`), sessions list both temperatures |
 | `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
 | `get_training_summary` | Totals per week, month, sport or gear with separate load sources and time in zones; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
@@ -150,6 +151,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep against 42-day baselines, durability, top sessions, the plan of the next 7 days and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule) |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
+| `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name; per sport, duration and intensity with sample sizes and logging coverage; no targets |
 | `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |
 
 **Athlete, gear, calendar and workouts**
