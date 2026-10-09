@@ -5,8 +5,9 @@ This module contains formatting functions for handling data from the Intervals.i
 """
 
 import json
-from datetime import datetime
 from typing import Any
+
+from intervals_mcp_server.utils.types import WorkoutDoc
 
 from intervals_mcp_server.utils.custom_fields import (
     CustomFieldDefs,
@@ -15,6 +16,12 @@ from intervals_mcp_server.utils.custom_fields import (
     format_value,
     is_missing,
     select_label,
+)
+from intervals_mcp_server.utils.sports import (
+    format_pace,
+    format_start_times,
+    format_zone_table,
+    hms,
 )
 from intervals_mcp_server.utils.streams import format_range_metrics
 
@@ -42,15 +49,8 @@ class _KeyTracker(dict):
 
 def format_activity_summary(activity: dict[str, Any]) -> str:
     """Format an activity into a readable string."""
-    start_time = activity.get("startTime", activity.get("start_date", "Unknown"))
-
-    if isinstance(start_time, str) and len(start_time) > 10:
-        # Format datetime if it's a full ISO string
-        try:
-            dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-            start_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            pass
+    # Local and UTC start are reported side by side (P0: timezone clarity).
+    start_time = format_start_times(activity)
 
     rpe = activity.get("perceived_exertion", None)
     if rpe is None:
@@ -97,7 +97,7 @@ Elevation Loss: {activity.get("total_elevation_loss", "N/A")} meters
 Power Data:
 Average Power: {activity.get("avgPower", activity.get("icu_average_watts", activity.get("average_watts", "N/A")))} watts
 Weighted Avg Power: {activity.get("icu_weighted_avg_watts", "N/A")} watts
-Training Load: {activity.get("trainingLoad", activity.get("icu_training_load", "N/A"))}
+Training Load (Intervals.icu): {activity.get("trainingLoad", activity.get("icu_training_load", "N/A"))}
 FTP: {activity.get("icu_ftp", "N/A")} watts
 Kilojoules: {activity.get("icu_joules", "N/A")}
 Intensity: {activity.get("icu_intensity", "N/A")}
@@ -132,14 +132,14 @@ Avg Wind Speed: {activity.get("average_wind_speed", "N/A")} km/h
 Headwind %: {activity.get("headwind_percent", "N/A")}%
 Tailwind %: {activity.get("tailwind_percent", "N/A")}%
 
-Training Metrics:
+Training Metrics (Intervals.icu; device loads such as a Garmin training load are custom fields):
 Fitness (CTL): {activity.get("icu_ctl", "N/A")}
 Fatigue (ATL): {activity.get("icu_atl", "N/A")}
 TRIMP: {activity.get("trimp", "N/A")}
 Polarization Index: {activity.get("polarization_index", "N/A")}
-Power Load: {activity.get("power_load", "N/A")}
-HR Load: {activity.get("hr_load", "N/A")}
-Pace Load: {activity.get("pace_load", "N/A")}
+Power Load (Intervals.icu): {activity.get("power_load", "N/A")}
+HR Load (Intervals.icu): {activity.get("hr_load", "N/A")}
+Pace Load (Intervals.icu): {activity.get("pace_load", "N/A")}
 Efficiency Factor: {activity.get("icu_efficiency_factor", "N/A")}
 
 Device Info:
@@ -187,6 +187,95 @@ def _format_activity_other_fields(activity: _KeyTracker) -> list[str]:
     return lines
 
 
+def _format_thresholds(activity: dict[str, Any]) -> str:
+    """Thresholds, zones and power source stored with the activity (historical snapshot)."""
+    lines: list[str] = []
+    ftp = activity.get("icu_ftp")
+    if ftp is not None:
+        parts = [f"FTP {ftp} W (icu_ftp, setting at the time)"]
+        if activity.get("icu_rolling_ftp") is not None:
+            parts.append(f"eFTP {activity['icu_rolling_ftp']} W (icu_rolling_ftp, Intervals.icu estimate)")
+        if activity.get("icu_pm_ftp") is not None:
+            parts.append(f"power-model FTP {activity['icu_pm_ftp']} W")
+        lines.append("- Power: " + ", ".join(parts))
+    if activity.get("icu_pm_cp") is not None or activity.get("icu_w_prime") is not None:
+        lines.append(
+            f"- Power model: CP {activity.get('icu_pm_cp', 'n/a')} W, W' {activity.get('icu_w_prime', 'n/a')} J "
+            f"(model W' {activity.get('icu_pm_w_prime', 'n/a')} J), Pmax {activity.get('icu_pm_p_max', 'n/a')} W"
+        )
+    if activity.get("lthr") is not None or activity.get("athlete_max_hr") is not None:
+        lines.append(
+            f"- Heart rate: LTHR {activity.get('lthr', 'n/a')} bpm, max HR {activity.get('athlete_max_hr', 'n/a')} bpm, "
+            f"resting HR {activity.get('icu_resting_hr', 'n/a')} bpm"
+        )
+    if activity.get("threshold_pace") is not None:
+        lines.append(
+            f"- Threshold pace: {activity['threshold_pace']} m/s = {format_pace(activity['threshold_pace'])}"
+        )
+    if activity.get("icu_weight") is not None:
+        lines.append(f"- Weight: {activity['icu_weight']} kg")
+    zones = format_zone_table("power", activity.get("icu_power_zones"), None, ftp=ftp)
+    if zones:
+        lines.append("- Power zones (% FTP, upper bounds): " + zones)
+    zones = format_zone_table("hr", activity.get("icu_hr_zones"), None)
+    if zones:
+        lines.append("- HR zones (bpm, upper bounds): " + zones)
+    zones = format_zone_table("pace", activity.get("pace_zones"), None, threshold_pace=activity.get("threshold_pace"))
+    if zones:
+        lines.append("- Pace zones (% threshold pace, upper bounds): " + zones)
+    source = [
+        f"{label} {activity[key]}"
+        for key, label in (
+            ("device_name", "device"),
+            ("power_meter", "power meter"),
+            ("power_meter_serial", "serial"),
+            ("power_meter_battery", "battery"),
+            ("power_field", "power field"),
+        )
+        if activity.get(key) not in (None, "")
+    ]
+    if activity.get("power_field_names"):
+        source.append(f"power fields {', '.join(str(p) for p in activity['power_field_names'])}")
+    if source:
+        lines.append("- Power/device source: " + ", ".join(source))
+    if not lines:
+        return ""
+    return "\nThresholds used for this activity (snapshot stored with the activity):\n" + "\n".join(lines) + "\n"
+
+
+_RUN_DYNAMICS = (
+    ("average_stance_time", "Ground contact time", "ms"),
+    ("average_stance_time_balance", "GCT balance", "%"),
+    ("average_stance_time_percent", "GCT percent", "%"),
+    ("average_vertical_oscillation", "Vertical oscillation", "mm"),
+    ("average_vertical_ratio", "Vertical ratio", "%"),
+    ("average_step_length", "Step length", "mm"),
+    ("average_leg_spring_stiffness", "Leg spring stiffness", "kN/m"),
+    ("average_impact_loading_rate", "Impact loading rate", ""),
+)
+
+
+def format_running_dynamics(payload: dict[str, Any], indent: str = "") -> str:
+    """Pace, GAP, cadence and running dynamics of an activity or interval (only present values)."""
+    lines: list[str] = []
+    speed = payload.get("average_speed")
+    if isinstance(speed, (int, float)) and speed > 0:
+        lines.append(f"{indent}Pace: {format_pace(speed)} ({speed:.3f} m/s)")
+    gap = payload.get("gap")
+    if isinstance(gap, (int, float)) and gap > 0:
+        lines.append(f"{indent}GAP (grade adjusted pace): {format_pace(gap)} ({gap:.3f} m/s)")
+    cadence = payload.get("average_cadence")
+    if isinstance(cadence, (int, float)) and cadence > 0 and payload.get("average_step_length"):
+        lines.append(f"{indent}Cadence: {cadence:.1f} rpm as stored (x2 = {cadence * 2:.0f} steps/min)")
+    for key, label, units in _RUN_DYNAMICS:
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and not is_missing(value):
+            lines.append(f"{indent}{label}: {format_value(value)}{(' ' + units) if units else ''}")
+    if len(lines) <= 1 and not payload.get("average_step_length"):
+        return ""
+    return "\n".join(lines)
+
+
 def format_activity_details(
     activity: dict[str, Any],
     custom_field_defs: CustomFieldDefs | None = None,
@@ -202,6 +291,10 @@ def format_activity_details(
     """
     data: dict[str, Any] = _KeyTracker(activity) if include_all_fields else activity
     view = format_activity_summary(data) + _format_activity_zones(data)
+    view += _format_thresholds(data)
+    dynamics = format_running_dynamics(data)
+    if dynamics:
+        view += "\nRunning Dynamics:\n" + dynamics + "\n"
     if custom_field_defs is not None:
         view += "\n" + format_custom_activity_fields(data, custom_field_defs) + "\n"
     if isinstance(data, _KeyTracker):
@@ -300,7 +393,8 @@ def _format_sleep_recovery(entries: dict[str, Any]) -> list[str]:
         sleep_lines.append(f"  Device Sleep Score: {entries['sleepScore']}/100")
 
     if entries.get("readiness") is not None:
-        sleep_lines.append(f"  Readiness: {entries['readiness']}/10")
+        # Device readiness scores (e.g. Garmin Training Readiness) are 0-100; report as stored.
+        sleep_lines.append(f"  Readiness: {entries['readiness']}")
 
     return sleep_lines
 
@@ -329,7 +423,8 @@ def _format_subjective_feelings(entries: dict[str, Any]) -> list[str]:
         ("injury", "Injury Level"),
     ]:
         if entries.get(k) is not None:
-            subjective_lines.append(f"  {label}: {entries[k]}/10")
+            # Intervals.icu stores these as small integer ratings; report as stored.
+            subjective_lines.append(f"  {label}: {entries[k]}")
     return subjective_lines
 
 
@@ -355,7 +450,7 @@ def _format_nutrition_hydration(entries: dict[str, Any]) -> list[str]:
             nutrition_lines.append(f"- {label}: {entries[k]}{suffix}")
 
     if entries.get("hydration") is not None:
-        nutrition_lines.append(f"  Hydration Score: {entries['hydration']}/10")
+        nutrition_lines.append(f"  Hydration Score: {entries['hydration']}")
 
     return nutrition_lines
 
@@ -492,21 +587,105 @@ def format_wellness_entry(
     return "\n".join(lines)
 
 
+_EVENT_CATEGORY_LABELS = {
+    "WORKOUT": "Workout",
+    "RACE_A": "Race A",
+    "RACE_B": "Race B",
+    "RACE_C": "Race C",
+    "NOTE": "Note",
+    "PLAN": "Plan",
+    "HOLIDAY": "Holiday",
+    "SICK": "Sick",
+    "INJURED": "Injured",
+    "SET_EFTP": "Set eFTP",
+    "SET_FITNESS": "Set fitness",
+    "FITNESS_DAYS": "Fitness days",
+    "SEASON_START": "Season start",
+    "TARGET": "Target",
+}
+
+
+def event_type_label(event: dict[str, Any]) -> str:
+    """Category (workout, race, note ...) and sport of an event, e.g. 'Workout (Ride)'.
+
+    Falls back to the legacy workout/race keys for payloads without a category.
+    """
+    category = event.get("category")
+    sport = event.get("type")
+    if category:
+        label = _EVENT_CATEGORY_LABELS.get(str(category), str(category).replace("_", " ").title())
+        return f"{label} ({sport})" if sport else label
+    if event.get("workout"):
+        return f"Workout ({sport})" if sport else "Workout"
+    if event.get("race"):
+        return f"Race ({sport})" if sport else "Race"
+    return f"Other ({sport})" if sport else "Other"
+
+
+def _event_extra_lines(event: dict[str, Any]) -> list[str]:
+    """Planned time, load, pairing and indoor flag of an event (only when present)."""
+    lines: list[str] = []
+    if event.get("category") == "WORKOUT" or event.get("moving_time") is not None:
+        if event.get("moving_time") is not None:
+            lines.append(f"Planned Time: {hms(event['moving_time'])}")
+        if event.get("distance"):
+            lines.append(f"Planned Distance: {event['distance']} m")
+        if event.get("icu_training_load") is not None:
+            lines.append(f"Planned Load (Intervals.icu): {event['icu_training_load']}")
+    if event.get("paired_activity_id"):
+        lines.append(f"Paired Activity: {event['paired_activity_id']}")
+    if event.get("indoor"):
+        lines.append("Indoor: yes")
+    return lines
+
+
 def format_event_summary(event: dict[str, Any]) -> str:
     """Format a basic event summary into a readable string."""
 
     # Update to check for "date" if "start_date_local" is not provided
     event_date = event.get("start_date_local", event.get("date", "Unknown"))
-    event_type = "Workout" if event.get("workout") else "Race" if event.get("race") else "Other"
     event_name = event.get("name", "Unnamed")
     event_id = event.get("id", "N/A")
     event_desc = event.get("description", "No description")
 
-    return f"""Date: {event_date}
+    text = f"""Date: {event_date} (local)
 ID: {event_id}
-Type: {event_type}
+Type: {event_type_label(event)}
 Name: {event_name}
 Description: {event_desc}"""
+    extra = _event_extra_lines(event)
+    if extra:
+        text += "\n" + "\n".join(extra)
+    return text
+
+
+def _format_workout_doc(doc: dict[str, Any]) -> str:
+    """Render a workout_doc (duration, steps, zone times) as text."""
+    lines: list[str] = ["", "Workout Document:"]
+    if doc.get("duration") is not None:
+        lines.append(f"Planned Duration: {hms(doc['duration'])}")
+    if doc.get("distance"):
+        lines.append(f"Planned Distance: {doc['distance']} m")
+    for key, label in (("normalized_power", "Planned NP"), ("average_watts", "Planned Avg Power")):
+        if doc.get(key) is not None:
+            lines.append(f"{label}: {doc[key]} W")
+    steps = doc.get("steps")
+    if steps:
+        try:
+            lines.append("Steps:")
+            lines.append(str(WorkoutDoc.from_dict({"steps": steps})).strip())
+        except (ValueError, KeyError, TypeError):
+            lines.append(f"Steps (raw): {json.dumps(steps, ensure_ascii=False)}")
+    zone_times = doc.get("zoneTimes")
+    if isinstance(zone_times, list) and zone_times:
+        parts = [
+            f"{z.get('id')}: {hms(z.get('secs', 0))}"
+            for z in zone_times
+            if isinstance(z, dict) and z.get("secs")
+        ]
+        if parts:
+            lines.append("Planned Time in Zones: " + ", ".join(parts))
+    return "\n".join(lines)
 
 
 def format_event_details(event: dict[str, Any]) -> str:
@@ -515,9 +694,21 @@ def format_event_details(event: dict[str, Any]) -> str:
     event_details = f"""Event Details:
 
 ID: {event.get("id", "N/A")}
-Date: {event.get("date", "Unknown")}
+Date: {event.get("start_date_local", event.get("date", "Unknown"))} (local)
+Type: {event_type_label(event)}
 Name: {event.get("name", "Unnamed")}
 Description: {event.get("description", "No description")}"""
+    extra = _event_extra_lines(event)
+    if extra:
+        event_details += "\n" + "\n".join(extra)
+    if event.get("end_date_local"):
+        event_details += f"\nEnd: {event['end_date_local']} (local)"
+    if event.get("tags"):
+        event_details += f"\nTags: {', '.join(str(t) for t in event['tags'])}"
+    if event.get("updated"):
+        event_details += f"\nUpdated: {event['updated']}"
+    if isinstance(event.get("workout_doc"), dict):
+        event_details += _format_workout_doc(event["workout_doc"])
 
     # Check if it's a workout-based event
     if "workout" in event and event["workout"]:
@@ -738,6 +929,9 @@ Analyzed: {intervals_data.get("analyzed", "N/A")}
 
         for i, interval in enumerate(intervals, 1):
             result += _format_interval_block(i, interval)
+            dynamics = format_running_dynamics(interval, indent="  ")
+            if dynamics:
+                result += "Running Dynamics:\n" + dynamics + "\n\n"
             result += _format_interval_extras(
                 interval,
                 _interval_ranges(interval),

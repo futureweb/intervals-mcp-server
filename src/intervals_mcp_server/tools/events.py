@@ -11,7 +11,11 @@ from typing import Any
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.dates import get_default_end_date, get_default_future_end_date
-from intervals_mcp_server.utils.formatting import format_event_details, format_event_summary
+from intervals_mcp_server.utils.formatting import (
+    event_type_label,
+    format_event_details,
+    format_event_summary,
+)
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import resolve_activity_type, resolve_athlete_id, validate_date
 
@@ -87,20 +91,59 @@ async def _delete_events_list(
     return failed_events
 
 
+EVENT_JSON_FIELDS = (
+    "id",
+    "start_date_local",
+    "end_date_local",
+    "category",
+    "type",
+    "name",
+    "description",
+    "moving_time",
+    "distance",
+    "icu_training_load",
+    "icu_intensity",
+    "indoor",
+    "paired_activity_id",
+    "tags",
+    "color",
+    "plan_name",
+    "updated",
+)
+
+
+def _event_json(event: dict[str, Any], include_workout_doc: bool = False) -> dict[str, Any]:
+    """Compact machine-readable view of an event (workout_doc optional)."""
+    row = {key: event.get(key) for key in EVENT_JSON_FIELDS if key in event}
+    row["type_label"] = event_type_label(event)
+    if include_workout_doc and "workout_doc" in event:
+        row["workout_doc"] = event.get("workout_doc")
+    return row
+
+
 @mcp.tool()
-async def get_events(
+async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     athlete_id: str | None = None,
     api_key: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    categories: str | None = None,
+    output_format: str = "text",
 ) -> str:
     """Get events for an athlete from Intervals.icu
+
+    Events are planned workouts, races, notes and other calendar items. Each event is
+    reported with its category (Workout, Race A/B/C, Note ...) and sport (Ride, Run ...),
+    planned time and load, and the paired activity once it has been done.
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to today)
         end_date: End date in YYYY-MM-DD format (optional, defaults to 30 days from today)
+        categories: Comma-separated categories to return, e.g. "WORKOUT" or "WORKOUT,RACE_A,RACE_B"
+            (optional, default all categories)
+        output_format: "text" (default) or "json" (list of events with technical fields)
     """
     # Resolve athlete ID
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -114,7 +157,9 @@ async def get_events(
         end_date = get_default_future_end_date()
 
     # Call the Intervals.icu API
-    params = {"oldest": start_date, "newest": end_date}
+    params: dict[str, str] = {"oldest": start_date, "newest": end_date}
+    if categories:
+        params["category"] = ",".join(c.strip().upper() for c in categories.split(",") if c.strip())
 
     result = await make_intervals_request(
         url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key, params=params
@@ -134,6 +179,12 @@ async def get_events(
     if not events:
         return f"No events found for athlete {athlete_id_to_use} in the specified date range."
 
+    if output_format.strip().lower() == "json":
+        return json.dumps(
+            {"events": [_event_json(e) for e in events if isinstance(e, dict)]},
+            ensure_ascii=False,
+        )
+
     events_summary = "Events:\n\n"
     for event in events:
         if not isinstance(event, dict):
@@ -149,22 +200,32 @@ async def get_event_by_id(
     event_id: str,
     athlete_id: str | None = None,
     api_key: str | None = None,
+    output_format: str = "text",
+    resolve_targets: bool = False,
 ) -> str:
     """Get detailed information for a specific event from Intervals.icu
+
+    Returns category and sport, planned time/load, the paired activity and the full
+    workout document (steps, planned time in zones). Use it to read back a workout
+    right after creating or updating it.
 
     Args:
         event_id: The Intervals.icu event ID
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        output_format: "text" (default) or "json" (complete event including workout_doc)
+        resolve_targets: Ask Intervals.icu to resolve %FTP / %LTHR / pace targets to watts, bpm
+            and m/s inside the workout steps (optional, default False)
     """
     # Resolve athlete ID
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
 
-    # Call the Intervals.icu API
+    # Call the Intervals.icu API (the endpoint is /events/{id}, plural)
+    params = {"resolve": "true"} if resolve_targets else None
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/event/{event_id}", api_key=api_key
+        url=f"/athlete/{athlete_id_to_use}/events/{event_id}", api_key=api_key, params=params
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -177,6 +238,9 @@ async def get_event_by_id(
 
     if not isinstance(result, dict):
         return f"Invalid event format for event {event_id}."
+
+    if output_format.strip().lower() == "json":
+        return json.dumps(_event_json(result, include_workout_doc=True), ensure_ascii=False)
 
     return format_event_details(result)
 

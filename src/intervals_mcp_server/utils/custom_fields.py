@@ -149,9 +149,79 @@ def format_field_value(definition: dict[str, Any], value: Any) -> str:
     label = select_label(definition, value)
     if label:
         text = f"{text} ({label})"
-    if _is_zero(value) and (definition.get("fit_source") or definition.get("has_script")):
-        text = f"{text} (0: may be absent in source file)"
     return text
+
+
+def value_status(definition: dict[str, Any] | None, payload: dict[str, Any], code: str) -> str:
+    """Classify a custom field on a payload: 'value', 'zero', 'missing' (null/NaN) or 'absent' (no key)."""
+    if code not in payload:
+        return "absent"
+    value = payload[code]
+    if is_missing(value):
+        return "missing"
+    if _is_zero(value):
+        return "zero"
+    return "value"
+
+
+def is_device_file_field(definition: dict[str, Any]) -> bool:
+    """True when the field is filled from the device file (FIT field or script)."""
+    return bool(definition.get("fit_source") or definition.get("has_script"))
+
+
+def field_source(definition: dict[str, Any]) -> str:
+    """Where the value comes from: 'fit:<field>', 'script' or 'manual/input'."""
+    if definition.get("fit_source"):
+        return f"fit:{definition['fit_source']}"
+    if definition.get("has_script"):
+        return "script"
+    return "manual/input"
+
+
+def custom_fields_json(payload: dict[str, Any], defs: CustomFieldDefs) -> list[dict[str, Any]]:
+    """Machine-readable view of every defined custom field for a payload.
+
+    Each entry carries code, name, value (null for missing/absent), units, select label,
+    status ('value' | 'zero' | 'missing' | 'absent'), source and item type, so that a
+    consumer can tell a stored 0 from a missing value and from an undefined field.
+    """
+    rows: list[dict[str, Any]] = []
+    for code, definition in defs.items():
+        status = value_status(definition, payload, code)
+        value = payload.get(code)
+        rows.append(
+            {
+                "code": code,
+                "name": definition.get("name"),
+                "value": None if status in ("absent", "missing") else value,
+                "units": definition.get("units"),
+                "units_source": definition.get("units_source", "definition"),
+                "label": select_label(definition, value) if status in ("value", "zero") else None,
+                "status": status,
+                "zero_ambiguous": status == "zero" and is_device_file_field(definition),
+                "source": field_source(definition),
+                "item_type": definition.get("type"),
+                "value_type": definition.get("value_type"),
+            }
+        )
+    return rows
+
+
+def apply_units_overrides(index: CustomItemIndex, overrides: dict[str, str]) -> CustomItemIndex:
+    """Apply operator-configured display units (code -> units) to the definitions in place.
+
+    Used for definitions that carry no or unspecific units (e.g. a stream defined with
+    units 'point' that is known to be a percentage). The override is marked with
+    units_source='override' so outputs can show where the unit came from.
+    """
+    if not overrides:
+        return index
+    for defs in index.values():
+        for code, definition in defs.items():
+            if code in overrides:
+                definition["units"] = overrides[code]
+                definition["units_source"] = "override"
+    return index
 
 
 def format_custom_field_lines(
@@ -185,9 +255,15 @@ def format_custom_activity_fields(activity: dict[str, Any], defs: CustomFieldDef
     absent = sorted(code for code in defs if code not in activity)
     if absent:
         lines.append(f"Defined but not present on this activity: {', '.join(absent)}")
-    lines.append(
-        "Note: 'no value' = null/NaN in Intervals.icu. Values are reported exactly as stored; "
-        "for fields filled from the device file Intervals.icu stores 0 when the source field "
-        "is absent, so a 0 marked 'may be absent' is not necessarily a measurement."
+    ambiguous = sorted(
+        code
+        for code, definition in defs.items()
+        if value_status(definition, activity, code) == "zero" and is_device_file_field(definition)
     )
+    if ambiguous:
+        lines.append(
+            "Zero values in device-file fields (a real 0 or an absent source field; Intervals.icu "
+            "stores 0 for both, so treat with care): " + ", ".join(ambiguous)
+        )
+    lines.append("Note: 'no value' = null/NaN in Intervals.icu; values are reported exactly as stored.")
     return "\n".join(lines)

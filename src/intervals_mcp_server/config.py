@@ -5,7 +5,7 @@ This module handles loading and validation of configuration from environment var
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from intervals_mcp_server.utils.validation import validate_athlete_id
 
@@ -27,6 +27,9 @@ class Config:
     athlete_id: str
     intervals_api_base_url: str
     user_agent: str
+    # Display units for custom item codes whose definition has none or unspecific ones,
+    # e.g. {"Stamina": "%"}; configured via CUSTOM_UNITS_OVERRIDES="Stamina=%,RecoveryTime=h".
+    custom_units_overrides: dict[str, str] = field(default_factory=dict)
 
 
 _config_instance: Config | None = None  # pylint: disable=invalid-name
@@ -56,7 +59,20 @@ def load_config() -> Config:
         athlete_id=athlete_id,
         intervals_api_base_url=intervals_api_base_url,
         user_agent=user_agent,
+        custom_units_overrides=parse_units_overrides(os.getenv("CUSTOM_UNITS_OVERRIDES", "")),
     )
+
+
+def parse_units_overrides(raw: str) -> dict[str, str]:
+    """Parse 'Code=unit,Other=unit' into a dict (blank entries ignored)."""
+    overrides: dict[str, str] = {}
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        code, units = part.split("=", 1)
+        if code.strip() and units.strip():
+            overrides[code.strip()] = units.strip()
+    return overrides
 
 
 def get_config() -> Config:

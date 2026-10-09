@@ -196,3 +196,90 @@ async def get_gear_list(
         output += f"{gid:<14} {gtype:<8} {name:<32} {str(default_for):<8} {acts:<6} {dist_km:<10} {retired:<8}\n"
 
     return output
+
+
+def _gear_stats_line(item: dict[str, Any]) -> str:
+    """'12498.4 km, 522.1 h, 215 activities' from a gear item."""
+    dist_m = item.get("distance") or 0
+    secs = item.get("time") or 0
+    dist = f"{dist_m / 1000:.1f} km" if isinstance(dist_m, (int, float)) else "? km"
+    hours = f"{secs / 3600:.1f} h" if isinstance(secs, (int, float)) else "? h"
+    return f"{dist}, {hours}, {item.get('activities', '?')} activities"
+
+
+@mcp.tool()
+async def get_gear_details(
+    gear_id: str,
+    athlete_id: str | None = None,
+    api_key: str | None = None,
+    refresh: bool = False,
+) -> str:
+    """Get details of one gear item (bike, shoes, component) from Intervals.icu
+
+    Shows distance, time and activity count, purchase date, retirement, notes, the activity
+    type filters that assign activities to it automatically, reminders, and for a bike the
+    list of its components (frame, power meter, chain, tyres ...) with their own mileage.
+    Which power meter recorded a given activity is NOT derived from gear: use
+    get_activity_details (power meter and serial come from the device file) for that.
+    To list the activities done on this gear use get_activities(gear_id=...).
+
+    Args:
+        gear_id: The gear ID, e.g. "b12472159" for a bike or "30303" for a component
+        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        refresh: Re-fetch the gear catalog instead of using the cache (optional, default False)
+    """
+    athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+    if error_msg:
+        return error_msg
+    items = await get_gear_raw(athlete_id=athlete_id_to_use, api_key=api_key, refresh=refresh)
+    by_id = {str(it.get("id")): it for it in items}
+    item = by_id.get(str(gear_id))
+    if item is None:
+        return f"No gear with id {gear_id} found for athlete {athlete_id_to_use}."
+
+    lines = [
+        f"Gear {item.get('id')}: {item.get('name', '?')} ({item.get('type', '?')})",
+        f"- Usage: {_gear_stats_line(item)}"
+        + (" (elapsed time)" if item.get("use_elapsed_time") else " (moving time)"),
+    ]
+    if item.get("purchased"):
+        lines.append(f"- Purchased: {item['purchased']}")
+    if item.get("retired"):
+        lines.append(f"- Retired: {item['retired']}")
+    if item.get("notes"):
+        lines.append(f"- Notes: {item['notes']}")
+    if item.get("component"):
+        parents = [
+            f"{p.get('name')} ({p.get('id')})"
+            for p in items
+            if str(item.get("id")) in [str(c) for c in (p.get("component_ids") or [])]
+        ]
+        if parents:
+            lines.append(f"- Component of: {', '.join(parents)}")
+    filters = item.get("activity_filters")
+    if isinstance(filters, list) and filters:
+        parts = []
+        for flt in filters:
+            if isinstance(flt, dict):
+                value = flt.get("value")
+                value_text = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+                parts.append(f"{'not ' if flt.get('not') else ''}{flt.get('field_id')} in [{value_text}]")
+        if parts:
+            lines.append("- Auto-assignment filters: " + "; ".join(parts))
+    reminders = item.get("reminders")
+    if isinstance(reminders, list) and reminders:
+        lines.append(f"- Reminders: {len(reminders)}")
+    component_ids = item.get("component_ids") or []
+    if component_ids:
+        lines.append(f"- Components ({len(component_ids)}):")
+        for cid in component_ids:
+            comp = by_id.get(str(cid))
+            if comp is None:
+                lines.append(f"  - {cid}: (not in catalog)")
+                continue
+            retired = f", retired {comp['retired']}" if comp.get("retired") else ""
+            lines.append(
+                f"  - {comp.get('type', '?')} {comp.get('name', '?')} ({cid}): {_gear_stats_line(comp)}{retired}"
+            )
+    return "\n".join(lines)

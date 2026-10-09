@@ -13,7 +13,11 @@ from typing import Any
 from intervals_mcp_server.api import client as api_client
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.utils.custom_fields import CustomItemIndex, index_custom_items
+from intervals_mcp_server.utils.custom_fields import (
+    CustomItemIndex,
+    apply_units_overrides,
+    index_custom_items,
+)
 from intervals_mcp_server.utils.formatting import format_custom_item_details
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
@@ -57,8 +61,12 @@ async def get_custom_item_index(
     *,
     refresh: bool = False,
 ) -> CustomItemIndex:
-    """Custom item definitions grouped by item type and code (see utils.custom_fields)."""
-    return index_custom_items(await get_custom_items_raw(athlete_id, api_key, refresh=refresh))
+    """Custom item definitions grouped by item type and code (see utils.custom_fields).
+
+    Operator-configured display units (CUSTOM_UNITS_OVERRIDES) are applied on top.
+    """
+    index = index_custom_items(await get_custom_items_raw(athlete_id, api_key, refresh=refresh))
+    return apply_units_overrides(index, get_config().custom_units_overrides)
 
 
 def invalidate_custom_items_cache(athlete_id: str) -> None:
