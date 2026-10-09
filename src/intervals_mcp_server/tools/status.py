@@ -184,10 +184,26 @@ def weekly_training_review(start_date: str = "") -> str:
     """Review the past training week(s): load, compliance, intensity distribution, recovery."""
     week = f"the week starting {start_date}" if start_date else "the last 7 days"
     return (
-        f"Review {week} as an endurance coach. Use get_training_summary(group_by='week') for the totals and load "
-        "split, get_plan_compliance for planned versus done, get_weekly_summary for the end-of-week CTL/ATL/form, "
-        "and get_recovery_snapshot(days_back=6, detail_level='compact') for the recovery trend. Summarise volume, "
+        f"Review {week} as an endurance coach. Use get_coach_context for load, intensity distribution, recovery "
+        "markers and durability in one call, get_training_summary(group_by='week') for the totals and load split, "
+        "get_plan_compliance for planned versus done, get_weekly_summary for the end-of-week CTL/ATL/form, and "
+        "get_recovery_snapshot(days_back=6, detail_level='compact') for the recovery trend. Summarise volume, "
         "intensity distribution, compliance, fatigue and the one thing to change next week." + _NO_DIAGNOSIS
+    )
+
+
+@mcp.prompt()
+def training_load_review(end_date: str = "") -> str:
+    """Training load, intensity distribution, durability and the planned load (statistics with sample sizes)."""
+    day = f"end_date='{end_date}'" if end_date else "today"
+    return (
+        f"Review the training load as an endurance coach for {day}. Start with get_coach_context for the overview, then "
+        "go deeper only where needed: get_training_load (acute and chronic load, ratio, monotony, strain, deload-like "
+        "weeks, per sport), get_intensity_distribution (three-zone distribution, polarization index, hard days, drift), "
+        "get_durability (decoupling of steady long sessions, efficiency factor) and, when workouts are planned, "
+        "get_load_projection. Report the numbers with their windows, sample sizes and the cited reference ranges as "
+        "context; a value outside a commonly cited range is a statistic, not a risk statement. Say which data is "
+        "missing (sessions without zones or load, small samples)." + _NO_DIAGNOSIS
     )
 
 
@@ -265,6 +281,9 @@ def usage_guide() -> str:
         "4. Recovery: get_recovery_snapshot, get_wellness_trends, get_nutrition_summary.\n"
         "5. Periods: get_training_summary (week/month/sport/gear), get_weekly_summary, get_plan_compliance, "
         "compare_workouts, get_power_hr_efficiency, get_fatigue_resistance, curves.\n"
+        "5a. Load and intensity: get_coach_context (compact weekly overview) then get_training_load (ACWR, monotony, "
+        "strain, deload weeks), get_intensity_distribution (three zones, polarization index, hard days), get_durability "
+        "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts).\n"
         "6. Planning: get_sport_settings / get_training_zones, get_training_plan, get_workout_library, "
         "validate_workout, then (if the write class is enabled) add_or_update_event.\n"
         "Conventions: times are local and UTC with timezone; 'no value' = null/NaN; a 0 in a device-file field may "

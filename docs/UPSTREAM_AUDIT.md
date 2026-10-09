@@ -35,7 +35,7 @@ decision), `REJECT`.
 | #147 | HR and pace curves | ADOPT | – | merged | mirrors the power curve tool; verified response shapes | yes | low |
 | #148 | JSON output for activities/wellness/events | ALREADY COVERED | `output_format="json"` on activities, details, intervals, streams, events and all new tools | not merged | we standardised on `output_format` and explicit local/UTC start fields | yes | medium |
 | #149 | tags and sub_type in activity summary | ADOPT | – | merged | two lines, tests | yes | low |
-| #150 | "coach athlete": coach report (load, ACWR, monotony/strain, intensity distribution with polarization index, HRV/RHR status, durability, efficiency, eFTP trend, plan projection) plus event fixes | PARTIAL | analysis tools overlap partly | bug fixes re-implemented (partial event/note updates, `category`, absolute pace syntax); coach metrics evaluated (2026-10-09): sound and sourced (Foster, Treff et al. 2019), candidates for our own load/intensity tools | 28 files incl. lock-file churn and German-language internals; fits better as dedicated tools on our summary/wellness helpers than as one monolithic report | yes | high |
+| #150 | "coach athlete": coach report (load, ACWR, monotony/strain, intensity distribution with polarization index, HRV/RHR status, durability, efficiency, eFTP trend, plan projection) plus event fixes | PARTIAL | analysis tools overlap partly | bug fixes re-implemented (partial event/note updates, `category`, absolute pace syntax); coach metrics re-implemented as separate tools (`get_training_load`, `get_intensity_distribution`, `get_durability`, `get_load_projection`, `get_coach_context`) with sample sizes and without flags/verdicts | 28 files incl. lock-file churn and German-language internals; fits better as dedicated tools on our summary/wellness helpers than as one monolithic report | yes | high |
 | #151 | subjective wellness `/4 (1 = best)` | ALREADY COVERED | #143 labels each field explicitly | not merged | #143 is the better fix for the same bug | yes | low |
 | #152 | OAuth resource server for remote use | PARTIAL | built-in OAuth 2.1 authorization server (`auth.py`, `MCP_AUTH=oauth`) with "Continue with Intervals.icu" sign-in | idea adopted, implemented differently | #152 needs an external JWT issuer; ChatGPT needs client metadata documents or dynamic registration, PKCE and RFC 9207, so the fork ships its own authorization server that delegates the identity check to Intervals.icu OAuth; single athlete per deployment (one API key) | yes (ours) | low |
 | #153 | our custom fields / streams PR | – | this fork | – | – | yes | – |
@@ -47,7 +47,7 @@ decision), `REJECT`.
 - Re-implemented ideas: #123 (local message time), #125 (gear of the activity owner),
   #139 (extra event fields), #141 (sport settings, as richer read tools).
 - Already covered by our P0 work: #119, #120, #121, #122, #129, #133, #148, #151.
-- Deferred: #136 (SDK v2), #150 (coach feature). Re-implemented differently: #152 (OAuth). Rejected: #118, #124, #126, #135.
+- Deferred: #136 (SDK v2). Re-implemented differently: #150 (coach metrics as separate tools), #152 (OAuth). Rejected: #118, #124, #126, #135.
 
 Every merged PR was based on upstream `cb1fbca`; conflicts were limited to the export lists
 in `server.py` / `tools/__init__.py`, the README tool list and the appended tests, which were

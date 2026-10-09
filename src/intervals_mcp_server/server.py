@@ -145,6 +145,13 @@ from intervals_mcp_server.tools.wellness_insights import (  # pylint: disable=wr
     get_wellness_trends,
 )
 from intervals_mcp_server.tools.summary import get_training_summary  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.training_load import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_load_projection,
+    get_training_load,
+)
+from intervals_mcp_server.tools.intensity import get_intensity_distribution  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.durability import get_durability  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.coach_context import get_coach_context  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.workout_check import (  # pylint: disable=wrong-import-position  # noqa: E402
     preview_workout,
     validate_workout,
@@ -213,6 +220,11 @@ __all__ = [
     "get_recovery_snapshot",
     "get_wellness_trends",
     "get_training_summary",
+    "get_training_load",
+    "get_load_projection",
+    "get_intensity_distribution",
+    "get_durability",
+    "get_coach_context",
     "preview_workout",
     "validate_workout",
     "get_server_status",

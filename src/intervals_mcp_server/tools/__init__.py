@@ -67,6 +67,10 @@ from intervals_mcp_server.tools.wellness_insights import (  # noqa: F401
     get_wellness_trends,
 )
 from intervals_mcp_server.tools.summary import get_training_summary  # noqa: F401
+from intervals_mcp_server.tools.training_load import get_load_projection, get_training_load  # noqa: F401
+from intervals_mcp_server.tools.intensity import get_intensity_distribution  # noqa: F401
+from intervals_mcp_server.tools.durability import get_durability  # noqa: F401
+from intervals_mcp_server.tools.coach_context import get_coach_context  # noqa: F401
 from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: F401
 from intervals_mcp_server.tools.status import get_server_status  # noqa: F401
 from intervals_mcp_server.tools.training_review import (  # noqa: F401
@@ -144,6 +148,11 @@ __all__ = [
     "get_recovery_snapshot",
     "get_wellness_trends",
     "get_training_summary",
+    "get_training_load",
+    "get_load_projection",
+    "get_intensity_distribution",
+    "get_durability",
+    "get_coach_context",
     "preview_workout",
     "validate_workout",
     "get_server_status",

@@ -56,18 +56,20 @@ read all of it, but works just as well without the bridge.
 - **Coaching analysis instead of raw dumps.** One-call activity report, planned versus executed
   per step (also for deleted events and rides extended beyond the plan), climbs and descents,
   second power meter check, best efforts, similar intervals, repeated workouts over time,
-  power-to-heart-rate efficiency, fatigue resistance, recovery snapshot with 42-day baselines,
-  wellness trends and correlations, nutrition and weight trends, weekly and monthly summaries.
+  power-to-heart-rate efficiency, fatigue resistance, training load (acute:chronic ratio,
+  monotony, strain), three-zone intensity distribution with polarization index, aerobic
+  durability, load projection over the plan, recovery snapshot with 42-day baselines, wellness
+  trends and correlations, nutrition and weight trends, weekly and monthly summaries.
   Statistics with their sample sizes; the interpretation stays with the coach.
 - **Token-efficient.** `detail_level` (`compact`, `standard`, `full`) and `output_format="json"`
-  on the heavy tools, eight ready-made coaching prompts and two MCP resources.
+  on the heavy tools, nine ready-made coaching prompts and two MCP resources.
 - **Safe remote access.** Built-in OAuth 2.1 server with **"Continue with Intervals.icu"**
   sign-in, a consent page with per-connection permissions, client metadata documents with
   `private_key_jwt` (ChatGPT), PKCE and RFC 9207. Streamable HTTP (`/mcp`) and SSE from one
   process.
 - **Read-only by default.** Tools are grouped into permission classes (`read`, `write`,
   `destructive`, `admin`) enforced on the server; only `read` is active unless you enable more.
-- **Tested.** More than 300 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
+- **Tested.** More than 400 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
   build and Docker smoke tests on every pull request.
 
 ## Works with the Garmin Intervals Bridge
@@ -89,7 +91,7 @@ shows up in the tools automatically:
 
 | Restored by the bridge | Where the MCP shows it |
 | --- | --- |
-| Training effect, EPOC, Garmin training load, recovery time, VO₂max, performance condition, stamina start/end, sweat loss, temperatures | `get_activity_details`, `get_activity_report`, `get_training_summary` |
+| Training effect, EPOC, Garmin training load, recovery time, VO₂max, performance condition, stamina start/end, sweat loss, temperatures | `get_activity_details`, `get_activity_report`, `get_training_summary`, `get_training_load` (device loads apart from the Intervals.icu load) |
 | Stamina and potential stamina, second power meter, grade-adjusted speed, gear selection, running dynamics streams | `get_activity_streams`, `get_activity_intervals`, `analyze_workout_execution`, `analyze_climbs`, `compare_power_streams` |
 | Night SpO₂, respiration, sleeping HR, HRV details, Body Battery, sleep stages and stress, readiness, nutrition | `get_wellness_data`, `get_recovery_snapshot`, `get_wellness_trends`, `get_nutrition_summary` |
 
@@ -99,7 +101,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 
 ## Tools
 
-57 tools; 42 of them only read. Write tools are marked ✎ (`write`), ✖ (`destructive`) or
+62 tools; 47 of them only read. Write tools are marked ✎ (`write`), ✖ (`destructive`) or
 ⚙ (`admin`) and are hidden unless their class is enabled. Most tools accept `output_format="json"`.
 
 **Activity analysis**
@@ -132,6 +134,10 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `compare_workouts` | Repeated workouts over time, comparing only comparable work intervals (reference activity, sport family, length, intensity, reps, FTP range); surges kept apart, time-weighted means, power, HR, cadence and whole-activity RPE trends, gear and power meter flags |
 | `get_power_hr_efficiency` | Watts per heartbeat per power band and bike over time, with minimum sample sizes and filters for gear, indoor/outdoor and interval position |
 | `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
+| `get_training_load` | Acute and chronic load, acute:chronic ratio, Foster monotony and strain (rest days as 0), deload-like weeks, per sport with the primary sport, ISO week table, CTL/ATL/form/ramp; device loads kept separate; reference ranges with sources, no verdict |
+| `get_intensity_distribution` | Three-zone distribution from power, HR or pace zones (mapping by zone count), polarization index after Treff et al. 2019, class, hard sessions and days, drift between the halves, per sport and week, zone coverage |
+| `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend |
+| `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
 | `get_training_summary` | Totals per week, month, sport or gear with separate load sources and time in zones; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
@@ -141,6 +147,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call |
+| `get_coach_context` | Weekly coaching overview in about 2k characters: load, fitness, intensity distribution, HRV / resting HR / sleep against 42-day baselines, durability, top sessions and the plan of the next 7 days |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |
@@ -165,8 +172,8 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_server_status` | Version, enabled permissions, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
 
 **Prompts:** `recovery_check`, `workout_deep_dive`, `weekly_training_review`,
-`performance_progression`, `long_ride_climbing_analysis`, `nutrition_weight_trend`,
-`power_meter_comparison`, `workout_planning_validation`.
+`training_load_review`, `performance_progression`, `long_ride_climbing_analysis`,
+`nutrition_weight_trend`, `power_meter_comparison`, `workout_planning_validation`.
 **Resources:** `intervals://guide` (how to use the tools), `intervals://custom-items` (your
 custom item definitions).
 
@@ -305,6 +312,8 @@ Details and how to report a vulnerability: [SECURITY.md](SECURITY.md).
 - Analytics quality: extended rides split correctly, only comparable intervals compared,
   custom field aggregation by meaning, clear wellness periods, minimum sample sizes for
   efficiency trends, honest fatigue resistance, smoothed climb grades, compact report
+- Training load and intensity: acute:chronic ratio, monotony and strain, three-zone distribution
+  with polarization index, aerobic durability, load projection and a weekly coach context
 
 **Next**
 - PyPI package and the first tagged release with a GHCR image
@@ -351,8 +360,9 @@ integrates community pull requests by
 [#142](https://github.com/mvilanova/intervals-mcp-server/pull/142) to
 [#147](https://github.com/mvilanova/intervals-mcp-server/pull/147)),
 [biochaos](https://github.com/biochaos) ([#131](https://github.com/mvilanova/intervals-mcp-server/pull/131)) and
-[kokostitiahah](https://github.com/kokostitiahah) ([#149](https://github.com/mvilanova/intervals-mcp-server/pull/149)), and fixes reported by
-[morritter](https://github.com/morritter) ([#150](https://github.com/mvilanova/intervals-mcp-server/pull/150));
+[kokostitiahah](https://github.com/kokostitiahah) ([#149](https://github.com/mvilanova/intervals-mcp-server/pull/149)), and fixes reported and
+the training load and intensity metrics proposed by [morritter](https://github.com/morritter)
+([#150](https://github.com/mvilanova/intervals-mcp-server/pull/150));
 thank you. Maintained by [Futureweb](https://www.futureweb.at), together with the
 [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge).
 
