@@ -35,6 +35,12 @@ moving time. A device moving-time counter stream, when present, is reported for 
 but not treated as truth. VAM and speed use the moving time of a segment (recording stops
 and real pauses excluded). Segment gains are sums inside detected segments of the smoothed
 profile and are not the same number as the activity's total elevation gain.
+
+Every segment carries a grade confidence (high / medium / low) with its reasons, derived from
+the horizontal distance relative to the minimum grade distance, the GPS speed, pauses and
+recording stops inside it and the plausibility flags. Below the minimum horizontal distance no
+grade is computed, the raw grade included ("not determinable"); the raw grade uses windows of
+at least the minimum grade distance.
 """
 
 # pylint: disable=too-many-lines
@@ -70,6 +76,14 @@ NP_MIN_DURATION_S = 60
 SLOW_MOVEMENT_MIN_SPEED_M_S = 0.15
 SLOW_MOVEMENT_MIN_CADENCE_SHARE = 0.6
 SLOW_MOVEMENT_MIN_VERTICAL_M = 3.0  # altitude range per chunk below this is treated as barometer/GPS noise
+# Grade confidence: a horizontal distance below this multiple of the minimum grade distance is short
+# (a few metres of GPS error change the grade noticeably), a moving speed below this multiple of the
+# stationary speed is slow (GPS distance less reliable), pauses / stops above this share of the
+# segment time and very slow movement above it lower the confidence.
+CONFIDENCE_SHORT_DISTANCE_FACTOR = 3.0
+CONFIDENCE_SLOW_SPEED_FACTOR = 2.0
+CONFIDENCE_PAUSE_SHARE = 0.25
+CONFIDENCE_LEVELS = ("high", "medium", "low")
 SLOW_CHUNK_S = 120  # pause candidates are classified in chunks of this length
 MAX_LISTED_PAUSES = 20
 
@@ -110,7 +124,7 @@ SEGMENT_KEYS = (
     "distance_m", "elevation_gain_m", "elevation_loss_m", "avg_grade_pct", "max_grade_pct",
     "vam_m_per_h", "avg_watts", "normalized_power", "max_watts", "avg_hr", "max_hr",
     "avg_cadence_nonzero", "avg_speed_m_s", "streams", "moving_s", "raw_avg_grade_pct",
-    "raw_max_grade_pct", "quality_flags",
+    "raw_max_grade_pct", "quality_flags", "grade_confidence",
 )
 
 Samples = list[float | None]
@@ -577,8 +591,10 @@ def _terrain_metrics(  # pylint: disable=too-many-arguments,too-many-positional-
     vam = gain / (moving_s / 3600) if kind == "climb" and gain is not None and moving_s else None
     raw_avg = raw_max = None
     if thresholds.show_raw_grade and profile.raw_altitude is not None:
-        raw_avg = _avg_grade(profile, start, end, 0.0, profile.raw_altitude)
-        raw_max = _pick_max([g for _, _, g in _window_grades(profile, start, end, defaults.raw_window_m, profile.raw_altitude)], kind)
+        # The raw grade honours the minimum horizontal distance as well (no percentages over a few metres).
+        raw_avg = _avg_grade(profile, start, end, defaults.min_grade_distance_m, profile.raw_altitude)
+        raw_window = max(defaults.raw_window_m, defaults.min_grade_distance_m)
+        raw_max = _pick_max([g for _, _, g in _window_grades(profile, start, end, raw_window, profile.raw_altitude)], kind)
     return {
         "distance_m": _round(_delta(profile.distance, start, end), 1),
         "elevation_gain_m": _round(gain, 1),
@@ -649,6 +665,46 @@ def _quality_flags(  # pylint: disable=too-many-arguments,too-many-positional-ar
     return flags
 
 
+def _grade_confidence(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    thresholds: _Thresholds, segment: dict[str, Any], pauses: list[dict[str, Any]],
+    slow: list[dict[str, Any]], start: int, end: int,
+) -> dict[str, Any]:
+    """Confidence of a segment's grade: high, medium or low with the reasons (statistical, no verdict)."""
+    defaults = thresholds.defaults
+    minimum = defaults.min_grade_distance_m
+    low: list[str] = []
+    medium: list[str] = []
+    distance = segment["distance_m"]
+    if distance is None:
+        low.append("no distance stream: grade not determinable")
+    elif distance < minimum:
+        low.append(f"horizontal distance {distance:.0f} m below the minimum {minimum:.0f} m: grade not determinable")
+    elif distance < minimum * CONFIDENCE_SHORT_DISTANCE_FACTOR:
+        medium.append(f"short horizontal distance {distance:.0f} m (a few metres of GPS error change the grade)")
+    grade = segment["avg_grade_pct"]
+    if grade is not None and abs(grade) > defaults.plausible_grade_pct:
+        low.append(f"average grade {grade:.0f}% above the plausible {defaults.plausible_grade_pct:.0f}%")
+    max_grade = segment["max_grade_pct"]
+    if max_grade is not None and abs(max_grade) > defaults.plausible_grade_pct:
+        medium.append(f"steepest window {max_grade:.0f}% above the plausible {defaults.plausible_grade_pct:.0f}%")
+    duration = segment["duration_s"] or 0
+    crawl = sum(p["duration_s"] for p in slow if start <= p["start_index"] < end)
+    if duration and crawl > CONFIDENCE_PAUSE_SHARE * duration:
+        low.append(f"GPS speed near zero while moving for {crawl / duration:.0%} of the time")
+    speed = segment.get("avg_speed_m_s")
+    slow_speed = defaults.stationary_speed_m_s * CONFIDENCE_SLOW_SPEED_FACTOR
+    if speed is not None and speed < slow_speed:
+        medium.append(f"slow GPS speed {speed * 3.6:.1f} km/h (below {slow_speed * 3.6:.1f} km/h)")
+    stopped = sum(
+        p["duration_s"] for p in pauses
+        if start <= p["start_index"] < end and (p["kind"] == "stationary" or p["end_index"] < end)
+    )
+    if duration and stopped > CONFIDENCE_PAUSE_SHARE * duration:
+        medium.append(f"pauses / recording stops {stopped / duration:.0%} of the segment time")
+    level = "low" if low else "medium" if medium else "high"
+    return {"level": level, "reasons": low + medium}
+
+
 def _segment_metrics(
     profile: _Profile, thresholds: _Thresholds, segment_range: Range, pauses: list[dict[str, Any]], slow: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -678,6 +734,7 @@ def _segment_metrics(
     segment["raw_avg_grade_pct"] = terrain["raw_avg_grade_pct"]
     segment["raw_max_grade_pct"] = terrain["raw_max_grade_pct"]
     segment["quality_flags"] = _quality_flags(thresholds, segment, pauses, slow, start, end)
+    segment["grade_confidence"] = _grade_confidence(thresholds, segment, pauses, slow, start, end)
     return segment
 
 
@@ -849,6 +906,7 @@ def _climb_summary(segment: dict[str, Any]) -> dict[str, Any]:
         "distance_m": segment["distance_m"],
         "avg_grade_pct": segment["avg_grade_pct"],
         "vam_m_per_h": segment["vam_m_per_h"],
+        "grade_confidence": (segment.get("grade_confidence") or {}).get("level"),
     }
 
 
@@ -885,6 +943,10 @@ def _summary(segments: list[dict[str, Any]], pauses: list[dict[str, Any]], slow:
         "profile_gain_m": round(whole[0], 1) if whole else None,
         "profile_loss_m": round(whole[1], 1) if whole else None,
         "flagged_segments": sum(1 for s in segments if s.get("quality_flags")),
+        "grade_confidence": {
+            level: sum(1 for s in segments if (s.get("grade_confidence") or {}).get("level") == level)
+            for level in CONFIDENCE_LEVELS
+        },
     }
 
 
@@ -979,21 +1041,30 @@ def _fmt(value: Any, suffix: str = "") -> str:
 
 
 def _km(metres: float | None) -> str:
-    return "n/a" if metres is None else f"{metres / 1000:.1f} km"
+    if metres is None:
+        return "n/a"
+    return f"{metres:.0f} m" if abs(metres) < 1000 else f"{metres / 1000:.1f} km"
 
 
 def _kmh(metres_per_second: float | None) -> str:
     return "n/a" if metres_per_second is None else f"{metres_per_second * 3.6:.1f} km/h"
 
 
-def _segment_line(number: int, segment: dict[str, Any]) -> str:
-    """The one-line description of a segment."""
-    grade = f"avg grade {_fmt(segment['avg_grade_pct'])} %"
-    if segment.get("raw_avg_grade_pct") is not None:
-        grade += f" (raw {_fmt(segment['raw_avg_grade_pct'])} %)"
-    grade += f", max {_fmt(segment['max_grade_pct'])} %"
-    if segment.get("raw_max_grade_pct") is not None:
-        grade += f" (raw {_fmt(segment['raw_max_grade_pct'])} %)"
+def _grade(value: Any) -> str:
+    return "not determinable" if value is None else f"{format_value(value)} %"
+
+
+def _segment_line(number: int, segment: dict[str, Any], show_raw: bool = False) -> str:
+    """The one-line description of a segment (a grade that cannot be computed is 'not determinable')."""
+    grade = f"avg grade {_grade(segment['avg_grade_pct'])}"
+    if show_raw:
+        grade += f" (raw {_grade(segment.get('raw_avg_grade_pct'))})"
+    grade += f", max {_grade(segment['max_grade_pct'])}"
+    if show_raw:
+        grade += f" (raw {_grade(segment.get('raw_max_grade_pct'))})"
+    confidence = segment.get("grade_confidence")
+    if confidence:
+        grade += f", grade confidence {confidence['level']}"
     head = (
         f"[{number}] {str(segment['type']).capitalize()} "
         f"{_clock(segment['start_time'])}-{_clock(segment['end_time'])} "
@@ -1055,11 +1126,19 @@ def _summary_lines(result: dict[str, Any]) -> list[str]:
         if climb:
             lines.append(
                 f"{label.capitalize()} climb: idx {climb['start_index']}, +{_fmt(climb['gain_m'])} m "
-                f"over {_km(climb['distance_m'])}, avg grade {_fmt(climb['avg_grade_pct'])} %, "
+                f"over {_km(climb['distance_m'])}, avg grade {_grade(climb['avg_grade_pct'])}, "
                 f"VAM {_fmt(climb['vam_m_per_h'])} m/h"
+                + (f", grade confidence {climb['grade_confidence']}" if climb.get("grade_confidence") else "")
             )
     if summary.get("flagged_segments"):
         lines.append(f"Segments with data-quality flags: {summary['flagged_segments']} (see 'data quality' lines; not used for the steepest climb)")
+    confidence = summary.get("grade_confidence")
+    if confidence and any(confidence.values()):
+        lines.append(
+            f"Grade confidence: {confidence.get('high', 0)} high, {confidence.get('medium', 0)} medium, "
+            f"{confidence.get('low', 0)} low (from horizontal distance, GPS speed, pauses and plausibility; "
+            "low = grade not determinable or approximate)"
+        )
     return lines
 
 
@@ -1098,8 +1177,12 @@ def format_segments(
     if hidden:
         lines.append("Custom streams left out per segment: " + ", ".join(f"{code} ({why})" for code, why in sorted(hidden.items())))
     segments = result.get("segments") or []
+    show_raw = bool((result.get("settings") or {}).get("show_raw_grade"))
     for number, segment in enumerate(segments[:max_segments], 1):
-        lines.append(_segment_line(number, segment))
+        lines.append(_segment_line(number, segment, show_raw))
+        confidence = segment.get("grade_confidence") or {}
+        if confidence.get("reasons"):
+            lines.append(f"  grade confidence {confidence['level']}: " + "; ".join(confidence["reasons"]))
         if segment.get("quality_flags"):
             lines.append("  data quality: " + "; ".join(segment["quality_flags"]))
         for stream_type, stats in (segment.get("streams") or {}).items():

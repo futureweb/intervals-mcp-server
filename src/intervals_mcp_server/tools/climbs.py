@@ -50,7 +50,11 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
     any extra standard streams requested. Defaults depend on the sport (hike / walk / run vs
     bike): no grade is computed over tiny horizontal distances, grades above a plausible limit
     are flagged as data-quality problems (GPS distance too short on slow, steep terrain) and
-    excluded from the steepest climb. Pause candidates (speed below the stationary speed) are
+    excluded from the steepest climb. Every segment gets a grade confidence (high / medium /
+    low with reasons: horizontal distance relative to min_grade_distance_m, GPS speed, pauses
+    and recording stops, implausible grades), counted in the summary; below the minimum
+    horizontal distance the grade - raw included - is "not determinable", and the raw maximum
+    uses windows of at least that distance. Pause candidates (speed below the stationary speed) are
     classified: real pauses and recording stops count as pause time, very slow movement with
     vertical or horizontal progress (scrambling) is kept as moving time. A device moving-time
     counter stream is shown for comparison but not treated as truth. The sum of the climbs'
@@ -69,8 +73,8 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
             addition to the custom streams, e.g. "temp,respiration,left_right_balance" (optional)
         max_segments: Maximum number of segments to print in text output (optional, default 40)
         output_format: "text" (default) or "json"
-        show_raw_grade: Also report the grade from the unsmoothed altitude over short windows
-            (optional, default False)
+        show_raw_grade: Also report the grade from the unsmoothed altitude over short windows (at
+            least min_grade_distance_m; optional, default False)
         grade_window_m: Distance window of the steepest grade in metres (optional; default 50 for
             foot sports, 100 otherwise)
         min_grade_distance_m: No grade below this horizontal distance in metres (optional; default

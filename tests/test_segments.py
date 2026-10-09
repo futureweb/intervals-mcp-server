@@ -232,7 +232,7 @@ def test_pauses_and_summary():
     assert summary["total_descent_loss_m"] == _segments_of(result, "descent")[0]["elevation_loss_m"]
     assert summary["pause_time_s"] == GAP_SECS + STATIONARY_SECS - 1
     assert set(summary["longest_climb"]) == {
-        "start_index", "gain_m", "distance_m", "avg_grade_pct", "vam_m_per_h",
+        "start_index", "gain_m", "distance_m", "avg_grade_pct", "vam_m_per_h", "grade_confidence",
     }
     assert summary["longest_climb"]["start_index"] == climb["start_index"]
     assert summary["steepest_climb"]["vam_m_per_h"] == climb["vam_m_per_h"]
@@ -350,7 +350,7 @@ def test_format_segments_writes_missing_values_as_na_and_long_times():
         "summary": {"climbs": 0, "descents": 0, "pause_time_s": 0},
     }
     text = format_segments(result)
-    assert "[1] Other 1:02:03-2:02:02 (idx 0-2): +n/a m / -n/a m over n/a, avg grade n/a %" in text
+    assert "[1] Other 1:02:03-2:02:02 (idx 0-2): +n/a m / -n/a m over n/a, avg grade not determinable, max not determinable;" in text
     assert "power avg n/a W, NP n/a W, max n/a W; HR avg n/a, max n/a bpm; cadence n/a rpm; speed n/a" in text
     assert "VAM" not in text
     assert text.endswith("Pauses: none detected")
@@ -478,3 +478,42 @@ def test_gear_position_streams_are_not_labelled_as_teeth():
     defs = dict(STREAM_DEFS, RearGearPos={"code": "RearGearPos", "name": "RearGearPos", "units": "cog"})
     text = format_segments(detect_segments(streams), defs)
     assert "  RearGearPos (gear position): start" in text and "(cog)" not in text
+
+
+def test_grade_confidence_and_raw_grade_not_determinable():
+    """Phase 5 (D): per-segment grade confidence; no raw grade below the minimum horizontal distance."""
+    result = detect_segments(_hike_streams(), sport="Hike", min_climb_gain_m=30, show_raw_grade=True)
+    climb, descent = _segments_of(result, "climb")[0], _segments_of(result, "descent")[0]
+    assert climb["grade_confidence"]["level"] == "low"
+    assert any(r.startswith("GPS speed near zero while moving for 60%") for r in climb["grade_confidence"]["reasons"])
+    assert descent["grade_confidence"] == {"level": "high", "reasons": []}
+    assert result["summary"]["grade_confidence"] == {"high": 1, "medium": 0, "low": 1}
+    assert result["summary"]["steepest_climb"]["grade_confidence"] == "low"
+    text = format_segments(result)
+    assert "Grade confidence: 1 high, 0 medium, 1 low" in text
+    assert "max 178.3 % (raw 198.3 %), grade confidence low" in text and "over 678 m" in text
+    assert "  grade confidence low: GPS speed near zero while moving for 60% of the time;" in text
+    json.dumps(segments_to_json(result))
+    # Below the minimum horizontal distance neither the smoothed nor the raw grade is a number.
+    tiny = detect_segments(_hike_streams(), sport="Hike", min_climb_gain_m=30, min_grade_distance_m=800, show_raw_grade=True)
+    pitch = _segments_of(tiny, "climb")[0]
+    assert pitch["avg_grade_pct"] is None and pitch["raw_avg_grade_pct"] is None
+    assert pitch["grade_confidence"]["reasons"][0] == "horizontal distance 678 m below the minimum 800 m: grade not determinable"
+    assert "avg grade not determinable (raw not determinable)" in format_segments(tiny)
+    # The raw maximum uses windows of at least the minimum distance: a longer minimum smooths it.
+    wide = detect_segments(_hike_streams(), sport="Hike", min_climb_gain_m=30, min_grade_distance_m=300, show_raw_grade=True)
+    assert _segments_of(wide, "climb")[0]["raw_max_grade_pct"] < climb["raw_max_grade_pct"]
+    # A steady road climb is high confidence; a short but long-enough section is medium.
+    ride = _Ride()
+    ride.add(300, speed=8.0)
+    ride.add(600, climb_m=200.0, speed=5.0)
+    ride.add(300, speed=8.0)
+    road = _segments_of(detect_segments(ride.streams(), sport="Ride"), "climb")[0]
+    assert road["grade_confidence"] == {"level": "high", "reasons": []}
+    short = _Ride()
+    short.add(300, speed=8.0)
+    short.add(20, climb_m=20.0, speed=2.0)  # about 100 m horizontal after smoothing, below 3 x 50 m
+    short.add(300, speed=8.0)
+    kick = _segments_of(detect_segments(short.streams(), sport="Ride", min_climb_gain_m=15), "climb")[0]
+    assert kick["grade_confidence"]["level"] == "medium"
+    assert any(r.startswith("short horizontal distance") for r in kick["grade_confidence"]["reasons"])

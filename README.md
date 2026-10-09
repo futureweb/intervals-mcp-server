@@ -110,7 +110,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | --- | --- |
 | `get_activity_report` | Complete analysis in one call: overview, plan vs execution or intervals, second power meter check, climbs, data-quality notes; `detail_level` compact (core numbers and key findings, about 2k characters), standard or full |
 | `analyze_workout_execution` | Planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina). Steps are capped at their planned duration, longer intervals are split for the analysis, and riding beyond the plan is reported separately with its load and extra efforts. Tolerances for start shift, pauses and step length; `planned_workout_doc` for deleted events; matching events suggested read-only |
-| `analyze_climbs` | Climbs, descents and pauses with power, NP, HR, VAM and custom streams per segment; grade smoothed over a distance window (raw grade optional), real pauses vs slow movement, sport profiles for riding, running and hiking, data-quality flags |
+| `analyze_climbs` | Climbs, descents and pauses with power, NP, HR, VAM and custom streams per segment; grade smoothed over a distance window (raw grade optional), grade confidence high/medium/low per segment (no grade below the minimum horizontal distance, raw included), real pauses vs slow movement, sport profiles for riding, running and hiking, data-quality flags |
 | `compare_power_streams` | Sample-aligned comparison of two power meters: offset, power bands, stable windows, drift, lag |
 | `get_best_efforts` | Best efforts of one activity for durations or distances, with their elapsed-time windows; windows across a recording pause are flagged |
 | `get_activity_histogram` | Time distribution of power, heart rate, pace or GAP |
