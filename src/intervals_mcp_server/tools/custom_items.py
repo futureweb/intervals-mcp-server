@@ -1,24 +1,80 @@
 """
 Custom items MCP tools for Intervals.icu.
 
-This module contains tools for managing athlete custom items (charts, fields, zones, etc.).
+This module contains tools for managing athlete custom items (charts, fields, zones, etc.)
+and a per-process cache of the custom item definitions. The definitions are needed to
+label custom activity fields, interval fields, streams and wellness fields (name, units,
+select options), so they are fetched once per athlete and reused by the other tools.
 """
 
 import json
 from typing import Any
 
+from intervals_mcp_server.api import client as api_client
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.custom_fields import (
+    CustomItemIndex,
+    apply_units_overrides,
+    index_custom_items,
+)
 from intervals_mcp_server.utils.formatting import format_custom_item_details
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
+# Module-level cache of the raw custom item list per athlete. Errors are not cached.
+_CUSTOM_ITEMS_CACHE: dict[str, list[dict[str, Any]]] = {}
 
-@mcp.tool()
+
+async def get_custom_items_raw(
+    athlete_id: str,
+    api_key: str | None = None,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Return (and cache) the raw custom item list for an athlete.
+
+    One API call per athlete per process lifetime unless ``refresh=True`` or the
+    previous fetch failed. The request is issued through ``api.client`` so that a
+    monkeypatched client is honoured even when the caller patched only that module.
+    """
+    if not refresh and athlete_id in _CUSTOM_ITEMS_CACHE:
+        return _CUSTOM_ITEMS_CACHE[athlete_id]
+
+    result = await api_client.make_intervals_request(
+        url=f"/athlete/{athlete_id}/custom-item", api_key=api_key
+    )
+    if not isinstance(result, list):
+        return []
+    items = [item for item in result if isinstance(item, dict)]
+    _CUSTOM_ITEMS_CACHE[athlete_id] = items
+    return items
+
+
+async def get_custom_item_index(
+    athlete_id: str,
+    api_key: str | None = None,
+    *,
+    refresh: bool = False,
+) -> CustomItemIndex:
+    """Custom item definitions grouped by item type and code (see utils.custom_fields).
+
+    Operator-configured display units (CUSTOM_UNITS_OVERRIDES) are applied on top.
+    """
+    index = index_custom_items(await get_custom_items_raw(athlete_id, api_key, refresh=refresh))
+    return apply_units_overrides(index, get_config().custom_units_overrides)
+
+
+def invalidate_custom_items_cache(athlete_id: str) -> None:
+    """Drop the cached definitions of an athlete (after create/update/delete)."""
+    _CUSTOM_ITEMS_CACHE.pop(athlete_id, None)
+
+
+@tool("read")
 async def get_custom_items(
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -43,6 +99,11 @@ async def get_custom_items(
     if not result:
         return f"No custom items found for athlete {athlete_id_to_use}."
 
+    if isinstance(result, list):
+        _CUSTOM_ITEMS_CACHE[athlete_id_to_use] = [
+            item for item in result if isinstance(item, dict)
+        ]
+
     output = "Custom Items:\n\n"
     for item in result:
         if isinstance(item, dict):
@@ -55,7 +116,7 @@ async def get_custom_items(
     return output
 
 
-@mcp.tool()
+@tool("read")
 async def get_custom_item_by_id(
     item_id: int,
     athlete_id: str | None = None,
@@ -85,7 +146,7 @@ async def get_custom_item_by_id(
     return format_custom_item_details(result)
 
 
-@mcp.tool()
+@tool("admin")
 async def create_custom_item(
     name: str,
     item_type: str,
@@ -138,10 +199,11 @@ async def create_custom_item(
     if not result or not isinstance(result, dict):
         return "Error: Unexpected response when creating custom item."
 
+    invalidate_custom_items_cache(athlete_id_to_use)
     return f"Successfully created custom item:\n\n{format_custom_item_details(result)}"
 
 
-@mcp.tool()
+@tool("admin")
 async def update_custom_item(
     item_id: int,
     athlete_id: str | None = None,
@@ -200,10 +262,11 @@ async def update_custom_item(
     if not result or not isinstance(result, dict):
         return "Error: Unexpected response when updating custom item."
 
+    invalidate_custom_items_cache(athlete_id_to_use)
     return f"Successfully updated custom item:\n\n{format_custom_item_details(result)}"
 
 
-@mcp.tool()
+@tool("destructive")
 async def delete_custom_item(
     item_id: int,
     athlete_id: str | None = None,
@@ -229,4 +292,5 @@ async def delete_custom_item(
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting custom item: {result.get('message')}"
 
+    invalidate_custom_items_cache(athlete_id_to_use)
     return f"Successfully deleted custom item {item_id}."

@@ -89,6 +89,7 @@ class ValueUnits(Enum):
     WATTS = "w"
     PERCENT_FTP = "%ftp"
     CADENCE = "cadence"
+    RPM = "rpm"
     MINS_KM = "MINS_KM"
     MINS_MILE = "MINS_MILE"
     SECS_100M = "SECS_100M"
@@ -102,6 +103,7 @@ class TransportAliases(StrEnum):
     SSE = "sse"
     HTTP = "http"
     STREAMABLE_HTTP = "streamable-http"
+    HTTP_SSE = "http+sse"
 
 
 def float_to_str(value: float) -> str:
@@ -176,7 +178,7 @@ class Value:
             return f"Z{float_to_str(value)}"
         if self.units in [ValueUnits.WATTS]:
             return f"{float_to_str(value)}W"
-        if self.units in [ValueUnits.CADENCE]:
+        if self.units in [ValueUnits.CADENCE, ValueUnits.RPM]:
             return f"{float_to_str(value)}rpm"
         return float_to_str(value)
 
@@ -192,6 +194,7 @@ class Value:
             ValueUnits.PERCENT_FTP: "ftp",
             ValueUnits.POWER_ZONE: "W",
             ValueUnits.CADENCE: "Cadence",
+            ValueUnits.RPM: "Cadence",
         }
         if self.units is None:
             return ""

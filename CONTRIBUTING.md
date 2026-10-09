@@ -1,6 +1,6 @@
-# Contributing to Intervals.icu MCP Server
+# Contributing to Futureweb Intervals MCP
 
-Thank you for taking the time to contribute! This project uses **Python 3.12** and manages its dependencies with [uv](https://github.com/astral-sh/uv). The following guide summarizes how to set up your environment and outlines the workflow we expect for pull requests.
+Thank you for taking the time to contribute! This is the Futureweb fork of the Intervals.icu MCP server (upstream: mvilanova/intervals-mcp-server). The project uses **Python 3.12** and manages its dependencies with [uv](https://github.com/astral-sh/uv). The following guide summarizes how to set up your environment and outlines the workflow we expect for pull requests.
 
 ## Development environment
 
@@ -49,15 +49,17 @@ Automated dependency upgrades are encouraged. You can use Dependabot, Renovate, 
 Before opening a pull request, ensure all checks pass locally:
 
 ```bash
-ruff check .
-mypy src tests
+uv run --locked ruff check .
+uv run --locked mypy src tests
 uv run --locked pytest
 ```
+
+CI runs the same three checks on Python 3.12 and 3.13; pylint is advisory. New tools must declare their permission class with `@tool("read" | "write" | "destructive" | "admin")`, be read-only unless they really write, carry a docstring that tells a language model when and how to use them, and come with tests that use synthetic fixtures only (never real athlete data, hostnames or keys).
 
 ## Pull request guidelines
 
 * Use concise commit messages.
-* Title your pull request using the format `[intervals-mcp-server] <brief description>`.
+* Give the pull request a short imperative title and describe what changed and why.
 * Describe any manual testing you performed and confirm whether `ruff`, `mypy`, and `pytest` passed.
 
 We appreciate your contributions and your attention to these guidelines. Happy coding!

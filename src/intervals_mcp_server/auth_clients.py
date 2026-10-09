@@ -1,0 +1,401 @@
+"""OAuth client identification beyond dynamic registration.
+
+* **Client ID Metadata Documents (CIMD).**  MCP clients may use an HTTPS URL as their
+  ``client_id`` (MCP authorization spec 2026-07-28, preferred over dynamic client
+  registration).  The authorization server fetches the JSON document behind the URL,
+  checks that its ``client_id`` equals the URL and only accepts the ``redirect_uris``
+  listed there.  ChatGPT identifies itself as ``https://chatgpt.com/oauth/client.json``.
+  Documents are only fetched from an allowlist of hosts (no SSRF to arbitrary URLs),
+  without redirects, with a size limit and a short timeout, and cached.
+
+* **private_key_jwt client authentication (RFC 7523).**  A CIMD client may authenticate
+  at the token endpoint with a JWT signed by a key from the ``jwks_uri`` of its metadata
+  document.  :class:`ClientAssertionMiddleware` verifies such an assertion before the
+  MCP SDK's token handler runs (which only knows client secrets) and hands the request
+  on as a public-client request.  Requests without an assertion are passed through
+  unchanged; PKCE still protects them.
+
+The module never logs assertions, tokens or document contents beyond the client id.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit
+
+import httpx
+import jwt
+from mcp.shared.auth import OAuthClientInformationFull
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+__all__ = [
+    "ASSERTION_TYPE",
+    "ClientAssertionMiddleware",
+    "ClientAssertionVerifier",
+    "ClientMetadataResolver",
+    "is_metadata_client_id",
+]
+
+logger = logging.getLogger(__name__)
+
+ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+MAX_DOCUMENT_BYTES = 64 * 1024
+FETCH_TIMEOUT = 5.0
+MIN_CACHE_SECONDS = 60
+MAX_CACHE_SECONDS = 3600
+DEFAULT_CACHE_SECONDS = 300
+NEGATIVE_CACHE_SECONDS = 60
+MAX_ASSERTION_LIFETIME = 600
+CLOCK_SKEW = 30
+ASSERTION_ALGORITHMS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384"]
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+Fetcher = Callable[[str], Awaitable[tuple[int, dict[str, str], bytes]]]
+
+
+def is_metadata_client_id(client_id: str) -> bool:
+    """True when *client_id* has the shape of a client metadata document URL."""
+    return client_id.startswith("https://")
+
+
+def _cache_seconds(headers: dict[str, str]) -> int:
+    """Lifetime from ``Cache-Control: max-age``, clamped to sane bounds."""
+    for part in headers.get("cache-control", "").split(","):
+        name, _, value = part.strip().partition("=")
+        if name.lower() == "max-age" and value.isdigit():
+            return max(MIN_CACHE_SECONDS, min(MAX_CACHE_SECONDS, int(value)))
+        if name.lower() in ("no-store", "no-cache"):
+            return MIN_CACHE_SECONDS
+    return DEFAULT_CACHE_SECONDS
+
+
+async def _default_fetch(url: str) -> tuple[int, dict[str, str], bytes]:
+    """GET *url* without redirects; read at most MAX_DOCUMENT_BYTES (+1 to detect overflow)."""
+    async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=False) as client:
+        async with client.stream("GET", url, headers={"Accept": "application/json"}) as response:
+            body = b""
+            async for chunk in response.aiter_bytes():
+                body += chunk
+                if len(body) > MAX_DOCUMENT_BYTES:
+                    break
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            return response.status_code, headers, body
+
+
+def _redirect_uri_ok(uri: Any) -> bool:
+    if not isinstance(uri, str):
+        return False
+    parts = urlsplit(uri)
+    if parts.fragment:
+        return False
+    if parts.scheme == "https":
+        return bool(parts.hostname)
+    return parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS
+
+
+@dataclass
+class _CachedDocument:
+    client: OAuthClientInformationFull | None
+    expires_at: float
+    jwks_uri: str | None = None
+
+
+class ClientMetadataResolver:
+    """Fetch, validate and cache client metadata documents from allowlisted hosts."""
+
+    def __init__(
+        self,
+        allowed_hosts: Iterable[str],
+        client_scope: str,
+        fetch: Fetcher | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._hosts = frozenset(h.strip().lower() for h in allowed_hosts if h.strip())
+        self._scope = client_scope
+        self._fetch = fetch or _default_fetch
+        self._clock = clock
+        self._cache: dict[str, _CachedDocument] = {}
+
+    @property
+    def enabled(self) -> bool:
+        """True when at least one host is allowed."""
+        return bool(self._hosts)
+
+    @property
+    def fetch(self) -> Fetcher:
+        """The fetcher used for documents (shared with the assertion verifier)."""
+        return self._fetch
+
+    @property
+    def allowed_hosts(self) -> frozenset[str]:
+        """Hosts whose metadata documents are accepted."""
+        return self._hosts
+
+    def url_allowed(self, url: str) -> bool:
+        """Shape and host check of a metadata URL (no network access)."""
+        parts = urlsplit(url)
+        return (
+            parts.scheme == "https"
+            and bool(parts.hostname)
+            and (parts.hostname or "").lower() in self._hosts
+            and parts.port in (None, 443)
+            and not parts.username
+            and not parts.password
+            and not parts.fragment
+            and parts.path not in ("", "/")
+        )
+
+    def jwks_uri(self, client_id: str) -> str | None:
+        """``jwks_uri`` of a cached, valid document (same host as the client id)."""
+        cached = self._cache.get(client_id)
+        return cached.jwks_uri if cached and cached.client else None
+
+    async def get(self, client_id: str) -> OAuthClientInformationFull | None:
+        """Client information for a metadata URL, or None when unknown / invalid."""
+        if not self.url_allowed(client_id):
+            return None
+        cached = self._cache.get(client_id)
+        if cached and cached.expires_at > self._clock():
+            return cached.client
+        entry = await self._load(client_id)
+        self._cache[client_id] = entry
+        return entry.client
+
+    async def _load(self, url: str) -> _CachedDocument:
+        try:
+            status, headers, body = await self._fetch(url)
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("Client metadata document %s could not be fetched: %s", url, type(exc).__name__)
+            return _CachedDocument(None, self._clock() + NEGATIVE_CACHE_SECONDS)
+        problem, client, jwks_uri = self._validate(url, status, body)
+        if problem:
+            logger.warning("Client metadata document %s rejected: %s", url, problem)
+            return _CachedDocument(None, self._clock() + NEGATIVE_CACHE_SECONDS)
+        logger.info("Client metadata document %s accepted (%s)", url, client.client_name if client else "")
+        return _CachedDocument(client, self._clock() + _cache_seconds(headers), jwks_uri)
+
+    def _validate(  # pylint: disable=too-many-return-statements
+        self, url: str, status: int, body: bytes
+    ) -> tuple[str | None, OAuthClientInformationFull | None, str | None]:
+        if status != 200:
+            return f"HTTP {status}", None, None
+        if len(body) > MAX_DOCUMENT_BYTES:
+            return "document too large", None, None
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return "not JSON", None, None
+        if not isinstance(data, dict):
+            return "not a JSON object", None, None
+        if data.get("client_id") != url:
+            return "client_id does not match the document URL", None, None
+        redirect_uris = data.get("redirect_uris")
+        if not isinstance(redirect_uris, list) or not redirect_uris or not all(_redirect_uri_ok(u) for u in redirect_uris):
+            return "redirect_uris missing or not https", None, None
+        jwks_uri = data.get("jwks_uri")
+        if jwks_uri is not None:
+            jwks_parts = urlsplit(str(jwks_uri))
+            if jwks_parts.scheme != "https" or (jwks_parts.hostname or "").lower() != (urlsplit(url).hostname or "").lower():
+                return "jwks_uri must be https on the client's host", None, None
+        name = data.get("client_name")
+        try:
+            client = OAuthClientInformationFull(
+                client_id=url,
+                client_name=name if isinstance(name, str) else urlsplit(url).hostname,
+                redirect_uris=redirect_uris,
+                # The SDK only knows client secrets; private_key_jwt is verified by
+                # ClientAssertionMiddleware before the SDK sees the request.
+                token_endpoint_auth_method="none",
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                scope=self._scope,
+                client_uri=data.get("client_uri") if isinstance(data.get("client_uri"), str) else None,
+            )
+        except ValueError as exc:
+            return f"invalid metadata ({type(exc).__name__})", None, None
+        return None, client, str(jwks_uri) if jwks_uri else None
+
+
+class ClientAssertionVerifier:  # pylint: disable=too-few-public-methods
+    """Verify RFC 7523 client assertions of metadata-document clients."""
+
+    def __init__(
+        self,
+        resolver: ClientMetadataResolver,
+        audiences: Iterable[str],
+        fetch: Fetcher | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._resolver = resolver
+        self._audiences = sorted({a for a in audiences if a})
+        self._fetch = fetch or resolver.fetch
+        self._clock = clock
+        self._jwks: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._last_forced_refresh: dict[str, float] = {}
+        self._seen_jti: dict[str, float] = {}
+
+    async def _keys(self, jwks_uri: str, force: bool = False) -> dict[str, Any]:
+        cached = self._jwks.get(jwks_uri)
+        now = self._clock()
+        if cached and cached[0] > now and not force:
+            return cached[1]
+        if force and now - self._last_forced_refresh.get(jwks_uri, 0) < MIN_CACHE_SECONDS and cached:
+            return cached[1]
+        self._last_forced_refresh[jwks_uri] = now
+        status, headers, body = await self._fetch(jwks_uri)
+        if status != 200 or len(body) > MAX_DOCUMENT_BYTES:
+            raise ValueError(f"JWKS fetch returned HTTP {status}")
+        data = json.loads(body)
+        if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
+            raise ValueError("JWKS has no keys")
+        self._jwks[jwks_uri] = (now + _cache_seconds(headers), data)
+        return data
+
+    @staticmethod
+    def _pick_key(jwks: dict[str, Any], kid: str | None, alg: str) -> jwt.PyJWK | None:
+        for raw in jwks.get("keys", []):
+            if not isinstance(raw, dict) or (kid and raw.get("kid") != kid) or raw.get("use", "sig") != "sig":
+                continue
+            try:
+                return jwt.PyJWK(raw, algorithm=raw.get("alg") or alg)
+            except (jwt.PyJWKError, jwt.InvalidKeyError, ValueError):
+                continue
+        return None
+
+    def _remember_jti(self, jti: str, expires_at: float) -> bool:
+        now = self._clock()
+        for key in [k for k, exp in self._seen_jti.items() if exp <= now]:
+            del self._seen_jti[key]
+        if jti in self._seen_jti:
+            return False
+        self._seen_jti[jti] = expires_at
+        return True
+
+    async def verify(self, assertion: str, client_id_hint: str | None) -> str:  # pylint: disable=too-many-branches
+        """Return the client id the assertion proves, or raise ValueError."""
+        try:
+            header = jwt.get_unverified_header(assertion)
+            unverified = jwt.decode(assertion, options={"verify_signature": False})
+        except jwt.PyJWTError as exc:
+            raise ValueError(f"malformed assertion ({type(exc).__name__})") from exc
+        client_id = unverified.get("iss")
+        if not isinstance(client_id, str) or unverified.get("sub") != client_id:
+            raise ValueError("assertion iss and sub must both be the client id")
+        if client_id_hint and client_id_hint != client_id:
+            raise ValueError("assertion does not belong to the client_id of the request")
+        alg = header.get("alg")
+        if alg not in ASSERTION_ALGORITHMS:
+            raise ValueError(f"unsupported assertion algorithm {alg!r}")
+        if await self._resolver.get(client_id) is None:
+            raise ValueError("assertion issuer is not an accepted client metadata document")
+        jwks_uri = self._resolver.jwks_uri(client_id)
+        if not jwks_uri:
+            raise ValueError("client metadata document has no jwks_uri")
+        try:
+            key = self._pick_key(await self._keys(jwks_uri), header.get("kid"), alg)
+            if key is None:
+                key = self._pick_key(await self._keys(jwks_uri, force=True), header.get("kid"), alg)
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            raise ValueError(f"client keys unavailable ({type(exc).__name__})") from exc
+        if key is None:
+            raise ValueError("no matching signing key in the client's JWKS")
+        try:
+            claims = jwt.decode(
+                assertion,
+                key=key,
+                algorithms=[alg],
+                audience=self._audiences,
+                issuer=client_id,
+                leeway=CLOCK_SKEW,
+                options={"require": ["exp", "iss", "sub", "aud"]},
+            )
+        except jwt.PyJWTError as exc:
+            raise ValueError(f"assertion rejected ({type(exc).__name__})") from exc
+        now = self._clock()
+        exp = float(claims["exp"])
+        if exp - now > MAX_ASSERTION_LIFETIME + CLOCK_SKEW:
+            raise ValueError("assertion lifetime is too long")
+        jti = claims.get("jti")
+        if jti is not None and not self._remember_jti(f"{client_id}|{jti}", exp + CLOCK_SKEW):
+            raise ValueError("assertion was already used")
+        return client_id
+
+
+class ClientAssertionMiddleware:  # pylint: disable=too-few-public-methods
+    """ASGI wrapper for ``/token`` and ``/revoke`` that verifies private_key_jwt assertions.
+
+    A request carrying ``client_assertion_type=...jwt-bearer`` is verified; on success
+    the assertion fields are removed and ``client_id`` is set, so the SDK handler sees a
+    public-client request.  A failed verification is answered with ``invalid_client``.
+    """
+
+    def __init__(self, app: ASGIApp, verifier: ClientAssertionVerifier) -> None:
+        self.app = app
+        self.verifier = verifier
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        body = b""
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+            if len(body) > MAX_DOCUMENT_BYTES:
+                await _json_error(send, 413, "invalid_request", "request body too large")
+                return
+        fields = parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)
+        form = dict(fields)
+        if form.get("client_assertion_type") == ASSERTION_TYPE or "client_assertion" in form:
+            if form.get("client_assertion_type") != ASSERTION_TYPE or not form.get("client_assertion"):
+                await _json_error(send, 400, "invalid_request", "unsupported client assertion")
+                return
+            try:
+                client_id = await self.verifier.verify(form["client_assertion"], form.get("client_id"))
+            except ValueError as exc:
+                logger.warning("Client assertion rejected: %s", exc)
+                await _json_error(send, 401, "invalid_client", "client authentication failed")
+                return
+            fields = [(k, v) for k, v in fields if k not in ("client_assertion", "client_assertion_type", "client_id")]
+            fields.append(("client_id", client_id))
+            body = urlencode(fields).encode("utf-8")
+        await self.app(scope, _replay(body, receive), send)
+
+
+def _replay(body: bytes, original: Receive) -> Receive:
+    """Hand the (possibly rewritten) body to the app once, then defer to the real channel."""
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await original()
+
+    return receive
+
+
+async def _json_error(send: Send, status: int, error: str, description: str) -> None:
+    payload = json.dumps({"error": error, "error_description": description}).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"cache-control", b"no-store"),
+                (b"content-length", str(len(payload)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})

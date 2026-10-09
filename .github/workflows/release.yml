@@ -1,0 +1,162 @@
+name: Release
+
+# Triggered by version tags. Tag format (PEP 440, prefixed with v):
+#   v1.0.0        final release   -> GitHub release, GHCR tags 1.0.0, 1.0 and latest
+#   v1.0.0b1      beta            -> GitHub PRE-release, GHCR tag 1.0.0b1 only
+#   v1.0.0rc1     release cand.   -> GitHub PRE-release, GHCR tag 1.0.0rc1 only
+# The tag must match the version in pyproject.toml. All CI checks (tests on
+# 3.12/3.13, build, Docker smoke test) must pass before anything is published.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/futureweb/intervals-mcp-server
+
+jobs:
+  checks:
+    name: Checks, build and Docker smoke test
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  version:
+    name: Validate tag and classify release
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.classify.outputs.version }}
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+      docker_tags: ${{ steps.classify.outputs.docker_tags }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Classify the tag (PEP 440) and compare with pyproject.toml
+        id: classify
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::Tag ${tag} is not a supported version (vX.Y.Z, vX.Y.ZaN, vX.Y.ZbN or vX.Y.ZrcN)"
+            exit 1
+          fi
+          project_version="$(uv version --short)"
+          if [ "${version}" != "${project_version}" ]; then
+            echo "::error::Tag ${tag} does not match version ${project_version} in pyproject.toml"
+            exit 1
+          fi
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            prerelease=false
+            major_minor="${version%.*}"
+            docker_tags="${IMAGE_NAME}:${version},${IMAGE_NAME}:${major_minor},${IMAGE_NAME}:latest"
+          else
+            prerelease=true
+            docker_tags="${IMAGE_NAME}:${version}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "docker_tags=${docker_tags}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}, prerelease ${prerelease}, docker tags ${docker_tags}"
+
+  github-release:
+    name: GitHub release
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions (built by the CI workflow)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  docker:
+    name: Docker image (GHCR)
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU (arm64 build)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64, arm64)
+        # Tags are computed explicitly from the PEP 440 version (docker/metadata-action's
+        # semver parser does not understand 1.0.0b1); `latest` only for final releases.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.version.outputs.docker_tags }}
+          labels: |
+            org.opencontainers.image.title=futureweb-intervals-mcp
+            org.opencontainers.image.description=Advanced Intervals.icu MCP server with Garmin-enriched metrics
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/futureweb/intervals-mcp-server
+            org.opencontainers.image.licenses=GPL-3.0-only
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  pypi:
+    name: Publish to PyPI
+    # Disabled by default. To enable:
+    #   1. On PyPI, add a "trusted publisher" for the project futureweb-intervals-mcp with
+    #      owner "futureweb", repository "intervals-mcp-server", workflow "release.yml"
+    #      and environment "pypi" (https://docs.pypi.org/trusted-publishers/).
+    #   2. In this repository create the GitHub environment "pypi" (Settings ->
+    #      Environments), ideally with required reviewers.
+    #   3. Replace the `if: false` below with `if: ${{ needs.version.outputs.prerelease == 'false' }}`
+    #      (pre-releases can be published too; PyPI marks them as such automatically).
+    if: false
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/futureweb-intervals-mcp/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/
