@@ -708,7 +708,7 @@ def _fmt_short(value: Any) -> str:
     return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
 
 
-async def _planned_step_types(
+async def _planned_step_types(  # pylint: disable=too-many-locals
     activity_id: str, intervals: list[dict[str, Any]], api_key: str | None, planned_workout_doc: dict[str, Any] | None
 ) -> tuple[dict[int, dict[str, Any]], str]:
     """Planned step matched to each interval index (alignment by order, duration and target) and the plan source."""

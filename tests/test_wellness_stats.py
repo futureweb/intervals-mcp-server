@@ -462,7 +462,7 @@ def test_requested_period_lookback_and_baseline_are_separate() -> None:
     assert result["baseline"]["n"] == 42 and result["baseline"]["start"] == period_start
     text = format_metric_trend(result, units="ms")
     assert text.startswith(f"hrv (ms): period {period_start} to {period_end}, 42 days, 42 with values, 0 missing")
-    assert "84" not in text.split("\n")[0]
+    assert "84" not in text.split("\n", maxsplit=1)[0]
 
 
 def test_zeros_are_missing_for_physiology_and_small_samples_are_flagged() -> None:

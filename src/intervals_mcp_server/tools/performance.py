@@ -702,7 +702,8 @@ def _best_group(
 ) -> dict[str, Any] | None:
     """The interval_summary group that best matches the search window (or the reference pattern)."""
     ftp = _num(activity.get("icu_ftp"))
-    best: tuple[float, dict[str, Any]] | None = None
+    best_score = -1.0
+    best: dict[str, Any] | None = None
     centre_secs = reference["secs"] if reference else (params["minSecs"] + params["maxSecs"]) / 2
     centre_pct = reference.get("pct_ftp") if reference else (params["minIntensity"] + params["maxIntensity"]) / 2
     for group in parse_interval_summary(activity.get("interval_summary")):
@@ -712,9 +713,9 @@ def _best_group(
         closeness = 1 - min(1.0, abs(group["secs"] - centre_secs) / max(centre_secs, 1))
         if pct is not None and centre_pct:
             closeness += 1 - min(1.0, abs(pct - centre_pct) / 15)
-        if best is None or closeness > best[0]:
-            best = (closeness, {**group, "pct_ftp": round(pct, 1) if pct is not None else None})
-    return best[1] if best else None
+        if closeness > best_score:
+            best_score, best = closeness, {**group, "pct_ftp": round(pct, 1) if pct is not None else None}
+    return best
 
 
 def _comparability(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -1426,7 +1427,7 @@ def _band_label(band: tuple[float, float]) -> str:
     return f"{band[0]:g}-{band[1]:g} W"
 
 
-def _band_stats(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _band_stats(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     intervals: list[dict[str, Any]], bands: list[tuple[float, float]], min_secs: int,
     min_start_s: float = 0.0, max_start_s: float | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -1738,7 +1739,9 @@ def _round_kj(value: float, down: bool = False) -> int:
     return int(max(SUGGESTION_ROUND_KJ, steps * SUGGESTION_ROUND_KJ))
 
 
-async def _suggest_thresholds(api: _Api, athlete_id: str, activity_type: str, ftp: float | None) -> dict[str, Any]:
+async def _suggest_thresholds(  # pylint: disable=too-many-locals
+    api: _Api, athlete_id: str, activity_type: str, ftp: float | None
+) -> dict[str, Any]:
     """Plausible kJ0 / kJ1 from body mass (or FTP) and from the work of recent rides (suggestion only, never saved)."""
     athlete = await api.get(f"/athlete/{athlete_id}")
     weight = _num(athlete.get("icu_weight")) if isinstance(athlete, dict) else None
