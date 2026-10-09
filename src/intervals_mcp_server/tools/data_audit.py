@@ -235,6 +235,7 @@ def _activity_text(audit: dict[str, Any], detail_level: str) -> str:  # pylint: 
     if sensors["power"]:
         power = f"; power meter {sensors['power_meter'] or 'not named'}" + (f" (serial {sensors['power_meter_serial']})" if sensors["power_meter_serial"] else "")
         power += f", power fields {', '.join(sensors['power_fields'])}" if sensors["power_fields"] else ""
+        power += ", second power stream recorded" if sensors["second_power_stream"] else ""
     lines.append(f"Sensors: device {sensors['device'] or 'unknown'}; recorded {', '.join(kinds) or 'no sensor streams'}{power}")
     lines.extend(f"  - {note}" for note in sensors["notes"])
     lines.extend(_stream_text(audit["streams"], audit["baseline"], detail_level))
@@ -242,7 +243,7 @@ def _activity_text(audit: dict[str, Any], detail_level: str) -> str:  # pylint: 
     lines.extend(_field_text(audit["fields"], defs, audit.get("type"), detail_level))
     candidates = audit["fields"]["device_file_without_value"]
     if candidates:
-        lines.append(f"Device-file fields without a real value: {names(candidates, defs, 10)}; {BRIDGE_NOTE}.")
+        lines.append(f"Device-file fields with a 0, no value or no key: {names(candidates, defs, 10)}; {BRIDGE_NOTE}.")
     context = audit["context_data"]
     present = [label for key, label in (("weather", "weather"), ("route_id", "route"), ("carbs_used", "carbs used (estimate)"),
                                         ("carbs_ingested", "carbs ingested"), ("w_prime_depletion", "W′ depletion")) if context.get(key) not in (None, False)]

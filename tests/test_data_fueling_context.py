@@ -315,7 +315,7 @@ def test_get_activity_data_audit_single(monkeypatch):
     assert "usually present on recent Ride (n 3) but missing here: secondary_power (3/3)" in result
     assert "zero placeholders (a real 0 or a source missing from the file): Performance Condition [PerformanceCondition]" in result
     assert "usually with a value on recent activities of the sport but not here: Performance Condition [PerformanceCondition] (3)" in result
-    assert "Device-file fields without a real value: Performance Condition [PerformanceCondition], New Metric [NewMetric]; the Garmin Intervals Bridge" in result
+    assert "Device-file fields with a 0, no value or no key: Performance Condition [PerformanceCondition], New Metric [NewMetric]; the Garmin Intervals Bridge" in result
     assert "Context data present: weather, route, carbs used (estimate), carbs ingested, W′ depletion" in result
     list_call = next(c for c in calls if c[0].endswith("/activities"))
     assert list_call[1]["oldest"] == "2026-09-10" and list_call[1]["newest"] == "2026-10-08" and "PerformanceCondition" in list_call[1]["fields"]
@@ -337,6 +337,8 @@ def test_get_activity_data_audit_duplicate_and_stub(monkeypatch):
     assert "Listing: NOT in the activity list: filtered duplicate of i50 ('Long ride', UPLOAD, same Garmin activity)" in result
     assert "- the streams endpoint returned none of the listed streams (file not retained, e.g. a filtered duplicate)" in result
     assert "- no intervals (Intervals.icu detected none, or the file was not processed)" in result
+    _routes(monkeypatch, **{"/activity/": dict(FUELING_ACTIVITY, stream_types=["time", "watts", "secondary_power"])})
+    assert "power fields power, second power stream recorded" in asyncio.run(get_activity_data_audit("i50", detail_level="compact"))
     _routes(monkeypatch, **{"/activity/": STRAVA_STUB})
     stub = asyncio.run(get_activity_data_audit("i77"))
     assert stub.splitlines()[1] == "Source: Strava import"
