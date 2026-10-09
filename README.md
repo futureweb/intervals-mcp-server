@@ -122,7 +122,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output |
 | `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units |
 | `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream, optionally the planned step type next to the Intervals.icu type |
-| `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging |
+| `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging (2000 samples per page by default) |
 | `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description |
 
 **Performance over time**
@@ -157,11 +157,11 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_athlete_profile`, `get_sport_settings`, `get_training_zones` | Profile, per-sport thresholds, zones with absolute ranges |
-| `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace |
+| `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace (pace with its unit, e.g. `4:30/km`) |
 | `get_gear_list`, `get_gear_details` | Bikes, shoes and components with mileage and maintenance reminders |
 | `get_events`, `get_event_by_id`, `get_training_plan` | Calendar with the full workout document; plan phases, weekly targets, races |
 | `validate_workout`, `preview_workout` | Check and render a workout document before writing it |
-| `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes |
+| `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes (workouts are validated before they are written; the range delete previews by default) |
 | `get_workout_library`, `get_library_workout`, `create_library_workout` ✎, `add_event_from_library` ✎, `delete_library_workout` ✖ | Workout library |
 
 **Custom items and server**
@@ -281,6 +281,9 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `OAUTH_PASSWORD_HASH` / `OAUTH_USERNAME` | – / `athlete` | Password sign-in (hash: `python -m intervals_mcp_server.auth hash-password`) |
 | `OAUTH_STATE_FILE` | `./oauth_state.json` | Registered clients and refresh token digests |
 | `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
+| `ATHLETE_TIMEZONE` | athlete profile | Time zone for "today" and default date ranges, e.g. `Europe/Vienna`; `server` uses the server clock. Unset: the `timezone` of the Intervals.icu athlete profile |
+| `MCP_TOOL_MAX_REQUESTS` / `MCP_TOOL_TIMEOUT_S` | `300` / `120` | Limits of one tool call (Intervals.icu requests, seconds); a tool that hits them stops and says its result is incomplete |
+| `MCP_MAX_OUTPUT_CHARS` | `100000` | Largest tool result; longer text is cut with a note on how to get the rest, too large JSON is replaced by an error object |
 
 Further OAuth options (client and redirect host allowlists, token lifetimes, rate limit) are
 listed in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md).
@@ -297,6 +300,13 @@ listed in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md).
 Tools of a disabled class are not registered at all. With OAuth, each connection additionally
 gets only the classes granted on the consent page (`intervals:read`, `intervals:write`, …);
 other tools are hidden from it and refused if called.
+
+Write tools that can replace existing values (`add_or_update_event`, `add_or_update_note`,
+`update_activity`, `update_wellness`) carry the MCP hint `destructiveHint: true`, so clients ask
+before running them; their class stays `write`. Nothing is created, paired, renamed or deleted
+automatically: `delete_events_by_date_range` only lists what it would delete unless it is called
+with `dry_run=false`, and touches only the named categories (default planned workouts), at most
+31 days, never workouts already paired with an activity unless asked.
 
 - Credentials never appear in logs or tool output; the Intervals.icu sign-in token is used for
   the identity check only and never stored.
