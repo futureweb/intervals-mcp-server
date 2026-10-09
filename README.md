@@ -241,14 +241,15 @@ MCP_PERMISSIONS=read,write \
 uv run futureweb-intervals-mcp
 ```
 
-1. Create an Intervals.icu OAuth app at <https://intervals.icu/oauth/apply> with the redirect URL
-   `https://mcp.example.com/oauth/intervals/callback` (until it is approved, use the password
-   sign-in).
+1. Choose the sign-in: without further settings you sign in with your Intervals.icu **API key**
+   (optionally plus an authenticator code, `OAUTH_TOTP_SECRET`). For **Continue with Intervals.icu**
+   create an OAuth app at <https://intervals.icu/oauth/apply> with the redirect URL
+   `https://mcp.example.com/oauth/intervals/callback`; a server password is the third option.
 2. In ChatGPT (developer mode) add a connection with the URL `https://mcp.example.com/mcp` and
    authentication **OAuth**; leave client id and secret empty. Claude.ai: *Add custom connector*
    with the same URL.
-3. On the consent page choose the permissions for this connection and press **Continue with
-   Intervals.icu**. Only the athletes in `OAUTH_ALLOWED_ATHLETES` (default `ATHLETE_ID`) can sign in.
+3. On the consent page choose the permissions for this connection and sign in. With
+   Intervals.icu only the athletes in `OAUTH_ALLOWED_ATHLETES` (default `ATHLETE_ID`) can sign in.
 4. After server updates use **Refresh** on the ChatGPT connection to reload the tools.
 
 Everything about the OAuth server, the reverse proxy (Apache and nginx examples) and the
@@ -274,7 +275,8 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `MCP_AUTH` | `none` | `oauth` enables the built-in OAuth 2.1 server |
 | `MCP_PUBLIC_URL` | – | Public base URL, required with `MCP_AUTH=oauth` |
 | `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | – | Intervals.icu OAuth app for "Continue with Intervals.icu" |
-| `OAUTH_LOGIN` | `intervals` if an app is set, else `password` | Sign-in method(s): `intervals`, `password` or both |
+| `OAUTH_LOGIN` | `intervals` with an app, else `password` if set, else `apikey` | Sign-in method(s): `intervals`, `password`, `apikey` |
+| `OAUTH_TOTP_SECRET` | – | Authenticator code as second factor for password and API-key sign-in (`python -m intervals_mcp_server.auth totp-secret`) |
 | `OAUTH_ALLOWED_ATHLETES` | `ATHLETE_ID` | Athletes allowed to sign in |
 | `OAUTH_PASSWORD_HASH` / `OAUTH_USERNAME` | – / `athlete` | Password sign-in (hash: `python -m intervals_mcp_server.auth hash-password`) |
 | `OAUTH_STATE_FILE` | `./oauth_state.json` | Registered clients and refresh token digests |

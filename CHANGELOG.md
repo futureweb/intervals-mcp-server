@@ -78,6 +78,14 @@ First public beta of the Futureweb fork. Based on upstream
 - Prompt `training_load_review`; `weekly_training_review` and the `intervals://guide` resource
   mention the new tools.
 
+### Added (sign-in options)
+- OAuth sign-in with the Intervals.icu API key (`OAUTH_LOGIN=apikey`), the default without an
+  Intervals.icu app and without a password: OAuth works with zero extra configuration. The entered key is
+  compared in constant time with the configured one and never stored or logged.
+- Optional TOTP second factor (`OAUTH_TOTP_SECRET`, RFC 6238, single-use codes) for the password and
+  API-key sign-ins; `python -m intervals_mcp_server.auth totp-secret` creates the secret and the
+  `otpauth://` URI; status shows the second factor.
+
 ### Added (client integration)
 - MCP tool annotations derived from the permission class (`readOnlyHint`, `destructiveHint`,
   `openWorldHint`), so clients such as ChatGPT run read-only tools without asking and request a

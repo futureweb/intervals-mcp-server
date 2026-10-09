@@ -34,13 +34,16 @@ Environment variables (all optional unless noted):
 
 ``MCP_AUTH``                       ``none`` (default) or ``oauth``
 ``MCP_PUBLIC_URL``                 public base URL (required with oauth); issuer and resource
-``OAUTH_LOGIN``                    ``intervals``, ``password`` or ``intervals,password``
-                                   (default: intervals when a client id is set, else password)
+``OAUTH_LOGIN``                    comma-separated ``intervals``, ``password``, ``apikey``
+                                   (default: intervals with an Intervals.icu app, else password
+                                   when one is set, else apikey: sign in with the API_KEY)
 ``INTERVALS_OAUTH_CLIENT_ID``      Intervals.icu OAuth app (required for the intervals sign-in)
 ``INTERVALS_OAUTH_CLIENT_SECRET``  its secret
 ``INTERVALS_OAUTH_SCOPE``          scope requested at Intervals.icu (default ``ACTIVITY:READ``)
 ``OAUTH_ALLOWED_ATHLETES``         comma-separated athlete ids (default ``ATHLETE_ID``)
 ``OAUTH_PASSWORD`` / ``OAUTH_PASSWORD_HASH`` / ``OAUTH_USERNAME``  password sign-in
+``OAUTH_TOTP_SECRET``              optional second factor (authenticator app) for the password
+                                   and API-key sign-ins
 ``OAUTH_CLIENT_HOSTS``             hosts whose client metadata documents are accepted
                                    (default ``chatgpt.com,claude.ai,claude.com``; ``none``)
 ``OAUTH_REDIRECT_HOSTS``           hosts allowed as redirect URIs of dynamically registered
@@ -92,6 +95,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, ValidationError
 
 from intervals_mcp_server.auth_clients import ClientMetadataResolver, Fetcher, is_metadata_client_id
+from intervals_mcp_server.auth_totp import generate_secret, match_counter, normalize_secret, provisioning_uri
 
 __all__ = [
     "INTERVALS_CALLBACK_PATH",
@@ -122,7 +126,7 @@ INTERVALS_AUTHORIZE_URL = "https://intervals.icu/oauth/authorize"
 INTERVALS_TOKEN_URL = "https://intervals.icu/api/oauth/token"
 DEFAULT_INTERVALS_SCOPE = "ACTIVITY:READ"
 DEFAULT_TRUSTED_CLIENT_HOSTS = ("chatgpt.com", "claude.ai", "claude.com")
-LOGIN_METHODS = ("intervals", "password")
+LOGIN_METHODS = ("intervals", "password", "apikey")
 DEFAULT_USERNAME = "athlete"
 DEFAULT_STATE_FILE = "./oauth_state.json"
 DEFAULT_ACCESS_TOKEN_TTL = 3600
@@ -235,6 +239,9 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
     dynamic_registration: bool = True
     private_key_jwt: bool = True
     permission_classes: tuple[str, ...] = ("read",)
+    # Kept out of repr(); compared in constant time. It is the key the server already holds.
+    api_key: str | None = field(default=None, repr=False)
+    totp_secret: str | None = field(default=None, repr=False)
 
     @property
     def issuer(self) -> str:
@@ -271,6 +278,12 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
                 password.encode("utf-8"), (self.password or "").encode("utf-8")
             )
         return bool(user_ok & password_ok) and "password" in self.login_methods
+
+    def verify_api_key(self, api_key: str) -> bool:
+        """Constant-time check of an Intervals.icu API key against the configured one."""
+        if "apikey" not in self.login_methods or not self.api_key:
+            return False
+        return hmac.compare_digest(api_key.strip().encode("utf-8"), self.api_key.encode("utf-8"))
 
     def same_origin(self, url: str) -> bool:
         """True when *url* points at this server (scheme, host and port of the issuer)."""
@@ -336,7 +349,11 @@ def _validate_public_url(url: str) -> None:
 def _login_methods(env: Mapping[str, str]) -> tuple[str, ...]:
     raw = env.get("OAUTH_LOGIN", "").strip().lower()
     if not raw:
-        return ("intervals",) if env.get("INTERVALS_OAUTH_CLIENT_ID", "").strip() else ("password",)
+        if env.get("INTERVALS_OAUTH_CLIENT_ID", "").strip():
+            return ("intervals",)
+        if env.get("OAUTH_PASSWORD") or env.get("OAUTH_PASSWORD_HASH", "").strip():
+            return ("password",)
+        return ("apikey",)
     methods = tuple(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
     unknown = [m for m in methods if m not in LOGIN_METHODS]
     if unknown or not methods:
@@ -362,12 +379,20 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         raise ValueError("Set either OAUTH_PASSWORD or OAUTH_PASSWORD_HASH, not both")
     if "password" in methods and not password and not password_hash:
         raise ValueError(
-            "MCP_AUTH=oauth requires OAUTH_PASSWORD or OAUTH_PASSWORD_HASH "
-            "(create a hash with: python -m intervals_mcp_server.auth hash-password), "
-            "or OAUTH_LOGIN=intervals with an Intervals.icu OAuth app"
+            "OAUTH_LOGIN=password requires OAUTH_PASSWORD or OAUTH_PASSWORD_HASH "
+            "(create a hash with: python -m intervals_mcp_server.auth hash-password)"
         )
     if password_hash:
         _parse_password_hash(password_hash)
+    api_key = env.get("API_KEY", "").strip()
+    if "apikey" in methods and not api_key:
+        raise ValueError(
+            "MCP_AUTH=oauth needs a sign-in method: API_KEY for the sign-in with the Intervals.icu API key "
+            "(the default), OAUTH_PASSWORD or OAUTH_PASSWORD_HASH for a password, or an Intervals.icu OAuth app "
+            "(OAUTH_LOGIN=intervals)"
+        )
+    totp_raw = env.get("OAUTH_TOTP_SECRET", "").strip()
+    totp_secret = normalize_secret(totp_raw) if totp_raw else None
 
     client_id = env.get("INTERVALS_OAUTH_CLIENT_ID", "").strip() or None
     client_secret = env.get("INTERVALS_OAUTH_CLIENT_SECRET", "").strip() or None
@@ -407,6 +432,8 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         dynamic_registration=_env_bool(env, "OAUTH_DYNAMIC_REGISTRATION", True),
         private_key_jwt=_env_bool(env, "OAUTH_PRIVATE_KEY_JWT", True),
         permission_classes=tuple(p for p in PERMISSION_CLASSES if p in permissions),
+        api_key=api_key if "apikey" in methods else None,
+        totp_secret=totp_secret,
     )
 
 
@@ -554,6 +581,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             config.client_hosts, " ".join(config.scopes_supported), fetch=fetch, clock=clock
         )
         self._intervals_exchange = intervals_exchange or self._exchange_intervals_code
+        self._totp_last_counter = -1
         self._load_state()
 
     @property
@@ -871,6 +899,26 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         """Constant-time check of the submitted credentials."""
         return self._config.verify_credentials(username, password)
 
+    def verify_api_key(self, api_key: str) -> bool:
+        """Constant-time check of a submitted Intervals.icu API key."""
+        return self._config.verify_api_key(api_key)
+
+    @property
+    def totp_required(self) -> bool:
+        """True when the password and API-key sign-ins need an authenticator code."""
+        return self._config.totp_secret is not None
+
+    def verify_second_factor(self, code: str) -> bool:
+        """Accept an authenticator code once (no replay); always True without TOTP."""
+        secret = self._config.totp_secret
+        if secret is None:
+            return True
+        counter = match_counter(secret, code or "", self._clock())
+        if counter is None or counter <= self._totp_last_counter:
+            return False
+        self._totp_last_counter = counter
+        return True
+
     def grant_for(self, pending: _PendingLogin, chosen: list[str] | None) -> tuple[str, ...]:
         """Permission classes to grant: ``read`` plus the chosen offered classes."""
         picked = set(chosen or []) | {"read"}
@@ -1062,6 +1110,7 @@ def auth_status_from_env(environ: Mapping[str, str] | None = None) -> dict[str, 
             if env.get("OAUTH_PASSWORD_HASH", "").strip()
             else "plain" if env.get("OAUTH_PASSWORD") else "missing"
         ),
+        "second_factor": "totp" if env.get("OAUTH_TOTP_SECRET", "").strip() else "none",
         "dynamic_registration": env.get("OAUTH_DYNAMIC_REGISTRATION", "true").strip().lower() not in _FALSE,
     }
 
@@ -1071,8 +1120,8 @@ def auth_status_from_env(environ: Mapping[str, str] | None = None) -> dict[str, 
 # --------------------------------------------------------------------------- #
 
 
-def main(argv: list[str] | None = None) -> int:
-    """``python -m intervals_mcp_server.auth hash-password`` prints an OAUTH_PASSWORD_HASH value."""
+def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-locals
+    """CLI helpers: ``hash-password`` (OAUTH_PASSWORD_HASH) and ``totp-secret`` (OAUTH_TOTP_SECRET)."""
     parser = argparse.ArgumentParser(
         prog="python -m intervals_mcp_server.auth",
         description="Helpers for the built-in OAuth authorization server.",
@@ -1085,7 +1134,19 @@ def main(argv: list[str] | None = None) -> int:
     hasher.add_argument(
         "--iterations", type=int, default=PBKDF2_ITERATIONS, help="PBKDF2 iterations"
     )
+    totp_cmd = commands.add_parser(
+        "totp-secret", help="create an OAUTH_TOTP_SECRET and the otpauth:// URI for an authenticator app"
+    )
+    totp_cmd.add_argument("--account", default=os.environ.get("OAUTH_USERNAME", "").strip() or DEFAULT_USERNAME,
+                          help="account name shown in the authenticator app")
+    totp_cmd.add_argument("--issuer", default="Intervals MCP", help="issuer shown in the authenticator app")
     args = parser.parse_args(argv)
+
+    if args.command == "totp-secret":
+        secret = generate_secret()
+        print(f"OAUTH_TOTP_SECRET={secret}")
+        print(provisioning_uri(secret, args.account, args.issuer))
+        return 0
 
     password = args.password
     if password is None:
