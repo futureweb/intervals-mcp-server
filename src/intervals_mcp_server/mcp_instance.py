@@ -14,6 +14,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 from intervals_mcp_server.api.client import setup_api_client
 from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
@@ -164,6 +165,17 @@ _TOOL_PERMISSIONS: dict[str, str] = {}
 _DISABLED_TOOLS: dict[str, str] = {}
 
 
+# MCP tool annotations per permission class. Clients such as ChatGPT use them to decide which
+# tools may run without asking (read-only) and which need a confirmation (writes, deletions).
+# The tools only talk to the athlete's own Intervals.icu account: a closed domain.
+PERMISSION_ANNOTATIONS: dict[str, dict[str, bool]] = {
+    "read": {"readOnlyHint": True, "openWorldHint": False},
+    "write": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+    "destructive": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+    "admin": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
+}
+
+
 def tool(permission: str = "read", **kwargs: Any) -> Callable[[F], F]:
     """Register an MCP tool only when its permission class is enabled.
 
@@ -179,7 +191,9 @@ def tool(permission: str = "read", **kwargs: Any) -> Callable[[F], F]:
     def decorator(func: F) -> F:
         _TOOL_PERMISSIONS[func.__name__] = permission
         if permission in get_config().permissions:
-            return cast(F, mcp.tool(**kwargs)(func))
+            options = dict(kwargs)
+            options.setdefault("annotations", ToolAnnotations.model_validate(PERMISSION_ANNOTATIONS[permission]))
+            return cast(F, mcp.tool(**options)(func))
         _DISABLED_TOOLS[func.__name__] = permission
         return func
 
