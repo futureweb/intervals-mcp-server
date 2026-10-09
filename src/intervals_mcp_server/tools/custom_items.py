@@ -4,15 +4,17 @@ Custom items MCP tools for Intervals.icu.
 This module contains tools for managing athlete custom items (charts, fields, zones, etc.)
 and a per-process cache of the custom item definitions. The definitions are needed to
 label custom activity fields, interval fields, streams and wellness fields (name, units,
-select options), so they are fetched once per athlete and reused by the other tools.
+select options), so they are fetched once per athlete (and API key) and reused by the other
+tools for CUSTOM_ITEMS_CACHE_TTL_S; creating, changing or deleting an item drops the cache.
 """
 
 import json
 from typing import Any
 
 from intervals_mcp_server.api import client as api_client
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.cache import TTLCache, cache_key
 from intervals_mcp_server.utils.custom_fields import (
     CustomItemIndex,
     apply_units_overrides,
@@ -27,8 +29,9 @@ from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
+CUSTOM_ITEMS_CACHE_TTL_S = 1800
 # Module-level cache of the raw custom item list per athlete. Errors are not cached.
-_CUSTOM_ITEMS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_CUSTOM_ITEMS_CACHE: TTLCache[list[dict[str, Any]]] = TTLCache(CUSTOM_ITEMS_CACHE_TTL_S)
 
 
 async def get_custom_items_raw(
@@ -39,20 +42,22 @@ async def get_custom_items_raw(
 ) -> list[dict[str, Any]]:
     """Return (and cache) the raw custom item list for an athlete.
 
-    One API call per athlete per process lifetime unless ``refresh=True`` or the
+    One API call per athlete per CUSTOM_ITEMS_CACHE_TTL_S unless ``refresh=True`` or the
     previous fetch failed. The request is issued through ``api.client`` so that a
     monkeypatched client is honoured even when the caller patched only that module.
     """
-    if not refresh and athlete_id in _CUSTOM_ITEMS_CACHE:
-        return _CUSTOM_ITEMS_CACHE[athlete_id]
+    key = cache_key(athlete_id, api_key)
+    cached = None if refresh else _CUSTOM_ITEMS_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{athlete_id}/custom-item", api_key=api_key
+        url=f"/athlete/{seg(athlete_id)}/custom-item", api_key=api_key
     )
     if not isinstance(result, list):
         return []
     items = [item for item in result if isinstance(item, dict)]
-    _CUSTOM_ITEMS_CACHE[athlete_id] = items
+    _CUSTOM_ITEMS_CACHE.set(key, items)
     return items
 
 
@@ -72,9 +77,13 @@ async def get_custom_item_index(
     return apply_units_overrides(infer_temperature_units(index), get_config().custom_units_overrides)
 
 
-def invalidate_custom_items_cache(athlete_id: str) -> None:
-    """Drop the cached definitions of an athlete (after create/update/delete)."""
-    _CUSTOM_ITEMS_CACHE.pop(athlete_id, None)
+def invalidate_custom_items_cache(athlete_id: str | None = None) -> None:  # pylint: disable=unused-argument
+    """Drop the cached definitions after create/update/delete.
+
+    The whole cache is dropped: the same athlete may be cached under an alias ("0") or
+    another API key, and the cache is small.
+    """
+    _CUSTOM_ITEMS_CACHE.clear()
 
 
 @tool("read")
@@ -93,7 +102,7 @@ async def get_custom_items(
         return error_msg
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/custom-item", api_key=api_key
+        url=f"/athlete/{seg(athlete_id_to_use)}/custom-item", api_key=api_key
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -103,9 +112,9 @@ async def get_custom_items(
         return f"No custom items found for athlete {athlete_id_to_use}."
 
     if isinstance(result, list):
-        _CUSTOM_ITEMS_CACHE[athlete_id_to_use] = [
-            item for item in result if isinstance(item, dict)
-        ]
+        _CUSTOM_ITEMS_CACHE.set(
+            cache_key(athlete_id_to_use, api_key), [item for item in result if isinstance(item, dict)]
+        )
 
     output = "Custom Items:\n\n"
     for item in result:
@@ -137,7 +146,7 @@ async def get_custom_item_by_id(
         return error_msg
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/custom-item/{item_id}", api_key=api_key
+        url=f"/athlete/{seg(athlete_id_to_use)}/custom-item/{seg(item_id)}", api_key=api_key
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -190,7 +199,7 @@ async def create_custom_item(
         data["visibility"] = visibility
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/custom-item",
+        url=f"/athlete/{seg(athlete_id_to_use)}/custom-item",
         api_key=api_key,
         data=data,
         method="POST",
@@ -207,7 +216,7 @@ async def create_custom_item(
 
 
 @tool("admin")
-async def update_custom_item(
+async def update_custom_item(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-branches
     item_id: int,
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -219,6 +228,10 @@ async def update_custom_item(
 ) -> str:
     """Update an existing custom item for an athlete on Intervals.icu
 
+    Only the fields passed are changed. ``content`` is MERGED into the item's current content
+    (top-level keys): {"aggregate": "SUM"} changes the aggregate and keeps code, type, options
+    and formula. Set a key to null to clear it. A call without any field is refused.
+
     Args:
         item_id: The custom item ID to update
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
@@ -226,7 +239,7 @@ async def update_custom_item(
         name: New name for the custom item (optional)
         item_type: New type for the custom item (optional)
         description: New description for the custom item (optional)
-        content: New configuration content for the custom item as a dict (optional). Important enum values:
+        content: Configuration keys to change, merged into the current content (optional). Important enum values:
             - "type" field for INPUT_FIELD/ACTIVITY_FIELD: must be "numeric", "text", or "select" (NOT "number")
             - "aggregate" field: must be "MIN", "SUM", "MAX", or "AVERAGE" (NOT "AVG")
         visibility: New visibility setting: PRIVATE, FOLLOWERS, or PUBLIC (optional)
@@ -237,6 +250,8 @@ async def update_custom_item(
 
     data: dict[str, Any] = {}
     if name is not None:
+        if not name.strip():
+            return "Error: name must not be blank."
         data["name"] = name
     if item_type is not None:
         data["type"] = item_type
@@ -248,16 +263,26 @@ async def update_custom_item(
                 content = json.loads(content)
             except json.JSONDecodeError:
                 return "Error: content must be valid JSON when passed as a string."
-        data["content"] = content
+        if not isinstance(content, dict):
+            return "Error: content must be an object."
+        if content:
+            data["content"] = content
     if visibility is not None:
         data["visibility"] = visibility
+    if not data:
+        return "Error: nothing to update; pass at least one of name, item_type, description, content or visibility."
 
-    result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/custom-item/{item_id}",
-        api_key=api_key,
-        data=data,
-        method="PUT",
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/custom-item/{seg(item_id)}"
+    if "content" in data:
+        current = await make_intervals_request(url=url, api_key=api_key)
+        if isinstance(current, dict) and "error" in current:
+            return f"Error reading custom item {item_id} before the update: {current.get('message')}"
+        if not isinstance(current, dict) or not current:
+            return f"No custom item found with ID {item_id}."
+        existing = current.get("content")
+        data["content"] = {**(existing if isinstance(existing, dict) else {}), **data["content"]}
+
+    result = await make_intervals_request(url=url, api_key=api_key, data=data, method="PUT")
 
     if isinstance(result, dict) and "error" in result:
         return f"Error updating custom item: {result.get('message')}"
@@ -275,7 +300,10 @@ async def delete_custom_item(
     athlete_id: str | None = None,
     api_key: str | None = None,
 ) -> str:
-    """Delete a custom item for an athlete from Intervals.icu
+    """DELETES from Intervals.icu: permanently remove one custom item (chart, field, stream, zones ...)
+
+    The item is read first, so the answer names what was deleted; a missing item is not deleted.
+    Data recorded in a deleted custom field is no longer shown. This cannot be undone.
 
     Args:
         item_id: The custom item ID to delete
@@ -286,14 +314,20 @@ async def delete_custom_item(
     if error_msg:
         return error_msg
 
-    result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/custom-item/{item_id}",
-        api_key=api_key,
-        method="DELETE",
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/custom-item/{seg(item_id)}"
+    item = await make_intervals_request(url=url, api_key=api_key)
+    if isinstance(item, dict) and "error" in item:
+        return f"Error reading custom item {item_id}: {item.get('message')}"
+    if not isinstance(item, dict) or not item:
+        return f"No custom item found with ID {item_id}; nothing was deleted."
+
+    result = await make_intervals_request(url=url, api_key=api_key, method="DELETE")
 
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting custom item: {result.get('message')}"
 
     invalidate_custom_items_cache(athlete_id_to_use)
-    return f"Successfully deleted custom item {item_id}."
+    return (
+        f"Successfully deleted custom item {item_id} '{item.get('name') or 'unnamed'}' "
+        f"({item.get('type') or 'unknown type'})."
+    )
