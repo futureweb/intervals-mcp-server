@@ -469,3 +469,12 @@ def test_implausible_grade_is_flagged_and_not_the_steepest_climb():
     assert any("exceeds 60%" in flag and "treat the grade as approximate" in flag for flag in steep["quality_flags"])
     assert result["summary"]["steepest_climb"]["avg_grade_pct"] < 20
     assert result["summary"]["flagged_segments"] >= 1
+
+
+def test_gear_position_streams_are_not_labelled_as_teeth():
+    """Regression: a gear stream with units 'cog' and values 1-12 is shown as a gear position."""
+    streams = _ride_streams()
+    streams.append({"type": "RearGearPos", "custom": True, "data": [(i // 50) % 12 + 1 for i in range(TOTAL_SAMPLES)]})
+    defs = dict(STREAM_DEFS, RearGearPos={"code": "RearGearPos", "name": "RearGearPos", "units": "cog"})
+    text = format_segments(detect_segments(streams), defs)
+    assert "  RearGearPos (gear position): start" in text and "(cog)" not in text

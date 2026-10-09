@@ -1103,7 +1103,8 @@ def format_segments(
         if segment.get("quality_flags"):
             lines.append("  data quality: " + "; ".join(segment["quality_flags"]))
         for stream_type, stats in (segment.get("streams") or {}).items():
-            info = describe_stream({"type": stream_type}, defs)
+            # min / max are enough to recognise gear positions defined with tooth units
+            info = describe_stream({"type": stream_type, "data": [stats.get("min"), stats.get("max")]}, defs)
             lines.append(f"  {stream_label(info)}: {format_stats(stats)}")
     if len(segments) > max_segments:
         lines.append(f"... {len(segments) - max_segments} more segments not shown")
