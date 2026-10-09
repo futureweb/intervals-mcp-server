@@ -53,7 +53,7 @@ from intervals_mcp_server.auth import (
 
 PASSWORD = "correct horse battery staple"
 ISSUER = "http://localhost"
-REDIRECT_URI = "https://chatgpt.example/connector_platform_oauth_redirect"
+REDIRECT_URI = "https://chatgpt.com/connector/oauth/test-callback"
 CHATGPT_REGISTRATION: dict[str, Any] = {
     "client_name": "ChatGPT",
     "redirect_uris": [REDIRECT_URI],
@@ -206,7 +206,7 @@ def test_authorization_server_metadata(client):
     assert metadata["registration_endpoint"] == f"{ISSUER}/register"
     assert metadata["revocation_endpoint"] == f"{ISSUER}/revoke"
     assert metadata["code_challenge_methods_supported"] == ["S256"]
-    assert metadata["scopes_supported"] == ["mcp"]
+    assert metadata["scopes_supported"] == ["mcp", "intervals:read"]
     assert set(metadata["grant_types_supported"]) == {"authorization_code", "refresh_token"}
 
 
@@ -243,7 +243,7 @@ def test_public_client_registration(client):
     assert "client_secret" not in info
     assert info["token_endpoint_auth_method"] == "none"
     assert info["redirect_uris"] == [REDIRECT_URI]
-    assert info["scope"] == "mcp"
+    assert info["scope"] == "mcp intervals:read"
 
 
 def test_confidential_client_registration(client):
@@ -297,7 +297,8 @@ def test_login_page_renders_form(client):
     assert '<form method="post"' in body
     assert f'name="request" value="{request_id}"' in body
     assert 'name="username" value="athlete"' in body
-    assert 'name="password" type="password"' in body
+    assert 'type="password" id="password" name="password"' in body
+    assert 'name="grant" value="read"' in body and "Deny" in body
     assert "<script" not in body and "http://" not in body and "https://" not in body
 
 
@@ -358,7 +359,7 @@ def test_code_exchange_issues_tokens(client):
     _, tokens = obtain_tokens(client)
     assert tokens["token_type"] == "Bearer"
     assert tokens["expires_in"] == 3600
-    assert tokens["scope"] == "mcp"
+    assert tokens["scope"] == "mcp intervals:read"
     assert len(tokens["access_token"]) >= 32
     assert len(tokens["refresh_token"]) >= 32
     assert tokens["access_token"] != tokens["refresh_token"]
@@ -417,7 +418,7 @@ def test_bearer_token_grants_access(client):
     assert response.status_code == 400
     assert "session_id" in response.text
     identity = client.get("/whoami", headers=headers).json()
-    assert identity == {"client_id": client_id, "scopes": ["mcp"]}
+    assert identity == {"client_id": client_id, "scopes": ["mcp", "intervals:read"]}
     assert client.get("/whoami").json()["client_id"] is None
     assert client.get("/whoami", headers=bearer(tokens["refresh_token"])).json()["client_id"] is None
 

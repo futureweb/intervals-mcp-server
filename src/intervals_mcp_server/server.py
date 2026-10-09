@@ -57,7 +57,7 @@ from intervals_mcp_server.api.client import (
     make_intervals_request,
 )
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.mcp_instance import mcp
+from intervals_mcp_server.mcp_instance import mcp, oauth_provider
 
 # Import types and validation
 from intervals_mcp_server.server_setup import setup_transport, start_server
@@ -244,7 +244,7 @@ def main() -> None:
 
     # Setup transport and start server
     selected_transport = setup_transport()
-    start_server(mcp, selected_transport)
+    start_server(mcp, selected_transport, provider=oauth_provider)
 
 
 # Run the server
