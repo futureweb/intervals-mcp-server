@@ -106,11 +106,11 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 
 | Tool | What it does |
 | --- | --- |
-| `get_activity_report` | Complete compact analysis in one call: overview, plan vs execution or intervals, second power meter check, climbs, data-quality notes |
-| `analyze_workout_execution` | Planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina); takes a `planned_workout_doc` for deleted events, reports training beyond the plan separately, suggests matching events read-only |
-| `analyze_climbs` | Climbs, descents and pauses from the streams with power, NP, HR, VAM, grade and custom streams per segment |
+| `get_activity_report` | Complete analysis in one call: overview, plan vs execution or intervals, second power meter check, climbs, data-quality notes; `detail_level` compact (core numbers and key findings, about 2k characters), standard or full |
+| `analyze_workout_execution` | Planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina). Steps are capped at their planned duration, longer intervals are split for the analysis, and riding beyond the plan is reported separately with its load and extra efforts. Tolerances for start shift, pauses and step length; `planned_workout_doc` for deleted events; matching events suggested read-only |
+| `analyze_climbs` | Climbs, descents and pauses with power, NP, HR, VAM and custom streams per segment; grade smoothed over a distance window (raw grade optional), real pauses vs slow movement, sport profiles for riding, running and hiking, data-quality flags |
 | `compare_power_streams` | Sample-aligned comparison of two power meters: offset, power bands, stable windows, drift, lag |
-| `get_best_efforts` | Best efforts of one activity for durations or distances, with their time windows |
+| `get_best_efforts` | Best efforts of one activity for durations or distances, with their elapsed-time windows; windows across a recording pause are flagged |
 | `get_activity_histogram` | Time distribution of power, heart rate, pace or GAP |
 
 **Activities and streams**
@@ -119,7 +119,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | --- | --- |
 | `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output |
 | `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units |
-| `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream |
+| `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream, optionally the planned step type next to the Intervals.icu type |
 | `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging |
 | `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description |
 
@@ -128,12 +128,12 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `compare_best_efforts` | Best efforts across activities (ids, date range, sport, gear) side by side |
-| `find_similar_intervals` | Activities with intervals of a given length and intensity |
-| `compare_workouts` | The same workout type over weeks: work intervals, NP, HR, Pw:HR, load |
-| `get_power_hr_efficiency` | Watts per heartbeat per power band over time |
-| `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds |
+| `find_similar_intervals` | Activities with comparable intervals, from a reference activity or a given length and intensity; same sport family by default, ranked by comparability, with gear and power meter context |
+| `compare_workouts` | Repeated workouts over time, comparing only comparable work intervals (reference activity, sport family, length, intensity, reps, FTP range); surges kept apart, time-weighted means, power, HR, cadence and whole-activity RPE trends, gear and power meter flags |
+| `get_power_hr_efficiency` | Watts per heartbeat per power band and bike over time, with minimum sample sizes and filters for gear, indoor/outdoor and interval position |
+| `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
-| `get_training_summary` | Totals per week, month, sport or gear with separate load sources, time in zones and custom field aggregates |
+| `get_training_summary` | Totals per week, month, sport or gear with separate load sources and time in zones; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
 
 **Wellness and recovery**
@@ -141,7 +141,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call |
-| `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport |
+| `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |
 
@@ -252,6 +252,7 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
 | `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
 | `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
+| `CUSTOM_AGGREGATE_OVERRIDES` | – | Aggregation per custom field code in summaries (`sum`, `device_load_sum`, `trend`, `mean`, `none`), e.g. `TrainingLoad=device_load_sum` |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (`/mcp` and `/sse` in one process) |
 | `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address of the HTTP transports |
 | `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | SSE endpoint paths |
@@ -300,18 +301,9 @@ Details and how to report a vulnerability: [SECURITY.md](SECURITY.md).
   one-call activity report, prompts and resources
 - OAuth with "Continue with Intervals.icu", per-connection permissions, client metadata
   documents, streamable HTTP and SSE in one process
-
-**In progress: analytics quality**
-- Extended rides: planned steps capped in time, longer intervals split for the analysis, all
-  extra riding after the plan reported separately
-- `compare_workouts` and `find_similar_intervals` restricted to truly comparable intervals
-  (sport, duration, intensity, reference activity), surges kept apart, time-weighted means
-- Custom field aggregation by meaning and units (no sums of percentages, ground contact time or
-  oscillation)
-- Clearer periods and units in wellness trends, minimum sample sizes for efficiency trends,
-  reliable detection of missing fatigue-resistance configuration
-- Smoothed grades, pause vs scrambling detection and sport-specific thresholds in `analyze_climbs`
-- Compact `detail_level` for the report and summaries
+- Analytics quality: extended rides split correctly, only comparable intervals compared,
+  custom field aggregation by meaning, clear wellness periods, minimum sample sizes for
+  efficiency trends, honest fatigue resistance, smoothed climb grades, compact report
 
 **Next**
 - PyPI package and the first tagged release with a GHCR image
