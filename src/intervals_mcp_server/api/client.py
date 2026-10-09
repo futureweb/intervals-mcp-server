@@ -23,6 +23,16 @@ logger = logging.getLogger("intervals_icu_mcp_server")
 
 # Transient statuses that are retried with a short back-off (Retry-After is honoured).
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+# POST is not idempotent: after a 5xx the event may already exist, so a retry could create a
+# duplicate. Only 429 (rejected before processing) is retried for POST.
+NON_IDEMPOTENT_RETRY_STATUSES = {429}
+
+
+def retry_statuses(method: str) -> set[int]:
+    """Statuses retried for *method* (GET/PUT/DELETE are idempotent, POST is not)."""
+    return NON_IDEMPOTENT_RETRY_STATUSES if method.upper() == "POST" else RETRY_STATUSES
+
+
 MAX_ATTEMPTS = 3
 MAX_RETRY_DELAY_S = 30.0
 
@@ -231,9 +241,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
 
     try:
         response = await _send_with_client_recovery()
+        retryable = retry_statuses(method)
         for attempt in range(MAX_ATTEMPTS - 1):
             status = getattr(response, "status_code", 200)
-            if status not in RETRY_STATUSES:
+            if status not in retryable:
                 break
             delay = _retry_delay(response, attempt)
             logger.warning("Intervals.icu answered %s for %s; retrying in %.1f s", status, url, delay)
