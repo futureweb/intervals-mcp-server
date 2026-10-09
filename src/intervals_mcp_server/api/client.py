@@ -9,10 +9,16 @@ from json import JSONDecodeError
 import asyncio
 import json
 import logging
+import os
 import sys
-from contextlib import asynccontextmanager
+import time
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import quote
 
 import httpx  # pylint: disable=import-error
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
@@ -35,6 +41,13 @@ def retry_statuses(method: str) -> set[int]:
 
 MAX_ATTEMPTS = 3
 MAX_RETRY_DELAY_S = 30.0
+REQUEST_TIMEOUT_S = 30.0
+
+# Limits of ONE tool call (all API requests it makes): a tool that loops over many activities
+# or durations stops with a clear message instead of running for minutes and burning the
+# athlete's rate limit. Overridable with MCP_TOOL_MAX_REQUESTS / MCP_TOOL_TIMEOUT_S.
+DEFAULT_TOOL_MAX_REQUESTS = 300
+DEFAULT_TOOL_TIMEOUT_S = 120.0
 
 
 def _retry_delay(response: httpx.Response, attempt: int) -> float:
@@ -46,6 +59,69 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
         except ValueError:
             pass
     return min(MAX_RETRY_DELAY_S, 1.5 * (2**attempt))
+
+
+def _env_number(name: str, default: float) -> float:
+    """Positive number from the environment, or the default."""
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+@dataclass
+class CallLimits:
+    """Request budget and deadline of one tool call."""
+
+    max_requests: int
+    timeout_s: float
+    started: float
+    requests: int = 0
+    hit: str | None = None
+
+    def remaining_s(self) -> float:
+        """Seconds left until the deadline."""
+        return self.timeout_s - (time.monotonic() - self.started)
+
+    def admit(self) -> str | None:
+        """Count one request, or say why it may not be sent."""
+        if self.requests >= self.max_requests:
+            self.hit = f"its limit of {self.max_requests} Intervals.icu API requests"
+        elif self.remaining_s() < 1.0:
+            self.hit = f"its time limit of {self.timeout_s:.0f} s"
+        else:
+            self.requests += 1
+            return None
+        return (
+            f"Not sent: this tool call reached {self.hit}. Narrow the request (fewer activities, "
+            "ids or durations, a shorter date range) and call the tool again."
+        )
+
+
+_CALL_LIMITS: ContextVar[CallLimits | None] = ContextVar("intervals_call_limits", default=None)
+
+
+@contextmanager
+def call_limits(max_requests: int | None = None, timeout_s: float | None = None) -> Iterator[CallLimits]:
+    """Request budget and deadline for the API requests of one tool call.
+
+    Nested use (a tool calling another tool) keeps the outer limits.
+    """
+    current = _CALL_LIMITS.get()
+    if current is not None:
+        yield current
+        return
+    limits = CallLimits(
+        max_requests=int(max_requests or _env_number("MCP_TOOL_MAX_REQUESTS", DEFAULT_TOOL_MAX_REQUESTS)),
+        timeout_s=float(timeout_s or _env_number("MCP_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S)),
+        started=time.monotonic(),
+    )
+    token = _CALL_LIMITS.set(limits)
+    try:
+        yield limits
+    finally:
+        _CALL_LIMITS.reset(token)
 
 
 # Create a single AsyncClient instance for all requests (lazily initialized)
@@ -120,22 +196,71 @@ async def _close_shared_clients() -> None:
         pass
 
 
-def _get_error_message(error_code: int, error_text: str) -> str:
-    """Return a user-friendly error message for a given HTTP status code."""
-    error_messages = {
-        HTTPStatus.UNAUTHORIZED: f"{HTTPStatus.UNAUTHORIZED.value} {HTTPStatus.UNAUTHORIZED.phrase}: Please check your API key.",
-        HTTPStatus.FORBIDDEN: f"{HTTPStatus.FORBIDDEN.value} {HTTPStatus.FORBIDDEN.phrase}: You may not have permission to access this resource.",
-        HTTPStatus.NOT_FOUND: f"{HTTPStatus.NOT_FOUND.value} {HTTPStatus.NOT_FOUND.phrase}: The requested endpoint or ID doesn't exist.",
-        HTTPStatus.UNPROCESSABLE_ENTITY: f"{HTTPStatus.UNPROCESSABLE_ENTITY.value} {HTTPStatus.UNPROCESSABLE_ENTITY.phrase}: The server couldn't process the request (invalid parameters or unsupported operation).",
-        HTTPStatus.TOO_MANY_REQUESTS: f"{HTTPStatus.TOO_MANY_REQUESTS.value} {HTTPStatus.TOO_MANY_REQUESTS.phrase}: Too many requests in a short time period.",
-        HTTPStatus.INTERNAL_SERVER_ERROR: f"{HTTPStatus.INTERNAL_SERVER_ERROR.value} {HTTPStatus.INTERNAL_SERVER_ERROR.phrase}: The Intervals.icu server encountered an internal error.",
-        HTTPStatus.SERVICE_UNAVAILABLE: f"{HTTPStatus.SERVICE_UNAVAILABLE.value} {HTTPStatus.SERVICE_UNAVAILABLE.phrase}: The Intervals.icu server might be down or undergoing maintenance.",
-    }
+_STATUS_HINTS: dict[int, str] = {
+    HTTPStatus.UNAUTHORIZED: "Please check your API key.",
+    HTTPStatus.FORBIDDEN: "You may not have permission to access this resource.",
+    HTTPStatus.NOT_FOUND: "The requested endpoint or ID doesn't exist.",
+    HTTPStatus.UNPROCESSABLE_ENTITY: "The server couldn't process the request (invalid parameters or unsupported operation).",
+    HTTPStatus.TOO_MANY_REQUESTS: "Too many requests in a short time period.",
+    HTTPStatus.INTERNAL_SERVER_ERROR: "The Intervals.icu server encountered an internal error.",
+    HTTPStatus.BAD_GATEWAY: "The Intervals.icu server or a proxy in front of it did not answer properly.",
+    HTTPStatus.SERVICE_UNAVAILABLE: "The Intervals.icu server might be down or undergoing maintenance.",
+    HTTPStatus.GATEWAY_TIMEOUT: "The Intervals.icu server did not answer in time.",
+}
+_MAX_REASON_CHARS = 300
+
+
+def _get_error_message(error_code: int, reason: str | None = None) -> str:
+    """User-friendly message for an HTTP status, with the API's own reason when it gave one."""
     try:
         status = HTTPStatus(error_code)
-        return error_messages.get(status, error_text)
+        text = f"{status.value} {status.phrase}"
     except ValueError:
-        return error_text
+        text = f"HTTP {error_code}"
+    hint = _STATUS_HINTS.get(error_code)
+    if hint:
+        text += f": {hint}"
+    if reason:
+        text += f" Intervals.icu says: {reason}"
+    return text
+
+
+def _redact(text: str, secrets: tuple[str | None, ...]) -> str:
+    """Remove secret values (the API key) from text that is shown to the client or logged."""
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def _api_reason(response: Any, secrets: tuple[str | None, ...] = ()) -> str | None:  # pylint: disable=too-many-return-statements
+    """Short reason from an error response body ({"error": "..."} or plain text; never HTML)."""
+    try:
+        content = getattr(response, "content", b"") or b""
+        if not content:
+            return None
+        try:
+            body = response.json()
+        except (JSONDecodeError, ValueError):
+            body = None
+        if isinstance(body, dict):
+            reason = body.get("error") or body.get("message") or body.get("detail")
+            if isinstance(reason, bool) or reason is None:
+                return None
+            text = str(reason)
+        elif body is None:
+            text = str(getattr(response, "text", "") or "")
+            if "<html" in text[:500].lower() or "<!doctype" in text[:500].lower():
+                return None
+        else:
+            return None
+    except (AttributeError, TypeError, UnicodeDecodeError):
+        return None
+    text = " ".join(text.split())
+    if not text:
+        return None
+    text = _redact(text, secrets)
+    return text if len(text) <= _MAX_REASON_CHARS else text[: _MAX_REASON_CHARS - 3] + "..."
 
 
 def _prepare_request_config(
@@ -180,15 +305,35 @@ _SEGMENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 SECRET_FIELDS = frozenset({"icu_api_key", "api_key", "apiKey", "password", "access_token", "refresh_token", "client_secret", "secret"})
 
 
+def unsafe_segment_reason(value: Any) -> str | None:
+    """Why *value* cannot be used as ONE path segment (an id), or None when it can."""
+    text = str(value)
+    if text in ("", ".", ".."):
+        return "empty or dot path segment"
+    if not set(text) <= _SEGMENT_CHARS:
+        return "invalid characters in an identifier"
+    return None
+
+
+def seg(value: Any) -> str:
+    """One URL path segment made from an identifier (activity, event, workout, athlete id ...).
+
+    Use it wherever an id is formatted into an API path: ``f"/activity/{seg(activity_id)}/streams"``.
+    Characters that are not plain identifier characters are percent-encoded, so a "/" or "?" in
+    an argument cannot add a sub-path or a query string; make_intervals_request then refuses the
+    request ("Invalid identifier") because "%" is not an identifier character.
+    """
+    return quote(str(value), safe=",:~")
+
+
 def unsafe_path_reason(url: str) -> str | None:
     """Why *url* is not a safe API path, or None when every segment is a plain identifier."""
     if not url.startswith("/"):
         return "path must start with '/'"
     for segment in url[1:].split("/"):
-        if segment in ("", ".", ".."):
-            return "empty or dot path segment"
-        if not set(segment) <= _SEGMENT_CHARS:
-            return "invalid characters in an identifier"
+        reason = unsafe_segment_reason(segment)
+        if reason:
+            return reason
     return None
 
 
@@ -206,19 +351,40 @@ def _parse_response(
 ) -> dict[str, Any] | list[dict[str, Any]]:
     """Parse HTTP response and return JSON data or error dict.
 
+    The status is checked first, so an HTML or plain-text error page (e.g. a 502 from a
+    proxy) keeps its status code instead of becoming "Invalid JSON".
+
     Returns:
         Parsed JSON response or error dict.
     """
+    status = getattr(response, "status_code", 200)
+    if isinstance(status, int) and status >= 400:
+        response.raise_for_status()
     try:
         response_data = response.json() if response.content else {}
     except JSONDecodeError:
         logger.error("Invalid JSON in response from: %s", full_url)
-        return {"error": True, "message": "Invalid JSON in response"}
+        return {"error": True, "status_code": status, "message": f"Invalid JSON in response (HTTP {status})"}
     response.raise_for_status()
     return scrub_secrets(response_data)
 
 
-async def make_intervals_request(  # pylint: disable=too-many-locals
+def _transport_error(error: Exception, method: str) -> tuple[str, bool]:
+    """Readable message for a transport error (timeouts, dropped connections) and whether
+    the request may nevertheless have been applied by Intervals.icu."""
+    detail = str(error).strip()
+    text = f"Request error ({type(error).__name__})" + (f": {detail}" if detail else "")
+    not_sent = isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+    maybe_applied = method != "GET" and not not_sent
+    if maybe_applied:
+        text += (
+            ". The request may still have reached Intervals.icu and been applied; check the current "
+            "state (e.g. get_events or the activity) before retrying, so nothing is created twice."
+        )
+    return text, maybe_applied
+
+
+async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-statements,too-many-return-statements
     url: str,
     api_key: str | None = None,
     params: dict[str, Any] | None = None,
@@ -228,6 +394,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
     """
     Make a request to the Intervals.icu API with proper error handling.
 
+    Retries: HTTP 429/5xx for GET/PUT/DELETE, only 429 for POST; transport errors
+    (timeouts, dropped connections) only for GET. Inside a tool call the request budget
+    and deadline of the call apply (see call_limits).
+
     Args:
         url (str): The API endpoint path (e.g., '/athlete/{id}/activities').
         api_key (str | None): Optional API key to use for authentication. Defaults to the global API_KEY.
@@ -236,8 +406,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
         data (dict[str, Any] | list[dict[str, Any]] | None): Optional JSON data (object or array) to send in the request body.
 
     Returns:
-        dict[str, Any] | list[dict[str, Any]]: The parsed JSON response from the API, or an error dict.
+        dict[str, Any] | list[dict[str, Any]]: The parsed JSON response from the API, or an error dict
+        ({"error": True, "message": ..., "status_code": ... when the API answered}).
     """
+    method = method.upper()
     reason = unsafe_path_reason(url)
     if reason:
         logger.warning("Rejected API path built from tool arguments (%s)", reason)
@@ -247,6 +419,19 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
     full_url, auth, headers, error_msg = _prepare_request_config(url, api_key, method)
     if error_msg:
         return {"error": True, "message": error_msg}
+    secrets = (api_key, get_config().api_key)
+
+    limits = _CALL_LIMITS.get()
+    if limits is not None:
+        refusal = limits.admit()
+        if refusal:
+            logger.warning("Tool call limit reached (%s); %s %s not sent", limits.hit, method, url)
+            return {"error": True, "limit_reached": True, "message": refusal}
+
+    def _timeout() -> float:
+        if limits is None:
+            return REQUEST_TIMEOUT_S
+        return max(1.0, min(REQUEST_TIMEOUT_S, limits.remaining_s()))
 
     async def _send_request(client: httpx.AsyncClient) -> httpx.Response:
         if method in {"POST", "PUT"} and data is not None:
@@ -258,7 +443,7 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
                 headers=headers,
                 params=params,
                 auth=auth,
-                timeout=30.0,
+                timeout=_timeout(),
                 content=body,
             )
         return await client.request(
@@ -267,7 +452,7 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
             headers=headers,
             params=params,
             auth=auth,
-            timeout=30.0,
+            timeout=_timeout(),
         )
 
     async def _send_with_client_recovery() -> httpx.Response:
@@ -285,43 +470,66 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
             client = await _get_httpx_client()
             return await _send_request(client)
 
+    def _time_for_retry(delay: float) -> bool:
+        return limits is None or limits.remaining_s() > delay + 1.0
+
     try:
-        response = await _send_with_client_recovery()
         retryable = retry_statuses(method)
-        for attempt in range(MAX_ATTEMPTS - 1):
+        response: httpx.Response | None = None
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                response = await _send_with_client_recovery()
+            except httpx.TransportError as error:
+                # Only GET is retried after a transport error: a POST/PUT/DELETE may already
+                # have been applied when the connection dropped.
+                delay = min(MAX_RETRY_DELAY_S, 1.5 * (2**attempt))
+                if method != "GET" or attempt == MAX_ATTEMPTS - 1 or not _time_for_retry(delay):
+                    raise
+                logger.warning("%s for %s; retrying in %.1f s", type(error).__name__, url, delay)
+                await asyncio.sleep(delay)
+                continue
             status = getattr(response, "status_code", 200)
-            if status not in retryable:
+            if status not in retryable or attempt == MAX_ATTEMPTS - 1:
                 break
             delay = _retry_delay(response, attempt)
+            if not _time_for_retry(delay):
+                break
             logger.warning("Intervals.icu answered %s for %s; retrying in %.1f s", status, url, delay)
             await asyncio.sleep(delay)
-            response = await _send_with_client_recovery()
 
+        assert response is not None  # the loop either set it or raised
         return _parse_response(response, full_url)
     except httpx.HTTPStatusError as e:
-        return _handle_http_status_error(e)
+        return _handle_http_status_error(e, secrets)
     except httpx.RequestError as e:
-        logger.error("Request error: %s", str(e))
-        return {"error": True, "message": f"Request error: {str(e)}"}
+        message, maybe_applied = _transport_error(e, method)
+        message = _redact(message, secrets)
+        logger.error("%s %s failed: %s", method, url, message)
+        return {"error": True, "message": message, **({"maybe_applied": True} if maybe_applied else {})}
     except httpx.HTTPError as e:
-        logger.error("HTTP client error: %s", str(e))
-        return {"error": True, "message": f"HTTP client error: {str(e)}"}
+        message = _redact(f"HTTP client error ({type(e).__name__}): {e}", secrets)
+        logger.error("%s", message)
+        return {"error": True, "message": message}
 
 
-def _handle_http_status_error(e: httpx.HTTPStatusError) -> dict[str, Any]:
+def _handle_http_status_error(e: httpx.HTTPStatusError, secrets: tuple[str | None, ...] = ()) -> dict[str, Any]:
     """Handle HTTP status errors and return formatted error dict.
+
+    The message keeps the status code and the reason Intervals.icu gave (e.g. "Invalid oldest:
+    Text 'bad' could not be parsed"), shortened and with the API key removed.
 
     Args:
         e: The HTTPStatusError exception.
+        secrets: Values that must not appear in the message (API keys).
 
     Returns:
         Error dictionary with status code and message.
     """
     error_code = e.response.status_code
-    error_text = e.response.text
-    logger.error("HTTP error: %s - %s", error_code, error_text)
+    reason = _api_reason(e.response, secrets)
+    logger.error("HTTP error: %s - %s", error_code, reason or "(no reason given)")
     return {
         "error": True,
         "status_code": error_code,
-        "message": _get_error_message(error_code, error_text),
+        "message": _get_error_message(error_code, reason),
     }
