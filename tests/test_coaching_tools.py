@@ -432,7 +432,7 @@ def test_get_training_summary_groups(monkeypatch):
     assert "- Ride: 1 sessions, 1:21:01, 40.4 km, load 90" in result
     assert "- gear Canyon Ultimate (b1): 1 sessions" in result
     assert "feel 2: 1, 3: 1, 4: 1 | RPE mean 5.0 | sessions >= 3 h: 0 | longest 1:51:48 ('Grail gravel')" in result
-    assert "Custom fields (e.g. device loads, kept separate from Intervals.icu load): Aerobic Effect [AerobicEffect] mean 3.4 (n 2)" in result
+    assert "Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept separate from the Intervals.icu load): Aerobic Effect [AerobicEffect] mean 3.3 (median 3.3, min 3.3, max 3.3; n 1) (1 value(s) from sports without this field ignored)" in result  # not assigned to Ride
     epoc = asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json"))
     assert json.loads(epoc)["overall"]["custom_fields"].get("EPOC") is None  # no EPOC values in the fixtures
     assert "End of period (2026-10-09): CTL 65.8, ATL 66.0, form -0.2, ramp 1.0" in result
