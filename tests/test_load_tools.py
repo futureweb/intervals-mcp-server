@@ -391,6 +391,18 @@ def test_new_tools_are_read_only_and_prompt():
     assert "not a risk statement" in text and "Do not state causes" in text
 
 
+def test_coach_context_is_the_recommended_first_call():
+    """Phase 5 (I): the guide and both weekly prompts make get_coach_context the first call."""
+    from intervals_mcp_server.tools.status import usage_guide, weekly_training_review  # pylint: disable=import-outside-toplevel
+
+    assert "Call get_coach_context first" in training_load_review()
+    assert "Call get_coach_context first" in weekly_training_review()
+    guide = usage_guide()
+    assert "For a weekly analysis the recommended first call is get_coach_context" in guide
+    assert guide.index("get_coach_context") < guide.index("get_activity_report")
+    assert "cadence in steps per minute" in guide
+
+
 def test_new_tools_through_mcp_layer(monkeypatch):
     """The registered tools accept JSON arguments via FastMCP (argument validation included)."""
     from intervals_mcp_server.mcp_instance import mcp  # pylint: disable=import-outside-toplevel
