@@ -178,3 +178,24 @@ def test_apply_units_overrides_marks_source():
     assert index[ACTIVITY_FIELD]["EPOC"]["units_source"] == "override"
     assert "units_source" not in index[ACTIVITY_FIELD]["AerobicEffect"]
     assert apply_units_overrides(index, {}) is index
+
+
+def test_temperature_fields_without_units_get_the_shared_unit():
+    """Phase 5 (E): 'Max. Temperature' without units follows the °C of the other temperature fields."""
+    from intervals_mcp_server.utils.custom_fields import infer_temperature_units  # pylint: disable=import-outside-toplevel
+
+    def item(item_id, name, code, units):
+        return {"id": item_id, "type": "ACTIVITY_FIELD", "name": name, "content": {"code": code, "type": "numeric", "units": units}}
+
+    index = infer_temperature_units(index_custom_items([
+        item(1, "Min. Temperature", "Mintemperature", "°C"), item(2, "Max. Temperature", "MaxTemperature", None),
+        item(3, "Avg. Temperature", "AvgTemperature", "°C"), item(4, "Mystery", "Mystery", None),
+    ]))
+    defs = index["ACTIVITY_FIELD"]
+    assert defs["MaxTemperature"]["units"] == "°C" and defs["MaxTemperature"]["units_source"] == "inferred"
+    assert format_field_value(defs["MaxTemperature"], 22.0) == "22 °C"
+    assert defs["Mystery"].get("units") is None
+    mixed = infer_temperature_units(index_custom_items([
+        item(1, "Min. Temperature", "Mintemperature", "°C"), item(2, "Max Temp F", "MaxTempF", "°F"), item(3, "Max. Temperature", "MaxTemperature", None),
+    ]))
+    assert mixed["ACTIVITY_FIELD"]["MaxTemperature"].get("units") is None  # units disagree: nothing assumed

@@ -22,6 +22,7 @@ import math
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import CustomFieldDefs, format_value, is_missing
+from intervals_mcp_server.utils.sports import FOOT_SPORTS
 
 # Units of the standard Intervals.icu streams (only the unambiguous ones). Any
 # other stream, including every custom stream, gets its units from the athlete's
@@ -380,7 +381,6 @@ def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int
 # a ride) from compact and standard outputs; "full" output still shows them.
 _FOOT_WORDS = ("run", "running", "stride", "gct", "ground", "stance", "vertical", "step", "flight")
 _BIKE_WORDS = ("gear", "pedal", "crank", "chainring", "cog")
-FOOT_SPORTS = ("run", "trailrun", "virtualrun", "walk", "hike", "snowshoe")
 BIKE_SPORTS = ("ride", "virtualride", "gravelride", "mountainbikeride", "ebikeride", "emountainbikeride", "velomobile", "handcycle", "trackride")
 
 

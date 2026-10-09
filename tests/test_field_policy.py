@@ -148,8 +148,66 @@ def test_zeros_and_sport_foreign_values():
     assert aggs["Mystery"]["n"] == 1  # assigned to no sport: every value counts
     assert aggs["VO2MaxGarmin"]["min"] == 50 and aggs["VO2MaxGarmin"]["zeros_excluded"] == 1
     assert aggs["AerobicEffect"]["min"] == 0 and aggs["AerobicEffect"]["zero_values"] == 1  # a real 0 effect is kept
+    assert aggs["GCT"]["excluded_by_sport_settings"] == 1 and aggs["GCT"]["zero_placeholders_ignored"] == 1
     text = format_aggregate("GCT", aggs["GCT"])
-    assert "2 value(s) from sports without this field ignored" in text
+    assert "1 value(s) from sports whose (family) field settings exclude this field ignored" in text
+    assert "1 zero placeholder(s) on sports without field assignment ignored" in text
     assert "1 stored 0 left out as 'no value'" in format_aggregate("VO2MaxGarmin", aggs["VO2MaxGarmin"])
     unknown = aggregate_custom_fields(activities, DEFS)  # without sport settings every value counts
     assert unknown["GCT"]["n"] == 4
+
+
+def test_real_values_on_sports_without_field_assignment_count():
+    """Phase 5 (A): a sport without any field list keeps real non-zero values, zeros stay placeholders."""
+    activities = [
+        {"start_date_local": "2026-10-01", "type": "Ride", "TrainingLoad": 120.0, "Stride": 2.7, "GCT": 0.0},
+        {"start_date_local": "2026-10-02", "type": "GravelRide", "TrainingLoad": 150.0, "Stride": 2.5, "GCT": 0.0},
+        {"start_date_local": "2026-10-03", "type": "GravelRide", "TrainingLoad": 0.0, "GCT": 0.0},
+        {"start_date_local": "2026-10-04", "type": "Run", "TrainingLoad": 80.0, "Stride": 1.0, "GCT": 300.0},
+    ]
+    defs = index_custom_items(ITEMS + [_item(30, "Stride", "Stride", "m")])["ACTIVITY_FIELD"]
+    assigned = {"Ride": {"TrainingLoad"}, "Run": {"TrainingLoad", "Stride", "GCT"}, "GravelRide": None}
+    aggs = aggregate_custom_fields(activities, defs, assigned_by_type=assigned)
+    load = aggs["TrainingLoad"]
+    assert load["sum"] == 350 and load["n"] == 3  # the gravel ride's 150 counts, its 0 does not
+    assert load["values_from_unassigned_sports"] == 1 and load["unassigned_sports"] == ["GravelRide"]
+    assert load["zero_placeholders_ignored"] == 1 and load["excluded_by_sport_settings"] == 0
+    text = format_aggregate("TrainingLoad", load)
+    assert "incl. 1 value(s) from sports without field assignment (GravelRide)" in text
+    assert "1 zero placeholder(s)" in text
+    # Ride lists fields but not Stride (and the gravel ride follows Ride): the bike "stride"
+    # (development) stays out of the run stride.
+    stride = aggs["Stride"]
+    assert stride["n"] == 1 and stride["mean"] == 1.0
+    assert stride["excluded_by_sport_settings"] == 2
+    # Running dynamics stored as 0 on bike sports never count.
+    gct = aggs["GCT"]
+    assert gct["n"] == 1 and gct["mean"] == 300
+    assert gct["excluded_by_sport_settings"] == 3 and gct["other_sport_values_ignored"] == 3
+    # Without a family list the zero on a sport without assignment is a placeholder.
+    alone = aggregate_custom_fields(activities, defs, assigned_by_type={"Run": {"GCT", "TrainingLoad"}, "GravelRide": None})
+    assert alone["GCT"]["zero_placeholders_ignored"] == 3 and alone["GCT"]["n"] == 1  # ride and gravel zeros
+
+
+def test_sport_without_field_list_follows_its_family():
+    """A gravel ride without own field list follows the ride settings: EPOC counts, a bike 'stride' does not."""
+    activities = [
+        {"start_date_local": "2026-10-01", "type": "Ride", "EPOC": 100.0, "Stride": 2.7},
+        {"start_date_local": "2026-10-02", "type": "GravelRide", "EPOC": 150.0, "Stride": 2.5, "AerobicEffect": 0.0},
+        {"start_date_local": "2026-10-03", "type": "Run", "EPOC": 80.0, "Stride": 1.0, "AerobicEffect": 3.0},
+        {"start_date_local": "2026-10-04", "type": "Swim", "EPOC": 40.0, "Stride": 0.0},
+    ]
+    defs = index_custom_items(ITEMS + [_item(30, "Stride", "Stride", "m")])["ACTIVITY_FIELD"]
+    assigned = {
+        "Ride": {"EPOC", "AerobicEffect"}, "GravelRide": None, "MountainBikeRide": None,
+        "Run": {"EPOC", "Stride", "AerobicEffect"}, "Swim": None, "OpenWaterSwim": None,
+    }
+    aggs = aggregate_custom_fields(activities, defs, assigned_by_type=assigned)
+    epoc = aggs["EPOC"]
+    assert epoc["sum"] == 370 and epoc["n"] == 4  # gravel via the ride list, swim without any family list
+    assert epoc["values_from_unassigned_sports"] == 2 and epoc["unassigned_sports"] == ["GravelRide", "Swim"]
+    stride = aggs["Stride"]
+    assert stride["n"] == 1 and stride["mean"] == 1.0  # ride and gravel ride excluded, swim zero is a placeholder
+    assert stride["excluded_by_sport_settings"] == 2 and stride["zero_placeholders_ignored"] == 1
+    effect = aggs["AerobicEffect"]
+    assert effect["n"] == 1 and effect["zero_placeholders_ignored"] == 1  # the gravel ride's 0 is a placeholder

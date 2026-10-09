@@ -24,6 +24,9 @@ from intervals_mcp_server.tools.training_load import (
 )
 from intervals_mcp_server.utils.intensity import (
     CLASS_RULES,
+    HARD_HIGH_SECS,
+    HARD_IF,
+    HARD_IF_MIN_SECS,
     REFERENCES,
     THRESHOLD_MODES,
     ZONE_BASES,
@@ -61,6 +64,31 @@ def _basis_text(block: dict[str, Any]) -> str:
     return ", ".join(f"{basis} {fmt(pct)} %" for basis, pct in shares.items()) or "none"
 
 
+def mixed_basis_note(block: dict[str, Any]) -> str | None:
+    """Caveat when a total combines time in zones of different bases (power for rides, HR for others)."""
+    shares = block.get("basis_pct") or {}
+    if len(shares) < 2:
+        return None
+    return (
+        f"the total combines zone bases ({_basis_text(block)} of the time: power zones for cycling, HR/pace zones for "
+        "other sports), which are not the same thresholds; compare the per-sport split"
+    )
+
+
+def sport_split_text(by_sport: dict[str, Any], limit: int = 4) -> str:
+    """'cycling (power) 52/36/12 %, walking (hr) 88/12/0 %' - Z1/Z2/Z3 shares per sport family and its basis."""
+    parts = []
+    for family, block in list(by_sport.items())[:limit]:
+        if block.get("pct") is None:
+            continue
+        basis = "/".join(block.get("basis_pct") or {}) or "n/a"
+        parts.append(f"{family} ({basis}) " + "/".join(fmt(v) for v in block["pct"]) + " %")
+    return ", ".join(parts)
+
+
+HARD_RULE_SHORT = f"hard session = >= {HARD_HIGH_SECS // 60} min in Z3 or IF >= {HARD_IF:.2f} on >= {HARD_IF_MIN_SECS // 60} min"
+
+
 def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable=too-many-locals
     result = payload["result"]
     total, coverage, drift = result["total"], result["coverage"], result["drift"]
@@ -72,6 +100,11 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         f"sessions with usable zones, {fmt(coverage['moving_time_with_zones_pct'])} % of {fmt(coverage['moving_hours'], 1)} h moving time"
         + ("; excluded: " + ", ".join(f"{reason} {count}" for reason, count in coverage["excluded"].items()) if coverage["excluded"] else ""),
     ]
+    mixed = mixed_basis_note(total)
+    if mixed:
+        lines.append(f"Caveat: {mixed} below.")
+    if detail_level == "compact":
+        lines.append(f"Rule: {HARD_RULE_SHORT}.")
     if result["by_sport"]:
         lines.append("By sport family:")
         for family, block in result["by_sport"].items():

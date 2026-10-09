@@ -21,9 +21,9 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.tools.athlete import assigned_field_ids
+from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, assigned_codes
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.field_policy import aggregate_field, aggregation_policy
 from intervals_mcp_server.utils.load_metrics import (
     ATL_DAYS,
@@ -57,7 +57,7 @@ DETAIL_LEVELS = ("compact", "standard", "full")
 LOAD_FIELDS = "id,start_date_local,type,name,moving_time,icu_training_load,icu_intensity"
 ZONE_FIELDS = "icu_zone_times,icu_hr_zone_times,pace_zone_times"
 DURABILITY_FIELDS = (
-    "elapsed_time,decoupling,icu_efficiency_factor,icu_variability_index,average_temp,average_heartrate,trainer,gear"
+    "elapsed_time,decoupling,icu_efficiency_factor,icu_variability_index,average_temp,average_heartrate,trainer,gear,power_meter"
 )
 FITNESS_FIELDS = "id,ctl,atl,rampRate,ctlLoad,atlLoad"
 RACE_CATEGORIES = ("RACE_A", "RACE_B", "RACE_C")
@@ -256,6 +256,9 @@ def _device_loads(
         for label, (start, end) in windows.items():
             agg = aggregate_field(between(activities, start, end), code, definition, overrides.get(code), assigned)
             row[label] = {"sum": rnd(agg["sum"], 0), "n": agg["n"]} if agg else {"sum": None, "n": 0}
+            if agg and agg.get("values_from_unassigned_sports"):
+                row[label]["from_unassigned_sports"] = agg["values_from_unassigned_sports"]
+                row[label]["unassigned_sports"] = agg.get("unassigned_sports") or []
             any_value = any_value or bool(agg)
         if any_value:
             rows.append(row)
@@ -336,10 +339,15 @@ def _load_text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: di
         lines.extend(_week_line(row) for row in payload["weeks"])
         for row in payload["device_loads"]:
             units = f" {row['units']}" if row.get("units") else ""
+            unassigned = row["chronic"].get("from_unassigned_sports")
+            note = (
+                f"; incl. {unassigned} value(s) from sports without field assignment ({', '.join(row['chronic'].get('unassigned_sports') or [])})"
+                if unassigned else ""
+            )
             lines.append(
                 f"Device load {row['name']} [{row['code']}] (own scale, not comparable with or added to the Intervals.icu load): "
                 f"acute {fmt(row['acute']['sum'])}{units} (n {row['acute']['n']}), chronic {fmt(row['chronic']['sum'])}{units} "
-                f"(n {row['chronic']['n']}); activities without a value are not counted"
+                f"(n {row['chronic']['n']}); activities without a value are not counted{note}"
             )
     if detail_level == "full":
         lines.append("Daily load (chronic window): " + ", ".join(f"{d['date'][5:]} {fmt(d['load'])}" for d in payload["daily"]))
@@ -424,10 +432,9 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     total = load_metrics(activities, load_end, acute_days, chronic_days)
     chronic_start = load_end - timedelta(days=chronic_days - 1)
     acute_start = load_end - timedelta(days=acute_days - 1)
-    assigned = {
-        sport: assigned_codes(device_defs, await assigned_field_ids(athlete_id_to_use, api_key, sport))
-        for sport in sorted({str(a.get("type") or "") for a in activities} - {""})
-    } if device_defs else {}
+    assigned = await field_assignments(
+        athlete_id_to_use, api_key, device_defs, {str(a.get("type") or "") for a in activities} - {""}
+    ) if device_defs else {}
     daily = daily_loads(activities, chronic_start, load_end)
     payload: dict[str, Any] = {
         "athlete_id": athlete_id_to_use,
@@ -498,13 +505,29 @@ def _projection_weeks(
     return out
 
 
+def projection_basis(planned: dict[str, Any]) -> dict[str, Any]:
+    """Whether a projection contains planned training: 'planned_load', 'no_planned_load' or 'no_planned_workouts'."""
+    if not planned["sessions"]:
+        return {"kind": "no_planned_workouts", "label": "PROJECTION WITHOUT PLANNED TRAINING (no planned workouts in the calendar)"}
+    if not planned["with_load"]:
+        return {
+            "kind": "no_planned_load",
+            "label": f"PROJECTION WITHOUT PLANNED LOAD ({planned['sessions']} planned workouts, none with a planned load)",
+        }
+    return {"kind": "planned_load", "label": "PROJECTION"}
+
+
 def _projection_text(payload: dict[str, Any], detail_level: str) -> str:
     start, today_info, plan = payload["start"], payload["today"], payload["planned"]
     end_row = payload["days"][-1] if payload["days"] else None
+    basis = payload["projection_basis"]
+    assumption = (
+        "assumes every planned workout is done with its planned Intervals.icu load and nothing else"
+        if basis["kind"] == "planned_load" else "only the decay of CTL and ATL without any training after today's completed load"
+    )
     lines = [
-        f"Load projection for athlete {payload['athlete_id']}, {payload['from']} to {payload['to']} (PROJECTION: assumes every "
-        f"planned workout is done with its planned Intervals.icu load and nothing else; model CTL {payload['ctl_days']} d / "
-        f"ATL {payload['atl_days']} d).",
+        f"{basis['label']}: load projection for athlete {payload['athlete_id']}, {payload['from']} to {payload['to']} "
+        f"({assumption}; model CTL {payload['ctl_days']} d / ATL {payload['atl_days']} d).",
         f"Start (end of {start['date']}, Intervals.icu): CTL {fmt(start['ctl'], 1)} | ATL {fmt(start['atl'], 1)} | "
         f"form {fmt(start['form'], 1, signed=True)}",
         f"Today {today_info['date']}: completed load {fmt(today_info['completed_load'])} + planned, not yet done "
@@ -575,7 +598,9 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     assumed. Reports the values at the end date, the lowest form and highest 7-day ramp,
     per ISO week (load, sessions, CTL/ATL/form at the end of the week, lowest form, ramp),
     projected values on race days (RACE_A/B/C) and, for comparison, Intervals.icu's own
-    projection from the wellness records. A model check replays the last 14 days of
+    projection from the wellness records. Without planned workouts (or without any planned
+    load) the header says so at every detail level ("PROJECTION WITHOUT PLANNED TRAINING";
+    JSON projection_basis). A model check replays the last 14 days of
     Intervals.icu loads to show that the time constants match. Clearly a projection, not a
     forecast; no verdict.
 
@@ -657,6 +682,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         "model_check": model_check(wellness, today - timedelta(days=1), 14, ctl_days, atl_days),
         "days": projected,
     }
+    payload["projection_basis"] = projection_basis(payload["planned"])
     if output_format.strip().lower() == "json":
         return json.dumps(payload, ensure_ascii=False)
     return _projection_text(payload, detail_level)

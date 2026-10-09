@@ -259,7 +259,7 @@ def test_list_activity_streams_from_activity_payload(monkeypatch):
     _install_router(monkeypatch, activity=ACTIVITY_WITH_CUSTOM_FIELDS, streams=STREAMS_DATA,
                     custom_items=CUSTOM_ITEMS_DATA, calls=calls)
     result = asyncio.run(list_activity_streams("i1"))
-    assert "Streams available for activity i1 ('Sweet Spot', start 2026-10-06T17:36:22, elapsed 4967 s):" in result
+    assert "Streams available for activity i1 ('Sweet Spot', start 2026-10-06T17:36:22 local, elapsed 4967 s):" in result
     assert "Power fields: power, Power2" in result
     assert "Standard streams (4):" in result
     assert "- secondary_power (W)" in result

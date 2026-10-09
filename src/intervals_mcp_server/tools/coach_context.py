@@ -14,7 +14,8 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.tools.intensity import dist_text
+from intervals_mcp_server.tools.durability import sample_note
+from intervals_mcp_server.tools.intensity import HARD_RULE_SHORT, dist_text, sport_split_text
 from intervals_mcp_server.tools.training_load import (
     DURABILITY_FIELDS,
     FITNESS_FIELDS,
@@ -31,7 +32,7 @@ from intervals_mcp_server.tools.training_load import (
     past_end,
 )
 from intervals_mcp_server.utils.durability import decoupling_summary, efficiency_summary
-from intervals_mcp_server.utils.intensity import analyze_period
+from intervals_mcp_server.utils.intensity import THRESHOLD_MODES, analyze_period
 from intervals_mcp_server.utils.load_metrics import (
     REFERENCES,
     activity_day,
@@ -133,9 +134,9 @@ def _durability_text(durability: dict[str, Any], efficiency: dict[str, Any]) -> 
         trend = f", last 7 d {fmt(recent['delta_pp'], 1, ' pp', signed=True)} ({recent['direction']})" if recent["direction"] else ""
         ef = efficiency.get(family) or {}
         ef_text = f", EF {fmt(ef['mean'], 2)} (n {ef['n']}{', small sample' if ef['small_sample'] else ''})" if ef.get("n") else ""
-        small = ", small sample" if entry["small_sample"] else ""
         parts.append(
-            f"{family} decoupling median {fmt(entry['median'], 1)} % (n {entry['n']}{small}, {entry['above_threshold']} > 5 %){trend}{ef_text}"
+            f"{family} decoupling median {fmt(entry['median'], 1)} % ({sample_note(entry, short=True)}; {entry['above_threshold']} > 5 %)"
+            f"{trend}{ef_text}"
         )
     excluded = f"; {durability['excluded']} of {durability['considered']} sessions excluded by the quality filter"
     return ("; ".join(parts) or "no qualifying steady sessions") + excluded
@@ -160,6 +161,19 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         f"Fitness: {fitness_text(payload['fitness'])}",
         f"Intensity 7 d: {dist_text(intensity['last_7'])}",
         f"Intensity 28 d: {dist_text(intensity['last_28'])}",
+    ]
+    split = sport_split_text(intensity["by_sport_28"])
+    shares = intensity["last_28"].get("basis_pct") or {}
+    if len(shares) > 1 or len(intensity["last_7"].get("basis_pct") or {}) > 1:
+        bases = " / ".join(f"{basis} {fmt(pct)} %" for basis, pct in shares.items())
+        lines.append(f"Caveat: totals mix zone bases ({bases} of the time), not the same thresholds; 28 d Z1/Z2/Z3 by sport: {split}.")
+    elif split and len(intensity["by_sport_28"]) > 1:
+        lines.append(f"Intensity 28 d by sport (Z1/Z2/Z3): {split}.")
+    method = payload["method"]
+    lines += [
+        f"Method: {method['acute_days']} d acute / {method['chronic_days']} d chronic, ratio of daily means, coupled; monotony = "
+        f"mean/SD of 7 daily loads; zones power (cycling) or HR/pace, power Z4 = {method['threshold_as']} (threshold_as); "
+        f"{HARD_RULE_SHORT.replace('hard session', 'hard')}.",
         f"Recovery markers: {_recovery_text(payload['recovery'])}",
         f"Durability 28 d: {_durability_text(payload['durability'], payload['efficiency'])}",
     ]
@@ -184,10 +198,15 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         plan = payload["plan"]
         if plan:
             race = plan["next_race"]
-            lines.append(
-                f"Planned {plan['from']} to {plan['to']}: {plan['sessions']} workouts, load {fmt(plan['load'])}"
+            planned = (
+                f"{plan['sessions']} workouts, load {fmt(plan['load'])}"
                 + (f" ({plan['without_load']} without planned load)" if plan["without_load"] else "")
-                + f", {fmt(plan['hours'], 1)} h" + (f" | next race {race['date']} {race['category']} '{race['name']}'" if race else "")
+                + f", {fmt(plan['hours'], 1)} h"
+                if plan["sessions"] else "NO PLANNED WORKOUTS in the calendar (a load projection shows only the decay)"
+            )
+            lines.append(
+                f"Planned {plan['from']} to {plan['to']}: {planned}"
+                + (f" | next race {race['date']} {race['category']} '{race['name']}'" if race else "")
             )
         cov = payload["coverage"]
         lines.append(
@@ -214,6 +233,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
+    threshold_as: str = "moderate",
 ) -> str:
     """Compact coaching context for a weekly review in one call (read-only, about 2-3k characters)
 
@@ -226,8 +246,12 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     42-day baseline with n, difference and z-score); durability (median aerobic decoupling
     of steady sessions and efficiency factor over 28 days); the top sessions of the last 7
     days; the planned workouts of the next 7 days and the next race (when the end date is
-    today); and the data coverage. Small samples are flagged; missing values are never
-    counted as 0. No verdict or diagnosis. The single tools give the details:
+    today); and the data coverage. A method line states the windows, the ACWR method
+    (coupled daily means), the zone basis, the threshold_as mode and the hard-session rule;
+    when the intensity totals combine power and HR zones a caveat gives the per-sport split.
+    Small samples are flagged (durability: qualifying share, fewer than 8 sessions, mixed
+    indoor/outdoor or gear); missing values are never counted as 0. Recommended first call
+    for a weekly analysis. No verdict or diagnosis. The single tools give the details:
     get_training_load, get_intensity_distribution, get_durability, get_recovery_snapshot,
     get_load_projection. Three API calls. After morritter's coach report (upstream PR #150).
 
@@ -236,12 +260,17 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json" (the full structure)
-        detail_level: "compact" (load, fitness, intensity, recovery, durability), "standard" (default, plus
-            sports, drift, top sessions, plan and coverage) or "full" (plus the last 4 ISO weeks and references)
+        detail_level: "compact" (load, fitness, intensity, recovery, durability, method), "standard" (default,
+            plus sports, drift, top sessions, plan and coverage) or "full" (plus the last 4 ISO weeks and references)
+        threshold_as: How power zone Z4 (threshold work) counts in the intensity distribution: "moderate"
+            (default) or "high", as in get_intensity_distribution
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:
         return error_msg
+    threshold_mode = (threshold_as or "moderate").strip().lower()
+    if threshold_mode not in THRESHOLD_MODES:
+        return f"Error: threshold_as must be one of {', '.join(THRESHOLD_MODES)}."
     days = past_end(end_date)
     if isinstance(days, str):
         return days
@@ -268,8 +297,8 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     wellness = wellness_by_day(wellness_list)
     window_start = load_end - timedelta(days=27)
     window = between(activities, window_start, load_end)
-    intensity_28 = analyze_period(activities, window_start, load_end)
-    intensity_7 = analyze_period(activities, load_end - timedelta(days=6), load_end)
+    intensity_28 = analyze_period(activities, window_start, load_end, threshold_as=threshold_mode)
+    intensity_7 = analyze_period(activities, load_end - timedelta(days=6), load_end, threshold_as=threshold_mode)
     durability = decoupling_summary(activities, window_start, load_end)
     durability.pop("excluded_sessions")
     for entry in durability["by_sport"].values():
@@ -277,6 +306,11 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     window_days = [load_end - timedelta(days=o) for o in range(28)]
     payload: dict[str, Any] = {
         "athlete_id": athlete_id_to_use, "end": end.isoformat(), "load_end": load_end.isoformat(), "load_end_note": note,
+        "method": {
+            "acute_days": 7, "chronic_days": 28, "acwr": "ratio of the daily means, coupled (acute window inside the chronic one)",
+            "monotony": "mean / SD of the last 7 daily loads (rest days 0)", "zone_basis": "auto (power for cycling, HR then pace otherwise)",
+            "threshold_as": threshold_mode, "hard_session": HARD_RULE_SHORT,
+        },
         "load": load_metrics(activities, load_end),
         "sports": sport_breakdown(activities, load_end),
         "fitness": fitness_status(wellness, end, sum(activity_load(a) or 0.0 for a in between(activities, end, end)), today),

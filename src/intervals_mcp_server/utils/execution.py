@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import is_missing
-from intervals_mcp_server.utils.sports import format_pace, hms
+from intervals_mcp_server.utils.sports import cadence_text, format_pace, hms
 from intervals_mcp_server.utils.streams import (
     foreign_stream_reason,
     is_counter_stream,
@@ -539,6 +539,79 @@ def align(planned: list[dict[str, Any]], intervals: list[dict[str, Any]]) -> lis
     return pairs
 
 
+def planned_step_map(  # pylint: disable=too-many-locals
+    planned: list[dict[str, Any]], intervals: list[dict[str, Any]], tolerances: Tolerances | None = None
+) -> dict[int, dict[str, Any]]:
+    """Planned step matched to each interval index, with the time beyond the planned duration.
+
+    Without streams: the alignment of ``align_spans`` and the intervals' moving time (elapsed
+    time when missing). A matched span (one or several consecutive intervals) longer than the
+    planned duration plus the tolerance gets ``beyond_plan_s`` on each of its intervals, counted
+    as in ``analyze``: after the last matched step as additional training after the plan,
+    earlier as extra time inside the plan. Nothing is changed on Intervals.icu.
+    """
+    tol = tolerances or Tolerances()
+    spans = _spans(intervals, Profile([]))
+    alignment = align_spans(planned, intervals)
+    matched = [indices for p_idx, indices in alignment if p_idx is not None and indices]
+    last_matched = matched[-1][-1] if matched else None
+    mapping: dict[int, dict[str, Any]] = {}
+    for p_idx, indices in alignment:
+        if p_idx is None or not indices:
+            continue
+        step = planned[p_idx]
+        duration = step.get("duration")
+        actual = sum(spans[i].active for i in indices)
+        entry: dict[str, Any] = {
+            "index": step["index"], "kind": step["kind"], "duration": duration,
+            "span_intervals": [i + 1 for i in indices], "span_actual_s": round(actual, 1),
+            "beyond_plan_s": None, "beyond_plan_counted_as": None,
+        }
+        if duration and actual > duration + tol.duration_allowance(duration):
+            entry["beyond_plan_s"] = round(actual - duration, 1)
+            entry["beyond_plan_counted_as"] = (
+                "additional training after the plan" if indices[-1] == last_matched else "extra time inside the plan"
+            )
+        for i_idx in indices:
+            mapping[i_idx] = entry
+    return mapping
+
+
+UNPLANNED_TEXT = {
+    "before_plan": "no planned step (before the plan)",
+    "after_plan": "no planned step (after the plan: additional training)",
+    "extra_inside_plan": "no planned step (extra inside the plan)",
+}
+
+
+def plan_position(mapping: dict[int, dict[str, Any]], index: int) -> str:
+    """Where an interval lies relative to the matched plan: planned_step, before_plan, after_plan or extra_inside_plan."""
+    if index in mapping:
+        return "planned_step"
+    if not mapping:
+        return "no_plan"
+    if index < min(mapping):
+        return "before_plan"
+    if index > max(mapping):
+        return "after_plan"
+    return "extra_inside_plan"
+
+
+def planned_step_text(step: dict[str, Any] | None, position: str = "extra_inside_plan") -> str:
+    """'plan step 7 cooldown 10:00, actual 17:58: 7:58 beyond the plan (...)' for interval listings."""
+    if not step:
+        return UNPLANNED_TEXT.get(position, "no planned step (extra)")
+    text = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}"
+    if step.get("beyond_plan_s"):
+        span = step.get("span_intervals") or []
+        merged = f" (intervals {span[0]}-{span[-1]})" if len(span) > 1 else ""
+        text += (
+            f", actual {hms(step.get('span_actual_s'))}{merged}: first {hms(step.get('duration'))} inside the plan, "
+            f"{hms(step['beyond_plan_s'])} beyond the plan ({step.get('beyond_plan_counted_as')})"
+        )
+    return text
+
+
 # ------------------------------------------------------------------- slice metrics
 def _fade_pct(values: list[Any]) -> float | None:
     """Second half mean vs first half mean in percent (negative = fading)."""
@@ -1018,7 +1091,7 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
     }
 
 
-def analyze(  # pylint: disable=too-many-locals
+def analyze(  # pylint: disable=too-many-locals,too-many-statements
     planned: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
     streams: list[dict[str, Any]],
@@ -1041,6 +1114,7 @@ def analyze(  # pylint: disable=too-many-locals
     if not planned:
         result = _analyze_without_plan(intervals, profile, ftp, hidden)
         result["hidden_streams"] = hidden_map
+        result["activity_type"] = ctx.get("activity_type")
         return result
     spans = _spans(intervals, profile)
     alignment = align_spans(planned, intervals, profile)
@@ -1083,7 +1157,10 @@ def analyze(  # pylint: disable=too-many-locals
         if profile.elapsed(0, start_index) >= EXTENSION_MIN_SECS:
             pre_plan = _block(profile, 0, start_index, pre_spans, ftp, hidden)
     summary = _summary(planned, intervals, rows, profile, extension, pre_plan, tol)
-    return {"rows": rows, "summary": summary, "extension": extension, "pre_plan": pre_plan, "hidden_streams": hidden_map}
+    return {
+        "rows": rows, "summary": summary, "extension": extension, "pre_plan": pre_plan, "hidden_streams": hidden_map,
+        "activity_type": ctx.get("activity_type"),
+    }
 
 
 # ------------------------------------------------------------------------ rendering
@@ -1104,7 +1181,7 @@ def _target_text(target: dict[str, Any] | None) -> str:
 
 
 def _metric_lines(  # pylint: disable=too-many-branches
-    metrics: dict[str, Any], target: dict[str, Any] | None, pace_based: bool, detail_level: str = "standard"
+    metrics: dict[str, Any], target: dict[str, Any] | None, pace_based: bool, detail_level: str = "standard", sport: Any = None
 ) -> list[str]:
     lines: list[str] = []
     if pace_based or metrics.get("avg_speed_m_s") and not metrics.get("avg_watts"):
@@ -1128,7 +1205,7 @@ def _metric_lines(  # pylint: disable=too-many-branches
             hr += f", Pw:HR drift {_fmt(metrics['pw_hr_drift_pct'], 1, '%')}"
         lines.append(hr)
     if metrics.get("cadence_nonzero_mean") is not None:
-        lines.append(f"    cadence {_fmt(metrics['cadence_nonzero_mean'])} rpm (non-zero samples)")
+        lines.append(f"    cadence {cadence_text(metrics['cadence_nonzero_mean'], sport)} (non-zero samples)")
     if target and metrics.get("time_in_target_pct") is not None:
         lines.append(f"    time in target range (±{TARGET_TOLERANCE_PCT:.0f}%): {_fmt(metrics['time_in_target_pct'], 0, '%')}")
     if detail_level == "compact":
@@ -1182,7 +1259,7 @@ def _compact_row(row: dict[str, Any]) -> str:
     return text
 
 
-def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str) -> list[str]:
+def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None) -> list[str]:
     if detail_level == "compact":
         return [_compact_row(row)]
     step = row.get("planned")
@@ -1214,7 +1291,7 @@ def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str) -> list
             f"    remaining {hms(overrun.get('moving_time_s'))} ({hms(overrun.get('start_time'))}-{hms(overrun.get('end_time'))}, "
             f"avg {_fmt(overrun.get('avg_watts'))} W, HR {_fmt(overrun.get('avg_hr'))} bpm) counted as {overrun['counted_as']}"
         )
-    lines.extend(_metric_lines(metrics, step["target"] if step else None, pace_based, detail_level))
+    lines.extend(_metric_lines(metrics, step["target"] if step else None, pace_based, detail_level, sport))
     notes = [d["text"] for d in row.get("deviations", []) if not (overrun and "longer than planned" in d["text"])]
     if notes:
         lines.append("    notes: " + "; ".join(notes))
@@ -1232,7 +1309,7 @@ def _effort_line(effort: dict[str, Any]) -> str:
     return f"    extra effort: {hms(effort.get('elapsed_time'))} from {hms(effort.get('start_time'))} at {format_pace(effort.get('average_speed'))} {where}"
 
 
-def _block_lines(title: str, block: dict[str, Any], pace_based: bool, detail_level: str) -> list[str]:
+def _block_lines(title: str, block: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None) -> list[str]:
     metrics = block.get("metrics") or {}
     head = f"{title}: {hms(block['duration_s'])} from {hms(block.get('start_time'))} to {hms(block.get('end_time'))} ({block['intervals']} interval(s)"
     remainder = block.get("remainder_of_last_step")
@@ -1244,7 +1321,7 @@ def _block_lines(title: str, block: dict[str, Any], pace_based: bool, detail_lev
     lines = [head]
     if metrics.get("estimated_load") is not None:
         lines.append(f"    estimated load ≈ {metrics['estimated_load']:.0f} (TSS formula from NP and FTP; the Intervals.icu load covers the whole activity)")
-    lines.extend(_metric_lines(metrics, None, pace_based, detail_level))
+    lines.extend(_metric_lines(metrics, None, pace_based, detail_level, sport))
     lines.extend(_effort_line(effort) for effort in block.get("efforts") or [])
     hardest = block.get("hardest_interval") or {}
     if hardest.get("elapsed_time"):
@@ -1300,12 +1377,13 @@ def format_execution(result: dict[str, Any], header: str, pace_based: bool = Fal
     if hidden and detail_level == "standard":
         lines.append("Custom streams not shown per step: " + ", ".join(f"{code} ({why})" for code, why in sorted(hidden.items())))
     lines.append("")
+    sport = result.get("activity_type")
     for row in result["rows"]:
-        lines.extend(_row_lines(row, pace_based, detail_level))
+        lines.extend(_row_lines(row, pace_based, detail_level, sport))
     if result.get("pre_plan"):
         lines.append("")
-        lines.extend(_block_lines("Riding before the plan", result["pre_plan"], pace_based, detail_level))
+        lines.extend(_block_lines("Riding before the plan", result["pre_plan"], pace_based, detail_level, sport))
     if result.get("extension"):
         lines.append("")
-        lines.extend(_block_lines("Additional training after the plan", result["extension"], pace_based, detail_level))
+        lines.extend(_block_lines("Additional training after the plan", result["extension"], pace_based, detail_level, sport))
     return "\n".join(lines)

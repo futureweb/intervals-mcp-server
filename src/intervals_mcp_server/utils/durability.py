@@ -32,7 +32,7 @@ DRIFT_THRESHOLD_PCT = 5.0
 TREND_BAND_PP = 1.0
 MIN_RECENT = 2
 MIN_WINDOW = 3
-SMALL_SAMPLE = 5
+SMALL_SAMPLE = 8  # fewer qualifying sessions per sport are flagged "small sample, not reliable"
 EF_MIN_MOVING_S = 1200
 EF_BAND_PCT = 2.0
 
@@ -114,8 +114,23 @@ def _session(activity: Activity) -> dict[str, Any]:
         "efficiency_factor": rnd(num(activity.get("icu_efficiency_factor")), 3),
         "variability_index": rnd(vi, 2), "avg_temp_c": rnd(num(activity.get("average_temp")), 1),
         "indoor": is_indoor(activity), "basis": "power:HR" if vi else "pace:HR",
-        "gear_id": _gear_id(activity),
+        "gear_id": _gear_id(activity), "power_meter": activity.get("power_meter") or None,
     }
+
+
+def heterogeneity(sessions: list[dict[str, Any]]) -> list[str]:
+    """Notes when the qualifying sessions mix indoor/outdoor, several bikes/shoes or power meters."""
+    notes = []
+    indoor = sum(1 for s in sessions if s["indoor"])
+    if 0 < indoor < len(sessions):
+        notes.append(f"indoor and outdoor mixed ({indoor} indoor, {len(sessions) - indoor} outdoor)")
+    gear = {s["gear_id"] for s in sessions if s.get("gear_id")}
+    if len(gear) > 1:
+        notes.append(f"{len(gear)} different bikes/shoes")
+    meters = {s["power_meter"] for s in sessions if s.get("power_meter")}
+    if len(meters) > 1:
+        notes.append(f"{len(meters)} different power meters ({', '.join(sorted(meters))})")
+    return notes
 
 
 def _describe(values: list[float]) -> dict[str, Any]:
@@ -152,12 +167,15 @@ def decoupling_summary(  # pylint: disable=too-many-arguments,too-many-locals
     Per family: median (plus mean, range and quartiles from 4 values), count and share above
     ``threshold_pct``, and the median of the last ``recent_days`` against the window median
     (direction "lower"/"higher" outside +/- ``band_pp`` percentage points, else "within band";
-    needs 2 recent and 3 window values). Fewer than 5 values are flagged as a small sample.
+    needs 2 recent and 3 window values). Fewer than 8 values are flagged as a small sample;
+    the number of sessions considered per family (qualifying share) and the mix of the
+    qualifying sessions (indoor/outdoor, bikes/shoes, power meters) are reported.
     Negative values (HR drifting down) are kept.
     """
     recent_start = end - timedelta(days=recent_days - 1)
     reasons: dict[str, int] = defaultdict(int)
     by_family: dict[str, list[dict[str, Any]]] = {family: [] for family in families}
+    considered_by_family: dict[str, int] = defaultdict(int)
     excluded_rows: list[dict[str, Any]] = []
     considered = 0
     for activity in sorted(activities, key=lambda a: str(a.get("start_date_local") or "")):
@@ -166,6 +184,7 @@ def decoupling_summary(  # pylint: disable=too-many-arguments,too-many-locals
         if day is None or not start <= day <= end or family not in by_family:
             continue
         considered += 1
+        considered_by_family[family] += 1
         reason = exclusion_reason(activity, **filters)
         if reason is not None:
             reasons[reason] += 1
@@ -184,6 +203,9 @@ def decoupling_summary(  # pylint: disable=too-many-arguments,too-many-locals
             "above_threshold": above,
             "above_threshold_pct": rnd(above / len(values) * 100, 0) if values else None,
             "small_sample": len(values) < SMALL_SAMPLE,
+            "considered": considered_by_family[family],
+            "qualifying_share_pct": rnd(len(values) / considered_by_family[family] * 100, 0) if considered_by_family[family] else None,
+            "heterogeneity": heterogeneity(sessions),
             "recent": {"days": recent_days, "n": len(recent),
                        "median": rnd(statistics.median(recent), 1) if recent else None,
                        "above_threshold": sum(1 for v in recent if v > threshold_pct)},

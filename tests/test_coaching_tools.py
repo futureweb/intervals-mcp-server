@@ -255,7 +255,7 @@ def test_get_activity_details_json_and_thresholds(monkeypatch):
     """Details JSON carries the raw activity, custom fields with status and the thresholds snapshot."""
     _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY})
     text = asyncio.run(get_activity_details("i1"))
-    assert "Date: 2026-10-06T17:36:22 local / 2026-10-06T15:36:22Z UTC" in text
+    assert "Date: 2026-10-06T17:36:22 local (UTC+02:00) / 2026-10-06T15:36:22Z UTC" in text
     assert "Thresholds used for this activity" in text
     assert "FTP 234 W (icu_ftp, setting at the time)" in text
     assert "Power zones (% FTP, upper bounds): Z1 ≤55% (0-129 W)" in text
@@ -435,7 +435,7 @@ def test_get_training_summary_groups(monkeypatch):
     assert "- Ride: 1 sessions, 1:21:01, 40.4 km, load 90" in result
     assert "- gear Canyon Ultimate (b1): 1 sessions" in result
     assert "feel 2: 1, 3: 1, 4: 1 | RPE mean 5.0 | sessions >= 3 h: 0 | longest 1:51:48 ('Grail gravel')" in result
-    assert "Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept separate from the Intervals.icu load): Aerobic Effect [AerobicEffect] 3.3 (n 1) (1 value(s) from sports without this field ignored)" in result  # not assigned to Ride
+    assert "Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept separate from the Intervals.icu load): Aerobic Effect [AerobicEffect] 3.3 (n 1) (1 value(s) from sports whose (family) field settings exclude this field ignored)" in result  # not assigned to Ride
     epoc = asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json"))
     assert json.loads(epoc)["overall"]["custom_fields"].get("EPOC") is None  # no EPOC values in the fixtures
     assert "End of period (2026-10-09): CTL 65.8, ATL 66.0, form -0.2, ramp 1.0" in result
@@ -619,7 +619,7 @@ def test_detail_levels_details_intervals_snapshot(monkeypatch):
 
     compact_iv = asyncio.run(get_activity_intervals("i1", detail_level="compact", stream_types="Stamina"))
     assert compact_iv.startswith("Intervals of i1 (analysed True):")
-    assert "[2] WORK | 5:00 (10:00-15:00, idx 600-900) | avg 242 W NP n/a max 260 | HR 155/160 | cad 88 | streams Stamina 88→82.0 (min 82.0)" in compact_iv
+    assert "[2] WORK | 5:00 (10:00-15:00, idx 600-900) | avg 242 W NP n/a max 260 | HR 155/160 | cad 88 rpm | streams Stamina 88→82.0 (min 82.0)" in compact_iv
     full_iv = asyncio.run(get_activity_intervals("i1", detail_level="full"))
     assert "Stream Metrics (samples 600-899):" in full_iv and "Garmin Stamina [Stamina]" in full_iv
 
@@ -730,7 +730,7 @@ def test_get_activity_intervals_planned_step_types(monkeypatch):
     plain = asyncio.run(get_activity_intervals("i1"))
     assert "Planned step" not in plain and not any("/events/" in c[0] for c in calls)
     text = asyncio.run(get_activity_intervals("i1", include_planned_types=True, detail_level="compact"))
-    assert "Planned step per interval (event 5 ('2x5 min Threshold'); the Intervals.icu type is kept as stored):" in text
+    assert "Planned step per interval (event 5 ('2x5 min Threshold'); the Intervals.icu type is kept as stored;" in text
     assert "  [3] Intervals.icu WORK | plan step 3 rest 2:00 <- type differs from the plan" in text
     assert "  [2] Intervals.icu WORK | plan step 2 work 5:00\n" in text
     payload = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=EVENT_DATA["workout_doc"], output_format="json")))
@@ -739,6 +739,73 @@ def test_get_activity_intervals_planned_step_types(monkeypatch):
     _install_router(monkeypatch, {"/activity/": unpaired, "/intervals": labelled_work})
     assert "Planned step types: not available (no planned workout paired with this activity)." in asyncio.run(
         get_activity_intervals("i1", include_planned_types=True))
+
+
+def test_get_activity_intervals_shows_time_beyond_the_plan(monkeypatch):
+    """Phase 5 (C): an interval longer than its planned step shows the planned duration and the time beyond the plan."""
+    extended = [dict(i) for i in EXECUTION_INTERVALS["icu_intervals"]]
+    extended[-1].update(end_index=2518, end_time=2518, elapsed_time=1078, moving_time=1078)  # cooldown 5:00 ridden 17:58
+    data = {"id": "i1", "analyzed": True, "icu_groups": [], "icu_intervals": extended}
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/intervals": data})
+    doc = EVENT_DATA["workout_doc"]
+    compact = asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, detail_level="compact"))
+    line = next(row for row in compact.splitlines() if row.startswith("[6] WORK 'Cooldown'"))
+    assert line.endswith(
+        "plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan "
+        "(additional training after the plan)"
+    )
+    assert "  [6] Intervals.icu WORK | plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan" in compact
+    assert next(row for row in compact.splitlines() if row.startswith("[2] WORK")).endswith("| plan step 2 work 5:00")
+    standard = asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc))
+    assert "[6] Cooldown (WORK)\nPlan: plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan" in standard
+    payload = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, output_format="json")))
+    step = payload["intervals"][5]["planned_step"]
+    assert step["duration"] == 300 and step["span_actual_s"] == 1078 and step["beyond_plan_s"] == 778
+    assert step["beyond_plan_counted_as"] == "additional training after the plan"
+    assert payload["intervals"][1]["planned_step"]["beyond_plan_s"] is None  # 5:00 as planned
+    assert payload["intervals"][5]["plan_position"] == "planned_step"
+    trailing = [dict(i) for i in extended] + [dict(extended[-1], label=None, type="WORK", start_index=2518, end_index=2600, elapsed_time=82, moving_time=82)]
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/intervals": dict(data, icu_intervals=trailing)})
+    after = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, output_format="json")))
+    assert after["intervals"][6]["planned_step"] is None and after["intervals"][6]["plan_position"] == "after_plan"
+    assert "  [7] Intervals.icu WORK | no planned step (after the plan: additional training)" in asyncio.run(
+        get_activity_intervals("i1", planned_workout_doc=doc, detail_level="compact"))
+    assert "[7] Interval 7 (WORK)\nPlan: no planned step (after the plan: additional training)" in asyncio.run(
+        get_activity_intervals("i1", planned_workout_doc=doc))
+    plain = asyncio.run(get_activity_intervals("i1", detail_level="compact"))
+    assert "plan step" not in plain and "Plan:" not in asyncio.run(get_activity_intervals("i1"))
+
+
+def test_run_cadence_in_steps_per_minute_and_units(monkeypatch):
+    """Phase 5 (E): foot sports show spm (2 x the stored per-leg cadence), rides rpm; temperatures with °C or n/a;
+    running dynamics only for foot sports; local start with the UTC offset."""
+    run = dict(EXECUTION_ACTIVITY, id="i2", type="Run", average_cadence=73.565, average_step_length=920.0,
+               average_stance_time=300.0, average_temp=29.04, max_temp=33, min_temp=None)
+    run_intervals = {"id": "i2", "analyzed": True, "icu_groups": [], "icu_intervals": [
+        {"type": "WORK", "label": None, "start_index": 0, "end_index": 600, "elapsed_time": 600, "moving_time": 600,
+         "average_cadence": 80.0, "min_cadence": 0, "max_cadence": 92.5, "average_step_length": 1000.0, "average_temp": 21.0},
+    ]}
+    _install_router(monkeypatch, {"/activity/": run, "/intervals": run_intervals})
+    details = asyncio.run(get_activity_details("i2"))
+    assert "Cadence: 147 spm (73.6 rpm as stored)" in details
+    assert "Average Temp: 29 °C" in details and "Max Temp: 33 °C" in details and "Min Temp: n/a" in details
+    assert "Running Dynamics:" in details and "Cadence: 147 spm (73.6 rpm as stored, per leg)" in details
+    compact = asyncio.run(get_activity_details("i2", detail_level="compact"))
+    assert "2026-10-06 17:36 local (UTC+02:00)" in compact and "cadence 147 spm (74 rpm as stored)" in compact
+    intervals = asyncio.run(get_activity_intervals("i2"))
+    assert "Cadence: Avg 160, Min 0, Max 185 spm (as stored per leg: 80 / 0 / 92.5 rpm)" in intervals
+    assert "Temperature: 21 °C (Weather: n/a, Feels like: n/a)" in intervals
+    assert "cad 160 spm (80 rpm as stored)" in asyncio.run(get_activity_intervals("i2", detail_level="compact"))
+    payload = json.loads(asyncio.run(get_activity_intervals("i2", output_format="json")))
+    assert payload["activity_type"] == "Run" and payload["intervals"][0]["average_cadence_spm"] == 160
+    # A ride keeps rpm and shows no running dynamics although Intervals.icu stores a step length.
+    ride = dict(EXECUTION_ACTIVITY, average_cadence=88.2, average_step_length=2874.0)
+    ride_intervals = dict(run_intervals, id="i1")
+    _install_router(monkeypatch, {"/activity/": ride, "/intervals": ride_intervals})
+    ride_details = asyncio.run(get_activity_details("i1"))
+    assert "Cadence: 88.2 rpm" in ride_details and "Running Dynamics" not in ride_details
+    ride_iv = asyncio.run(get_activity_intervals("i1"))
+    assert "Cadence: Avg 80, Min 0, Max 92.5 rpm" in ride_iv and "Running Dynamics" not in ride_iv
 
 
 def test_get_training_plan_empty_and_unknown(monkeypatch):

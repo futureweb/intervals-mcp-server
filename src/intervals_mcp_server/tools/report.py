@@ -23,7 +23,7 @@ from intervals_mcp_server.utils.execution import analyze, format_execution, plan
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
 from intervals_mcp_server.utils.power_compare import compare_power_streams as compute_power_comparison
 from intervals_mcp_server.utils.segments import detect_segments
-from intervals_mcp_server.utils.sports import hms
+from intervals_mcp_server.utils.sports import hms, utc_offset
 from intervals_mcp_server.utils.streams import find_stream, gear_units_note, numeric_values
 from intervals_mcp_server.utils.work_sets import set_summary, split_work
 
@@ -333,7 +333,10 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
         if not planned:
             interval_rows = intervals if detail_level != "compact" else [{k: i.get(k) for k in INTERVAL_JSON_KEYS} for i in intervals]
         payload = {
-            "activity": {k: activity.get(k) for k in ("id", "name", "type", "start_date_local", "start_date", "moving_time", "elapsed_time", "distance", "total_elevation_gain", "icu_training_load", "icu_intensity", "icu_ftp", "device_name", "power_meter", "power_field_names", "compliance", "paired_event_id", "_resolved_gear_name")},
+            "activity": {
+                **{k: activity.get(k) for k in ("id", "name", "type", "start_date_local", "start_date", "moving_time", "elapsed_time", "distance", "total_elevation_gain", "icu_training_load", "icu_intensity", "icu_ftp", "device_name", "power_meter", "power_field_names", "compliance", "paired_event_id", "_resolved_gear_name")},
+                "utc_offset": utc_offset(activity),
+            },
             "detail_level": detail_level,
             "plan_source": plan_source or None,
             "key_findings": findings,
@@ -364,7 +367,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
         shown_streams = streams if detail_level == "full" else [
             s for s in streams if s.get("custom") and str(s.get("type")) not in ((execution or {}).get("hidden_streams") or {})
         ]
-        listing = _compact_intervals(intervals_payload, interval_defs, shown_streams, stream_defs)
+        listing = _compact_intervals(intervals_payload, interval_defs, shown_streams, stream_defs, activity_type=activity.get("type"))
         lines = listing.split("\n")
         if detail_level == "standard" and len(lines) > STANDARD_MAX_INTERVALS + 1:
             lines = lines[: STANDARD_MAX_INTERVALS + 1] + [f"... {len(lines) - STANDARD_MAX_INTERVALS - 1} more lines (detail_level=full)"]

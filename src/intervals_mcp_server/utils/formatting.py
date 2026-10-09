@@ -21,10 +21,14 @@ from intervals_mcp_server.utils.custom_fields import (
     select_label,
 )
 from intervals_mcp_server.utils.sports import (
+    cadence_spm,
+    cadence_text,
     format_pace,
     format_start_times,
     format_zone_table,
     hms,
+    is_foot_sport,
+    temperature_text,
 )
 from intervals_mcp_server.utils.streams import format_range_metrics
 
@@ -124,7 +128,7 @@ Resting HR: {activity.get("icu_resting_hr", "N/A")} bpm
 Decoupling: {activity.get("decoupling", "N/A")}
 
 Other Metrics:
-Cadence: {activity.get("average_cadence", "N/A")} rpm
+Cadence: {cadence_text(activity.get("average_cadence"), activity.get("type"), 1)}
 Calories burned: {activity.get("calories", "N/A")} kcal
 Average Speed: {activity.get("average_speed", "N/A")} m/s
 Max Speed: {activity.get("max_speed", "N/A")} m/s
@@ -137,9 +141,9 @@ Feel: {feel}
 
 Environment:
 Trainer: {activity.get("trainer", "N/A")}
-Average Temp: {activity.get("average_temp", "N/A")}°C
-Min Temp: {activity.get("min_temp", "N/A")}°C
-Max Temp: {activity.get("max_temp", "N/A")}°C
+Average Temp: {temperature_text(activity.get("average_temp"))}
+Min Temp: {temperature_text(activity.get("min_temp"))}
+Max Temp: {temperature_text(activity.get("max_temp"))}
 Avg Wind Speed: {activity.get("average_wind_speed", "N/A")} km/h
 Headwind %: {activity.get("headwind_percent", "N/A")}%
 Tailwind %: {activity.get("tailwind_percent", "N/A")}%
@@ -267,8 +271,16 @@ _RUN_DYNAMICS = (
 )
 
 
-def format_running_dynamics(payload: dict[str, Any], indent: str = "") -> str:
-    """Pace, GAP, cadence and running dynamics of an activity or interval (only present values)."""
+def format_running_dynamics(payload: dict[str, Any], indent: str = "", activity_type: Any = None) -> str:
+    """Pace, GAP, cadence and running dynamics of an activity or interval (only present values).
+
+    ``activity_type`` (the payload's own ``type`` when present) limits the section to foot
+    sports: Intervals.icu stores a step length and cadence for rides too (distance per crank
+    revolution), which are not running dynamics. Unknown types keep the section.
+    """
+    sport = activity_type if activity_type is not None else payload.get("type")
+    if sport and not is_foot_sport(sport):
+        return ""
     lines: list[str] = []
     speed = payload.get("average_speed")
     if isinstance(speed, (int, float)) and speed > 0:
@@ -278,7 +290,7 @@ def format_running_dynamics(payload: dict[str, Any], indent: str = "") -> str:
         lines.append(f"{indent}GAP (grade adjusted pace): {format_pace(gap)} ({gap:.3f} m/s)")
     cadence = payload.get("average_cadence")
     if isinstance(cadence, (int, float)) and cadence > 0 and payload.get("average_step_length"):
-        lines.append(f"{indent}Cadence: {cadence:.1f} rpm as stored (x2 = {cadence * 2:.0f} steps/min)")
+        lines.append(f"{indent}Cadence: {cadence * 2:.0f} spm ({cadence:.1f} rpm as stored, per leg)")
     for key, label, units in _RUN_DYNAMICS:
         value = payload.get(key)
         if isinstance(value, (int, float)) and not is_missing(value):
@@ -305,7 +317,7 @@ def format_activity_details(
     data: dict[str, Any] = _KeyTracker(activity) if include_all_fields else activity
     view = format_activity_summary(data) + _format_activity_zones(data)
     view += _format_thresholds(data)
-    dynamics = format_running_dynamics(data)
+    dynamics = format_running_dynamics(data, activity_type=activity.get("type"))
     if dynamics:
         view += "\nRunning Dynamics:\n" + dynamics + "\n"
     if custom_field_defs is not None:
@@ -845,9 +857,25 @@ def format_custom_item_details(item: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_interval_block(index: int, interval: dict[str, Any]) -> str:
-    """Render the standard metrics of one interval."""
-    return f"""[{index}] {interval.get("label", f"Interval {index}")} ({interval.get("type", "Unknown")})
+def _cadence_range(payload: dict[str, Any], keys: tuple[str, ...], activity_type: Any) -> str:
+    """'Avg 88, Min 0, Max 119 rpm' or, for foot sports, 'Avg 132, Min 0, Max 246 spm (as stored per leg: 66 / 0 / 123 rpm)'."""
+    labels = {"average_cadence": "Avg", "min_cadence": "Min", "max_cadence": "Max"}
+    values = [payload.get(key) for key in keys]
+
+    def text(value: Any) -> str:
+        return "n/a" if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value) else format_value(round(float(value), 1))
+
+    if is_foot_sport(activity_type):
+        steps = [cadence_spm(value, activity_type) for value in values]
+        shown = ", ".join(f"{labels[k]} {text(v)}" for k, v in zip(keys, steps, strict=True))
+        stored = " / ".join(text(v) for v in values)
+        return f"{shown} spm (as stored per leg: {stored} rpm)"
+    return ", ".join(f"{labels[k]} {text(v)}" for k, v in zip(keys, values, strict=True)) + " rpm"
+
+
+def _format_interval_block(index: int, interval: dict[str, Any], activity_type: Any = None) -> str:
+    """Render the standard metrics of one interval (cadence on the sport's basis when the type is known)."""
+    return f"""[{index}] {interval.get("label") or f"Interval {index}"} ({interval.get("type", "Unknown")})
 Duration: {interval.get("elapsed_time", 0)} seconds (moving: {interval.get("moving_time", 0)} seconds)
 Distance: {interval.get("distance", 0)} meters
 Start-End Indices: {interval.get("start_index", 0)}-{interval.get("end_index", 0)}
@@ -878,21 +906,21 @@ Heart Rate & Metabolic:
 Speed & Cadence:
   Speed: Avg {interval.get("average_speed", 0)}, Min {interval.get("min_speed", 0)}, Max {interval.get("max_speed", 0)} m/s
   GAP: {interval.get("gap", 0)} m/s
-  Cadence: Avg {interval.get("average_cadence", 0)}, Min {interval.get("min_cadence", 0)}, Max {interval.get("max_cadence", 0)} rpm
+  Cadence: {_cadence_range(interval, ("average_cadence", "min_cadence", "max_cadence"), activity_type)}
   Stride: {interval.get("average_stride", 0)}
 
 Elevation & Environment:
   Elevation Gain: {interval.get("total_elevation_gain", 0)} meters
   Altitude: Min {interval.get("min_altitude", 0)}, Max {interval.get("max_altitude", 0)} meters
   Gradient: {interval.get("average_gradient", 0)}%
-  Temperature: {interval.get("average_temp", 0)}°C (Weather: {interval.get("average_weather_temp", 0)}°C, Feels like: {interval.get("average_feels_like", 0)}°C)
+  Temperature: {temperature_text(interval.get("average_temp"))} (Weather: {temperature_text(interval.get("average_weather_temp"))}, Feels like: {temperature_text(interval.get("average_feels_like"))})
   Wind: Speed {interval.get("average_wind_speed", 0)} km/h, Gust {interval.get("average_wind_gust", 0)} km/h, Direction {interval.get("prevailing_wind_deg", 0)}°
   Headwind: {interval.get("headwind_percent", 0)}%, Tailwind: {interval.get("tailwind_percent", 0)}%
 
 """
 
 
-def _format_group_block(index: int, group: dict[str, Any]) -> str:
+def _format_group_block(index: int, group: dict[str, Any], activity_type: Any = None) -> str:
     """Render the standard metrics of one interval group."""
     return f"""Group: {group.get("id", f"Group {index}")} (Contains {group.get("count", 0)} intervals)
 Duration: {group.get("elapsed_time", 0)} seconds (moving: {group.get("moving_time", 0)} seconds)
@@ -903,7 +931,7 @@ Power: Avg {group.get("average_watts", 0)} watts ({group.get("average_watts_kg",
 W. Avg Power: {group.get("weighted_average_watts", 0)} watts, Intensity: {group.get("intensity", 0)}
 Heart Rate: Avg {group.get("average_heartrate", 0)}, Max {group.get("max_heartrate", 0)} bpm
 Speed: Avg {group.get("average_speed", 0)}, Max {group.get("max_speed", 0)} m/s
-Cadence: Avg {group.get("average_cadence", 0)}, Max {group.get("max_cadence", 0)} rpm
+Cadence: {_cadence_range(group, ("average_cadence", "max_cadence"), activity_type)}
 
 """
 
@@ -958,11 +986,13 @@ def _format_interval_extras(  # pylint: disable=too-many-arguments,too-many-posi
     return "\n".join(lines) + "\n\n"
 
 
-def format_intervals(
+def format_intervals(  # pylint: disable=too-many-locals
     intervals_data: dict[str, Any],
     interval_field_defs: CustomFieldDefs | None = None,
     streams: list[dict[str, Any]] | None = None,
     stream_defs: CustomFieldDefs | None = None,
+    plan_lines: dict[int, str] | None = None,
+    activity_type: Any = None,
 ) -> str:
     """Format intervals data into a readable string with all available fields.
 
@@ -974,6 +1004,10 @@ def format_intervals(
             each interval's start_index..end_index (and over all member intervals of a
             group) are appended per metric stream
         stream_defs: ACTIVITY_STREAM definitions keyed by code (labels and units)
+        plan_lines: Planned step text per interval index (0-based), shown under the interval header
+        activity_type: The activity's type: foot sports show cadence in steps per minute (2 x the
+            stored per-leg value) and running dynamics; other sports cadence in rpm and no
+            running dynamics (unknown: as stored)
 
     Returns:
         A formatted string representation of the intervals data
@@ -992,8 +1026,12 @@ Analyzed: {intervals_data.get("analyzed", "N/A")}
         result += "Individual Intervals:\n\n"
 
         for i, interval in enumerate(intervals, 1):
-            result += _format_interval_block(i, interval)
-            dynamics = format_running_dynamics(interval, indent="  ")
+            block = _format_interval_block(i, interval, activity_type)
+            if plan_lines is not None:
+                header, rest = block.split("\n", 1)
+                block = f"{header}\nPlan: {plan_lines.get(i - 1, 'no planned step (extra)')}\n{rest}"
+            result += block
+            dynamics = format_running_dynamics(interval, indent="  ", activity_type=activity_type)
             if dynamics:
                 result += "Running Dynamics:\n" + dynamics + "\n\n"
             result += _format_interval_extras(
@@ -1011,7 +1049,7 @@ Analyzed: {intervals_data.get("analyzed", "N/A")}
         result += "Interval Groups:\n\n"
 
         for i, group in enumerate(groups, 1):
-            result += _format_group_block(i, group)
+            result += _format_group_block(i, group, activity_type)
             result += _format_interval_extras(
                 group,
                 _group_ranges(group, intervals),

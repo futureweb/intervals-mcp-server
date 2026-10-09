@@ -29,11 +29,17 @@ from intervals_mcp_server.utils.execution import (  # pylint: disable=wrong-impo
     resolve_target,
 )
 from intervals_mcp_server.utils.sports import (  # pylint: disable=wrong-import-position
+    cadence_spm,
+    cadence_text,
+    format_local_start,
     format_pace,
     format_start_times,
     format_zone_table,
     hms,
+    start_times,
+    temperature_text,
     to_utc_iso,
+    utc_offset,
     zone_ranges,
 )
 from tests.sample_data import EVENT_DATA, EXECUTION_INTERVALS, EXECUTION_STREAMS  # pylint: disable=wrong-import-position
@@ -132,9 +138,26 @@ def test_sports_helpers():
     assert to_utc_iso("2026-10-06T17:36:22+02:00") == "2026-10-06T15:36:22Z"
     assert to_utc_iso("nonsense") is None
     assert format_start_times({"start_date_local": "2026-10-06T17:36:22", "start_date": "2026-10-06T15:36:22Z", "timezone": "Europe/Vienna"}) == (
-        "2026-10-06T17:36:22 local (Europe/Vienna) / 2026-10-06T15:36:22Z UTC"
+        "2026-10-06T17:36:22 local (Europe/Vienna, UTC+02:00) / 2026-10-06T15:36:22Z UTC"
     )
     assert format_start_times({}) == "Unknown"
+
+
+def test_times_cadence_and_temperature_helpers():
+    """Phase 5 (E): offset from local vs UTC, steps per minute for foot sports, temperatures with unit or n/a."""
+    no_zone = {"start_date_local": "2026-10-04T09:03:51", "start_date": "2026-10-04T07:03:51Z"}
+    assert utc_offset(no_zone) == "+02:00"
+    assert format_start_times(no_zone) == "2026-10-04T09:03:51 local (UTC+02:00) / 2026-10-04T07:03:51Z UTC"
+    assert format_local_start(no_zone) == "2026-10-04 09:03 local (UTC+02:00)"
+    assert format_local_start({"start_date_local": "2026-01-10T07:00:00"}) == "2026-01-10 07:00 local"
+    assert utc_offset({"start_date_local": "2026-01-10T07:00:00", "start_date": "2026-01-10T12:30:00Z"}) == "-05:30"
+    assert utc_offset({"start_date_local": "2026-01-10T07:00:00"}) is None
+    assert start_times(no_zone)["utc_offset"] == "+02:00"
+    assert cadence_text(73.565, "Run") == "147 spm (74 rpm as stored)"
+    assert cadence_text(41.6, "Hike", 1) == "83 spm (41.6 rpm as stored)"
+    assert cadence_text(88.2, "Ride") == "88 rpm" and cadence_text(None, "Run") == "n/a"
+    assert cadence_spm(80, "TrailRun") == 160 and cadence_spm(80, "Ride") is None
+    assert temperature_text(16.549) == "16.5 °C" and temperature_text(22) == "22 °C" and temperature_text(None) == "n/a"
 
 
 def test_permission_configuration():

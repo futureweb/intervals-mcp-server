@@ -148,7 +148,12 @@ def test_get_training_load_text_default_end(monkeypatch):
     assert "2026-W41 (2026-10-05 to 2026-10-08, partial 4 d)" in result
     assert "2026-W40 (2026-09-28 to 2026-10-04): load 350 (cycling 240, walking 60, running 50, weighttraining n/a), 5 sessions, 8.1 h, 2 rest days" in result
     assert "100 % of the trailing weekly mean" in result
-    assert "Device load EPOC [EPOC] (own scale, not comparable with or added to the Intervals.icu load): acute 180 ml/kg (n 2), chronic 720 ml/kg (n 8)" in result
+    # Run has no field list in its sport settings: its real EPOC values count (phase 5), reported separately.
+    assert (
+        "Device load EPOC [EPOC] (own scale, not comparable with or added to the Intervals.icu load): acute 220 ml/kg (n 3), "
+        "chronic 880 ml/kg (n 12); activities without a value are not counted; incl. 4 value(s) from sports without field "
+        "assignment (Run)"
+    ) in result
     assert "Coverage: 4 session(s) in the chronic window have no Intervals.icu load" in result
     assert "[1] Gabbett 2016" in result and "no assessment is made" in result
     activity_call = next(c for c in calls if c[0].endswith("/activities"))
@@ -166,7 +171,7 @@ def test_get_training_load_json_full_and_explicit_end(monkeypatch):
     assert payload["sports"]["primary_sport"] == "cycling" and payload["sports"]["multi_sport"] is True
     assert len(payload["daily"]) == 28 and payload["daily"][-1] == {"date": "2026-10-09", "load": 0.0, "sessions": 0}
     epoc = payload["device_loads"][0]
-    assert epoc["code"] == "EPOC" and epoc["acute"] == {"sum": 180.0, "n": 2}
+    assert epoc["code"] == "EPOC" and epoc["acute"] == {"sum": 220.0, "n": 3, "from_unassigned_sports": 1, "unassigned_sports": ["Run"]}
     assert payload["references"]["acwr"]["range"] == [0.8, 1.3]
     standard = json.loads(asyncio.run(get_training_load(end_date="2026-09-30", output_format="json")))
     assert "daily" not in standard and standard["fitness"]["source"] == "intervals.icu"
@@ -199,7 +204,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     """Planned loads drive the projection; missing planned loads are reported; races and Intervals.icu's projection."""
     _setup(monkeypatch)
     result = asyncio.run(get_load_projection())
-    assert "2026-10-09 to 2026-11-06 (PROJECTION" in result
+    assert result.startswith("PROJECTION: load projection for athlete i1, 2026-10-09 to 2026-11-06 (assumes every planned workout")
     assert "Start (end of 2026-10-08, Intervals.icu)" in result
     assert "Today 2026-10-09: completed load 0 + planned, not yet done 100" in result
     assert "Planned workouts: 4 (3 with a planned load, sum 300); 1 without a planned load are not included" in result
@@ -231,6 +236,25 @@ def test_get_load_projection_validation_and_missing_data(monkeypatch):
     assert asyncio.run(get_load_projection()) == "Error fetching events: boom"
     _setup(monkeypatch, {"/events": []})
     assert "Planned workouts: none in the calendar" in asyncio.run(get_load_projection())
+
+
+def test_projection_and_coach_context_say_when_nothing_is_planned(monkeypatch):
+    """Phase 5 (F): without planned workouts the header says so at every detail level, also in the coach context."""
+    _setup(monkeypatch, {"/events": []})
+    for level in ("compact", "standard", "full"):
+        text = asyncio.run(get_load_projection(detail_level=level))
+        assert text.startswith("PROJECTION WITHOUT PLANNED TRAINING (no planned workouts in the calendar): load projection")
+        assert "only the decay of CTL and ATL without any training" in text.splitlines()[0]
+    payload = json.loads(asyncio.run(get_load_projection(output_format="json")))
+    assert payload["projection_basis"]["kind"] == "no_planned_workouts"
+    context = asyncio.run(get_coach_context())
+    assert "Planned 2026-10-10 to 2026-10-16: NO PLANNED WORKOUTS in the calendar" in context
+    unloaded = [dict(e, icu_training_load=None) for e in EVENTS if e["category"] == "WORKOUT" and not e.get("paired_activity_id")]
+    _setup(monkeypatch, {"/events": unloaded})
+    text = asyncio.run(get_load_projection(detail_level="compact"))
+    assert text.startswith("PROJECTION WITHOUT PLANNED LOAD (4 planned workouts, none with a planned load)")
+    _setup(monkeypatch)
+    assert asyncio.run(get_load_projection(detail_level="compact")).startswith("PROJECTION: ")
 
 
 # ------------------------------------------------------------------ get_intensity_distribution
@@ -288,7 +312,9 @@ def test_get_durability_text_and_filters(monkeypatch):
     assert "cycling: decoupling median 3.0 % (n 11" in result and "5 above 5 %" in result
     assert "last 7 d median 4.8 % (n 2), +1.8 pp vs window: higher" in result
     assert "efficiency factor mean 1.43 (n 12)" in result and "2 different bikes/shoes" in result
-    assert "running: no qualifying sessions" in result
+    assert "running: no qualifying sessions (6 considered)" in result
+    # Phase 5 (G): qualifying share, small sample below 8 and the mix of the qualifying sessions.
+    assert "    sample: 11 of 12 sessions qualify; mixed sample: indoor and outdoor mixed (1 indoor, 10 outdoor), 2 different bikes/shoes" in result
     assert "Excluded:" in result and "(long stops)" in result
     outdoor = json.loads(asyncio.run(get_durability(environment="outdoor", output_format="json")))
     assert outdoor["decoupling"]["excluded_by_reason"]["environment"] == 1
@@ -328,6 +354,33 @@ def test_get_coach_context_text_and_json(monkeypatch):
     assert asyncio.run(get_coach_context(end_date="2026-10-10")).startswith("Error: end_date lies in the future")
 
 
+def test_coach_context_and_intensity_state_their_method(monkeypatch):
+    """Phase 5 (H): windows, ACWR method, zone basis, threshold_as and hard-session rule in compact outputs; a caveat
+    with the per-sport split when the totals mix power and HR zones."""
+    _setup(monkeypatch)
+    for level in ("compact", "standard"):
+        text = asyncio.run(get_coach_context(detail_level=level))
+        assert (
+            "Method: 7 d acute / 28 d chronic, ratio of daily means, coupled; monotony = mean/SD of 7 daily loads; zones power "
+            "(cycling) or HR/pace, power Z4 = moderate (threshold_as); hard = >= 10 min in Z3 or IF >= 0.85 on >= 20 min."
+        ) in text
+        assert "Caveat: totals mix zone bases (hr " in text and "28 d Z1/Z2/Z3 by sport: cycling (power) " in text
+        assert "walking (hr) " in text
+    assert (
+        "cycling decoupling median 3.0 % (n 7 of 8, small sample, not reliable, mixed: indoor and outdoor mixed "
+        "(1 indoor, 6 outdoor), 2 different bikes/shoes; 3 > 5 %)"
+    ) in asyncio.run(get_coach_context())
+    high = json.loads(asyncio.run(get_coach_context(threshold_as="high", output_format="json")))
+    assert high["method"]["threshold_as"] == "high" and high["method"]["acute_days"] == 7
+    assert "power Z4 = high (threshold_as)" in asyncio.run(get_coach_context(threshold_as="high"))
+    assert asyncio.run(get_coach_context(threshold_as="x")).startswith("Error: threshold_as")
+    compact = asyncio.run(get_intensity_distribution(detail_level="compact"))
+    assert "Caveat: the total combines zone bases (" in compact and "compare the per-sport split below." in compact
+    assert "Rule: hard session = >= 10 min in Z3 or IF >= 0.85 on >= 20 min." in compact
+    rides = asyncio.run(get_intensity_distribution(detail_level="compact", sport_types="Ride"))
+    assert "Caveat" not in rides  # a single basis needs no caveat
+
+
 def test_new_tools_are_read_only_and_prompt():
     """All new tools are in the read class; the review prompt points to them and keeps the no-diagnosis rule."""
     permissions = tool_permissions()
@@ -336,6 +389,18 @@ def test_new_tools_are_read_only_and_prompt():
     text = training_load_review("2026-10-09")
     assert "get_coach_context" in text and "end_date='2026-10-09'" in text
     assert "not a risk statement" in text and "Do not state causes" in text
+
+
+def test_coach_context_is_the_recommended_first_call():
+    """Phase 5 (I): the guide and both weekly prompts make get_coach_context the first call."""
+    from intervals_mcp_server.tools.status import usage_guide, weekly_training_review  # pylint: disable=import-outside-toplevel
+
+    assert "Call get_coach_context first" in training_load_review()
+    assert "Call get_coach_context first" in weekly_training_review()
+    guide = usage_guide()
+    assert "For a weekly analysis the recommended first call is get_coach_context" in guide
+    assert guide.index("get_coach_context") < guide.index("get_activity_report")
+    assert "cadence in steps per minute" in guide
 
 
 def test_new_tools_through_mcp_layer(monkeypatch):

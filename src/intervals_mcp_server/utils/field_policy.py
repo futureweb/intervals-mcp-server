@@ -28,12 +28,20 @@ Fields named "... at start" / "... at end" with the same stem are paired so that
 typical start-to-end change (e.g. stamina) is reported where both values exist. Missing
 values (null, NaN) are skipped; a stored 0 counts as a value. Operator overrides
 (``CUSTOM_AGGREGATE_OVERRIDES="Code=mean,Other=sum"``) take precedence.
+
+With the sport settings' field assignments (``activity_field_ids``) a value only counts on a
+sport that lists the field; a sport whose list excludes the field contributes nothing (e.g.
+running dynamics on rides). A sport without any list (e.g. gravel rides without own fields)
+follows the lists of the other sports of its family (Ride), or counts every field when the
+family has none; there only real non-zero values count (reported separately), a stored 0 is a
+placeholder and left out.
 """
 
 import statistics
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import CustomFieldDefs, is_missing
+from intervals_mcp_server.utils.sports import sport_family
 
 POLICIES = ("sum", "device_load_sum", "trend", "mean", "none")
 
@@ -154,25 +162,58 @@ def _number(value: Any) -> float | None:
 AssignedByType = dict[str, set[str] | None]
 
 
+def _family_codes(by_type: AssignedByType, sport: str) -> set[str] | None:
+    """Union of the field lists of the other sports of ``sport``'s family; None when none of them has a list."""
+    family = sport_family(sport)
+    lists = [codes for other, codes in by_type.items() if other != sport and codes is not None and sport_family(other) == family]
+    return set().union(*lists) if lists else None
+
+
 def _values(
     activities: list[dict[str, Any]], code: str, assigned_by_type: AssignedByType | None = None
-) -> tuple[list[tuple[str, float]], int]:
-    """(date, value) pairs of a field, oldest first, and how many values came from sports without the field."""
+) -> tuple[list[tuple[str, float]], dict[str, Any]]:
+    """(date, value) pairs of a field, oldest first, and the counts of the sport-assignment filter.
+
+    ``assigned_by_type`` maps an activity type to the codes assigned in its sport settings
+    (None = the sport lists no fields). Rules:
+
+    - the sport lists the field: the value counts;
+    - the sport lists fields but not this one: ignored (e.g. running dynamics on rides);
+    - the sport lists no fields while the field is assigned elsewhere: the lists of the other
+      sports of its family stand in (a gravel ride follows the ride settings, so a bike "stride"
+      is not mixed into the run stride); without a family list every sport counts. Only real
+      non-zero values count there (the bridge only writes values the device delivered), a stored
+      0 is a placeholder; counted values are reported in ``from_unassigned_sports``;
+    - the field is assigned to no sport at all: every value counts.
+    """
     out: list[tuple[str, float]] = []
-    foreign = 0
-    # When the field is assigned to at least one sport, sports without an assignment list do not count either.
-    restricted = any(code in codes for codes in (assigned_by_type or {}).values() if codes)
+    counts: dict[str, Any] = {"excluded_by_sport_settings": 0, "zero_placeholders": 0, "from_unassigned_sports": 0}
+    by_type = assigned_by_type or {}
+    restricted = any(code in codes for codes in by_type.values() if codes)
+    unassigned: set[str] = set()
     for activity in activities:
         value = _number(activity.get(code))
         if value is None:
             continue
-        assigned = (assigned_by_type or {}).get(str(activity.get("type") or ""))
-        if (assigned is not None and code not in assigned) or (assigned is None and restricted):
-            foreign += 1
+        sport = str(activity.get("type") or "")
+        assigned = by_type.get(sport)
+        if assigned is not None and code not in assigned:
+            counts["excluded_by_sport_settings"] += 1
             continue
+        if assigned is None and restricted:
+            family = _family_codes(by_type, sport)
+            if family is not None and code not in family:
+                counts["excluded_by_sport_settings"] += 1
+                continue
+            if value == 0:
+                counts["zero_placeholders"] += 1
+                continue
+            counts["from_unassigned_sports"] += 1
+            unassigned.add(sport or "unknown")
         out.append((str(activity.get("start_date_local") or ""), value))
     out.sort(key=lambda item: item[0])
-    return out, foreign
+    counts["unassigned_sports"] = sorted(unassigned)
+    return out, counts
 
 
 def aggregate_field(  # pylint: disable=too-many-arguments
@@ -182,13 +223,15 @@ def aggregate_field(  # pylint: disable=too-many-arguments
     """Aggregate one custom field over activities according to its policy; None without values.
 
     ``assigned_by_type`` maps an activity type to the field codes assigned to its sport in the
-    Intervals.icu sport settings (None = no list); values on activities of a sport without the
-    field (e.g. running dynamics stored as 0 on rides or walks) are left out and counted. Sports
-    without an assignment list only count when the field is assigned to no sport at all. For estimates
-    (trend policy) on a never-negative scale a stored 0 is the device's "no value" and is left out
-    as well; elsewhere zeros are kept as stored and counted.
+    Intervals.icu sport settings (None = no list). Values on activities of a sport whose list
+    excludes the field (e.g. running dynamics on rides) are left out and counted. On sports
+    without any list the lists of the other sports of the same family stand in (GravelRide ->
+    Ride); real non-zero values count there and are reported separately
+    (``values_from_unassigned_sports``), a stored 0 is a placeholder and left out. For
+    estimates (trend policy) on a never-negative scale a stored 0 is the device's "no value" and
+    is left out as well; elsewhere zeros are kept as stored and counted.
     """
-    dated, foreign = _values(activities, code, assigned_by_type)
+    dated, counts = _values(activities, code, assigned_by_type)
     if not dated:
         return None
     policy = aggregation_policy(definition, override)
@@ -203,7 +246,12 @@ def aggregate_field(  # pylint: disable=too-many-arguments
     out: dict[str, Any] = {
         "name": definition.get("name"), "units": definition.get("units"), "n": len(values),
         "policy": policy["policy"], "primary": policy["primary"], "reason": policy["reason"],
-        "zero_values": zeros - excluded_zeros, "zeros_excluded": excluded_zeros, "other_sport_values_ignored": foreign,
+        "zero_values": zeros - excluded_zeros, "zeros_excluded": excluded_zeros,
+        "other_sport_values_ignored": counts["excluded_by_sport_settings"] + counts["zero_placeholders"],
+        "excluded_by_sport_settings": counts["excluded_by_sport_settings"],
+        "zero_placeholders_ignored": counts["zero_placeholders"],
+        "values_from_unassigned_sports": counts["from_unassigned_sports"],
+        "unassigned_sports": counts["unassigned_sports"],
     }
     kind = policy["policy"]
     if kind == "none":
@@ -284,7 +332,7 @@ def _num_text(value: Any) -> str:
     return str(int(rounded)) if rounded.is_integer() else str(rounded)
 
 
-def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) -> str:
+def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) -> str:  # pylint: disable=too-many-branches
     """One compact text item for an aggregate (units appended, policy-specific wording)."""
     units = f" {agg['units']}" if agg.get("units") else ""
     head = f"{agg.get('name') or code} [{code}]"
@@ -311,8 +359,20 @@ def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) 
     extras = []
     if agg.get("zeros_excluded"):
         extras.append(f"{agg['zeros_excluded']} stored 0 left out as 'no value'")
-    if agg.get("other_sport_values_ignored"):
+    if agg.get("values_from_unassigned_sports"):
+        sports = ", ".join(agg.get("unassigned_sports") or [])
+        extras.append(
+            f"incl. {agg['values_from_unassigned_sports']} value(s) from sports without field assignment"
+            + (f" ({sports})" if sports else "")
+        )
+    excluded = agg.get("excluded_by_sport_settings")
+    placeholders = agg.get("zero_placeholders_ignored")
+    if excluded is None and placeholders is None and agg.get("other_sport_values_ignored"):
         extras.append(f"{agg['other_sport_values_ignored']} value(s) from sports without this field ignored")
+    if excluded:
+        extras.append(f"{excluded} value(s) from sports whose (family) field settings exclude this field ignored")
+    if placeholders:
+        extras.append(f"{placeholders} zero placeholder(s) on sports without field assignment ignored")
     if extras:
         text += f" ({'; '.join(extras)})"
     if show_reason:
