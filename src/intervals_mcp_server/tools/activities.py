@@ -707,14 +707,61 @@ def _fmt_short(value: Any) -> str:
     return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
 
 
+async def _planned_step_types(
+    activity_id: str, intervals: list[dict[str, Any]], api_key: str | None, planned_workout_doc: dict[str, Any] | None
+) -> tuple[dict[int, dict[str, Any]], str]:
+    """Planned step matched to each interval index (alignment by order, duration and target) and the plan source."""
+    from intervals_mcp_server.tools.analysis import _get_event, _threshold_context  # pylint: disable=import-outside-toplevel,protected-access
+    from intervals_mcp_server.utils.execution import align_spans, plan_steps  # pylint: disable=import-outside-toplevel
+
+    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    activity = result[0] if isinstance(result, list) and result else result
+    if not isinstance(activity, dict) or "error" in activity:
+        return {}, "activity could not be loaded"
+    steps: Any = None
+    source = ""
+    if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
+        steps, source = planned_workout_doc["steps"], "workout document provided by the caller"
+    elif activity.get("paired_event_id"):
+        athlete = str(activity.get("icu_athlete_id") or config.athlete_id or "")
+        event = await _get_event(athlete, activity["paired_event_id"], api_key) if athlete else None
+        if event:
+            steps = (event.get("workout_doc") or {}).get("steps")
+            source = f"event {event.get('id')} ('{event.get('name')}')"
+    if not isinstance(steps, list):
+        return {}, "no planned workout paired with this activity"
+    planned = plan_steps(steps, _threshold_context(activity))
+    mapping: dict[int, dict[str, Any]] = {}
+    for p_idx, indices in align_spans(planned, intervals):
+        for i_idx in indices if p_idx is not None else []:
+            step = planned[p_idx]  # type: ignore[index]
+            mapping[i_idx] = {"index": step["index"], "kind": step["kind"], "duration": step.get("duration")}
+    return mapping, source
+
+
+def _plan_mapping_lines(intervals: list[dict[str, Any]], mapping: dict[int, dict[str, Any]], source: str) -> list[str]:
+    if not mapping:
+        return [f"Planned step types: not available ({source})."]
+    lines = [f"Planned step per interval ({source}; the Intervals.icu type is kept as stored):"]
+    for index, interval in enumerate(intervals):
+        step = mapping.get(index)
+        planned = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}" if step else "no planned step (extra)"
+        expected = "WORK" if step and step["kind"] == "work" else "RECOVERY"
+        flag = " <- type differs from the plan" if step and step["kind"] in ("work", "rest") and interval.get("type") != expected else ""
+        lines.append(f"  [{index + 1}] Intervals.icu {interval.get('type', '?')} | {planned}{flag}")
+    return lines
+
+
 @tool("read")
-async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches
+async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
     activity_id: str,
     api_key: str | None = None,
     stream_types: str | None = None,
     include_custom_fields: bool = True,
     output_format: str = "text",
     detail_level: str = "standard",
+    include_planned_types: bool = False,
+    planned_workout_doc: dict[str, Any] | None = None,
 ) -> str:
     """Get interval data for a specific activity from Intervals.icu
 
@@ -744,6 +791,11 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
         detail_level: "compact" (one line per interval with the key numbers; custom streams as
             start→end), "standard" (default, the full block per interval) or "full" (standard plus
             every custom stream when stream_types is not given)
+        include_planned_types: Also show the planned step (type) matched to each interval from the
+            paired event or planned_workout_doc; the Intervals.icu WORK/RECOVERY type is kept as
+            stored (optional, default False; one or two extra API calls)
+        planned_workout_doc: Workout document with "steps" to match against (optional; implies
+            include_planned_types)
     """
     if detail_level not in DETAIL_LEVELS_3:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
@@ -798,6 +850,13 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
                 streams = [s for s in streams if s.get("type") in requested]
             stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
 
+    plan_map: dict[int, dict[str, Any]] = {}
+    plan_source = ""
+    if include_planned_types or planned_workout_doc:
+        plan_map, plan_source = await _planned_step_types(
+            activity_id, [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)], api_key, planned_workout_doc
+        )
+
     if output_format.strip().lower() == "json":
         intervals = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
         payload = {
@@ -808,16 +867,21 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
                     **interval,
                     "custom_fields": [r for r in custom_fields_json(interval, interval_field_defs) if r["status"] in ("value", "zero")],
                     "stream_metrics": _interval_stream_metrics(interval, streams or [], stream_defs),
+                    **({"planned_step": plan_map.get(index)} if include_planned_types or planned_workout_doc else {}),
                 }
-                for interval in intervals
+                for index, interval in enumerate(intervals)
             ],
             "groups": [g for g in result.get("icu_groups") or [] if isinstance(g, dict)],
             "note": note.strip() or None,
         }
         return json.dumps(_json_safe(payload), ensure_ascii=False)
 
+    plan_text = ""
+    if include_planned_types or planned_workout_doc:
+        listed = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
+        plan_text = "\n" + "\n".join(_plan_mapping_lines(listed, plan_map, plan_source))
     if detail_level == "compact":
-        return _compact_intervals(result, interval_field_defs, streams, stream_defs) + note
+        return _compact_intervals(result, interval_field_defs, streams, stream_defs) + note + plan_text
 
     # Format the intervals data
     return (
@@ -828,6 +892,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             stream_defs=stream_defs,
         )
         + note
+        + plan_text
     )
 
 

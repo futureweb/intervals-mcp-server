@@ -45,6 +45,7 @@ ACTIVITY_FIELDS = (
     "icu_rpe,feel,compliance,interval_summary,power_meter,trainer,device_name,power_field_names"
 )
 MIN_TREND_ACTIVITIES = 3
+RECORDING_GAP_S = 5  # a jump in the time stream larger than this is a recording pause
 STREAM_UNITS = {
     "watts": "W",
     "secondary_power": "W",
@@ -326,6 +327,18 @@ def _time_at(time_data: list[Any], index: Any) -> float | None:
     return _num(time_data[min(max(index, 0), len(time_data) - 1)])
 
 
+def _paused_secs(time_data: list[Any], start: Any, end: Any) -> float:
+    """Seconds of recording pauses (time jumps > 5 s) between two sample indices."""
+    if not time_data or not isinstance(start, int) or not isinstance(end, int) or isinstance(start, bool):
+        return 0.0
+    paused = 0.0
+    for index in range(max(start, 0), min(end, len(time_data) - 1)):
+        current, following = _num(time_data[index]), _num(time_data[index + 1])
+        if current is not None and following is not None and following - current > RECORDING_GAP_S:
+            paused += following - current - 1
+    return paused
+
+
 def _position(time_data: list[Any], index: Any) -> str:
     secs = _time_at(time_data, index)
     return hms(secs) if secs is not None else f"index {index}"
@@ -357,6 +370,7 @@ def _effort_row(
         "end_secs": _time_at(time_data, end),
         "start": _position(time_data, start),
         "end": _position(time_data, end),
+        "paused_s_in_window": _paused_secs(time_data, start, end),
     }
 
 
@@ -368,7 +382,10 @@ def _effort_text(row: dict[str, Any]) -> str:
     text = f"#{row['rank']} {value}"
     if "distance" in row["requested"] and row.get("duration") is not None:
         text += f" in {hms(row['duration'])}"
-    return f"{text} from {row['start']} to {row['end']} (samples {row['start_index']}-{row['end_index']})"
+    text = f"{text} from {row['start']} to {row['end']} (samples {row['start_index']}-{row['end_index']})"
+    if row.get("paused_s_in_window"):
+        text += f" [window spans {hms(row['paused_s_in_window'])} of recording pause]"
+    return text
 
 
 @tool("read")
@@ -388,8 +405,10 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
 
     Asks Intervals.icu for the best average of a stream over each requested duration (seconds)
     or distance (metres) and reports, per effort, the average (W, bpm or m/s with pace), where
-    it happened as h:mm:ss from the activity's time stream (recording pauses excluded; sample
-    indices when the time stream is missing), the sample indices (usable as start_index /
+    it happened as elapsed h:mm:ss from the activity's time stream (the clock includes recording
+    pauses; an effort window that spans a pause is flagged with the paused time, because the
+    duration is elapsed time and the paused seconds lie inside the window; sample indices when
+    the time stream is missing), the sample indices (usable as start_index /
     end_index in other tools) and the duration/distance covered. Use it to find the peak 5 s /
     1 min / 5 min / 20 min power of a ride, the fastest kilometre of a run (stream
     velocity_smooth with distances) or the highest sustained heart rate. Durations longer than
@@ -467,7 +486,8 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
         header += f", samples {start_index or 0}-{end_index if end_index is not None else 'end'}"
     lines = [
         header + "):",
-        "Positions are h:mm:ss from the time stream (recording pauses excluded)."
+        "Positions are elapsed h:mm:ss from the time stream (the clock includes recording pauses; "
+        "windows that span a pause are flagged)."
         if time_data else "Time stream not available; positions are sample indices.",
     ]
     for row in rows:

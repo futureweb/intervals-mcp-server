@@ -84,13 +84,18 @@ def describe_stream(stream: dict[str, Any], stream_defs: CustomFieldDefs) -> dic
         label = stream.get("name") or stream_type
         units = STANDARD_STREAM_UNITS.get(stream_type)
         description = None
-    return {
+    info = {
         "type": stream_type,
         "label": str(label),
         "units": units,
         "custom": custom,
         "description": description,
     }
+    note = gear_units_note(stream_type, str(label), units, stream.get("data") or [])
+    if note:
+        info["units"] = "gear position"
+        info["units_note"] = note
+    return info
 
 
 def stream_label(info: dict[str, Any]) -> str:
@@ -318,6 +323,8 @@ def format_streams_summary(
         summary += f"  Value Type: {stream.get('valueType', '')}\n"
         summary += f"  Data Points: {len(data)}\n"
         summary += f"  Units: {info['units'] or 'not specified'}\n"
+        if info.get("units_note"):
+            summary += f"  Units note: {info['units_note']}\n"
         summary += f"  Custom: {'yes' if info['custom'] else 'no'}\n"
         if info["description"]:
             summary += f"  Description: {info['description']}\n"

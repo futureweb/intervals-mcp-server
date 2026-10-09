@@ -197,9 +197,11 @@ def test_get_best_efforts_text(monkeypatch):
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_best_efforts("a1", durations="5,300,3600", count=2))
     assert result.startswith("Best efforts for activity a1, stream watts (count 2):")
-    assert "Positions are h:mm:ss from the time stream" in result
-    assert "  5 s: #1 812.0 W from 1:40 to 1:45 (samples 100-105)" in result
-    assert "  5 min: #1 301.5 W from 28:20 to 36:40 (samples 1700-2000)" in result
+    # Regression: positions are elapsed time (the clock includes pauses), not "pauses excluded"
+    assert "Positions are elapsed h:mm:ss from the time stream (the clock includes recording pauses" in result
+    assert "pauses excluded" not in result
+    assert "  5 s: #1 812.0 W from 1:40 to 1:45 (samples 100-105)\n" in result
+    assert "  5 min: #1 301.5 W from 28:20 to 36:40 (samples 1700-2000) [window spans 3:20 of recording pause]" in result
     assert "#2 290.0 W from 6:40 to 11:40 (samples 400-700)" in result
     assert "  60 min: not available (longer than the activity or no data in this stream)" in result
     assert result.endswith("API calls: 4")
@@ -225,7 +227,7 @@ def test_get_best_efforts_json_and_query_params(monkeypatch):
     first = payload["efforts"][0]
     assert first["requested"] == {"duration": 300}
     assert first["units"] == "bpm" and first["pace"] is None
-    assert first["start_secs"] == 1700 and first["end_secs"] == 2200
+    assert first["start_secs"] == 1700 and first["end_secs"] == 2200 and first["paused_s_in_window"] == 200
     assert first["rank"] == 1 and payload["efforts"][1]["rank"] == 2
     assert calls[1][1] == {
         "stream": "heartrate", "count": 1, "excludeIntervals": "true", "startIndex": 10, "endIndex": 3000, "duration": 300,
