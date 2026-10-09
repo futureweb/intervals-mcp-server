@@ -44,26 +44,38 @@ Environment variables (all optional unless noted):
 ``OAUTH_PASSWORD`` / ``OAUTH_PASSWORD_HASH`` / ``OAUTH_USERNAME``  password sign-in
 ``OAUTH_TOTP_SECRET``              optional second factor (authenticator app) for the password
                                    and API-key sign-ins
-``OAUTH_CLIENT_HOSTS``             hosts whose client metadata documents are accepted
-                                   (default ``chatgpt.com,claude.ai,claude.com``; ``none``)
-``OAUTH_REDIRECT_HOSTS``           hosts allowed as redirect URIs of dynamically registered
-                                   clients (same default; ``*`` = any https host)
+``OAUTH_CLIENT_HOSTS``             hosts (or ``host/path`` document URLs) whose client metadata
+                                   documents are accepted (default ``chatgpt.com,claude.ai,claude.com``;
+                                   ``none``)
+``OAUTH_REDIRECT_HOSTS``           hosts (or ``host/path`` prefixes) allowed as redirect URIs of
+                                   dynamically registered clients (same default; ``*`` = any https host)
 ``OAUTH_DYNAMIC_REGISTRATION``     ``true`` (default) or ``false``
 ``OAUTH_PRIVATE_KEY_JWT``          advertise private_key_jwt client auth (default ``true``)
+``OAUTH_REQUIRE_PRIVATE_KEY_JWT``  refuse token requests without an assertion from clients whose
+                                   metadata document declares private_key_jwt (default ``true``)
 ``OAUTH_STATE_FILE``               JSON file for clients and refresh tokens
 ``OAUTH_ACCESS_TOKEN_TTL`` / ``OAUTH_REFRESH_TOKEN_TTL`` / ``OAUTH_LOGIN_RATE_LIMIT``
+``OAUTH_LOGIN_GLOBAL_RATE_LIMIT``  failed password / API-key sign-ins from all addresses together
+                                   per window before those sign-ins pause (default 50)
+``OAUTH_REFRESH_REUSE_GRACE``      seconds in which a just-rotated refresh token is still accepted
+                                   (a client retrying after a lost response); later reuse revokes
+                                   the grant (default 120)
 
 Access tokens live in memory only; registered clients and refresh tokens are persisted
-(as digests) so a restart does not disconnect clients.  Secrets are never logged.
+(as digests) so a restart does not disconnect clients.  The state file is written in a
+worker thread, in-memory state only changes once the write succeeded, and a file that
+cannot be read is never overwritten.  Secrets are never logged.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -71,12 +83,15 @@ import secrets
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
+import anyio
+import anyio.to_thread
 import httpx
 from mcp.server.auth.provider import (
     AccessToken,
@@ -94,7 +109,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, ValidationError
 
-from intervals_mcp_server.auth_clients import ClientMetadataResolver, Fetcher, is_metadata_client_id
+from intervals_mcp_server.auth_clients import (
+    ClientMetadataResolver,
+    Fetcher,
+    allowlist_match,
+    is_metadata_client_id,
+    normalize_allow_entry,
+)
 from intervals_mcp_server.auth_clients import log_safe as _for_log
 from intervals_mcp_server.auth_totp import generate_secret, match_counter, normalize_secret, provisioning_uri
 
@@ -108,12 +129,16 @@ __all__ = [
     "SingleUserOAuthProvider",
     "auth_settings",
     "auth_status_from_env",
+    "client_key",
     "granted_classes",
     "hash_password",
     "install_login_routes",
     "normalize_athlete_id",
     "oauth_config_from_env",
     "oauth_from_env",
+    "request_client_key",
+    "reset_request_client_key",
+    "set_request_client_key",
     "verify_password_hash",
 ]
 
@@ -139,15 +164,62 @@ LOGIN_REQUEST_TTL = 10 * 60
 PBKDF2_ITERATIONS = 600_000
 MAX_CLIENTS = 50
 MAX_PENDING_LOGINS = 500
+# Pending sign-ins per client address (IPv4 address or IPv6 /64): a flood from one address
+# only evicts its own requests.
+MAX_PENDING_PER_KEY = 20
 MAX_CLIENT_NAME_CHARS = 100
 MAX_REDIRECT_URIS = 10
 MAX_CLIENT_METADATA_BYTES = 8 * 1024
+DEFAULT_LOGIN_GLOBAL_RATE_LIMIT = 50
+REGISTRATIONS_PER_KEY = 10
+REGISTRATION_WINDOW = 3600
+DEFAULT_REFRESH_REUSE_GRACE = 120
+MAX_ROTATED_REFRESH_TOKENS = 2000
+MAX_RATE_LIMIT_KEYS = 10_000
 
 _STATE_VERSION = 1
 _HASH_PREFIX = "pbkdf2_sha256"
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
+
+# Client address of the request being handled (set by a middleware on /authorize and
+# /register, whose SDK handlers do not pass the request on to the provider).
+_REQUEST_CLIENT_KEY: ContextVar[str] = ContextVar("intervals_mcp_request_client_key", default="unknown")
+
+
+def client_key(host: str | None) -> str:
+    """Rate-limit key of a client address: the IPv4 address or the /64 network of an IPv6 address."""
+    if not host:
+        return "unknown"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host[:64]
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.IPv6Network((address, 64), strict=False))
+    return str(address)
+
+
+def set_request_client_key(host: str | None) -> Token[str]:
+    """Remember the client address of the current request (see :func:`request_client_key`)."""
+    return _REQUEST_CLIENT_KEY.set(client_key(host))
+
+
+def reset_request_client_key(token: Token[str]) -> None:
+    """Undo :func:`set_request_client_key` at the end of the request."""
+    _REQUEST_CLIENT_KEY.reset(token)
+
+
+def request_client_key() -> str:
+    """Rate-limit key of the current request's client, ``unknown`` outside a request."""
+    return _REQUEST_CLIENT_KEY.get()
+
+
+def _one_line(exc: BaseException) -> str:
+    return " ".join(str(exc).split()) or type(exc).__name__
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +305,9 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
     login_rate_limit: int = DEFAULT_LOGIN_RATE_LIMIT
     login_rate_window: int = LOGIN_RATE_LIMIT_WINDOW
+    login_global_rate_limit: int = DEFAULT_LOGIN_GLOBAL_RATE_LIMIT
+    refresh_reuse_grace: int = DEFAULT_REFRESH_REUSE_GRACE
+    require_private_key_jwt: bool = True
     login_methods: tuple[str, ...] = ("password",)
     intervals_client_id: str | None = None
     intervals_client_secret: str | None = None
@@ -291,24 +366,39 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
 
     def same_origin(self, url: str) -> bool:
         """True when *url* points at this server (scheme, host and port of the issuer)."""
-        mine, other = urlsplit(self.public_url), urlsplit(url)
-        return (mine.scheme, mine.hostname, mine.port) == (other.scheme, (other.hostname or "").lower(), other.port)
+        mine, other = _origin(self.public_url), _origin(url)
+        return other is not None and mine == other
+
+
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) with the default port filled in; None for an unparsable URL."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    return scheme, (parts.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
 
 
 def _auth_mode(env: Mapping[str, str]) -> str:
     return env.get("MCP_AUTH", "none").strip().lower() or "none"
 
 
-def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
+def _env_int(env: Mapping[str, str], name: str, default: int, minimum: int = 1) -> int:
     raw = env.get(name, "").strip()
     if not raw:
         return default
+    kind = "a positive integer" if minimum == 1 else f"an integer >= {minimum}"
     try:
         value = int(raw)
     except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+        raise ValueError(f"{name} must be {kind}, got {raw!r}") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be {kind}, got {raw!r}")
     return value
 
 
@@ -324,17 +414,21 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
 
 
 def _env_hosts(env: Mapping[str, str], name: str, allow_any: bool) -> frozenset[str] | None:
+    """Allowlist of ``host`` or ``host/path`` entries; None = any host (only with *allow_any*)."""
     raw = env.get(name)
     if raw is None or not raw.strip():
         return frozenset(DEFAULT_TRUSTED_CLIENT_HOSTS)
-    value = raw.strip().lower()
-    if value == "none":
+    value = raw.strip()
+    if value.lower() == "none":
         return frozenset()
     if value == "*":
         if not allow_any:
             raise ValueError(f"{name} does not accept '*'; list the hosts explicitly")
         return None
-    return frozenset(h.strip() for h in value.split(",") if h.strip())
+    try:
+        return frozenset(normalize_allow_entry(h) for h in value.split(",") if h.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name}: {exc}") from exc
 
 
 def _validate_public_url(url: str) -> None:
@@ -426,6 +520,9 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         access_token_ttl=_env_int(env, "OAUTH_ACCESS_TOKEN_TTL", DEFAULT_ACCESS_TOKEN_TTL),
         refresh_token_ttl=_env_int(env, "OAUTH_REFRESH_TOKEN_TTL", DEFAULT_REFRESH_TOKEN_TTL),
         login_rate_limit=_env_int(env, "OAUTH_LOGIN_RATE_LIMIT", DEFAULT_LOGIN_RATE_LIMIT),
+        login_global_rate_limit=_env_int(env, "OAUTH_LOGIN_GLOBAL_RATE_LIMIT", DEFAULT_LOGIN_GLOBAL_RATE_LIMIT),
+        refresh_reuse_grace=_env_int(env, "OAUTH_REFRESH_REUSE_GRACE", DEFAULT_REFRESH_REUSE_GRACE, minimum=0),
+        require_private_key_jwt=_env_bool(env, "OAUTH_REQUIRE_PRIVATE_KEY_JWT", True),
         login_methods=methods,
         intervals_client_id=client_id,
         intervals_client_secret=client_secret,
@@ -458,6 +555,7 @@ class _PendingLogin:  # pylint: disable=too-many-instance-attributes
     client_verified: bool = False
     redirect_host: str = ""
     offered: tuple[str, ...] = ("read",)
+    key: str = "unknown"
 
 
 @dataclass
@@ -468,6 +566,7 @@ class _UpstreamLogin:
     granted: tuple[str, ...]
     browser_digest: str
     expires_at: float
+    key: str = "unknown"
 
 
 @dataclass
@@ -482,6 +581,14 @@ class _TokenRecord:
 
 
 @dataclass
+class _RotatedToken:
+    """A refresh token that was exchanged: still accepted for a short grace period."""
+
+    record: _TokenRecord
+    rotated_at: float
+
+
+@dataclass
 class _TokenStore:
     """All token state; only ``refresh`` is persisted."""
 
@@ -489,6 +596,9 @@ class _TokenStore:
     used_codes: dict[str, tuple[float, str]] = field(default_factory=dict)
     access: dict[str, _TokenRecord] = field(default_factory=dict)
     refresh: dict[str, _TokenRecord] = field(default_factory=dict)
+    # Digests of exchanged refresh tokens (in memory): reuse after the grace period
+    # revokes the grant (RFC 9700 4.14.2).
+    rotated: dict[str, _RotatedToken] = field(default_factory=dict)
 
 
 class LoginError(Exception):
@@ -500,7 +610,11 @@ class LoginError(Exception):
 
 
 class _LoginRateLimiter:
-    """Counts failed logins per key (client IP) inside a sliding window."""
+    """Counts events (failed logins, registrations) per key inside a sliding window.
+
+    The table is bounded: expired keys are swept and, above ``MAX_RATE_LIMIT_KEYS``
+    keys, the oldest ones are dropped (an attacker rotating addresses cannot grow it).
+    """
 
     def __init__(self, limit: int, window: int, clock: Callable[[], float]) -> None:
         self._limit = limit
@@ -518,16 +632,27 @@ class _LoginRateLimiter:
         return recent
 
     def is_blocked(self, key: str) -> bool:
-        """True when *key* has reached the failure limit inside the window."""
+        """True when *key* has reached the limit inside the window."""
         return len(self._recent(key)) >= self._limit
 
     def record_failure(self, key: str) -> None:
-        """Remember one failed attempt for *key*."""
+        """Remember one event for *key*."""
         self._failures.setdefault(key, []).append(self._clock())
+        if len(self._failures) > MAX_RATE_LIMIT_KEYS:
+            self._sweep()
+
+    def _sweep(self) -> None:
+        for key in list(self._failures):
+            self._recent(key)
+        while len(self._failures) > MAX_RATE_LIMIT_KEYS:
+            del self._failures[next(iter(self._failures))]
 
     def reset(self, key: str) -> None:
-        """Forget the failures of *key* (after a successful login)."""
+        """Forget the events of *key* (after a successful login)."""
         self._failures.pop(key, None)
+
+    def __len__(self) -> int:
+        return len(self._failures)
 
 
 def _digest(token: str) -> str:
@@ -550,13 +675,62 @@ def _check_registration_size(client_info: OAuthClientInformationFull, redirect_c
 
 
 def _redirect_uri_allowed(uri: str, hosts: frozenset[str] | None = None) -> bool:
-    """https on an allowed host (``None`` = any host), or http on loopback."""
+    """https without a query on an allowed host or path prefix (``None`` = any host), or http on loopback."""
     parts = urlsplit(uri)
     if parts.scheme == "http":
         return parts.hostname in _LOOPBACK_HOSTS
-    if parts.scheme != "https" or not parts.hostname or parts.fragment:
+    if parts.scheme != "https" or not parts.hostname or parts.fragment or parts.query or "@" in parts.netloc:
         return False
-    return hosts is None or parts.hostname.lower() in hosts
+    return hosts is None or allowlist_match(parts.hostname, parts.path, hosts)
+
+
+def _record_from_state(raw: Any) -> _TokenRecord:
+    """A persisted refresh-token record; raises ValueError / TypeError / KeyError when malformed."""
+    if not isinstance(raw, dict):
+        raise TypeError("not an object")
+    client_id = raw["client_id"]
+    scopes = raw.get("scopes", [SCOPE])
+    expires_at = raw["expires_at"]
+    grant_id = raw.get("grant_id") or secrets.token_urlsafe(16)
+    resource = raw.get("resource")
+    if not isinstance(client_id, str) or not isinstance(grant_id, str):
+        raise TypeError("client_id and grant_id must be strings")
+    if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+        raise TypeError("scopes must be a list of strings")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        raise TypeError("expires_at must be a number")
+    if resource is not None and not isinstance(resource, str):
+        raise TypeError("resource must be a string")
+    return _TokenRecord(client_id, list(scopes), int(expires_at), grant_id, resource)
+
+
+def _state_format_problem(data: Any) -> str | None:
+    """Why *data* is not a state file this version can use, or None."""
+    if not isinstance(data, dict):
+        return "is not a JSON object"
+    version = data.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return f"has an unknown format version {version!r}"
+    if version > _STATE_VERSION:
+        return f"was written by a newer version of the server (format {version}, this version reads {_STATE_VERSION})"
+    for key in ("clients", "refresh_tokens"):
+        if not isinstance(data.get(key, {}), dict):
+            return f"has an unexpected format ('{key}' is not an object)"
+    return None
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make a rename in *path* durable; not every file system supports it."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def granted_classes(scopes: list[str] | None) -> set[str] | None:
@@ -613,12 +787,21 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self._pending: dict[str, _PendingLogin] = {}
         self._upstream: dict[str, _UpstreamLogin] = {}
         self._rate_limiter = _LoginRateLimiter(config.login_rate_limit, config.login_rate_window, clock)
+        self._global_failures = _LoginRateLimiter(config.login_global_rate_limit, config.login_rate_window, clock)
+        self._registrations = _LoginRateLimiter(REGISTRATIONS_PER_KEY, REGISTRATION_WINDOW, clock)
         self.metadata_clients = ClientMetadataResolver(
             config.client_hosts, " ".join(config.scopes_supported), fetch=fetch, clock=clock
         )
         self._intervals_exchange = intervals_exchange or self._exchange_intervals_code
         self._totp_last_counter = -1
+        # Key for the consent form tokens (CSRF); a restart also drops the pending requests.
+        self._form_key = secrets.token_bytes(32)
+        # Entries of the state file this version could not read: written back unchanged.
+        self._raw_clients: dict[str, Any] = {}
+        self._raw_refresh: dict[str, Any] = {}
+        self._state_lock = anyio.Lock()
         self._load_state()
+        self._check_state_writable()
 
     @property
     def config(self) -> OAuthConfig:
@@ -633,29 +816,49 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     # ----- persistence ---------------------------------------------------- #
 
     def _load_state(self) -> None:
+        """Read the state file; anything unusable raises ValueError and the file stays untouched."""
         path = self._config.state_file
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise ValueError(f"OAUTH_STATE_FILE {path} is not readable JSON: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ValueError(f"OAUTH_STATE_FILE {path} has an unexpected format")
+            raise ValueError(
+                f"OAUTH_STATE_FILE {path} could not be read ({_one_line(exc)}); the file was left unchanged. "
+                "Repair it, restore a backup or move it away (all clients then have to connect again)"
+            ) from exc
+        problem = _state_format_problem(data)
+        if problem:
+            raise ValueError(
+                f"OAUTH_STATE_FILE {path} {problem}; the file was left unchanged. "
+                "Repair it, restore a backup or move it away (all clients then have to connect again)"
+            )
         now = self._clock()
         for client_id, raw in data.get("clients", {}).items():
-            self._clients[client_id] = OAuthClientInformationFull.model_validate(raw)
+            try:
+                self._clients[client_id] = OAuthClientInformationFull.model_validate(raw)
+            except ValidationError as exc:
+                # Kept verbatim (a stricter SDK must not silently delete registrations).
+                logger.warning(
+                    "OAuth state: client %s could not be read (%d validation error(s)); kept in the file, not usable",
+                    _for_log(client_id),
+                    exc.error_count(),
+                )
+                self._raw_clients[client_id] = raw
         for digest, raw in data.get("refresh_tokens", {}).items():
-            record = _TokenRecord(
-                client_id=str(raw["client_id"]),
-                scopes=[str(scope) for scope in raw.get("scopes", [SCOPE])],
-                expires_at=int(raw["expires_at"]),
-                grant_id=str(raw.get("grant_id", secrets.token_urlsafe(16))),
-                resource=raw.get("resource"),
-            )
+            try:
+                record = _record_from_state(raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("OAuth state: a refresh token entry could not be read (%s); kept in the file", _one_line(exc))
+                self._raw_refresh[digest] = raw
+                continue
+            if record.expires_at <= now:
+                continue
+            if record.client_id in self._raw_clients:
+                self._raw_refresh[digest] = raw
+                continue
             known = record.client_id in self._clients or is_metadata_client_id(record.client_id)
-            if record.expires_at > now and known:
+            if known:
                 self._tokens.refresh[digest] = record
         logger.info(
             "OAuth state loaded: %d client(s), %d refresh token(s)",
@@ -663,15 +866,28 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             len(self._tokens.refresh),
         )
 
-    def _save_state(self) -> None:
+    def _check_state_writable(self) -> None:
+        """Fail at startup, not at the first sign-in, when the state file cannot be written."""
+        directory = self._config.state_file.parent
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            fd, probe = tempfile.mkstemp(prefix=self._config.state_file.name + ".", suffix=".probe", dir=directory)
+            os.close(fd)
+            os.unlink(probe)
+        except OSError as exc:
+            raise ValueError(
+                f"OAUTH_STATE_FILE directory {directory} is not writable ({exc.strerror or _one_line(exc)})"
+            ) from exc
+
+    def _state_snapshot(self) -> dict[str, Any]:
         now = self._clock()
-        data = {
-            "version": _STATE_VERSION,
-            "clients": {
-                client_id: client.model_dump(mode="json", exclude_none=True)
-                for client_id, client in self._clients.items()
-            },
-            "refresh_tokens": {
+        clients: dict[str, Any] = dict(self._raw_clients)
+        clients.update(
+            {client_id: client.model_dump(mode="json", exclude_none=True) for client_id, client in self._clients.items()}
+        )
+        refresh: dict[str, Any] = dict(self._raw_refresh)
+        refresh.update(
+            {
                 digest: {
                     "client_id": record.client_id,
                     "scopes": record.scopes,
@@ -681,8 +897,12 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 }
                 for digest, record in self._tokens.refresh.items()
                 if record.expires_at > now
-            },
-        }
+            }
+        )
+        return {"version": _STATE_VERSION, "clients": clients, "refresh_tokens": refresh}
+
+    def _write_state(self, data: dict[str, Any]) -> None:
+        """Atomically replace the state file (runs in a worker thread)."""
         path = self._config.state_file
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -693,9 +913,53 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 os.fsync(handle.fileno())
             os.chmod(tmp_name, 0o600)
             os.replace(tmp_name, path)
-        except OSError:
+        except BaseException:
             Path(tmp_name).unlink(missing_ok=True)
             raise
+        _fsync_directory(path.parent)
+
+    def _tables(self) -> list[dict[str, Any]]:
+        store = self._tokens
+        return [self._clients, store.codes, store.used_codes, store.access, store.refresh, store.rotated]
+
+    def _changes_since(self, before: list[dict[str, Any]]) -> list[tuple[list[str], dict[str, Any]]]:
+        """Per table: keys added or replaced, and the old entries removed or replaced."""
+        changes = []
+        for old, table in zip(before, self._tables(), strict=True):
+            added = [key for key, value in table.items() if old.get(key) is not value]
+            removed = {key: value for key, value in old.items() if table.get(key) is not value}
+            changes.append((added, removed))
+        return changes
+
+    def _undo(self, changes: list[tuple[list[str], dict[str, Any]]]) -> None:
+        for (added, removed), table in zip(changes, self._tables(), strict=True):
+            for key in added:
+                table.pop(key, None)
+            table.update(removed)
+
+    @contextlib.asynccontextmanager
+    async def _state_change(self) -> AsyncIterator[None]:
+        """Serialize a persisted change: apply it, write the file off the event loop, or undo it.
+
+        The body changes the in-memory tables; if the body raises or the file cannot be
+        written, exactly the body's changes are undone (concurrent requests keep theirs),
+        so a client can simply retry: a refresh token or code is never lost to a full disk.
+        """
+        async with self._state_lock:
+            before = [dict(table) for table in self._tables()]
+            try:
+                yield
+            except Exception:
+                self._undo(self._changes_since(before))
+                raise
+            changes = self._changes_since(before)
+            try:
+                await anyio.to_thread.run_sync(self._write_state, self._state_snapshot())
+            except Exception as exc:
+                self._undo(changes)
+                if isinstance(exc, OSError):
+                    logger.error("Could not write OAUTH_STATE_FILE %s: %s", self._config.state_file, _one_line(exc))
+                raise
 
     # ----- helpers -------------------------------------------------------- #
 
@@ -708,6 +972,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     def _issue_tokens(
         self, client_id: str, scopes: list[str], grant_id: str, resource: str | None
     ) -> OAuthToken:
+        """Add a new access / refresh token pair (call inside :meth:`_state_change`)."""
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         now = self._now()
@@ -718,7 +983,6 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             client_id, scopes, now + self._config.refresh_token_ttl, grant_id, resource
         )
         self._purge_expired_tokens()
-        self._save_state()
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
@@ -737,33 +1001,62 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             del store.used_codes[code]
         for code in [c for c, rec in store.codes.items() if rec.expires_at <= now]:
             del store.codes[code]
+        for digest in [d for d, rot in store.rotated.items() if rot.record.expires_at <= now]:
+            del store.rotated[digest]
+
+    def _remember_rotated(self, digest: str, record: _TokenRecord) -> None:
+        rotated = self._tokens.rotated
+        rotated[digest] = _RotatedToken(record, self._clock())
+        while len(rotated) > MAX_ROTATED_REFRESH_TOKENS:
+            del rotated[next(iter(rotated))]
+
+    def _in_grace(self, rotated: _RotatedToken) -> bool:
+        return self._clock() - rotated.rotated_at <= self._config.refresh_reuse_grace
 
     def _revoke_grant(self, grant_id: str) -> None:
+        """Drop every token of a grant (call inside :meth:`_state_change`)."""
         store = self._tokens
-        for digest in [d for d, rec in store.access.items() if rec.grant_id == grant_id]:
-            del store.access[digest]
-        refresh_digests = [d for d, rec in store.refresh.items() if rec.grant_id == grant_id]
-        for digest in refresh_digests:
-            del store.refresh[digest]
-        if refresh_digests:
-            self._save_state()
+        for bucket in (store.access, store.refresh):
+            for digest in [d for d, rec in bucket.items() if rec.grant_id == grant_id]:
+                del bucket[digest]
+        for digest in [d for d, rot in store.rotated.items() if rot.record.grant_id == grant_id]:
+            del store.rotated[digest]
+
+    @staticmethod
+    def _evict_for_key(table: dict[str, Any], key: str, per_key: int, total: int) -> None:
+        """Make room in *table* (insertion ordered) for one more entry of *key*.
+
+        A key may hold at most *per_key* entries (its oldest is dropped); when the table is
+        full, the oldest entry of the key with the most entries goes, so one address cannot
+        push out another address's sign-in. Without a known address (``unknown``: an app
+        built without the middleware) only the global limit applies.
+        """
+        if key == "unknown":
+            per_key = total
+        mine = [k for k, entry in table.items() if entry.key == key]
+        while len(mine) >= per_key:
+            del table[mine.pop(0)]
+        while len(table) >= total:
+            counts: dict[str, int] = {}
+            for entry in table.values():
+                counts[entry.key] = counts.get(entry.key, 0) + 1
+            busiest = max(counts, key=lambda k: counts[k])
+            del table[next(k for k, entry in table.items() if entry.key == busiest)]
 
     def _purge_pending(self) -> None:
         now = self._clock()
         for request_id in [r for r, p in self._pending.items() if p.expires_at <= now]:
             del self._pending[request_id]
-        while len(self._pending) >= MAX_PENDING_LOGINS:
-            del self._pending[next(iter(self._pending))]
         for state in [s for s, u in self._upstream.items() if u.expires_at <= now]:
             del self._upstream[state]
-        while len(self._upstream) >= MAX_PENDING_LOGINS:
-            del self._upstream[next(iter(self._upstream))]
 
     def _evict_clients(self) -> None:
         """Keep the client table bounded; /register is reachable without credentials."""
         if len(self._clients) < MAX_CLIENTS:
             return
         active = {record.client_id for record in self._tokens.refresh.values()}
+        active |= {pending.client_id for pending in self._pending.values()}
+        active |= {code.client_id for code in self._tokens.codes.values()}
         by_age = sorted(self._clients.values(), key=lambda c: c.client_id_issued_at or 0)
         idle = [c for c in by_age if c.client_id not in active]
         victim = (idle or by_age)[0]
@@ -803,15 +1096,22 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 allowed = "any https host" if hosts is None else ", ".join(sorted(hosts)) or "none"
                 raise RegistrationError(
                     "invalid_redirect_uri",
-                    f"redirect_uris must use https on an allowed host ({allowed}); "
+                    f"redirect_uris must use https without a query string on an allowed host ({allowed}); "
                     "http is only allowed for localhost / 127.0.0.1",
                 )
         if client_info.client_id is None:
             raise RegistrationError("invalid_client_metadata", "client_id is missing")
         _check_registration_size(client_info, len(uris))
-        self._evict_clients()
-        self._clients[client_info.client_id] = client_info
-        self._save_state()
+        key = request_client_key()
+        if key != "unknown" and self._registrations.is_blocked(key):
+            logger.warning("Client registration rate limit reached for %s", key)
+            raise RegistrationError(
+                "invalid_client_metadata", "too many client registrations from this address; try again later"
+            )
+        async with self._state_change():
+            self._evict_clients()
+            self._clients[client_info.client_id] = client_info
+        self._registrations.record_failure(key)
         logger.info(
             "Registered OAuth client %s (%s, auth=%s)",
             _for_log(client_info.client_id),
@@ -824,6 +1124,8 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         if params.resource and not self._config.same_origin(params.resource):
             raise AuthorizeError("invalid_request", "the resource indicator does not name this server")
         self._purge_pending()
+        key = request_client_key()
+        self._evict_for_key(self._pending, key, MAX_PENDING_PER_KEY, MAX_PENDING_LOGINS)
         request_id = secrets.token_urlsafe(32)
         scopes = params.scopes or self._client_scopes(client)
         requested = tuple(p for p in self._config.permission_classes if _scope_for(p) in scopes)
@@ -836,6 +1138,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             client_verified=is_metadata_client_id(client.client_id or ""),
             redirect_host=urlsplit(str(params.redirect_uri)).hostname or "",
             offered=requested or self._config.permission_classes,
+            key=key,
         )
         logger.info("Authorization requested by client %s", _for_log(client.client_id))
         return f"{self.login_url}?request={request_id}"
@@ -845,10 +1148,12 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     ) -> AuthorizationCode | None:
         """Return a live code of *client*; a reused code revokes the tokens it produced."""
         self._purge_expired_tokens()
-        used = self._tokens.used_codes.pop(authorization_code, None)
+        used = self._tokens.used_codes.get(authorization_code)
         if used is not None:
             logger.warning("Authorization code reused by client %s; revoking grant", _for_log(client.client_id))
-            self._revoke_grant(used[1])
+            async with self._state_change():
+                self._tokens.used_codes.pop(authorization_code, None)
+                self._revoke_grant(used[1])
             return None
         code = self._tokens.codes.get(authorization_code)
         if code is None or code.client_id != client.client_id:
@@ -859,21 +1164,42 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         """Consume the single-use code and issue access + refresh tokens."""
-        code = self._tokens.codes.pop(authorization_code.code, None)
-        if code is None or code.client_id != client.client_id:
-            raise TokenError("invalid_grant", "authorization code is not valid")
-        grant_id = secrets.token_urlsafe(16)
-        self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
+        async with self._state_change():
+            code = self._tokens.codes.pop(authorization_code.code, None)
+            if code is None or code.client_id != client.client_id:
+                raise TokenError("invalid_grant", "authorization code is not valid")
+            grant_id = secrets.token_urlsafe(16)
+            self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
+            token = self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
         logger.info("Issued tokens to client %s", _for_log(client.client_id))
-        return self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
+        return token
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        """Return the refresh token if it belongs to *client* and has not expired."""
+        """Return the refresh token if it belongs to *client* and has not expired.
+
+        A token that was already exchanged is accepted again for the grace period (a client
+        that lost the response retries); presented later it revokes the whole grant, because
+        then two parties hold tokens of one grant (RFC 9700, refresh token rotation).
+        """
         self._purge_expired_tokens()
-        record = self._tokens.refresh.get(_digest(refresh_token))
-        if record is None or record.client_id != client.client_id:
+        digest = _digest(refresh_token)
+        record = self._tokens.refresh.get(digest)
+        if record is None:
+            rotated = self._tokens.rotated.get(digest)
+            if rotated is None or rotated.record.client_id != client.client_id:
+                return None
+            if not self._in_grace(rotated):
+                logger.warning(
+                    "Refresh token of client %s was used again after it had been exchanged; revoking the grant",
+                    _for_log(client.client_id),
+                )
+                async with self._state_change():
+                    self._revoke_grant(rotated.record.grant_id)
+                return None
+            record = rotated.record
+        elif record.client_id != client.client_id:
             return None
         return RefreshToken(
             token=refresh_token,
@@ -886,11 +1212,26 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
         """Rotate the refresh token and issue a new access token for the same grant."""
-        record = self._tokens.refresh.pop(_digest(refresh_token.token), None)
-        if record is None or record.client_id != client.client_id:
-            raise TokenError("invalid_grant", "refresh token is not valid")
+        digest = _digest(refresh_token.token)
+        async with self._state_change():
+            record = self._tokens.refresh.pop(digest, None)
+            retry = False
+            if record is None:
+                rotated = self._tokens.rotated.get(digest)
+                if rotated is None or not self._in_grace(rotated):
+                    raise TokenError("invalid_grant", "refresh token is not valid")
+                record, retry = rotated.record, True
+            if record.client_id != client.client_id:
+                raise TokenError("invalid_grant", "refresh token is not valid")
+            if not retry:
+                self._remember_rotated(digest, record)
+            token = self._issue_tokens(
+                record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource
+            )
+        if retry:
+            logger.info("Refresh token of client %s presented again within the grace period", _for_log(client.client_id))
         logger.info("Refreshed tokens for client %s", _for_log(client.client_id))
-        return self._issue_tokens(record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource)
+        return token
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         """Return the access token metadata used by the bearer middleware (audience-checked)."""
@@ -910,12 +1251,20 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         """Revoke the whole grant (access + refresh token) the given token belongs to."""
-        bucket = self._tokens.refresh if isinstance(token, RefreshToken) else self._tokens.access
-        record = bucket.get(_digest(token.token))
+        digest = _digest(token.token)
+        record: _TokenRecord | None
+        if isinstance(token, RefreshToken):
+            record = self._tokens.refresh.get(digest)
+            rotated = self._tokens.rotated.get(digest)
+            if record is None and rotated is not None:
+                record = rotated.record
+        else:
+            record = self._tokens.access.get(digest)
         if record is None:
             return
         logger.info("Revoked tokens of client %s", _for_log(record.client_id))
-        self._revoke_grant(record.grant_id)
+        async with self._state_change():
+            self._revoke_grant(record.grant_id)
 
     # ----- consent / sign-in support -------------------------------------- #
 
@@ -924,16 +1273,33 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self._purge_pending()
         return self._pending.get(request_id) if request_id else None
 
+    def form_token(self, browser: str, request_id: str) -> str:
+        """Consent form token bound to the browser cookie *browser* and the request (CSRF)."""
+        message = f"{browser}|{request_id}".encode("utf-8")
+        return hmac.new(self._form_key, message, hashlib.sha256).hexdigest()
+
+    def check_form_token(self, browser: str, request_id: str, token: str) -> bool:
+        """Constant-time check of a submitted consent form token."""
+        if not browser or not token:
+            return False
+        return hmac.compare_digest(self.form_token(browser, request_id).encode("ascii"), token.encode("utf-8"))
+
     def login_blocked(self, key: str) -> bool:
         """True when *key* (client IP) exceeded the failed-login limit."""
         return self._rate_limiter.is_blocked(key)
 
-    def record_login_failure(self, key: str) -> None:
-        """Count a failed login for *key*."""
+    def local_login_blocked(self) -> bool:
+        """True when password / API-key sign-ins failed too often across all addresses."""
+        return self._global_failures.is_blocked("*")
+
+    def record_login_failure(self, key: str, local: bool = False) -> None:
+        """Count a failed login for *key*; *local* failures (password, API key) also count globally."""
         self._rate_limiter.record_failure(key)
+        if local:
+            self._global_failures.record_failure("*")
 
     def verify_credentials(self, username: str, password: str) -> bool:
-        """Constant-time check of the submitted credentials."""
+        """Constant-time check of the submitted credentials (CPU heavy with a hash: run it in a thread)."""
         return self._config.verify_credentials(username, password)
 
     def verify_api_key(self, api_key: str) -> bool:
@@ -945,15 +1311,20 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         """True when the password and API-key sign-ins need an authenticator code."""
         return self._config.totp_secret is not None
 
-    def verify_second_factor(self, code: str) -> bool:
-        """Accept an authenticator code once (no replay); always True without TOTP."""
+    def verify_second_factor(self, code: str, consume: bool = True) -> bool:
+        """Accept an authenticator code once (no replay); always True without TOTP.
+
+        With ``consume=False`` (the first factor failed) the code is checked the same way but
+        stays usable, so a typo in the password does not burn the current code.
+        """
         secret = self._config.totp_secret
         if secret is None:
             return True
         counter = match_counter(secret, code or "", self._clock())
         if counter is None or counter <= self._totp_last_counter:
             return False
-        self._totp_last_counter = counter
+        if consume:
+            self._totp_last_counter = counter
         return True
 
     def grant_for(self, pending: _PendingLogin, chosen: list[str] | None) -> tuple[str, ...]:
@@ -963,7 +1334,10 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
 
     def complete_login(self, request_id: str, login_key: str, granted: tuple[str, ...] | None = None) -> str:
         """Consume the pending request, mint a code and return the client redirect URL."""
-        pending = self._pending.pop(request_id)
+        pending = self._pending.pop(request_id, None)
+        if pending is None:
+            # Expired, denied or finished in another tab while this sign-in was running.
+            raise LoginError("This sign-in link is invalid or has expired. Go back to your MCP client and connect again.")
         self._rate_limiter.reset(login_key)
         params = pending.params
         classes = granted if granted is not None else ("read",)
@@ -986,16 +1360,22 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
 
     def deny_login(self, request_id: str) -> str:
         """Consume the pending request and return the access_denied redirect URL."""
-        pending = self._pending.pop(request_id)
+        pending = self._pending.pop(request_id, None)
+        if pending is None:
+            raise LoginError("This sign-in link is invalid or has expired. Go back to your MCP client and connect again.")
         logger.info("Authorization denied for client %s", _for_log(pending.client_id))
         return self._redirect(pending, error="access_denied", error_description="The athlete denied the request")
 
     # ----- sign-in with Intervals.icu -------------------------------------- #
 
-    def begin_intervals_login(self, request_id: str, granted: tuple[str, ...]) -> tuple[str, str]:
+    def begin_intervals_login(self, request_id: str, granted: tuple[str, ...], login_key: str = "unknown") -> tuple[str, str]:
         """Return (Intervals.icu authorize URL, browser binding value for a cookie)."""
         if self.pending_login(request_id) is None:
             raise LoginError("This sign-in link is invalid or has expired.")
+        # Only the latest attempt of a request counts (the cookie of an earlier one is overwritten anyway).
+        for state in [s for s, u in self._upstream.items() if u.request_id == request_id]:
+            del self._upstream[state]
+        self._evict_for_key(self._upstream, login_key, MAX_PENDING_PER_KEY, MAX_PENDING_LOGINS)
         state = secrets.token_urlsafe(32)
         browser = secrets.token_urlsafe(32)
         self._upstream[state] = _UpstreamLogin(
@@ -1003,6 +1383,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             granted=granted,
             browser_digest=_digest(browser),
             expires_at=self._clock() + LOGIN_REQUEST_TTL,
+            key=login_key,
         )
         query = urlencode(
             {
@@ -1038,9 +1419,9 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         if not athlete_id or athlete_id not in self._config.allowed_athletes:
             self._pending.pop(upstream.request_id, None)
             self.record_login_failure(login_key)
-            logger.warning("Intervals.icu athlete %s is not allowed on this server", athlete_id or "(unknown)")
+            logger.warning("Intervals.icu athlete %s is not allowed on this server", _for_log(athlete_id or "(unknown)"))
             raise LoginError("This Intervals.icu account is not allowed to use this server.", 403)
-        logger.info("Intervals.icu sign-in confirmed for athlete %s", athlete_id)
+        logger.info("Intervals.icu sign-in confirmed for athlete %s", _for_log(athlete_id))
         return self.complete_login(upstream.request_id, login_key, upstream.granted)
 
     async def _exchange_intervals_code(self, code: str) -> dict[str, Any]:

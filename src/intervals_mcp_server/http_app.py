@@ -13,7 +13,11 @@ When the built-in OAuth server is enabled it also adds what the MCP SDK does not
 * protected resource metadata listing the permission scopes,
 * an ``iss`` parameter on every authorization response of ``/authorize`` (also the error
   redirects produced by the SDK), so clients can use a stable redirect URI,
-* verification of ``private_key_jwt`` client assertions at ``/token`` and ``/revoke``.
+* verification of ``private_key_jwt`` client assertions at ``/token`` and ``/revoke``
+  (and, by default, refusal of token requests without one from clients whose metadata
+  document declares ``private_key_jwt``),
+* the client address for ``/authorize`` and ``/register``, whose SDK handlers do not hand
+  the request to the provider (per-address limits of pending sign-ins and registrations).
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from intervals_mcp_server.auth import SingleUserOAuthProvider
+from intervals_mcp_server.auth import SingleUserOAuthProvider, reset_request_client_key, set_request_client_key
 from intervals_mcp_server.auth_clients import (
     ASSERTION_ALGORITHMS,
     ClientAssertionMiddleware,
@@ -69,6 +73,24 @@ class IssuerParameterMiddleware:  # pylint: disable=too-few-public-methods
             await send(message)
 
         await self.app(scope, receive, send_with_iss)
+
+
+class ClientKeyMiddleware:  # pylint: disable=too-few-public-methods
+    """Make the client address of the request available to the provider (rate-limit key)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        token = set_request_client_key(client[0] if client else None)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            reset_request_client_key(token)
 
 
 class PublicClientRevocationMiddleware:  # pylint: disable=too-few-public-methods
@@ -154,9 +176,16 @@ def _json_route(path: str, payload: dict[str, Any]) -> Route:
 
 
 def _replace_route(routes: list[BaseRoute], path: str, new: Route) -> None:
+    """Replace the SDK route for *path* with *new* (keeping the SDK's path).
+
+    With an issuer that has a path (``https://host/prefix``) the SDK serves the metadata
+    at ``<path>/prefix`` (RFC 8414 / RFC 9728 path insertion); that route is replaced, so
+    there is exactly one document and it is the one the SDK advertises.
+    """
     for index, route in enumerate(routes):
-        if getattr(route, "path", None) == path:
-            routes[index] = new
+        route_path = getattr(route, "path", None)
+        if isinstance(route_path, str) and (route_path == path or route_path.startswith(path + "/")):
+            routes[index] = Route(route_path, endpoint=new.endpoint, methods=list(new.methods or []))
             return
     routes.append(new)
 
@@ -181,6 +210,8 @@ def _apply_oauth(app: Starlette, provider: SingleUserOAuthProvider, settings: Au
     _replace_route(routes, PRM_PATH, _json_route(PRM_PATH, resource))
     _wrap_route(routes, "/authorize", lambda inner: IssuerParameterMiddleware(inner, config.metadata_issuer))
     _wrap_route(routes, "/revoke", PublicClientRevocationMiddleware)
+    for path in ("/authorize", "/register"):
+        _wrap_route(routes, path, ClientKeyMiddleware)
     if config.private_key_jwt and provider.metadata_clients.enabled:
         audiences = {
             config.issuer,
@@ -189,8 +220,12 @@ def _apply_oauth(app: Starlette, provider: SingleUserOAuthProvider, settings: Au
             config.issuer + "/revoke",
         }
         verifier = ClientAssertionVerifier(provider.metadata_clients, audiences)
-        for path in ("/token", "/revoke"):
-            _wrap_route(routes, path, lambda inner: ClientAssertionMiddleware(inner, verifier))
+        _wrap_route(
+            routes,
+            "/token",
+            lambda inner: ClientAssertionMiddleware(inner, verifier, require_declared=config.require_private_key_jwt),
+        )
+        _wrap_route(routes, "/revoke", lambda inner: ClientAssertionMiddleware(inner, verifier))
 
 
 def build_http_app(

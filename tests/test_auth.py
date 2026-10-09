@@ -40,6 +40,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.testclient import TestClient
 
 from intervals_mcp_server import auth
+from tests.oauth_helpers import submit_consent
 from intervals_mcp_server.auth import (
     SingleUserOAuthProvider,
     auth_status_from_env,
@@ -148,9 +149,9 @@ def login(
     client: TestClient, request_id: str, password: str, username: str = "athlete"
 ) -> Any:
     """Submit the login form."""
-    return client.post(
-        "/oauth/login",
-        data={"request": request_id, "username": username, "password": password},
+    return submit_consent(
+        client,
+        {"request": request_id, "username": username, "password": password},
     )
 
 
@@ -451,8 +452,12 @@ def test_streamable_http_initialize_with_bearer(oauth_env):
 # --------------------------------------------------------------------------- #
 
 
-def test_refresh_token_rotation(client):
-    """The refresh grant returns new tokens and the old refresh token stops working."""
+def test_refresh_token_rotation(oauth_env):
+    """The refresh grant returns new tokens and the old refresh token stops working.
+
+    Without a grace period the replay is reuse: it fails and revokes the grant.
+    """
+    client = build_app({**oauth_env, "OAUTH_REFRESH_REUSE_GRACE": "0"})[1]
     client_id, tokens = obtain_tokens(client)
     response = client.post(
         "/token",
@@ -470,6 +475,8 @@ def test_refresh_token_rotation(client):
     )
     assert replay.status_code == 400
     assert replay.json()["error"] == "invalid_grant"
+    # the reuse revoked the grant: the rotated tokens stopped working too
+    assert client.get("/whoami", headers=bearer(rotated["access_token"])).json()["client_id"] is None
 
 
 def test_revocation(client):
@@ -693,9 +700,9 @@ def obtain_granted_tokens(client: TestClient, grants: list[str]) -> tuple[str, d
     client_id = register(client)["client_id"]
     verifier, challenge = pkce_pair()
     request_id = start_authorization(client, client_id, challenge)
-    redirect = client.post(
-        "/oauth/login",
-        data={"request": request_id, "username": "athlete", "password": PASSWORD, "grant": grants},
+    redirect = submit_consent(
+        client,
+        {"request": request_id, "username": "athlete", "password": PASSWORD, "grant": grants},
     )
     assert redirect.status_code == 302, redirect.text
     query = parse_qs(urlsplit(redirect.headers["location"]).query)

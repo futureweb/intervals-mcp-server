@@ -28,6 +28,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from starlette.testclient import TestClient
 
 from intervals_mcp_server import mcp_instance
+from tests.oauth_helpers import submit_consent
 from intervals_mcp_server.auth import (
     SingleUserOAuthProvider,
     auth_settings,
@@ -46,6 +47,7 @@ CHATGPT_JWKS = "https://chatgpt.com/oauth/jwks.json"
 STABLE_REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
 DCR_REDIRECT = "https://chatgpt.com/connector/oauth/abc123"
 PASSWORD = "correct horse battery staple"
+ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
 PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 PUBLIC_JWK = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(PRIVATE_KEY.public_key()))
@@ -216,9 +218,9 @@ def test_cimd_client_full_flow_with_private_key_jwt(tmp_path):
     assert "ChatGPT" in page and "verified: chatgpt.com" in page
     assert 'value="write"' in page and 'value="destructive"' not in page
 
-    redirect = client.post(
-        "/oauth/login",
-        data={"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD, "grant": ["read", "write"]},
+    redirect = submit_consent(
+        client,
+        {"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD, "grant": ["read", "write"]},
     )
     assert redirect.status_code == 302
     assert redirect.headers["location"].startswith(STABLE_REDIRECT + "?")
@@ -289,19 +291,48 @@ def test_private_key_jwt_rejections(tmp_path):
     assert response.status_code == 401 and response.json()["error"] == "invalid_client"
 
 
-def test_cimd_public_client_without_assertion(tmp_path):
-    """ChatGPT may also authenticate as a public client; PKCE protects the code."""
-    _, _, client = make_app(make_env(tmp_path))
+def _code_for(client: TestClient, client_id: str = CHATGPT_ID) -> tuple[str, str]:
     verifier, challenge = pkce_pair()
-    request_id = request_id_from(authorize(client, CHATGPT_ID, STABLE_REDIRECT, challenge))
-    redirect = client.post("/oauth/login", data={"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD})
-    code = query_of(redirect)["code"]
+    request_id = request_id_from(authorize(client, client_id, STABLE_REDIRECT, challenge))
+    redirect = submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD})
+    return query_of(redirect)["code"], verifier
+
+
+def test_cimd_public_client_without_assertion(tmp_path):
+    """A metadata document that does not declare private_key_jwt authenticates as a public client; PKCE protects the code."""
+    public_doc = dict(CHATGPT_DOC, token_endpoint_auth_method="none")
+    _, _, client = make_app(make_env(tmp_path), web=FakeWeb({CHATGPT_ID: public_doc}))
+    code, verifier = _code_for(client)
     token = client.post(
         "/token",
         data={"grant_type": "authorization_code", "code": code, "redirect_uri": STABLE_REDIRECT, "code_verifier": verifier, "client_id": CHATGPT_ID},
     )
     assert token.status_code == 200, token.text
     assert token.json()["scope"] == "mcp intervals:read"
+
+
+def test_declared_private_key_jwt_is_required(tmp_path):
+    """SEC-8: a client whose document declares private_key_jwt (ChatGPT) needs its assertion for
+    every token request, so a leaked refresh token alone is useless; OAUTH_REQUIRE_PRIVATE_KEY_JWT=false
+    restores the old behaviour."""
+    _, _, client = make_app(make_env(tmp_path))
+    code, verifier = _code_for(client)
+    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": STABLE_REDIRECT, "code_verifier": verifier, "client_id": CHATGPT_ID}
+    refused = client.post("/token", data=form)
+    assert refused.status_code == 401 and refused.json()["error"] == "invalid_client"
+    signed = client.post("/token", data={**form, "client_assertion_type": ASSERTION_TYPE, "client_assertion": client_assertion()})
+    assert signed.status_code == 200, signed.text
+    refresh_form = {"grant_type": "refresh_token", "refresh_token": signed.json()["refresh_token"], "client_id": CHATGPT_ID}
+    assert client.post("/token", data=refresh_form).status_code == 401
+    refreshed = client.post(
+        "/token", data={**refresh_form, "client_assertion_type": ASSERTION_TYPE, "client_assertion": client_assertion()}
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+    _, _, relaxed = make_app(make_env(tmp_path / "relaxed", OAUTH_REQUIRE_PRIVATE_KEY_JWT="false"))
+    code, verifier = _code_for(relaxed)
+    token = relaxed.post("/token", data={**form, "code": code, "code_verifier": verifier})
+    assert token.status_code == 200, token.text
 
 
 def test_cimd_document_validation():
@@ -353,7 +384,7 @@ def test_deny_redirects_with_access_denied_and_iss(tmp_path):
     _, _, client = make_app(make_env(tmp_path))
     client_id = register(client)
     request_id = request_id_from(authorize(client, client_id, DCR_REDIRECT, pkce_pair()[1]))
-    response = client.post("/oauth/login", data={"request": request_id, "action": "deny"})
+    response = submit_consent(client, {"request": request_id, "action": "deny"})
     query = query_of(response)
     assert query == {
         "error": "access_denied",
@@ -405,7 +436,7 @@ def start_intervals(client: TestClient, grant: list[str] | None = None) -> tuple
     request_id = request_id_from(authorize(client, client_id, DCR_REDIRECT, challenge))
     page = client.get("/oauth/login", params={"request": request_id}).text
     assert "Continue with Intervals.icu" in page and 'type="password"' not in page
-    response = client.post("/oauth/login", data={"request": request_id, "action": "intervals", "grant": grant or ["read"]})
+    response = submit_consent(client, {"request": request_id, "action": "intervals", "grant": grant or ["read"]})
     assert response.status_code == 302
     location = urlsplit(response.headers["location"])
     assert f"{location.scheme}://{location.netloc}{location.path}" == "https://intervals.icu/oauth/authorize"
@@ -465,7 +496,7 @@ def test_password_is_refused_when_only_intervals_sign_in_is_enabled(tmp_path):
     _, _, client = make_app(intervals_env(tmp_path, OAUTH_PASSWORD=PASSWORD))
     client_id = register(client)
     request_id = request_id_from(authorize(client, client_id, DCR_REDIRECT, pkce_pair()[1]))
-    response = client.post("/oauth/login", data={"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD})
+    response = submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD})
     assert response.status_code == 400
 
 
