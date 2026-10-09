@@ -1505,32 +1505,43 @@ def auth_settings(config: OAuthConfig) -> AuthSettings:
         return AuthSettings(**settings)
 
 
-def auth_status_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Describe the auth configuration for a status tool; never includes secrets."""
+def auth_status_from_env(environ: Mapping[str, str] | None = None, include_private: bool = False) -> dict[str, Any]:
+    """Describe the auth configuration for a status report; never includes secrets.
+
+    The sign-in user name, the password source, the allowed athletes and the state file
+    path describe the deployment rather than the connection; they are only included with
+    *include_private* (``--doctor`` on the server itself), not in the MCP tool's answer.
+    """
     env = os.environ if environ is None else environ
     if _auth_mode(env) != "oauth":
-        return {"mode": "none", "issuer": None, "state_file": None}
+        return {"mode": "none", "issuer": None, **({"state_file": None} if include_private else {})}
     try:
         methods: list[str] = list(_login_methods(env))
     except ValueError:
         methods = ["invalid"]
-    athletes = env.get("OAUTH_ALLOWED_ATHLETES", "").strip() or env.get("ATHLETE_ID", "").strip()
-    return {
+    status: dict[str, Any] = {
         "mode": "oauth",
         "issuer": env.get("MCP_PUBLIC_URL", "").strip() or None,
-        "state_file": str(Path(env.get("OAUTH_STATE_FILE", "").strip() or DEFAULT_STATE_FILE)),
         "login": methods,
         "intervals_app": "configured" if env.get("INTERVALS_OAUTH_CLIENT_ID", "").strip() else "not configured",
-        "allowed_athletes": sorted(normalize_athlete_id(a) for a in athletes.split(",") if a.strip()),
-        "username": env.get("OAUTH_USERNAME", "").strip() or DEFAULT_USERNAME,
-        "password_source": (
-            "hash"
-            if env.get("OAUTH_PASSWORD_HASH", "").strip()
-            else "plain" if env.get("OAUTH_PASSWORD") else "missing"
-        ),
         "second_factor": "totp" if env.get("OAUTH_TOTP_SECRET", "").strip() else "none",
         "dynamic_registration": env.get("OAUTH_DYNAMIC_REGISTRATION", "true").strip().lower() not in _FALSE,
     }
+    if include_private:
+        athletes = env.get("OAUTH_ALLOWED_ATHLETES", "").strip() or env.get("ATHLETE_ID", "").strip()
+        status.update(
+            {
+                "state_file": str(Path(env.get("OAUTH_STATE_FILE", "").strip() or DEFAULT_STATE_FILE)),
+                "allowed_athletes": sorted(normalize_athlete_id(a) for a in athletes.split(",") if a.strip()),
+                "username": env.get("OAUTH_USERNAME", "").strip() or DEFAULT_USERNAME,
+                "password_source": (
+                    "hash"
+                    if env.get("OAUTH_PASSWORD_HASH", "").strip()
+                    else "plain" if env.get("OAUTH_PASSWORD") else "missing"
+                ),
+            }
+        )
+    return status
 
 
 # --------------------------------------------------------------------------- #
