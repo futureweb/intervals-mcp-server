@@ -369,6 +369,8 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     header = f"Workout execution for {_activity_header(activity)}"
     if planned:
         header += f"\nPlan source: {plan_source}"
+    elif paired and event:
+        header += f"\nEvent {event.get('id')} ('{event.get('name')}', {event.get('category')}) has no workout steps; analysing intervals only."
     elif paired:
         header += f"\nPlanned workout {paired} could not be loaded; analysing intervals only."
     else:

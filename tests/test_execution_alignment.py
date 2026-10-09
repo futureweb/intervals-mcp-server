@@ -282,7 +282,7 @@ def test_event_without_workout_document_does_not_crash(monkeypatch):
     _install_router(monkeypatch, {"/activity/": activity, "/streams": EXECUTION_STREAMS, "/intervals": EXECUTION_INTERVALS,
                                   "/events/77": {"id": 77, "category": "RACE_A", "name": "Race", "workout_doc": None}})
     text = asyncio.run(analyze_workout_execution("i1"))
-    assert "No planned workout:" in text
+    assert "Event 77 ('Race', RACE_A) has no workout steps; analysing intervals only." in text and "No planned workout:" in text
     text = asyncio.run(analyze_workout_execution("i1", event_id="77"))
     assert "No planned workout:" in text
 
