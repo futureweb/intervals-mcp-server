@@ -409,7 +409,7 @@ def _correlation(
         return None
 
 
-def compute_correlation(
+def compute_correlation(  # pylint: disable=too-many-locals
     entries: list[dict[str, Any]],
     metric_a: str,
     metric_b: str,
@@ -431,7 +431,7 @@ def compute_correlation(
         if value_a is not None and value_b is not None:
             pairs.append((value_a, value_b))
     zeros = sum(
-        1 for entry in by_date.values() for metric in {metric_a, metric_b}
+        1 for entry in by_date.values() for metric in dict.fromkeys((metric_a, metric_b))
         if metric in ZERO_MEANS_MISSING and _number(entry.get(metric)) == 0
     )
     xs = [a for a, _ in pairs]

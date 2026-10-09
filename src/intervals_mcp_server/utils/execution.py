@@ -617,7 +617,7 @@ def _planned_amount(step: dict[str, Any], has_distance: bool) -> tuple[str, floa
     return None
 
 
-def _match_options(  # pylint: disable=too-many-locals
+def _match_options(  # pylint: disable=too-many-locals,too-many-branches
     step: dict[str, Any], spans: list[_Span], j: int, profile: Profile, part_cost: Any
 ) -> list[tuple[int, float]]:
     """(k, cost) for matching ``step`` with the k consecutive spans ending before index ``j``.
@@ -635,6 +635,9 @@ def _match_options(  # pylint: disable=too-many-locals
     options: list[tuple[int, float]] = []
     last = spans[j - 1] if j else None
     covered_time, covered_distance, worst_part = 0.0, 0.0, 0.0
+    weighted, weights = 0.0, 0.0  # interval averages, for intervals without sample indices
+    stream = STREAM_KEYS[target["kind"]] if target else ""
+    use_stream = bool(target) and last is not None and last.end is not None and profile.has(stream)
     for k in range(1, min(j, MAX_MERGE_PARTS) + 1):
         part = spans[j - k]
         if k > 1:
@@ -653,7 +656,6 @@ def _match_options(  # pylint: disable=too-many-locals
                     break
         covered_time += part.active
         covered_distance += part.distance or 0.0
-        parts = spans[j - k : j]
         if amount is None:
             cost = 0.25
         else:
@@ -663,7 +665,16 @@ def _match_options(  # pylint: disable=too-many-locals
             options.append((k, cost + 0.25))
             continue
         worst_part = max(worst_part, part_cost(j - k))
-        intensity = _intensity_cost(_span_intensity(parts, target["kind"], profile, cap_secs), target)
+        average = _num(part.interval.get(INTERVAL_KEYS[target["kind"]]))
+        if average is not None and (part.active or part.elapsed):
+            weighted += average * (part.active or part.elapsed)
+            weights += part.active or part.elapsed
+        if use_stream and part.start is not None and last is not None and last.end is not None:
+            end = profile.cap_by_time(part.start, last.end, cap_secs) if cap_secs else last.end
+            value = profile.mean(stream, part.start, end)
+        else:  # as _span_intensity without samples: time-weighted interval averages
+            value = weighted / weights if weights else None
+        intensity = _intensity_cost(value, target)
         if k > 1 and worst_part > intensity + MERGE_PART_MAX_COST:
             continue
         options.append((k, cost + weight * intensity))

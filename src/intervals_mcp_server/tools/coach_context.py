@@ -64,7 +64,7 @@ RECENT_DAYS = 7
 MIN_ROLLING_MEANS = 14  # 7-day means in the baseline needed for their spread (the z denominator)
 
 
-def _recovery(entries: list[dict[str, Any]], end: date) -> dict[str, Any]:
+def _recovery(entries: list[dict[str, Any]], end: date) -> dict[str, Any]:  # pylint: disable=too-many-locals
     """7-day mean of HRV, resting HR and sleep against the 42 days before those 7 days (numbers only).
 
     The baseline excludes the compared days. ``z`` relates the difference to the spread
