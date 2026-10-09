@@ -199,6 +199,8 @@ First public beta of the Futureweb fork. Based on upstream
   user, security policy, issue and PR templates, documentation (`docs/`).
 
 ### Fixed
+- POST requests are no longer retried after 500/502/503/504: Intervals.icu may already have created the
+  event, so a retry could duplicate it. POST is retried only on 429; GET/PUT/DELETE as before.
 - `add_or_update_event` / `add_or_update_note` updates are partial: only passed fields are sent, so an
   update no longer clears the description, moves the event to today or turns a NOTE into a WORKOUT;
   new optional `category` (e.g. `RACE_A`); a name is only required when creating (reported in
