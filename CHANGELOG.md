@@ -9,6 +9,43 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Changed (phase 5: coach test feedback)
+- `get_training_summary` / `get_training_load` device loads: a sport without its own field list
+  (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count
+  there and are reported as "from sports without field assignment", a stored 0 stays a placeholder.
+  Explicit exclusions in a sport's settings stay excluded (running dynamics, a bike "stride" on
+  rides), counted separately from zero placeholders.
+- `find_similar_intervals` with `reference_activity_id` and no `start_date` keeps the 365 days
+  before the reference (window and older matches shown; `start_date` allows any range);
+  `compare_workouts` applies the same window to a name search anchored on a reference.
+- `get_activity_intervals` with a plan shows the planned step on every interval line (compact,
+  standard, JSON) and, for an interval longer than its step, the planned part and the time beyond
+  the plan, consistent with `analyze_workout_execution`; unplanned intervals say whether they lie
+  before, inside or after the plan.
+- `analyze_climbs`: grade confidence high/medium/low per segment with reasons (horizontal distance,
+  GPS speed, pauses, implausible grades) in text and JSON, counted in the summary; no raw grade
+  below the minimum horizontal distance ("not determinable"); short distances in metres.
+- Units and times: foot-sport cadence in steps per minute (2 x the stored per-leg value, labelled
+  as stored) everywhere it is printed, bike cadence in rpm, no running dynamics for rides;
+  temperatures with °C or n/a (a temperature custom field without units takes the unit of its
+  sibling fields); local start times with the timezone name or the UTC offset derived from local
+  vs UTC (JSON `utc_offset`).
+- `get_load_projection` says "PROJECTION WITHOUT PLANNED TRAINING" (or "WITHOUT PLANNED LOAD") in
+  the header at every detail level; `get_coach_context` flags "NO PLANNED WORKOUTS".
+- `get_durability`: qualifying share per sport (e.g. 6 of 15), fewer than 8 qualifying sessions
+  flagged as a small sample, mixed indoor/outdoor, bikes/shoes or power meters pointed out.
+- `get_coach_context`: method line (windows, coupled daily-mean ACWR, monotony, zone basis,
+  `threshold_as` - new optional parameter - and the hard-session rule), a caveat with the per-sport
+  Z1/Z2/Z3 split when totals mix power and HR zones; the compact intensity distribution carries the
+  caveat and the hard-session rule. `get_coach_context` is the recommended first call for weekly
+  analyses in `intervals://guide`, `weekly_training_review` and `training_load_review`.
+- Also fixes [mvilanova/intervals-mcp-server#134](https://github.com/mvilanova/intervals-mcp-server/issues/134):
+  `get_activities` no longer adds activities from the 60 days before `start_date` when the range
+  holds fewer named activities than the limit; every result lies in the requested local dates.
+- Also fixes [mvilanova/intervals-mcp-server#132](https://github.com/mvilanova/intervals-mcp-server/issues/132):
+  a leaf step's text is rendered as the cue at the start of the workout line
+  (`- Sprint 40mtr intensity=active Z5 HR`) as in Intervals.icu's builder syntax.
+
 ### Added (phase 4: training load and intensity)
 - Training load and intensity metrics as separate read-only tools, after the coach report proposed
   by [morritter](https://github.com/morritter) in upstream
