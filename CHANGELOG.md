@@ -22,7 +22,8 @@ First public beta of the Futureweb fork. Based on upstream
     recomputed without planned but not yet done workouts), device loads summed separately on their
     own scale. With the default end date and no activity today the windows end yesterday.
   - `get_intensity_distribution`: three-zone model from power, HR or pace zones with a documented
-    mapping by zone count (power 7: Z1-Z2 | Z3 | Z4-Z7, HR/pace 7: Z1-Z2 | Z3-Z4 | Z5-Z7, 5 and 3
+    mapping by zone count (power 7: Z1-Z2 | Z3-Z4 | Z5-Z7 with threshold work in the middle zone as in
+    Seiler's model, `threshold_as="high"` for the variant of #150; HR/pace 7: Z1-Z2 | Z3-Z4 | Z5-Z7, 5 and 3
     zones), `zone_basis` auto (power for cycling, HR then pace otherwise), polarization index after
     Treff et al. 2019 (Z3 < 1 %, Z1 = 0, Z2 = 0 edge cases), class with zone order, hard sessions
     and days (>= 10 min in Z3 or IF >= 0.85 on >= 20 min), drift between the halves of the period,

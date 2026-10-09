@@ -186,14 +186,18 @@ def test_zone_seconds_and_three_zone_mapping():
     """Power zones ignore the sweet-spot bucket; the mapping depends on basis and zone count."""
     ride = _act(END, icu_zone_times=_power(10, 20, 30, 40, 50, 60, 70), icu_hr_zone_times=[10, 20, 30, 40, 50, 60, 70])
     assert tid.zone_seconds(ride, "power") == [10, 20, 30, 40, 50, 60, 70]
-    assert tid.three_zones([10, 20, 30, 40, 50, 60, 70], "power") == [30, 30, 220]
+    # Coggan Z4 (threshold) is middle-zone work by default, high only with threshold_as="high"
+    assert tid.three_zones([10, 20, 30, 40, 50, 60, 70], "power") == [30, 70, 180]
+    assert tid.three_zones([10, 20, 30, 40, 50, 60, 70], "power", "high") == [30, 30, 220]
+    assert tid.three_zones([10, 20, 30, 40, 50, 60], "power") == [30, 70, 110]
     assert tid.three_zones([10, 20, 30, 40, 50, 60, 70], "hr") == [30, 70, 180]
     assert tid.three_zones([10, 20, 30, 40, 50], "hr") == [30, 30, 90]
     assert tid.three_zones([10, 20, 30], "pace") == [10, 20, 30]
     assert tid.three_zones([10, 20, 30, 40], "power") is None
     assert tid.zone_seconds(_act(END, icu_hr_zone_times=[0, 0, 0]), "hr") is None
     assert tid.zone_seconds(_act(END, icu_zone_times="n/a"), "power") is None
-    assert tid.mapping_text()["power"]["7"] == "Z1-Z2 | Z3 | Z4-Z7"
+    assert tid.mapping_text()["power"]["7"] == "Z1-Z2 | Z3-Z4 | Z5-Z7"
+    assert tid.mapping_text("high")["power"]["7"] == "Z1-Z2 | Z3 | Z4-Z7"
     assert tid.mapping_text()["hr"]["7"] == "Z1-Z2 | Z3-Z4 | Z5-Z7"
 
 
@@ -207,7 +211,9 @@ def test_activity_zones_basis_order_and_fallbacks():
     assert run_pace["basis"] == "pace" and run_pace["z"] == [100, 0, 0]
     assert tid.activity_zones(_act(END, icu_hr_zone_times=hr7))["basis"] == "hr"
     forced = tid.activity_zones(_act(END, sport="Run", icu_zone_times=power7, icu_hr_zone_times=hr7), "power")
-    assert forced["basis"] == "power" and forced["z"] == [0, 0, 100]
+    assert forced["basis"] == "power" and forced["z"] == [0, 100, 0]
+    high = tid.activity_zones(_act(END, sport="Run", icu_zone_times=power7, icu_hr_zone_times=hr7), "power", "high")
+    assert high["z"] == [0, 0, 100]
     unmapped = tid.activity_zones(_act(END, sport="Run", icu_hr_zone_times=[1, 2, 3, 4]))
     assert unmapped["z"] is None and unmapped["excluded"] == "hr zone model with 4 zones has no three-zone mapping"
     fallback = tid.activity_zones(_act(END, icu_zone_times=_power(1, 2, 3, 4), icu_hr_zone_times=hr7))
@@ -258,7 +264,7 @@ def test_analyze_period_weeks_drift_and_coverage():
         if offset < 7:
             acts.append(_act(day, icu_zone_times=_power(3000, 0, 0, 0, 0, 0, 0)))
         else:
-            acts.append(_act(day, icu_zone_times=_power(1800, 0, 600, 1200, 0, 0, 0)))
+            acts.append(_act(day, icu_zone_times=_power(1800, 0, 600, 0, 1200, 0, 0)))
     acts.append(_act(END, sport="Run", icu_hr_zone_times=[1800, 0, 0, 0, 0, 0, 0]))
     acts.append(_act(END, sport="WeightTraining"))
     result = tid.analyze_period(acts, start, END)
@@ -272,6 +278,12 @@ def test_analyze_period_weeks_drift_and_coverage():
     assert result["drift"]["available"] and result["drift"]["class_changed"]
     assert result["drift"]["delta_pp"][2] > 30
     assert [w["week"] for w in result["weeks"]] == ["2026-W39", "2026-W40"]
+    assert result["threshold_as"] == "moderate"
+    threshold_week = [_act(start + timedelta(days=i), icu_zone_times=_power(1800, 0, 0, 1200, 0, 0, 0)) for i in range(7)]
+    moderate = tid.analyze_period(threshold_week, start, start + timedelta(days=6))
+    high = tid.analyze_period(threshold_week, start, start + timedelta(days=6), threshold_as="high")
+    assert moderate["total"]["hard_sessions"] == 0 and moderate["total"]["class"] == "Base"
+    assert high["total"]["hard_sessions"] == 7
     assert all("day" not in row for row in result["sessions"])
     empty = tid.analyze_period([], start, END)
     assert empty["total"]["pct"] is None and empty["drift"]["available"] is False

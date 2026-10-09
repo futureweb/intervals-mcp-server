@@ -29,18 +29,23 @@ BASES = ("power", "hr", "pace")
 ZONE_BASES = ("auto",) + BASES
 
 # Zone index (Z1 = first entry) -> three-zone model, keyed by the number of zones.
-# power, % of FTP (Coggan 7 zones: Z1-Z2 <= 75 % low, Z3 76-90 % moderate, Z4 91-105 % and above
-#   high: Z4 spans the second threshold and counts as high as in #150 / Treff et al. 2019);
+# power, % of FTP (Coggan 7 zones: Z1-Z2 <= 75 % low, Z3 76-90 % and Z4 91-105 % moderate,
+#   Z5-Z7 > 105 % high). Z4 is threshold work around the second threshold, which Seiler's
+#   model places in the middle zone; it is counted as moderate by default, consistent with the
+#   LTHR-based HR mapping. threshold_as="high" counts it as high instead (the choice of #150);
 # hr, % of LTHR (Intervals.icu / Friel 7 zones: Z1-Z2 < ~90 % low, Z3-Z4 90-99 % moderate,
 #   Z5a-Z5c >= LTHR high);
 # pace, % of threshold pace (Intervals.icu 7 zones: Z1-Z2 low, Z3-Z4 moderate, Z5a-Z5c high);
 # 5 zones (e.g. %HRmax or Seiler's five zones): Z1-Z2 low, Z3 moderate, Z4-Z5 high;
 # 3 zones: taken as they are.
 ZONE_MAPS: dict[str, dict[int, tuple[int, ...]]] = {
-    "power": {3: (1, 2, 3), 5: (1, 1, 2, 3, 3), 6: (1, 1, 2, 3, 3, 3), 7: (1, 1, 2, 3, 3, 3, 3)},
+    "power": {3: (1, 2, 3), 5: (1, 1, 2, 3, 3), 6: (1, 1, 2, 2, 3, 3), 7: (1, 1, 2, 2, 3, 3, 3)},
     "hr": {3: (1, 2, 3), 5: (1, 1, 2, 3, 3), 7: (1, 1, 2, 2, 3, 3, 3)},
     "pace": {3: (1, 2, 3), 5: (1, 1, 2, 3, 3), 7: (1, 1, 2, 2, 3, 3, 3)},
 }
+# Power mappings with the threshold zone (Coggan Z4) counted as high (threshold_as="high").
+POWER_THRESHOLD_HIGH: dict[int, tuple[int, ...]] = {6: (1, 1, 2, 3, 3, 3), 7: (1, 1, 2, 3, 3, 3, 3)}
+THRESHOLD_MODES = ("moderate", "high")
 # Preferred zone basis per sport family in "auto" mode (first one with data wins).
 AUTO_ORDER: dict[str, tuple[str, ...]] = {"cycling": ("power", "hr", "pace")}
 DEFAULT_ORDER: tuple[str, ...] = ("hr", "pace", "power")
@@ -60,7 +65,8 @@ REFERENCES: dict[str, dict[str, Any]] = {
         "source": "Treff et al. 2019, Front Physiol 10:707",
     },
     "three_zone_model": {
-        "text": "Z1 below the first lactate/ventilatory threshold, Z2 between the thresholds, Z3 above the second",
+        "text": "Z1 below the first lactate/ventilatory threshold, Z2 between the thresholds, Z3 above the second; "
+        "threshold work (power Z4, 91-105 % FTP) is middle-zone work by default",
         "source": "Seiler & Kjerland 2006, Scand J Med Sci Sports 16:49-56",
     },
     "hard_session": {
@@ -78,12 +84,19 @@ CLASS_RULES = (
 )
 
 
-def mapping_text() -> dict[str, dict[str, str]]:
-    """Readable zone mapping per basis and zone count, e.g. {'power': {'7': 'Z1-Z2 | Z3 | Z4-Z7'}}."""
+def _mapping(basis: str, count: int, threshold_as: str = "moderate") -> tuple[int, ...] | None:
+    if basis == "power" and threshold_as == "high" and count in POWER_THRESHOLD_HIGH:
+        return POWER_THRESHOLD_HIGH[count]
+    return ZONE_MAPS.get(basis, {}).get(count)
+
+
+def mapping_text(threshold_as: str = "moderate") -> dict[str, dict[str, str]]:
+    """Readable zone mapping per basis and zone count, e.g. {'power': {'7': 'Z1-Z2 | Z3-Z4 | Z5-Z7'}}."""
     out: dict[str, dict[str, str]] = {}
     for basis, maps in ZONE_MAPS.items():
         out[basis] = {}
-        for count, mapping in maps.items():
+        for count in maps:
+            mapping = _mapping(basis, count, threshold_as) or maps[count]
             groups = []
             for target in (1, 2, 3):
                 zones = [i + 1 for i, value in enumerate(mapping) if value == target]
@@ -125,9 +138,9 @@ def zone_seconds(activity: Activity, basis: str) -> list[float] | None:
     return secs if sum(secs) > 0 else None
 
 
-def three_zones(secs: list[float], basis: str) -> list[float] | None:
+def three_zones(secs: list[float], basis: str, threshold_as: str = "moderate") -> list[float] | None:
     """Collapse zone seconds into [Z1, Z2, Z3]; None when the zone count has no mapping."""
-    mapping = ZONE_MAPS.get(basis, {}).get(len(secs))
+    mapping = _mapping(basis, len(secs), threshold_as)
     if mapping is None:
         return None
     result = [0.0, 0.0, 0.0]
@@ -136,7 +149,7 @@ def three_zones(secs: list[float], basis: str) -> list[float] | None:
     return result
 
 
-def activity_zones(activity: Activity, zone_basis: str = "auto") -> dict[str, Any]:
+def activity_zones(activity: Activity, zone_basis: str = "auto", threshold_as: str = "moderate") -> dict[str, Any]:
     """Three-zone seconds of one activity: {"z": [..] or None, "basis", "zone_count", "excluded"}.
 
     ``zone_basis`` "auto" uses power for cycling and heart rate (then pace, then power) for
@@ -148,7 +161,7 @@ def activity_zones(activity: Activity, zone_basis: str = "auto") -> dict[str, An
         secs = zone_seconds(activity, basis)
         if secs is None:
             continue
-        collapsed = three_zones(secs, basis)
+        collapsed = three_zones(secs, basis, threshold_as)
         if collapsed is not None:
             return {"z": collapsed, "basis": basis, "zone_count": len(secs), "excluded": None}
         unmapped = unmapped or f"{basis} zone model with {len(secs)} zones has no three-zone mapping"
@@ -257,14 +270,14 @@ def hard_session(activity: Activity, entry: dict[str, Any]) -> tuple[bool | None
 # ---------------------------------------------------------------------------
 
 
-def session_rows(activities: list[Activity], zone_basis: str = "auto") -> list[dict[str, Any]]:
+def session_rows(activities: list[Activity], zone_basis: str = "auto", threshold_as: str = "moderate") -> list[dict[str, Any]]:
     """One row per activity with its three-zone seconds, basis, hard flag and exclusion reason."""
     rows = []
     for activity in sorted(activities, key=lambda a: str(a.get("start_date_local") or "")):
         day = activity_day(activity)
         if day is None:
             continue
-        entry = activity_zones(activity, zone_basis)
+        entry = activity_zones(activity, zone_basis, threshold_as)
         hard, reasons = hard_session(activity, entry)
         rows.append({
             "date": day.isoformat(), "day": day, "id": activity.get("id"), "name": activity.get("name"),
@@ -328,10 +341,10 @@ def drift(rows: list[dict[str, Any]], start: date, end: date) -> dict[str, Any]:
 
 
 def analyze_period(
-    activities: list[Activity], start: date, end: date, zone_basis: str = "auto"
+    activities: list[Activity], start: date, end: date, zone_basis: str = "auto", threshold_as: str = "moderate"
 ) -> dict[str, Any]:
     """Distribution for the period, per sport family, per ISO week and per half, plus coverage."""
-    rows = [row for row in session_rows(activities, zone_basis) if start <= row["day"] <= end]
+    rows = [row for row in session_rows(activities, zone_basis, threshold_as) if start <= row["day"] <= end]
     families: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         families[row["family"]].append(row)
@@ -351,6 +364,7 @@ def analyze_period(
         "end": end.isoformat(),
         "days": (end - start).days + 1,
         "zone_basis": zone_basis,
+        "threshold_as": threshold_as,
         "total": {**distribution(rows), **_hard_counts(rows)},
         "by_sport": by_family,
         "weeks": weeks,

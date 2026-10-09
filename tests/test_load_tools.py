@@ -244,13 +244,17 @@ def test_get_intensity_distribution_text(monkeypatch):
     assert "cycling: " in result and "[basis power 100 %]" in result and "walking: " in result
     assert "hard sessions 4 on 4 days" in result
     assert "Drift 2026-09-12..2026-09-25 -> 2026-09-26..2026-10-09" in result
-    assert "7 zones Z1-Z2 | Z3 | Z4-Z7; hr 3 zones" in result and "Treff et al. 2019" in result
+    assert "7 zones Z1-Z2 | Z3-Z4 | Z5-Z7; hr 3 zones" in result and "Treff et al. 2019" in result
+    assert "power Z4 counted as moderate" in result
+    high = asyncio.run(get_intensity_distribution(threshold_as="high"))
+    assert "power Z4 counted as high" in high and "7 zones Z1-Z2 | Z3 | Z4-Z7" in high
+    assert asyncio.run(get_intensity_distribution(threshold_as="max")).startswith("Error: threshold_as must be one of")
     assert "ISO weeks:" in result and "2026-W37 (2026-09-12 to 2026-09-13, 2 d)" in result
     assert "icu_zone_times" in calls[0][1]["fields"]
     compact = asyncio.run(get_intensity_distribution(detail_level="compact"))
     assert "ISO weeks" not in compact and "Period: " in compact
     full = asyncio.run(get_intensity_distribution(detail_level="full", start_date="2026-10-05"))
-    assert "min Z1/Z2/Z3 (power, 7 zones)" in full and "hard: 15 min in Z3, IF 0.88" in full
+    assert "min Z1/Z2/Z3 (power, 7 zones)" in full and "hard: IF 0.88" in full
     assert "no zones (no zone times)" in full
 
 

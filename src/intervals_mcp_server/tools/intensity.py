@@ -25,6 +25,7 @@ from intervals_mcp_server.tools.training_load import (
 from intervals_mcp_server.utils.intensity import (
     CLASS_RULES,
     REFERENCES,
+    THRESHOLD_MODES,
     ZONE_BASES,
     analyze_period,
     mapping_text,
@@ -65,7 +66,7 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
     total, coverage, drift = result["total"], result["coverage"], result["drift"]
     lines = [
         f"Intensity distribution for athlete {payload['athlete_id']}, {result['start']} to {result['end']} "
-        f"({result['days']} days, three-zone model, zone basis {result['zone_basis']}; time in zones of each activity):",
+        f"({result['days']} days, three-zone model, zone basis {result['zone_basis']}, power Z4 counted as {result.get('threshold_as', 'moderate')}; time in zones of each activity):",
         f"Period: {dist_text(total)}",
         f"Zone basis of the time: {_basis_text(total)}. Coverage: {coverage['sessions_with_zones']} of {coverage['sessions']} "
         f"sessions with usable zones, {fmt(coverage['moving_time_with_zones_pct'])} % of {fmt(coverage['moving_hours'], 1)} h moving time"
@@ -89,7 +90,7 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         for week in result["weeks"]:
             partial = f", {week['days']} d" if week["days"] < 7 else ""
             lines.append(f"  {week['week']} ({week['start']} to {week['end']}{partial}): {dist_text(week)}")
-        maps = mapping_text()
+        maps = mapping_text(result.get("threshold_as", "moderate"))
         lines.append(
             "Zone mapping to Z1 | Z2 | Z3 by zone count: "
             + "; ".join(f"{basis} " + ", ".join(f"{n} zones {m}" for n, m in counts.items()) for basis, counts in maps.items())
@@ -120,6 +121,7 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
     end_date: str | None = None,
     zone_basis: str = "auto",
     sport_types: str | None = None,
+    threshold_as: str = "moderate",
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
@@ -130,8 +132,9 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
     Sums the time in zones Intervals.icu stores per activity and maps it to the three-zone
     model (Z1 below the first threshold, Z2 between the thresholds, Z3 above the second).
     The mapping depends on the zone basis and the number of zones of the athlete's model:
-    power 7 zones Z1-Z2 | Z3 | Z4-Z7 (Z4 at 91-105 % FTP spans the threshold and counts as
-    high), HR and pace 7 zones Z1-Z2 | Z3-Z4 | Z5a-Z5c, 5 zones Z1-Z2 | Z3 | Z4-Z5, 3 zones
+    power 7 zones Z1-Z2 | Z3-Z4 | Z5-Z7 (threshold work in Z4 at 91-105 % FTP is middle-zone work
+    as in Seiler's model; threshold_as="high" counts it as high), HR and pace 7 zones
+    Z1-Z2 | Z3-Z4 | Z5a-Z5c, 5 zones Z1-Z2 | Z3 | Z4-Z5, 3 zones
     as they are; other zone counts are left out and reported. zone_basis "auto" uses power
     for cycling and heart rate (then pace, then power) for other sports. Reports for the
     period, per sport family and per ISO week: the shares of Z1/Z2/Z3, hours, the
@@ -148,6 +151,8 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
         end_date: End date YYYY-MM-DD (optional, default today)
         zone_basis: "auto" (default), "power", "hr" or "pace"
         sport_types: Comma-separated activity types to include, e.g. "Ride,GravelRide" (optional, default all)
+        threshold_as: How power zone Z4 (91-105 % FTP, threshold work) is counted: "moderate"
+            (default, three-zone Z2) or "high" (three-zone Z3)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
@@ -160,6 +165,9 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
     basis = (zone_basis or "auto").strip().lower()
     if basis not in ZONE_BASES:
         return f"Error: zone_basis must be one of {', '.join(ZONE_BASES)}."
+    threshold_mode = (threshold_as or "moderate").strip().lower()
+    if threshold_mode not in THRESHOLD_MODES:
+        return f"Error: threshold_as must be one of {', '.join(THRESHOLD_MODES)}."
     period = resolve_period(start_date, end_date, DEFAULT_DAYS, MAX_DAYS)
     if isinstance(period, str):
         return period
@@ -169,12 +177,12 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
     )
     if error:
         return error
-    result = analyze_period(filter_types(activities, wanted_types(sport_types)), start, end, basis)
+    result = analyze_period(filter_types(activities, wanted_types(sport_types)), start, end, basis, threshold_mode)
     if detail_level != "full":
         result.pop("sessions")
     payload = {
         "athlete_id": athlete_id_to_use, "sport_types": sport_types, "result": result,
-        "mapping": mapping_text(), "class_rules": CLASS_RULES, "references": REFERENCES,
+        "mapping": mapping_text(threshold_mode), "class_rules": CLASS_RULES, "references": REFERENCES,
     }
     if output_format.strip().lower() == "json":
         return json.dumps(payload, ensure_ascii=False)
