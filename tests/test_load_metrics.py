@@ -197,6 +197,10 @@ def test_zone_seconds_and_three_zone_mapping():
     assert tid.three_zones([10, 20, 30], "pace") == [10, 20, 30]
     assert tid.three_zones([10, 20, 30, 40], "power") is None
     assert tid.zone_seconds(_act(END, icu_hr_zone_times=[0, 0, 0]), "hr") is None
+    # API-18: GAP zone times when Intervals.icu shows them (hilly runs)
+    hilly = _act(END, pace_zone_times=[3000, 5, 0, 0, 0, 0, 0], gap_zone_times=[2800, 192, 13, 0, 0, 0, 0], use_gap_zone_times=True)
+    assert tid.zone_seconds(hilly, "pace") == [2800, 192, 13, 0, 0, 0, 0]
+    assert tid.zone_seconds(dict(hilly, use_gap_zone_times=False), "pace") == [3000, 5, 0, 0, 0, 0, 0]
     assert tid.zone_seconds(_act(END, icu_zone_times="n/a"), "power") is None
     assert tid.mapping_text()["power"]["7"] == "Z1-Z2 | Z3-Z4 | Z5-Z7"
     assert tid.mapping_text("high")["power"]["7"] == "Z1-Z2 | Z3 | Z4-Z7"
