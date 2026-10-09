@@ -375,6 +375,40 @@ def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int
     return float((sum(fourth_powers) / len(fourth_powers)) ** 0.25)
 
 
+def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | None]:
+    """Per sample: the 4th power of the 30 s rolling mean power ending at it (None without power).
+
+    The window is defined on the time stream and runs over the whole activity (partial at
+    its start), so the NP of a slice computed from these values includes the 30 s before
+    the slice. This is how Intervals.icu computes the NP of an interval, so NP values of
+    split or merged steps are comparable with the NP of the Intervals.icu intervals.
+    """
+    out: list[float | None] = []
+    head, window_sum, count = 0, 0.0, 0
+    samples = [
+        (float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else None,
+         float(w) if isinstance(w, (int, float)) and not isinstance(w, bool) and not is_missing(w) else None)
+        for t, w in zip(time, watts, strict=False)
+    ]
+    for moment, power in samples:
+        if moment is None:
+            out.append(None)
+            continue
+        if power is not None:
+            window_sum += power
+            count += 1
+        while head < len(out):
+            old_moment, old_power = samples[head]
+            if old_moment is not None and old_moment > moment - NP_WINDOW_S:
+                break
+            if old_moment is not None and old_power is not None:
+                window_sum -= old_power
+                count -= 1
+            head += 1
+        out.append((window_sum / count) ** 4 if power is not None and count else None)
+    return out
+
+
 # ------------------------------------------------------------ stream relevance
 # Words in a custom stream's name/code that tie it to a sport family. Used only to hide
 # streams that a device or script computes for every activity (e.g. a running metric on

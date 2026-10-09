@@ -8,21 +8,28 @@ aligns planned steps with actual intervals and computes per-step execution metri
 Pw:HR drift). Without a plan the same metrics are computed per interval.
 
 Alignment is an order-preserving sequence alignment (Needleman-Wunsch style): planned
-steps are matched with one actual interval, or with up to three consecutive intervals of
-the same intensity (an effort split by a lap or a short stop), with a cost based on the
-planned duration and the target intensity measured on the planned part of the span.
-Interval names are never used. Extra intervals before the first or after the last
-planned step are cheap, so riding before or after the workout does not distort the
-pairing.
+steps are matched with one actual interval or with any number of consecutive intervals (an
+effort split by laps, e.g. 1 km device auto-laps on a run, or a stop), with a cost based
+on the planned duration (or distance) and the target intensity measured on the planned
+part of the span. A step absorbs a further interval only while the intervals after it do
+not yet cover its planned duration. Interval names are never used. Extra intervals before
+the first or after the last planned step are cheap when short (the cost grows with their
+duration), so riding before or after the workout does not distort the pairing.
+
+Lap boundaries need not coincide with step boundaries: when one step runs longer than
+planned and the adjacent step is correspondingly short, the boundary is moved on the
+continuous timeline (time carried over) when the moved samples fit the receiving step at
+least as well, instead of reporting a pair of opposite false deviations.
 
 Planned steps are capped in time: when the matched span is longer than the planned
 duration plus a tolerance, it is split logically (analysis only, nothing is changed on
 Intervals.icu). The planned part is evaluated against the plan from the samples; the
 remainder of the last planned step plus everything after it is reported as additional
 training after the plan, the remainder of an earlier step as extra time inside the plan.
-Durations are compared on moving time (recording pauses excluded). Nothing is
-interpolated: every metric is computed from recorded samples only, time-weighted by the
-sample spacing.
+Durations are compared on moving time (recording pauses excluded). Distance-based steps
+are compared on distance. Open-ended targets (top zone, a range given by its start only)
+are lower bounds, not point targets. Nothing is interpolated: every metric is computed
+from recorded samples only, time-weighted by the sample spacing.
 """
 
 # pylint: disable=too-many-lines
@@ -31,25 +38,36 @@ from dataclasses import dataclass
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import is_missing
-from intervals_mcp_server.utils.sports import cadence_text, format_pace, hms
+from intervals_mcp_server.utils.sports import cadence_text, default_pace_units, format_pace, hms
 from intervals_mcp_server.utils.streams import (
+    NP_WINDOW_S,
     foreign_stream_reason,
     is_counter_stream,
-    normalized_power,
     numeric_values,
     range_stats,
+    rolling_fourth_powers,
 )
 
 GAP_COST = 0.8
-EDGE_EXTRA_COST = 0.1  # an extra interval before the first / after the last planned step
-MERGE_PENALTY = 0.15  # per additional interval merged into one planned step
-MAX_MERGE = 3
-MERGE_PART_MAX_COST = 0.3  # every merged interval must be close to the step target
+EDGE_EXTRA_COST = 0.1  # an extra interval before the first / after the last planned step ...
+EDGE_COST_PER_HOUR = 0.6  # ... plus this per hour of its moving time, so a long block is never cheap
+MERGE_PENALTY = 0.05  # once for a planned step matched with several consecutive intervals
+MAX_MERGE_WITHOUT_AMOUNT = 3  # a step without duration or distance absorbs at most this many intervals
+MAX_MERGE_PARTS = 250  # upper limit of intervals in one step (bounds the alignment's run time)
+MERGE_PART_MAX_COST = 0.3  # a merged interval may be at most this much further off target than the span
 TARGET_TOLERANCE_PCT = 5.0
 EXTENSION_MIN_SECS = 120  # additional training shorter than this is not reported separately
-REST_POWER_FRACTION = 0.65  # of FTP: planned steps at or below this are "rest"
-REST_PACE_FRACTION = 0.80  # of threshold speed
-REST_HR_FRACTION = 0.80  # of LTHR
+# Planned steps whose target lies in the recovery zone (Z1) are "rest"; without zone settings
+# these fractions of FTP / threshold speed / LTHR are used (default Intervals.icu Z1 tops).
+RECOVERY_POWER_FRACTION = 0.55
+RECOVERY_PACE_FRACTION = 0.775
+RECOVERY_HR_FRACTION = 0.80
+# A step up to these fractions that sits between two clearly harder steps is a recovery
+# between efforts ("rest") even above Z1, e.g. 4 min at 60 % FTP between threshold efforts.
+REST_POWER_FRACTION = 0.65
+REST_PACE_FRACTION = 0.80
+REST_HR_FRACTION = 0.85
+HARDER_FACTOR = 1.1  # a neighbour is "clearly harder" when its target midpoint is 10 % higher
 EDGE_SAMPLES = 10
 DRIFT_MIN_SECS = 600
 RECORDING_GAP_S = 5  # a jump in the time stream larger than this is a recording pause
@@ -59,6 +77,7 @@ TIME_IN_TARGET_LOW_PCT = 50.0
 STREAM_KEYS = {"power": "watts", "hr": "heartrate", "pace": "velocity_smooth"}
 INTERVAL_KEYS = {"power": "average_watts", "hr": "average_heartrate", "pace": "average_speed"}
 DETAIL_LEVELS = ("compact", "standard", "full")
+DRIFT_CONVENTION = "positive = heart rate rose relative to power (Intervals.icu decoupling convention)"
 
 
 @dataclass(frozen=True)
@@ -90,30 +109,39 @@ def _num(value: Any) -> float | None:
 
 
 # --------------------------------------------------------------------------- plan
-def flatten_steps(steps: list[Any]) -> list[dict[str, Any]]:
-    """Expand repeat blocks into the flat list of planned steps in execution order."""
-    flat: list[dict[str, Any]] = []
-    for step in steps:
+def _flatten(steps: list[Any], block: tuple[int, ...] = ()) -> list[tuple[dict[str, Any], tuple[int, ...]]]:
+    """Flattened steps with a key naming their position inside the repeat blocks."""
+    flat: list[tuple[dict[str, Any], tuple[int, ...]]] = []
+    for position, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
         reps = step.get("reps")
         children = step.get("steps")
         if isinstance(reps, int) and reps > 0 and isinstance(children, list):
             for rep in range(1, reps + 1):
-                for child in flatten_steps(children):
+                for child, key in _flatten(children, block + (position,)):
                     child = dict(child)
                     child["rep"] = rep
                     child["reps"] = reps
-                    flat.append(child)
+                    flat.append((child, key))
             continue
         if step.get("duration") is None and step.get("distance") is None and not step.get("text"):
             continue
-        flat.append(dict(step))
+        flat.append((dict(step), block + (position,)))
     return flat
 
 
+def flatten_steps(steps: list[Any]) -> list[dict[str, Any]]:
+    """Expand repeat blocks into the flat list of planned steps in execution order."""
+    return [step for step, _ in _flatten(steps)]
+
+
 def _range_from_value(value: dict[str, Any]) -> tuple[float | None, float | None, str | None]:
-    """(low, high, units) of a workout target value; single values give low == high."""
+    """(low, high, units) of a workout target value.
+
+    A single value gives low == high; a range given by its start only is open-ended
+    (high None = no upper limit).
+    """
     units = value.get("units")
     if value.get("start") is not None or value.get("end") is not None:
         low = _num(value.get("start"))
@@ -126,7 +154,10 @@ def _range_from_value(value: dict[str, Any]) -> tuple[float | None, float | None
 
 
 def _zone_bounds(bounds: Any, zone: float, scale: float | None) -> tuple[float | None, float | None]:
-    """Absolute bounds of zone number ``zone`` from Intervals.icu upper bounds (% or bpm)."""
+    """Absolute bounds of zone number ``zone`` from Intervals.icu upper bounds (% or bpm).
+
+    The upper bound of the top zone (999 in Intervals.icu) is None: no upper limit.
+    """
     uppers = numeric_values(bounds) if isinstance(bounds, list) else []
     index = int(zone) - 1
     if index < 0 or index >= len(uppers):
@@ -143,7 +174,8 @@ def resolve_target(step: dict[str, Any], context: dict[str, Any]) -> dict[str, A
 
     context carries ftp, lthr, max_hr, threshold_pace (m/s), power_zones (% FTP upper
     bounds), hr_zones (bpm upper bounds), pace_zones (% threshold speed upper bounds).
-    Returns {"kind": "power"|"hr"|"pace", "low", "high", "units", "source"} or None.
+    Returns {"kind": "power"|"hr"|"pace", "low", "high", "units", "source"} or None;
+    ``high`` None means open-ended (a lower bound only, e.g. the top zone).
     """
     for kind, resolved_key in (("power", "_power"), ("hr", "_hr"), ("pace", "_pace")):
         resolved = step.get(resolved_key)
@@ -160,45 +192,47 @@ def resolve_target(step: dict[str, Any], context: dict[str, Any]) -> dict[str, A
     return None
 
 
-def _resolve_raw_target(  # pylint: disable=too-many-return-statements,too-many-branches
+def _zone_target(kind: str, bounds: Any, low: float, high: float | None, scale: float | None, units: str) -> dict[str, Any] | None:
+    """Target of a zone or zone range; a zone range given by its start only is open-ended."""
+    low_b, high_b = _zone_bounds(bounds, low, scale)
+    if high is None:
+        high_b = None
+    elif high != low:
+        _, high_b = _zone_bounds(bounds, high, scale)
+    return _target(kind, low_b, high_b, units)
+
+
+def _resolve_raw_target(  # pylint: disable=too-many-return-statements
     kind: str, raw: dict[str, Any], context: dict[str, Any]
 ) -> dict[str, Any] | None:
     """Convert a raw target (%ftp, w, %lthr, hr_zone, %pace ...) to absolute values."""
     low, high, units = _range_from_value(raw)
     if low is None:
         return None
-    high = high if high is not None else low
     ftp, lthr, max_hr = _num(context.get("ftp")), _num(context.get("lthr")), _num(context.get("max_hr"))
     threshold_pace = _num(context.get("threshold_pace"))
-    scale: float | None = None
-    label = units
-    if units == "w":
-        label = "W"
-    elif units == "%ftp" and ftp:
-        low, high, label = low / 100 * ftp, high / 100 * ftp, "W"
-    elif units == "power_zone" and ftp:
-        low_b, high_b = _zone_bounds(context.get("power_zones"), low, ftp)
-        _, high_b2 = _zone_bounds(context.get("power_zones"), high, ftp)
-        return _target(kind, low_b, high_b2 if high != low else high_b, "W")
-    elif units == "%lthr" and lthr:
-        low, high, label = low / 100 * lthr, high / 100 * lthr, "bpm"
-    elif units == "%hr" and max_hr:
-        low, high, label = low / 100 * max_hr, high / 100 * max_hr, "bpm"
-    elif units == "hr_zone":
-        low_b, _ = _zone_bounds(context.get("hr_zones"), low, scale)
-        _, high_b = _zone_bounds(context.get("hr_zones"), high, scale)
-        return _target(kind, low_b, high_b, "bpm")
-    elif units == "%pace" and threshold_pace:
-        low, high, label = low / 100 * threshold_pace, high / 100 * threshold_pace, "m/s"
-    elif units == "pace_zone" and threshold_pace:
-        low_b, _ = _zone_bounds(context.get("pace_zones"), low, threshold_pace)
-        _, high_b = _zone_bounds(context.get("pace_zones"), high, threshold_pace)
-        return _target(kind, low_b, high_b, "m/s")
-    elif units in ("bpm",):
-        label = "bpm"
-    else:
-        return None
-    return _target(kind, low, high, label)
+    label = {"w": "W", "%ftp": "W", "%lthr": "bpm", "%hr": "bpm", "bpm": "bpm", "%pace": "m/s"}.get(str(units), "")
+
+    def scaled(reference: float) -> dict[str, Any] | None:
+        return _target(kind, low / 100 * reference, None if high is None else high / 100 * reference, label)
+
+    if units in ("w", "bpm"):
+        return _target(kind, low, high, label)
+    if units == "%ftp" and ftp:
+        return scaled(ftp)
+    if units == "%lthr" and lthr:
+        return scaled(lthr)
+    if units == "%hr" and max_hr:
+        return scaled(max_hr)
+    if units == "%pace" and threshold_pace:
+        return scaled(threshold_pace)
+    if units == "power_zone" and ftp:
+        return _zone_target(kind, context.get("power_zones"), low, high, ftp, "W")
+    if units == "hr_zone":
+        return _zone_target(kind, context.get("hr_zones"), low, high, None, "bpm")
+    if units == "pace_zone" and threshold_pace:
+        return _zone_target(kind, context.get("pace_zones"), low, high, threshold_pace, "m/s")
+    return None
 
 
 def _target(kind: str, low: float | None, high: float | None, units: str) -> dict[str, Any] | None:
@@ -207,8 +241,32 @@ def _target(kind: str, low: float | None, high: float | None, units: str) -> dic
     return {"kind": kind, "low": low, "high": high, "units": units, "source": "resolved from athlete thresholds"}
 
 
-def classify_step(step: dict[str, Any], target: dict[str, Any] | None, context: dict[str, Any]) -> str:  # pylint: disable=too-many-return-statements
-    """'warmup', 'cooldown', 'rest' or 'work' for a planned step."""
+def _target_mid(target: dict[str, Any]) -> float:
+    """Midpoint of a target range; the lower bound of an open-ended target."""
+    high = target["high"]
+    return target["low"] if high is None else (target["low"] + high) / 2
+
+
+def _reference(kind: str, context: dict[str, Any]) -> float | None:
+    key = {"power": "ftp", "hr": "lthr", "pace": "threshold_pace"}[kind]
+    return _num(context.get(key))
+
+
+def _recovery_ceiling(kind: str, context: dict[str, Any]) -> float | None:
+    """Top of the recovery zone (Z1) in absolute units: from the zone settings, else a default fraction."""
+    zones = numeric_values(context.get({"power": "power_zones", "hr": "hr_zones", "pace": "pace_zones"}[kind]) or [])
+    if kind == "hr" and zones:
+        return zones[0]
+    reference = _reference(kind, context)
+    if not reference:
+        return None
+    if zones:
+        return zones[0] / 100 * reference
+    return reference * {"power": RECOVERY_POWER_FRACTION, "hr": RECOVERY_HR_FRACTION, "pace": RECOVERY_PACE_FRACTION}[kind]
+
+
+def _explicit_kind(step: dict[str, Any]) -> str | None:
+    """Kind set by the plan itself (warm-up/cool-down flags, step intensity)."""
     if step.get("warmup"):
         return "warmup"
     if step.get("cooldown"):
@@ -218,44 +276,94 @@ def classify_step(step: dict[str, Any], target: dict[str, Any] | None, context: 
         return "rest"
     if intensity in ("active", "interval"):
         return "work"
+    return None
+
+
+def classify_step(step: dict[str, Any], target: dict[str, Any] | None, context: dict[str, Any]) -> str:
+    """'warmup', 'cooldown', 'rest' or 'work' for a planned step on its own.
+
+    Without warm-up/cool-down flag or explicit intensity, a target in the recovery zone (Z1
+    of the athlete's zones) makes a step "rest"; easy aerobic (Z2) steps are "work" (steady
+    efforts). ``plan_steps`` additionally treats a step between two clearly harder steps as
+    a recovery between efforts.
+    """
+    explicit = _explicit_kind(step)
+    if explicit:
+        return explicit
     if target:
-        mid = (target["low"] + (target["high"] or target["low"])) / 2
-        ref = {
-            "power": (_num(context.get("ftp")), REST_POWER_FRACTION),
-            "hr": (_num(context.get("lthr")), REST_HR_FRACTION),
-            "pace": (_num(context.get("threshold_pace")), REST_PACE_FRACTION),
-        }[target["kind"]]
-        if ref[0] and mid <= ref[0] * ref[1]:
-            return "rest"
-        return "work"
+        ceiling = _recovery_ceiling(target["kind"], context)
+        return "rest" if ceiling and _target_mid(target) <= ceiling else "work"
     text = str(step.get("text") or "").lower()
     if any(word in text for word in ("rest", "recovery", "easy", "locker", "pause", "erholung")):
         return "rest"
     return "work"
 
 
+def _recovery_between_efforts(planned: list[dict[str, Any]], context: dict[str, Any]) -> set[tuple[int, ...]]:
+    """Repeat positions of target-classified work steps that sit between two clearly harder steps."""
+    keys: set[tuple[int, ...]] = set()
+    for pos, entry in enumerate(planned):
+        target = entry["target"]
+        if entry["kind"] != "work" or entry["_explicit"] or not target or pos == 0 or pos + 1 >= len(planned):
+            continue
+        reference = _reference(target["kind"], context)
+        fraction = {"power": REST_POWER_FRACTION, "hr": REST_HR_FRACTION, "pace": REST_PACE_FRACTION}[target["kind"]]
+        mid = _target_mid(target)
+        if not reference or mid > reference * fraction:
+            continue
+        neighbours = (planned[pos - 1]["target"], planned[pos + 1]["target"])
+        if all(t and t["kind"] == target["kind"] and _target_mid(t) >= mid * HARDER_FACTOR for t in neighbours):
+            keys.add(entry["_key"])
+    return keys
+
+
+def _estimated_duration(duration: float | None, distance: float | None, target: dict[str, Any] | None) -> float | None:
+    """Planned seconds: the duration, or a distance divided by the target speed of a pace step."""
+    if duration:
+        return duration
+    if distance and target and target["kind"] == "pace" and target["low"]:
+        return distance / _target_mid(target)
+    return None
+
+
 def plan_steps(steps: list[Any], context: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flattened planned steps with resolved target, kind and planned timeline."""
+    """Flattened planned steps with resolved target, kind and planned timeline.
+
+    ``planned_start``/``planned_end`` are seconds on the plan clock; a distance step adds
+    its estimated duration (distance / target speed for pace targets, ``est_duration``) and
+    the clock is unknown (None) after a distance step without a pace target.
+    """
     planned: list[dict[str, Any]] = []
-    clock = 0.0
-    for index, step in enumerate(flatten_steps(steps), 1):
+    clock: float | None = 0.0
+    for index, (step, key) in enumerate(_flatten(steps), 1):
         target = resolve_target(step, context)
         duration = _num(step.get("duration"))
+        distance = _num(step.get("distance"))
+        estimate = _estimated_duration(duration, distance, target)
         entry = {
             "index": index,
             "text": step.get("text"),
             "kind": classify_step(step, target, context),
             "duration": duration,
-            "distance": _num(step.get("distance")),
+            "distance": distance,
+            "est_duration": round(estimate, 1) if estimate is not None else None,
             "target": target,
             "ramp": bool(step.get("ramp")),
             "rep": step.get("rep"),
             "reps": step.get("reps"),
             "planned_start": clock,
+            "_explicit": _explicit_kind(step) is not None,
+            "_key": key,
         }
-        clock += duration or 0.0
+        if clock is not None:
+            clock = clock + estimate if estimate is not None else (clock if not distance else None)
         entry["planned_end"] = clock
         planned.append(entry)
+    recoveries = _recovery_between_efforts(planned, context)
+    for entry in planned:
+        if entry.pop("_key") in recoveries:
+            entry["kind"] = "rest"
+        entry.pop("_explicit")
     return planned
 
 
@@ -320,6 +428,7 @@ class Profile:  # pylint: disable=too-many-instance-attributes
             self.weights.append(1.0 if pause or step <= 0 else step)
             self.paused.append(self.paused[-1] + (step - 1.0 if pause else 0.0))
         self._prefix: dict[str, _Prefix] = {}
+        self._np: tuple[list[float], list[int]] | None = None
 
     def has(self, name: str) -> bool:
         """True when the stream exists with at least one numeric sample."""
@@ -383,6 +492,40 @@ class Profile:  # pylint: disable=too-many-instance-attributes
         prefix = self.prefix(name)
         return prefix.mean(start, end) if prefix else None
 
+    def distance(self, start: int, end: int) -> float | None:
+        """Metres covered over [start, end) from the cumulative distance stream; None without it.
+
+        As for an Intervals.icu interval, the range runs to the first sample after it (the
+        start of the next interval), so consecutive ranges add up without gaps.
+        """
+        data = self.raw.get("distance") or []
+        if end <= start or start >= len(data):
+            return None
+        first = _num(data[start])
+        last = next((_num(v) for v in reversed(data[start : min(end, len(data) - 1) + 1]) if _num(v) is not None), None)
+        return max(0.0, last - first) if first is not None and last is not None else None
+
+    def normalized_power(self, start: int, end: int) -> float | None:
+        """NP of [start, end) with the 30 s rolling mean taken over the whole activity.
+
+        Same method as the NP of an Intervals.icu interval, so a split or merged step is
+        comparable with the interval rows; None with less than 30 power samples.
+        """
+        if self._np is None:
+            if not self.has("watts"):
+                return None
+            fourth = rolling_fourth_powers(self.time, self.raw["watts"][: self.n])
+            sums, counts = [0.0], [0]
+            for value in fourth:
+                sums.append(sums[-1] + (value or 0.0))
+                counts.append(counts[-1] + (value is not None))
+            self._np = (sums, counts)
+        sums, counts = self._np
+        start, end = max(0, start), min(end, len(sums) - 1)
+        if end <= start or counts[end] - counts[start] < NP_WINDOW_S:
+            return None
+        return float(((sums[end] - sums[start]) / (counts[end] - counts[start])) ** 0.25)
+
     def values(self, name: str, start: int, end: int) -> list[Any]:
         """Raw samples of a stream over [start, end)."""
         return (self.raw.get(name) or [])[start:end]
@@ -390,7 +533,7 @@ class Profile:  # pylint: disable=too-many-instance-attributes
 
 # ---------------------------------------------------------------------- alignment
 @dataclass
-class _Span:
+class _Span:  # pylint: disable=too-many-instance-attributes
     """Indices and timing of one actual interval together with the raw interval dict."""
 
     index: int
@@ -399,6 +542,7 @@ class _Span:
     elapsed: float
     active: float
     interval: dict[str, Any]
+    distance: float | None = None
 
 
 def _spans(intervals: list[dict[str, Any]], profile: Profile) -> list[_Span]:
@@ -410,12 +554,14 @@ def _spans(intervals: list[dict[str, Any]], profile: Profile) -> list[_Span]:
         if start is None or end is None or end <= start or (profile.n and end > profile.n):
             start = end = None
         elapsed = _num(interval.get("elapsed_time")) or 0.0
+        distance = _num(interval.get("distance"))
         if start is not None and end is not None and profile.n:
             elapsed = profile.elapsed(start, end) or elapsed
             active = profile.active(start, end)
+            distance = distance if distance is not None else profile.distance(start, end)
         else:
             active = _num(interval.get("moving_time")) or elapsed
-        spans.append(_Span(index, start, end, elapsed, active, interval))
+        spans.append(_Span(index, start, end, elapsed, active, interval, distance))
     return spans
 
 
@@ -434,44 +580,94 @@ def _span_intensity(parts: list[_Span], kind: str, profile: Profile, cap_secs: f
 
 
 def _intensity_cost(value: float | None, target: dict[str, Any]) -> float:
-    """0 inside the target range (widened by the tolerance), rising with the relative distance."""
+    """0 inside the target range (widened by the tolerance), rising with the relative distance.
+
+    An open-ended target (``high`` None) is a lower bound: any value above it costs 0.
+    """
     if value is None:
         return 0.5
-    low, high = target["low"], target["high"] or target["low"]
+    low, high = target["low"], target["high"]
     if not low:
         return 0.5
-    if low * (1 - TARGET_TOLERANCE_PCT / 100) <= value <= high * (1 + TARGET_TOLERANCE_PCT / 100):
+    upper = float("inf") if high is None else high * (1 + TARGET_TOLERANCE_PCT / 100)
+    if low * (1 - TARGET_TOLERANCE_PCT / 100) <= value <= upper:
         return 0.0
     distance = (low - value) / low if value < low else (value - high) / high
     return min(1.0, abs(distance) * 2)
 
 
-def _duration_cost(step: dict[str, Any], active: float) -> float:
-    planned = step.get("duration")
-    if not planned or not active:
+def _amount_cost(planned: float | None, actual: float | None) -> float:
+    """Cost of a planned duration (or distance) against the actual one."""
+    if not planned or not actual:
         return 0.25
-    if active >= planned:  # a longer span is capped; the remainder is reported separately
-        return min(0.3, (active - planned) / planned * 0.15)
-    return min(1.0, (planned - active) / planned * 1.5)
+    if actual >= planned:  # a longer span is capped; the remainder is reported separately
+        return min(0.3, (actual - planned) / planned * 0.15)
+    return min(1.0, (planned - actual) / planned * 1.5)
 
 
-def _match_cost(step: dict[str, Any], parts: list[_Span], profile: Profile) -> float:
-    """Cost of evaluating ``step`` on the consecutive spans ``parts`` (inf = not allowed)."""
-    for left, right in zip(parts, parts[1:], strict=False):
-        if left.end is not None and right.start is not None and right.start != left.end:
-            return float("inf")
-    active = sum(p.active for p in parts)
-    cost = _duration_cost(step, active) + MERGE_PENALTY * (len(parts) - 1)
+def _planned_amount(step: dict[str, Any], has_distance: bool) -> tuple[str, float] | None:
+    """("time", seconds) for a timed step, ("distance", metres) for a distance step when the
+    activity has distances (else its estimated duration), None without either."""
+    if step.get("duration"):
+        return "time", float(step["duration"])
+    if step.get("distance") and has_distance:
+        return "distance", float(step["distance"])
+    if step.get("est_duration"):
+        return "time", float(step["est_duration"])
+    return None
+
+
+def _match_options(  # pylint: disable=too-many-locals
+    step: dict[str, Any], spans: list[_Span], j: int, profile: Profile, part_cost: Any
+) -> list[tuple[int, float]]:
+    """(k, cost) for matching ``step`` with the k consecutive spans ending before index ``j``.
+
+    A span of several intervals is only valid when neither its first nor its last interval
+    is superfluous: the intervals without the first and the intervals without the last
+    must each stay short of the planned duration (or distance). Steps without either absorb
+    at most ``MAX_MERGE_WITHOUT_AMOUNT`` intervals. Every merged interval must be adjacent
+    to the next and about as close to the target as the whole span.
+    """
+    amount = _planned_amount(step, j > 0 and spans[j - 1].distance is not None)
     target = step.get("target")
-    if not target:
-        return cost + 0.25
     weight = 1.0 if step.get("kind") == "work" else 0.5
-    if len(parts) > 1:
-        for part in parts:
-            if _intensity_cost(_span_intensity([part], target["kind"], profile, None), target) > MERGE_PART_MAX_COST:
-                return float("inf")
-    value = _span_intensity(parts, target["kind"], profile, step.get("duration"))
-    return cost + weight * _intensity_cost(value, target)
+    cap_secs = step.get("duration") or step.get("est_duration")
+    options: list[tuple[int, float]] = []
+    last = spans[j - 1] if j else None
+    covered_time, covered_distance, worst_part = 0.0, 0.0, 0.0
+    for k in range(1, min(j, MAX_MERGE_PARTS) + 1):
+        part = spans[j - k]
+        if k > 1:
+            following = spans[j - k + 1]
+            if part.end is not None and following.start is not None and following.start != part.end:
+                break
+            if amount is None and k > MAX_MERGE_WITHOUT_AMOUNT:
+                break
+            if amount is not None and last is not None:
+                if amount[0] == "time":
+                    without_first, without_last = covered_time, covered_time - last.active + part.active
+                else:
+                    without_first = covered_distance
+                    without_last = covered_distance - (last.distance or 0.0) + (part.distance or 0.0)
+                if without_first >= amount[1] or without_last >= amount[1]:
+                    break
+        covered_time += part.active
+        covered_distance += part.distance or 0.0
+        parts = spans[j - k : j]
+        if amount is None:
+            cost = 0.25
+        else:
+            cost = _amount_cost(amount[1], covered_time if amount[0] == "time" else covered_distance or None)
+        cost += MERGE_PENALTY if k > 1 else 0.0
+        if not target:
+            options.append((k, cost + 0.25))
+            continue
+        worst_part = max(worst_part, part_cost(j - k))
+        intensity = _intensity_cost(_span_intensity(parts, target["kind"], profile, cap_secs), target)
+        if k > 1 and worst_part > intensity + MERGE_PART_MAX_COST:
+            continue
+        options.append((k, cost + weight * intensity))
+    return options
 
 
 def align_spans(  # pylint: disable=too-many-locals,too-many-branches
@@ -486,10 +682,25 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches
     spans = _spans(intervals, profile)
     n, m = len(planned), len(spans)
     inf = float("inf")
+    part_costs: dict[tuple[int, int], float] = {}
+
+    def part_cost_of(step_index: int) -> Any:
+        target = planned[step_index].get("target")
+
+        def cost(span_index: int) -> float:
+            key = (step_index, span_index)
+            if key not in part_costs:
+                value = _span_intensity([spans[span_index]], target["kind"], profile, None) if target else None
+                part_costs[key] = _intensity_cost(value, target) if target else 0.0
+            return part_costs[key]
+
+        return cost
+
     score = [[inf] * (m + 1) for _ in range(n + 1)]
     trace: list[list[tuple[str, int]]] = [[("", 0)] * (m + 1) for _ in range(n + 1)]
     score[0][0] = 0.0
     for i in range(n + 1):
+        part_cost = part_cost_of(i - 1) if i > 0 else None
         for j in range(m + 1):
             if i == 0 and j == 0:
                 continue
@@ -497,14 +708,17 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches
             if i > 0 and score[i - 1][j] + GAP_COST < best:
                 best, move = score[i - 1][j] + GAP_COST, ("up", 0)
             if j > 0:
-                extra = EDGE_EXTRA_COST if i in (0, n) else GAP_COST
+                if i in (0, n):
+                    extra = EDGE_EXTRA_COST + EDGE_COST_PER_HOUR * (spans[j - 1].active or spans[j - 1].elapsed) / 3600
+                else:
+                    extra = GAP_COST
                 if score[i][j - 1] + extra < best:
                     best, move = score[i][j - 1] + extra, ("left", 0)
             if i > 0:
-                for k in range(1, min(MAX_MERGE, j) + 1):
+                for k, match in _match_options(planned[i - 1], spans, j, profile, part_cost):
                     if score[i - 1][j - k] == inf:
                         continue
-                    cost = score[i - 1][j - k] + _match_cost(planned[i - 1], spans[j - k : j], profile)
+                    cost = score[i - 1][j - k] + match
                     if cost < best:
                         best, move = cost, ("diag", k)
             score[i][j], trace[i][j] = best, move
@@ -548,25 +762,39 @@ def planned_step_map(  # pylint: disable=too-many-locals
     time when missing). A matched span (one or several consecutive intervals) longer than the
     planned duration plus the tolerance gets ``beyond_plan_s`` on each of its intervals, counted
     as in ``analyze``: after the last matched step as additional training after the plan,
-    earlier as extra time inside the plan. Nothing is changed on Intervals.icu.
+    earlier as extra time inside the plan. When the step or the next one spans several laps
+    (e.g. device auto-laps) and the next step is short, the lap boundary differs from the
+    step boundary: that time is carried over to the next step (``carried_to_next_s``)
+    instead. Nothing is changed on Intervals.icu.
     """
     tol = tolerances or Tolerances()
     spans = _spans(intervals, Profile([]))
     alignment = align_spans(planned, intervals)
-    matched = [indices for p_idx, indices in alignment if p_idx is not None and indices]
-    last_matched = matched[-1][-1] if matched else None
+    matched = [(p_idx, indices) for p_idx, indices in alignment if p_idx is not None and indices]
+    last_matched = matched[-1][1][-1] if matched else None
     mapping: dict[int, dict[str, Any]] = {}
-    for p_idx, indices in alignment:
+    carried_in = 0.0
+    for position, (p_idx, indices) in enumerate(alignment):
         if p_idx is None or not indices:
+            carried_in = 0.0
             continue
         step = planned[p_idx]
         duration = step.get("duration")
-        actual = sum(spans[i].active for i in indices)
+        actual = sum(spans[i].active for i in indices) + carried_in
+        carried_in = 0.0
         entry: dict[str, Any] = {
             "index": step["index"], "kind": step["kind"], "duration": duration,
             "span_intervals": [i + 1 for i in indices], "span_actual_s": round(actual, 1),
-            "beyond_plan_s": None, "beyond_plan_counted_as": None,
+            "beyond_plan_s": None, "beyond_plan_counted_as": None, "carried_to_next_s": None,
         }
+        nxt = alignment[position + 1] if position + 1 < len(alignment) else None
+        if duration and actual > duration + tol.duration_allowance(duration) and nxt and nxt[0] is not None and nxt[1]:
+            next_duration = planned[nxt[0]].get("duration")
+            next_actual = sum(spans[i].active for i in nxt[1])
+            if next_duration and next_actual < next_duration and (len(indices) > 1 or len(nxt[1]) > 1):
+                carried_in = min(actual - duration, next_duration - next_actual)
+                entry["carried_to_next_s"] = round(carried_in, 1)
+                actual -= carried_in
         if duration and actual > duration + tol.duration_allowance(duration):
             entry["beyond_plan_s"] = round(actual - duration, 1)
             entry["beyond_plan_counted_as"] = (
@@ -602,6 +830,8 @@ def planned_step_text(step: dict[str, Any] | None, position: str = "extra_inside
     if not step:
         return UNPLANNED_TEXT.get(position, "no planned step (extra)")
     text = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}"
+    if step.get("carried_to_next_s"):
+        text += f", last {hms(step['carried_to_next_s'])} counted to the next step (lap and step boundaries differ)"
     if step.get("beyond_plan_s"):
         span = step.get("span_intervals") or []
         merged = f" (intervals {span[0]}-{span[-1]})" if len(span) > 1 else ""
@@ -626,11 +856,12 @@ def _fade_pct(values: list[Any]) -> float | None:
 
 
 def _time_in_target(values: list[Any], target: dict[str, Any], tolerance_pct: float = TARGET_TOLERANCE_PCT) -> float | None:
+    """Share of samples inside the target range widened by the tolerance (open-ended: above the bound)."""
     nums = numeric_values(values)
     if not nums:
         return None
     low = target["low"] * (1 - tolerance_pct / 100)
-    high = (target["high"] or target["low"]) * (1 + tolerance_pct / 100)
+    high = float("inf") if target["high"] is None else target["high"] * (1 + tolerance_pct / 100)
     inside = sum(1 for v in nums if low <= v <= high)
     return inside / len(nums) * 100
 
@@ -644,7 +875,11 @@ def _edge_mean(values: list[Any], tail: bool) -> float | None:
 
 
 def _pw_hr_drift(watts: list[Any], heartrate: list[Any], secs: float | None) -> float | None:
-    """Pw:HR second half vs first half in percent for steady efforts >= 10 min."""
+    """Pw:HR decoupling in percent for steady efforts >= 10 min (Intervals.icu convention).
+
+    (power/HR of the first half - power/HR of the second half) / first half: positive means
+    the heart rate rose relative to the power, as the Intervals.icu ``decoupling``.
+    """
     if not secs or secs < DRIFT_MIN_SECS:
         return None
     pairs = [
@@ -657,7 +892,7 @@ def _pw_hr_drift(watts: list[Any], heartrate: list[Any], secs: float | None) -> 
     half = len(pairs) // 2
     first = sum(w for w, _ in pairs[:half]) / sum(h for _, h in pairs[:half])
     second = sum(w for w, _ in pairs[half:]) / sum(h for _, h in pairs[half:])
-    return (second - first) / first * 100 if first else None
+    return (first - second) / first * 100 if first else None
 
 
 def _max(values: list[Any]) -> float | None:
@@ -667,6 +902,14 @@ def _max(values: list[Any]) -> float | None:
 
 def _round(value: float | None, digits: int) -> float | None:
     return None if value is None else round(value, digits)
+
+
+def _average_speed(profile: Profile, start: int, end: int, active: float) -> float | None:
+    """Distance over moving time (as the Intervals.icu interval average), else the mean smoothed speed."""
+    distance = profile.distance(start, end)
+    if distance is not None and active > 0:
+        return distance / active
+    return profile.mean("velocity_smooth", start, end)
 
 
 def estimated_load(active_s: float, np_watts: float | None, avg_watts: float | None, ftp: float | None) -> float | None:
@@ -693,14 +936,16 @@ def slice_metrics(  # pylint: disable=too-many-arguments,too-many-locals
 
     When ``interval`` covers exactly this range its Intervals.icu averages are used (so the
     numbers match the Intervals.icu interval table); otherwise every value is computed from
-    the samples (``source`` = "streams"). Pw:HR drift is only computed for ``steady`` efforts.
+    the samples (``source`` = "streams"), NP with the 30 s rolling mean over the whole
+    activity as Intervals.icu does. Pw:HR drift (Intervals.icu decoupling convention:
+    positive = HR rose relative to power) is only computed for ``steady`` efforts.
     """
     use_interval = interval is not None and interval.get("start_index") == start and interval.get("end_index") == end
     iv = interval if use_interval and interval is not None else {}
     elapsed, active = profile.elapsed(start, end), profile.active(start, end)
     watts, heart = profile.values("watts", start, end), profile.values("heartrate", start, end)
     speed, cadence = profile.values("velocity_smooth", start, end), profile.values("cadence", start, end)
-    np_streams = normalized_power(profile.time, profile.raw.get("watts") or [], start, end) if profile.has("watts") else None
+    np_streams = profile.normalized_power(start, end)
 
     def pick(key: str, computed: float | None) -> float | None:
         value = _num(iv.get(key)) if iv else None
@@ -715,7 +960,7 @@ def slice_metrics(  # pylint: disable=too-many-arguments,too-many-locals
         "normalized_watts": pick("weighted_average_watts", np_streams),
         "avg_hr": pick("average_heartrate", profile.mean("heartrate", start, end)),
         "max_hr": pick("max_heartrate", _max(heart)),
-        "avg_speed_m_s": pick("average_speed", profile.mean("velocity_smooth", start, end)),
+        "avg_speed_m_s": pick("average_speed", _average_speed(profile, start, end, active)),
         "gap_m_s": _num(iv.get("gap")) if iv else None,
         "avg_cadence": pick("average_cadence", None),
         "intensity_pct": _num(iv.get("intensity")) if iv else None,
@@ -739,7 +984,8 @@ def slice_metrics(  # pylint: disable=too-many-arguments,too-many-locals
     metrics["hr_end"] = _edge_mean(heart, tail=True)
     metrics["power_fade_pct"] = _fade_pct(watts)
     metrics["speed_fade_pct"] = _fade_pct(speed)
-    metrics["pw_hr_drift_pct"] = _pw_hr_drift(watts, heart, active) if steady else None
+    drift = _pw_hr_drift(watts, heart, active) if steady else None
+    metrics["pw_hr_drift_pct"] = pick("decoupling", drift) if drift is not None else None
     if target:
         metrics["time_in_target_pct"] = _time_in_target({"power": watts, "hr": heart, "pace": speed}[target["kind"]], target)
     custom: dict[str, Any] = {}
@@ -801,25 +1047,34 @@ def interval_metrics(
 
 
 def adherence(target: dict[str, Any] | None, metrics: dict[str, Any], tolerance_pct: float = TARGET_TOLERANCE_PCT) -> dict[str, Any] | None:
-    """Actual value vs target range: status, percent of the target midpoint and offset from the range."""
+    """Actual value vs target range: status, percent of the target midpoint and offset from the range.
+
+    An open-ended target (``high`` None, e.g. the top zone) is a lower bound: any value at
+    or above it is in range, and ``pct_of_target`` relates to the bound (``open_ended``).
+    """
     if not target:
         return None
     actual = {"power": metrics.get("avg_watts"), "hr": metrics.get("avg_hr"), "pace": metrics.get("avg_speed_m_s")}[target["kind"]]
     if actual is None:
         return {"status": "no data"}
-    low, high = target["low"], target["high"] or target["low"]
-    mid = (low + high) / 2
+    low, high = target["low"], target["high"]
+    open_ended = high is None
+    upper = float("inf") if high is None else high
+    reference = _target_mid(target)
     offset = 0.0
-    if actual > high and high:
-        offset = (actual - high) / high * 100
+    if actual > upper and upper:
+        offset = (actual - upper) / upper * 100
     elif actual < low and low:
         offset = (actual - low) / low * 100
-    within = low * (1 - tolerance_pct / 100) <= actual <= high * (1 + tolerance_pct / 100)
+    within = low * (1 - tolerance_pct / 100) <= actual <= upper * (1 + tolerance_pct / 100)
     status = "in range" if within else ("below" if actual < low else "above")
-    return {
-        "actual": actual, "status": status, "pct_of_target": actual / mid * 100 if mid else None,
+    result = {
+        "actual": actual, "status": status, "pct_of_target": actual / reference * 100 if reference else None,
         "offset_from_range_pct": round(offset, 1), "inside_exact_range": offset == 0.0,
     }
+    if open_ended:
+        result["open_ended"] = True
+    return result
 
 
 # ------------------------------------------------------------------------ analysis
@@ -851,17 +1106,26 @@ def _deviation(severity: str, text: str) -> dict[str, str]:
     return {"severity": severity, "text": text}
 
 
-def _step_deviations(row: dict[str, Any], step: dict[str, Any], tol: Tolerances, span_active: float) -> None:
+def _distance_text(metres: float | None) -> str:
+    if metres is None:
+        return "n/a"
+    return f"{metres / 1000:.2f} km" if metres >= 1000 else f"{metres:.0f} m"
+
+
+def _step_deviations(row: dict[str, Any], step: dict[str, Any], tol: Tolerances, span_active: float, planned_s: float | None) -> None:
     """Fill row["deviations"]: duration, intensity, time in target, pauses and start shift."""
     kind = step.get("kind")
-    planned = step.get("duration")
     metrics = row["metrics"]
     overrun = row.get("overrun")
     if overrun and overrun["counted_as"].startswith("extra"):
         severity = "info" if kind == "warmup" else "deviation"
         row["deviations"].append(_deviation(severity, f"{hms(overrun['moving_time_s'])} longer than planned; the remainder is reported separately"))
-    elif not overrun and planned and span_active < planned - tol.duration_allowance(planned):
-        row["deviations"].append(_deviation("deviation", f"{hms(planned - span_active)} shorter than planned"))
+    elif not overrun and planned_s and span_active < planned_s - tol.duration_allowance(planned_s):
+        if step.get("duration"):
+            text = f"{hms(planned_s - span_active)} shorter than planned"
+        else:
+            text = f"{_distance_text(-(row.get('distance_diff_m') or 0))} shorter than planned"
+        row["deviations"].append(_deviation("deviation", text))
     adh = row.get("adherence") or {}
     if adh.get("status") in ("above", "below"):
         severity = "deviation" if kind in ("work", "rest") else "info"
@@ -874,6 +1138,113 @@ def _step_deviations(row: dict[str, Any], step: dict[str, Any], tol: Tolerances,
     shift = row.get("start_offset_s")
     if shift is not None and abs(shift) > tol.start_shift_s:
         row["deviations"].append(_deviation("info", f"started {hms(abs(shift))} {'later' if shift > 0 else 'earlier'} than the plan timeline"))
+    for carried in row.get("carried_over") or []:
+        if carried["seconds"] > 0:
+            part = "last" if carried["from"] == "previous" else "first"
+            row["deviations"].append(_deviation(
+                "info", f"includes the {part} {hms(carried['seconds'])} of the {carried['from']} step's lap (lap and step boundaries differ)"
+            ))
+
+
+def _planned_secs(step: dict[str, Any], profile: Profile, start: int, end: int) -> float | None:
+    """Planned seconds of a step on [start, end): its duration, or for a distance step the
+    moving time needed to cover the planned distance at the actual speed (estimated from the
+    target speed without a distance stream)."""
+    if step.get("duration"):
+        return float(step["duration"])
+    distance = step.get("distance")
+    actual = profile.distance(start, end) if distance else None
+    if distance and actual:
+        if actual >= distance:
+            cut = profile.cap_by_distance(start, end, distance)
+            return profile.active(start, cut if cut is not None else end)
+        return profile.active(start, end) * distance / actual
+    return step.get("est_duration")
+
+
+def _segment_cost(step: dict[str, Any], profile: Profile, start: int, end: int) -> float | None:
+    """Intensity cost of the samples [start, end) against a step's target; None without target or data."""
+    target = step.get("target")
+    if not target:
+        return None
+    value = profile.mean(STREAM_KEYS[target["kind"]], start, end)
+    return None if value is None else _intensity_cost(value, target)
+
+
+def _receives(receiver: dict[str, Any], giver: dict[str, Any], profile: Profile, start: int, end: int) -> bool:
+    """Whether the samples [start, end) of the giver's lap fit the receiving step at least as well."""
+    to_receiver, to_giver = _segment_cost(receiver, profile, start, end), _segment_cost(giver, profile, start, end)
+    if to_receiver is None or to_giver is None:
+        return True  # without targets the plan timeline decides
+    return to_receiver <= to_giver + 1e-9
+
+
+def _worth_moving(short: float, long: float, moved: float, allow_short: float, allow_long: float) -> bool:
+    """Whether moving ``moved`` seconds puts right a step flagged as too short or too long."""
+    return short > allow_short or long - moved <= allow_long < long
+
+
+def _carry_over(  # pylint: disable=too-many-locals
+    steps: tuple[dict[str, Any], dict[str, Any]], segs: tuple[dict[str, Any], dict[str, Any]], profile: Profile, tol: Tolerances
+) -> None:
+    """Move the boundary between two adjacent matched steps off the lap boundary.
+
+    When the first step is longer than planned and the second shorter (or vice versa), the
+    part of the lap that belongs to the other step is carried over, so a lap boundary that
+    does not coincide with the step boundary (e.g. device auto-laps) does not produce two
+    opposite deviations. Only done when keeping the lap boundary would flag a step that the
+    moved time puts right, and when the moved samples fit the receiving step's target at
+    least as well as the giving step's.
+    """
+    (step_a, step_b), (seg_a, seg_b) = steps, segs
+    plan_a = _planned_secs(step_a, profile, seg_a["start"], seg_a["end"])
+    plan_b = _planned_secs(step_b, profile, seg_b["start"], seg_b["end"])
+    if not plan_a or not plan_b:
+        return
+    act_a, act_b = profile.active(seg_a["start"], seg_a["end"]), profile.active(seg_b["start"], seg_b["end"])
+    allow_a, allow_b = tol.duration_allowance(plan_a), tol.duration_allowance(plan_b)
+    if act_a > plan_a and act_b < plan_b:  # the tail of step a's lap belongs to step b
+        moved = min(act_a - plan_a, plan_b - act_b)
+        if not _worth_moving(plan_b - act_b, act_a - plan_a, moved, allow_b, allow_a):
+            return
+        cut = profile.cap_by_time(seg_a["start"], seg_a["end"], act_a - moved)
+        if seg_a["start"] < cut < seg_a["end"] and _receives(step_b, step_a, profile, cut, seg_a["end"]):
+            seconds = round(profile.active(cut, seg_a["end"]), 1)
+            seg_a["carried"].append({"from": "next", "seconds": -seconds})
+            seg_b["carried"].append({"from": "previous", "seconds": seconds})
+            seg_a["end"] = seg_b["start"] = cut
+    elif act_a < plan_a and act_b > plan_b:  # the head of step b's lap belongs to step a
+        moved = min(plan_a - act_a, act_b - plan_b)
+        if not _worth_moving(plan_a - act_a, act_b - plan_b, moved, allow_a, allow_b):
+            return
+        cut = profile.cap_by_time(seg_b["start"], seg_b["end"], moved)
+        if seg_b["start"] < cut < seg_b["end"] and _receives(step_a, step_b, profile, seg_b["start"], cut):
+            seconds = round(profile.active(seg_b["start"], cut), 1)
+            seg_a["carried"].append({"from": "next", "seconds": seconds})
+            seg_b["carried"].append({"from": "previous", "seconds": -seconds})
+            seg_a["end"] = seg_b["start"] = cut
+
+
+def _step_segments(
+    planned: list[dict[str, Any]], alignment: list[tuple[int | None, list[int]]], spans: list[_Span], profile: Profile, tol: Tolerances
+) -> dict[int, dict[str, Any]]:
+    """Sample range of every matched step (by alignment position), boundaries carried over between adjacent steps."""
+    segs: dict[int, dict[str, Any]] = {}
+    if not profile.n:
+        return segs
+    for position, (p_idx, indices) in enumerate(alignment):
+        if p_idx is None or not indices:
+            continue
+        first, last = spans[indices[0]], spans[indices[-1]]
+        if first.start is not None and last.end is not None:
+            segs[position] = {"start": first.start, "end": last.end, "carried": []}
+    for position, seg in sorted(segs.items()):
+        following = segs.get(position + 1)
+        if following is None or seg["end"] != following["start"]:
+            continue  # a missed step or an extra interval lies between: keep the lap boundary
+        steps = (planned[alignment[position][0]], planned[alignment[position + 1][0]])  # type: ignore[index]
+        _carry_over(steps, (seg, following), profile, tol)
+    return segs
 
 
 def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
@@ -882,6 +1253,7 @@ def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
     profile: Profile,
     tol: Tolerances,
     *,
+    seg: dict[str, Any] | None,
     is_last: bool,
     anchor: float | None,
     ftp: float | None,
@@ -900,38 +1272,44 @@ def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
     types = {str(t) for t in row["interval_types"] if t}
     if kind in ("work", "rest") and types and types != {"WORK" if kind == "work" else "RECOVERY"}:
         row["type_note"] = f"Intervals.icu type {'/'.join(sorted(types))}, planned {kind}"
-    planned = step.get("duration")
     target = step.get("target")
-    if first.start is None or last.end is None or profile.n == 0:
+    if seg is None:
         # No usable sample indices or streams: evaluate the interval as reported.
         metrics = _interval_only_metrics(interval)
         row.update(start_time=interval.get("start_time"), end_time=last.interval.get("end_time"), metrics=metrics,
                    adherence=adherence(target, metrics, tol.target_pct))
-        if planned and metrics.get("duration_s") is not None:
-            row["duration_diff_s"] = metrics["duration_s"] - planned
-        _step_deviations(row, step, tol, sum(p.active for p in parts))
+        span_active = sum(p.active for p in parts)
+        planned_s = step.get("duration") or step.get("est_duration")
+        if step.get("duration") and metrics.get("duration_s") is not None:
+            row["duration_diff_s"] = metrics["duration_s"] - step["duration"]
+        _step_deviations(row, step, tol, span_active, planned_s)
         return row
-    start, end = first.start, last.end
+    start, end = seg["start"], seg["end"]
     span_active = profile.active(start, end)
+    planned_s = _planned_secs(step, profile, start, end)
     cap = end
-    if planned and span_active > planned + tol.duration_allowance(planned):
-        cap = profile.cap_by_time(start, end, planned)
-    elif not planned and step.get("distance"):
-        by_distance = profile.cap_by_distance(start, end, step["distance"])
-        cap = by_distance if by_distance is not None else end
+    if planned_s and span_active > planned_s + tol.duration_allowance(planned_s):
+        cap = profile.cap_by_time(start, end, planned_s)
     metrics = slice_metrics(profile, start, cap, target=target, interval=interval if len(parts) == 1 else None,
                             steady=kind == "work", ftp=ftp, hidden_streams=hidden)
     row.update(start_time=metrics["start_time"], end_time=metrics["end_time"], start_index=start, end_index=cap,
                metrics=metrics, adherence=adherence(target, metrics, tol.target_pct))
-    if planned:
-        row["duration_diff_s"] = round(span_active - planned, 1)
-    if anchor is not None:
-        row["start_offset_s"] = round(profile.at(start) - (anchor + step.get("planned_start", 0.0)), 1)
+    if seg["carried"]:
+        row["carried_over"] = seg["carried"]
+    if step.get("duration"):
+        row["duration_diff_s"] = round(span_active - step["duration"], 1)
+    elif step.get("distance"):
+        actual_distance = profile.distance(start, end)
+        if actual_distance is not None:
+            row["distance_diff_m"] = round(actual_distance - step["distance"], 1)
+        row["planned_s_estimated"] = _round(planned_s, 1)
+    if anchor is not None and step.get("planned_start") is not None:
+        row["start_offset_s"] = round(profile.at(start) - (anchor + step["planned_start"]), 1)
     if cap < end:
         remainder = slice_metrics(profile, cap, end, ftp=ftp, hidden_streams=hidden)
         row["overrun"] = {**remainder, "counted_as": "additional training after the plan" if is_last else "extra time inside the plan"}
         row["split"] = {"planned_part_s": metrics["moving_time_s"], "remainder_s": remainder["moving_time_s"]}
-    _step_deviations(row, step, tol, span_active)
+    _step_deviations(row, step, tol, span_active, planned_s)
     return row
 
 
@@ -1067,7 +1445,8 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
         "unmatched_intervals": sum(1 for r in rows if not r.get("planned") and r.get("metrics")),
         "merged_steps": sum(1 for r in matched_rows if r.get("merged")),
         "split_steps": sum(1 for r in matched_rows if r.get("overrun")),
-        "planned_total_s": sum(s.get("duration") or 0 for s in planned) or None,
+        "boundaries_off_lap": sum(1 for r in matched_rows for c in r.get("carried_over") or [] if c["seconds"] > 0),
+        "planned_total_s": sum(s.get("duration") or s.get("est_duration") or 0 for s in planned) or None,
         "actual_total_s": sum(_num(i.get("elapsed_time")) or 0 for i in intervals) or None,
         "plan_start_s": start,
         "plan_end_s": end,
@@ -1088,6 +1467,7 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
         ),
         "tolerances": {"duration_pct": tol.duration_pct, "duration_min_s": tol.duration_min_s,
                        "start_shift_s": tol.start_shift_s, "pause_s": tol.pause_s, "target_pct": tol.target_pct},
+        "pw_hr_drift_convention": DRIFT_CONVENTION,
     }
 
 
@@ -1103,7 +1483,8 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
 
     context may carry ``ftp`` (for kJ shares and the estimated load), ``activity_type`` and
     ``stream_defs`` (to hide counter and sport-foreign custom streams from step statistics;
-    ``include_all_streams`` keeps them).
+    ``include_all_streams`` keeps them) and ``pace_units`` (Intervals.icu pace units for the
+    text; default by sport: /100 m for swims, /500 m for rowing, else /km).
     """
     tol = tolerances or Tolerances()
     ctx = context or {}
@@ -1111,19 +1492,23 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
     profile = Profile(streams)
     hidden_map = hidden_custom_streams(streams, ctx.get("activity_type"), ctx.get("stream_defs"))
     hidden = set() if ctx.get("include_all_streams") else set(hidden_map)
+    pace_units = ctx.get("pace_units") or default_pace_units(ctx.get("activity_type"))
     if not planned:
         result = _analyze_without_plan(intervals, profile, ftp, hidden)
         result["hidden_streams"] = hidden_map
         result["activity_type"] = ctx.get("activity_type")
+        result["pace_units"] = pace_units
         return result
     spans = _spans(intervals, profile)
     alignment = align_spans(planned, intervals, profile)
+    segments = _step_segments(planned, alignment, spans, profile, tol)
     matched = [(p, idx) for p, idx in alignment if p is not None and idx]
     first_matched = matched[0][1][0] if matched else None
     last_matched = matched[-1][1][-1] if matched else None
     anchor = None
-    if matched and spans[matched[0][1][0]].start is not None and profile.n:
-        anchor = profile.at(spans[matched[0][1][0]].start or 0) - planned[matched[0][0]].get("planned_start", 0.0)  # type: ignore[index]
+    first_planned_start = planned[matched[0][0]].get("planned_start") if matched else None  # type: ignore[index]
+    if matched and spans[matched[0][1][0]].start is not None and profile.n and first_planned_start is not None:
+        anchor = profile.at(spans[matched[0][1][0]].start or 0) - first_planned_start
     rows: list[dict[str, Any]] = []
     pre_spans: list[_Span] = []
     post_spans: list[_Span] = []
@@ -1144,9 +1529,10 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
             rows.append({"planned": step, "interval_index": None, "deviations": [_deviation("deviation", "not executed / no matching interval")]})
             continue
         is_last = indices[-1] == last_matched
-        row = _step_row(step, [spans[i] for i in indices], profile, tol, is_last=is_last, anchor=anchor, ftp=ftp, hidden=hidden)
+        row = _step_row(step, [spans[i] for i in indices], profile, tol, seg=segments.get(position), is_last=is_last,
+                        anchor=anchor, ftp=ftp, hidden=hidden)
         if step.get("kind") == "work" and row.get("end_index") is not None:
-            _hr_recovery(profile, row["metrics"], row["end_index"] if row.get("overrun") else (following.start if following else None))
+            _hr_recovery(profile, row["metrics"], row["end_index"])
         if is_last:
             plan_end_index = row.get("end_index")
         rows.append(row)
@@ -1159,7 +1545,7 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
     summary = _summary(planned, intervals, rows, profile, extension, pre_plan, tol)
     return {
         "rows": rows, "summary": summary, "extension": extension, "pre_plan": pre_plan, "hidden_streams": hidden_map,
-        "activity_type": ctx.get("activity_type"),
+        "activity_type": ctx.get("activity_type"), "pace_units": pace_units,
     }
 
 
@@ -1170,23 +1556,36 @@ def _fmt(value: Any, digits: int = 0, suffix: str = "") -> str:
     return f"{value:.{digits}f}{suffix}"
 
 
-def _target_text(target: dict[str, Any] | None) -> str:
+def target_text(target: dict[str, Any] | None, pace_units: str | None = None) -> str:
+    """Target range as text: '238-242 W', '351 W or more', '6:48/km to 6:18/km', '4:47/km or faster'."""
     if not target:
         return "no target"
     low, high, units = target["low"], target["high"], target["units"]
     if target["kind"] == "pace":
-        return f"{format_pace(low)}" + (f" to {format_pace(high)}" if high and high != low else "")
-    span = f"{low:.0f}" + (f"-{high:.0f}" if high and high != low else "")
+        if high is None:
+            return f"{format_pace(low, pace_units)} or faster"
+        return f"{format_pace(low, pace_units)}" + (f" to {format_pace(high, pace_units)}" if high != low else "")
+    if high is None:
+        return f"{low:.0f} {units} or more"
+    span = f"{low:.0f}" + (f"-{high:.0f}" if high != low else "")
     return f"{span} {units}"
 
 
-def _metric_lines(  # pylint: disable=too-many-branches
-    metrics: dict[str, Any], target: dict[str, Any] | None, pace_based: bool, detail_level: str = "standard", sport: Any = None
+def _amount_text(step: dict[str, Any]) -> str:
+    """Planned duration, or the planned distance of a distance step."""
+    if not step.get("duration") and step.get("distance"):
+        return _distance_text(step["distance"])
+    return hms(step.get("duration"))
+
+
+def _metric_lines(  # pylint: disable=too-many-branches,too-many-arguments,too-many-positional-arguments
+    metrics: dict[str, Any], target: dict[str, Any] | None, pace_based: bool, detail_level: str = "standard", sport: Any = None,
+    units: str | None = None,
 ) -> list[str]:
     lines: list[str] = []
     if pace_based or metrics.get("avg_speed_m_s") and not metrics.get("avg_watts"):
         lines.append(
-            f"    pace {format_pace(metrics.get('avg_speed_m_s'))} (GAP {format_pace(metrics.get('gap_m_s'))}), "
+            f"    pace {format_pace(metrics.get('avg_speed_m_s'), units)} (GAP {format_pace(metrics.get('gap_m_s'), units)}), "
             f"speed fade {_fmt(metrics.get('speed_fade_pct'), 1, '%')}"
         )
     if metrics.get("avg_watts") is not None:
@@ -1202,7 +1601,7 @@ def _metric_lines(  # pylint: disable=too-many-branches
         if metrics.get("hr_recovery_60s_drop") is not None:
             hr += f", drop in first 60 s of next interval {_fmt(metrics['hr_recovery_60s_drop'])} bpm"
         if metrics.get("pw_hr_drift_pct") is not None:
-            hr += f", Pw:HR drift {_fmt(metrics['pw_hr_drift_pct'], 1, '%')}"
+            hr += f", Pw:HR drift {metrics['pw_hr_drift_pct']:+.1f}%"
         lines.append(hr)
     if metrics.get("cadence_nonzero_mean") is not None:
         lines.append(f"    cadence {cadence_text(metrics['cadence_nonzero_mean'], sport)} (non-zero samples)")
@@ -1229,7 +1628,7 @@ def _adherence_text(adh: dict[str, Any] | None) -> str:
         return ""
     text = f", {adh['status']}"
     if adh.get("pct_of_target"):
-        text += f" ({adh['pct_of_target']:.0f}% of target"
+        text += f" ({adh['pct_of_target']:.0f}% of {'the lower bound' if adh.get('open_ended') else 'target'}"
         offset = adh.get("offset_from_range_pct")
         if offset and adh["status"] == "in range":
             text += f", {offset:+.1f}% {'above' if offset > 0 else 'below'} the range, within the ±{TARGET_TOLERANCE_PCT:.0f}% tolerance"
@@ -1237,10 +1636,10 @@ def _adherence_text(adh: dict[str, Any] | None) -> str:
     return text
 
 
-def _compact_row(row: dict[str, Any]) -> str:
+def _compact_row(row: dict[str, Any], units: str | None = None) -> str:
     step = row.get("planned")
     metrics = row.get("metrics") or {}
-    head = f"[plan {step['index']}] {step['kind']} {hms(step['duration'])} @ {_target_text(step['target'])}" if step else f"[extra] {row.get('label')}"
+    head = f"[plan {step['index']}] {step['kind']} {_amount_text(step)} @ {target_text(step['target'], units)}" if step else f"[extra] {row.get('label')}"
     if not metrics:
         return f"{head}: not executed"
     parts = [f"{hms(metrics.get('moving_time_s'))}"]
@@ -1259,14 +1658,14 @@ def _compact_row(row: dict[str, Any]) -> str:
     return text
 
 
-def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None) -> list[str]:
+def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None, units: str | None = None) -> list[str]:
     if detail_level == "compact":
-        return [_compact_row(row)]
+        return [_compact_row(row, units)]
     step = row.get("planned")
     metrics = row.get("metrics")
     if step:
         rep = f" (rep {step['rep']}/{step['reps']})" if step.get("rep") else ""
-        head = f"[plan {step['index']}] {step['kind']}{rep} {hms(step['duration'])} @ {_target_text(step['target'])}"
+        head = f"[plan {step['index']}] {step['kind']}{rep} {_amount_text(step)} @ {target_text(step['target'], units)}"
         if step.get("text"):
             head += f" '{step['text']}'"
     else:
@@ -1284,6 +1683,8 @@ def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str, sport: 
             actual += f" ({hms(metrics.get('moving_time_s'))} moving)"
         if row.get("duration_diff_s") is not None:
             actual += f", {row['duration_diff_s']:+.0f} s vs plan"
+        elif row.get("distance_diff_m") is not None:
+            actual += f", {row['distance_diff_m']:+.0f} m vs plan"
     actual += _adherence_text(row.get("adherence"))
     lines = [f"{head} {actual}"]
     if overrun:
@@ -1291,14 +1692,14 @@ def _row_lines(row: dict[str, Any], pace_based: bool, detail_level: str, sport: 
             f"    remaining {hms(overrun.get('moving_time_s'))} ({hms(overrun.get('start_time'))}-{hms(overrun.get('end_time'))}, "
             f"avg {_fmt(overrun.get('avg_watts'))} W, HR {_fmt(overrun.get('avg_hr'))} bpm) counted as {overrun['counted_as']}"
         )
-    lines.extend(_metric_lines(metrics, step["target"] if step else None, pace_based, detail_level, sport))
+    lines.extend(_metric_lines(metrics, step["target"] if step else None, pace_based, detail_level, sport, units))
     notes = [d["text"] for d in row.get("deviations", []) if not (overrun and "longer than planned" in d["text"])]
     if notes:
         lines.append("    notes: " + "; ".join(notes))
     return lines
 
 
-def _effort_line(effort: dict[str, Any]) -> str:
+def _effort_line(effort: dict[str, Any], units: str | None = None) -> str:
     where = f"[Intervals.icu {effort.get('type')} interval {effort['interval_index'] + 1}]"
     if effort.get("average_watts") is not None:
         return (
@@ -1306,10 +1707,12 @@ def _effort_line(effort: dict[str, Any]) -> str:
             f"(max {_fmt(effort.get('max_watts'))} W), HR {_fmt(effort.get('average_heartrate'))}"
             + (f" (max {_fmt(effort.get('max_heartrate'))})" if effort.get("max_heartrate") is not None else "") + f" bpm {where}"
         )
-    return f"    extra effort: {hms(effort.get('elapsed_time'))} from {hms(effort.get('start_time'))} at {format_pace(effort.get('average_speed'))} {where}"
+    return f"    extra effort: {hms(effort.get('elapsed_time'))} from {hms(effort.get('start_time'))} at {format_pace(effort.get('average_speed'), units)} {where}"
 
 
-def _block_lines(title: str, block: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None) -> list[str]:
+def _block_lines(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    title: str, block: dict[str, Any], pace_based: bool, detail_level: str, sport: Any = None, units: str | None = None
+) -> list[str]:
     metrics = block.get("metrics") or {}
     head = f"{title}: {hms(block['duration_s'])} from {hms(block.get('start_time'))} to {hms(block.get('end_time'))} ({block['intervals']} interval(s)"
     remainder = block.get("remainder_of_last_step")
@@ -1321,15 +1724,15 @@ def _block_lines(title: str, block: dict[str, Any], pace_based: bool, detail_lev
     lines = [head]
     if metrics.get("estimated_load") is not None:
         lines.append(f"    estimated load ≈ {metrics['estimated_load']:.0f} (TSS formula from NP and FTP; the Intervals.icu load covers the whole activity)")
-    lines.extend(_metric_lines(metrics, None, pace_based, detail_level, sport))
-    lines.extend(_effort_line(effort) for effort in block.get("efforts") or [])
+    lines.extend(_metric_lines(metrics, None, pace_based, detail_level, sport, units))
+    lines.extend(_effort_line(effort, units) for effort in block.get("efforts") or [])
     hardest = block.get("hardest_interval") or {}
     if hardest.get("elapsed_time"):
         lines.append(
             f"    hardest part: {hms(hardest['elapsed_time'])} at avg {_fmt(hardest.get('average_watts'))} W "
             f"(max {_fmt(hardest.get('max_watts'))} W), HR {_fmt(hardest.get('average_heartrate'))} bpm"
             if hardest.get("average_watts") is not None
-            else f"    hardest part: {hms(hardest['elapsed_time'])} at {format_pace(hardest.get('average_speed'))}"
+            else f"    hardest part: {hms(hardest['elapsed_time'])} at {format_pace(hardest.get('average_speed'), units)}"
         )
     return lines
 
@@ -1351,6 +1754,8 @@ def _summary_lines(summary: dict[str, Any]) -> list[str]:
         quality.append(f"steps capped at their planned duration {summary['split_steps']}")
     if summary.get("merged_steps"):
         quality.append(f"steps matched to several intervals {summary['merged_steps']}")
+    if summary.get("boundaries_off_lap"):
+        quality.append(f"step boundaries set on the plan timeline inside a lap {summary['boundaries_off_lap']}")
     lines.append("Execution: " + ", ".join(quality))
     if summary.get("extended_beyond_plan"):
         share = f", {summary['extension_work_share_pct']:.0f}% of the activity's work in kJ" if summary.get("extension_work_share_pct") is not None else ""
@@ -1376,14 +1781,17 @@ def format_execution(result: dict[str, Any], header: str, pace_based: bool = Fal
     hidden = result.get("hidden_streams") or {}
     if hidden and detail_level == "standard":
         lines.append("Custom streams not shown per step: " + ", ".join(f"{code} ({why})" for code, why in sorted(hidden.items())))
+    if detail_level != "compact" and any((r.get("metrics") or {}).get("pw_hr_drift_pct") is not None for r in result["rows"]):
+        lines.append(f"Pw:HR drift: {DRIFT_CONVENTION}.")
     lines.append("")
     sport = result.get("activity_type")
+    units = result.get("pace_units") or default_pace_units(sport)
     for row in result["rows"]:
-        lines.extend(_row_lines(row, pace_based, detail_level, sport))
+        lines.extend(_row_lines(row, pace_based, detail_level, sport, units))
     if result.get("pre_plan"):
         lines.append("")
-        lines.extend(_block_lines("Riding before the plan", result["pre_plan"], pace_based, detail_level, sport))
+        lines.extend(_block_lines("Riding before the plan", result["pre_plan"], pace_based, detail_level, sport, units))
     if result.get("extension"):
         lines.append("")
-        lines.extend(_block_lines("Additional training after the plan", result["extension"], pace_based, detail_level, sport))
+        lines.extend(_block_lines("Additional training after the plan", result["extension"], pace_based, detail_level, sport, units))
     return "\n".join(lines)

@@ -344,7 +344,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     paired = event_id or activity.get("paired_event_id")
     if steps is None and paired and athlete_id:
         event = await _get_event(athlete_id, paired, api_key)
-        steps = (event or {}).get("workout_doc", {}).get("steps") if event else None
+        steps = ((event or {}).get("workout_doc") or {}).get("steps") if event else None
         if event:
             plan_source = f"event {event.get('id')} ('{event.get('name')}', {str(event.get('start_date_local', ''))[:10]})"
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
@@ -352,8 +352,9 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     if not planned and not paired and suggest_matches and athlete_id:
         candidates = await _match_candidates(athlete_id, activity, api_key)
 
+    doc = planned_workout_doc if isinstance(planned_workout_doc, dict) else ((event or {}).get("workout_doc") or {})
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
-               "include_all_streams": detail_level == "full"}
+               "include_all_streams": detail_level == "full", "pace_units": doc.get("pace_units")}
     result = analyze(planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 

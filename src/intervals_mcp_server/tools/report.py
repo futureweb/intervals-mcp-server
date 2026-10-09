@@ -19,11 +19,11 @@ from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import resolve_gear_for_activity
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, is_missing
-from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps
+from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps, target_text
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
 from intervals_mcp_server.utils.power_compare import compare_power_streams as compute_power_comparison
 from intervals_mcp_server.utils.segments import detect_segments
-from intervals_mcp_server.utils.sports import hms, utc_offset
+from intervals_mcp_server.utils.sports import format_pace, hms, utc_offset
 from intervals_mcp_server.utils.streams import find_stream, gear_units_note, numeric_values
 from intervals_mcp_server.utils.work_sets import set_summary, split_work
 
@@ -109,6 +109,33 @@ def _num(value: Any) -> float | None:
     return float(value)
 
 
+ACTUAL_KEYS = {"power": "avg_watts", "hr": "avg_hr", "pace": "avg_speed_m_s"}
+
+
+def _work_vs_plan(work: list[dict[str, Any]], pace_units: str | None) -> str:
+    """'work steps 249/249/253 W vs 238-246 W planned' in the unit of the planned targets.
+
+    Power targets are compared with the average power, pace targets with the average pace
+    and HR targets with the average HR; nothing when the work steps mix target kinds.
+    """
+    targets = [r["planned"]["target"] for r in work if r["planned"].get("target")]
+    kinds = {t["kind"] for t in targets}
+    if len(kinds) != 1:
+        return ""
+    kind = kinds.pop()
+    values = [r["metrics"][ACTUAL_KEYS[kind]] for r in work if r["metrics"].get(ACTUAL_KEYS[kind]) is not None]
+    if not values:
+        return ""
+    highs = [t["high"] for t in targets]
+    span = {"kind": kind, "low": min(t["low"] for t in targets), "high": None if None in highs else max(highs),
+            "units": "bpm" if kind == "hr" else "W"}
+    if kind == "pace":
+        actual = "/".join(format_pace(v, pace_units) for v in values)
+    else:
+        actual = "/".join(f"{v:.0f}" for v in values) + f" {span['units']}"
+    return f"; work steps {actual} vs {target_text(span, pace_units)} planned"
+
+
 def _execution_findings(execution: dict[str, Any]) -> list[str]:
     summary = execution["summary"]
     rows = [r for r in execution["rows"] if r.get("planned") and r.get("metrics")]
@@ -116,12 +143,7 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
     findings = []
     text = f"Plan: {summary['matched']}/{summary['planned_steps']} steps executed"
     if work:
-        watts = "/".join(f"{r['metrics']['avg_watts']:.0f}" for r in work if r["metrics"].get("avg_watts") is not None)
-        targets = [r["planned"]["target"] for r in work if r["planned"].get("target")]
-        if watts and targets:
-            low = min(t["low"] for t in targets)
-            high = max((t["high"] or t["low"]) for t in targets)
-            text += f"; work steps {watts} W vs {low:.0f}-{high:.0f} W planned"
+        text += _work_vs_plan(work, execution.get("pace_units"))
         text += f" ({summary['work_steps_in_range']} within ±5%, {summary.get('work_steps_inside_exact_range')} inside the exact range"
         if summary.get("work_time_in_target_pct_mean") is not None:
             text += f", mean time in target {summary['work_time_in_target_pct_mean']:.0f}%"
@@ -130,7 +152,11 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
     findings.append(text)
     extension = execution.get("extension")
     if extension:
-        efforts = ", ".join(f"{hms(e.get('elapsed_time'))} @ {e.get('average_watts')} W" for e in extension.get("efforts") or [])
+        efforts = ", ".join(
+            f"{hms(e.get('elapsed_time'))} @ {e['average_watts']} W" if e.get("average_watts") is not None
+            else f"{hms(e.get('elapsed_time'))} @ {format_pace(e.get('average_speed'), execution.get('pace_units'))}"
+            for e in extension.get("efforts") or []
+        )
         share = f", {summary['extension_work_share_pct']:.0f}% of the work" if summary.get("extension_work_share_pct") is not None else ""
         findings.append(
             f"Additional training after the plan: {hms(extension['duration_s'])} from {hms(extension.get('start_time'))}{share}"
@@ -304,16 +330,18 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
 
     steps: Any = None
     plan_source = ""
+    doc: dict[str, Any] = {}
     if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
-        steps, plan_source = planned_workout_doc["steps"], "workout document provided by the caller"
+        doc, plan_source = planned_workout_doc, "workout document provided by the caller"
     elif activity.get("paired_event_id") and athlete_id:
         event = await _get_event(athlete_id, activity["paired_event_id"], api_key)
         if event:
-            steps = (event.get("workout_doc") or {}).get("steps")
+            doc = event.get("workout_doc") or {}
             plan_source = f"event {event.get('id')} ('{event.get('name')}')"
+    steps = doc.get("steps")
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
-               "include_all_streams": detail_level == "full"}
+               "include_all_streams": detail_level == "full", "pace_units": doc.get("pace_units")}
     execution = analyze(planned, intervals, streams, tolerances=tolerances, context=context) if intervals else None
     pace_based = str(activity.get("type")) in PACE_SPORTS
     power = _power_check(streams)

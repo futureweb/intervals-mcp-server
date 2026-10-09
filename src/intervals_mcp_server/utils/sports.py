@@ -263,6 +263,14 @@ def sport_family(activity_type: Any) -> str:
     return wanted or "unknown"
 
 
+DEFAULT_PACE_UNITS = {"swimming": "SECS_100M", "rowing": "SECS_500M"}
+
+
+def default_pace_units(activity_type: Any) -> str:
+    """Pace units for a sport when none are configured: per 100 m for swims, per 500 m for rowing, else min/km."""
+    return DEFAULT_PACE_UNITS.get(sport_family(activity_type), "MINS_KM")
+
+
 def family_types(activity_type: Any) -> list[str]:
     """All activity types of the family of ``activity_type`` (just the type when unknown)."""
     family = sport_family(activity_type)
