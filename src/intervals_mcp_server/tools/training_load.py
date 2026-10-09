@@ -407,8 +407,9 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
         return days
     today, end = days
 
-    first_monday = end - timedelta(days=end.weekday() + 7 * (weeks - 1))
-    fetch_start = min(end - timedelta(days=chronic_days), first_monday - timedelta(days=chronic_days))
+    # One extra week: the windows may end yesterday (see load_end_for), which can move the weeks back.
+    first_monday = end - timedelta(days=end.weekday() + 7 * weeks)
+    fetch_start = min(end - timedelta(days=chronic_days + 1), first_monday - timedelta(days=chronic_days))
     device_defs = await device_load_fields(athlete_id_to_use, api_key)
     fields = LOAD_FIELDS + "".join(f",{code}" for code in device_defs)
     activities, error = await fetch_activities(athlete_id_to_use, api_key, fetch_start, end, fields)

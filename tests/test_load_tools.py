@@ -332,3 +332,15 @@ def test_new_tools_are_read_only_and_prompt():
     text = training_load_review("2026-10-09")
     assert "get_coach_context" in text and "end_date='2026-10-09'" in text
     assert "not a risk statement" in text and "Do not state causes" in text
+
+
+def test_new_tools_through_mcp_layer(monkeypatch):
+    """The registered tools accept JSON arguments via FastMCP (argument validation included)."""
+    from intervals_mcp_server.mcp_instance import mcp  # pylint: disable=import-outside-toplevel
+
+    _setup(monkeypatch)
+    result = asyncio.run(mcp.call_tool("get_training_load", {"acute_days": 7, "chronic_days": 28, "detail_level": "compact"}))
+    text = json.dumps(result, default=str)
+    assert "Acute:chronic ratio 1.00" in text
+    result = asyncio.run(mcp.call_tool("get_durability", {"max_temp_c": None, "min_minutes": 45.5}))
+    assert "no temperature limit" in json.dumps(result, default=str)
