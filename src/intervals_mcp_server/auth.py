@@ -239,8 +239,9 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
     dynamic_registration: bool = True
     private_key_jwt: bool = True
     permission_classes: tuple[str, ...] = ("read",)
-    api_key_digest: str | None = None
-    totp_secret: str | None = None
+    # Kept out of repr(); compared in constant time. It is the key the server already holds.
+    api_key: str | None = field(default=None, repr=False)
+    totp_secret: str | None = field(default=None, repr=False)
 
     @property
     def issuer(self) -> str:
@@ -280,10 +281,9 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
 
     def verify_api_key(self, api_key: str) -> bool:
         """Constant-time check of an Intervals.icu API key against the configured one."""
-        if "apikey" not in self.login_methods or not self.api_key_digest:
+        if "apikey" not in self.login_methods or not self.api_key:
             return False
-        candidate = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()
-        return hmac.compare_digest(candidate, self.api_key_digest)
+        return hmac.compare_digest(api_key.strip().encode("utf-8"), self.api_key.encode("utf-8"))
 
     def same_origin(self, url: str) -> bool:
         """True when *url* points at this server (scheme, host and port of the issuer)."""
@@ -432,7 +432,7 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         dynamic_registration=_env_bool(env, "OAUTH_DYNAMIC_REGISTRATION", True),
         private_key_jwt=_env_bool(env, "OAUTH_PRIVATE_KEY_JWT", True),
         permission_classes=tuple(p for p in PERMISSION_CLASSES if p in permissions),
-        api_key_digest=hashlib.sha256(api_key.encode("utf-8")).hexdigest() if "apikey" in methods else None,
+        api_key=api_key if "apikey" in methods else None,
         totp_secret=totp_secret,
     )
 

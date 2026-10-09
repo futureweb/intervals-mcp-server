@@ -43,8 +43,8 @@ First public beta of the Futureweb fork. Based on upstream
 
 ### Added (sign-in options)
 - OAuth sign-in with the Intervals.icu API key (`OAUTH_LOGIN=apikey`), the default without an
-  Intervals.icu app and without a password: OAuth works with zero extra configuration. The key is
-  compared in constant time against a digest and never stored or logged.
+  Intervals.icu app and without a password: OAuth works with zero extra configuration. The entered key is
+  compared in constant time with the configured one and never stored or logged.
 - Optional TOTP second factor (`OAUTH_TOTP_SECRET`, RFC 6238, single-use codes) for the password and
   API-key sign-ins; `python -m intervals_mcp_server.auth totp-secret` creates the secret and the
   `otpauth://` URI; status shows the second factor.

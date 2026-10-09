@@ -28,8 +28,8 @@ and never given to the MCP client.
   | `password`: server password | `OAUTH_PASSWORD_HASH` (or `OAUTH_PASSWORD`) | a password is set |
   | `apikey`: your Intervals.icu API key | nothing extra: the `API_KEY` the server already uses | otherwise (zero configuration) |
 
-  The API-key sign-in compares the entered key in constant time with a SHA-256 digest of the
-  configured key; the key is never stored, logged or sent anywhere. With `OAUTH_TOTP_SECRET` the
+  The API-key sign-in compares the entered key in constant time with the configured key; the
+  entered key is never stored, logged or sent anywhere. With `OAUTH_TOTP_SECRET` the
   password and API-key sign-ins additionally ask for the 6-digit code of an authenticator app
   (TOTP, RFC 6238, single use).
 * **Consent page** showing which client asks (verified for clients with a metadata
