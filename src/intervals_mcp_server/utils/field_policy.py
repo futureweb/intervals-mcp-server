@@ -160,12 +160,14 @@ def _values(
     """(date, value) pairs of a field, oldest first, and how many values came from sports without the field."""
     out: list[tuple[str, float]] = []
     foreign = 0
+    # When the field is assigned to at least one sport, sports without an assignment list do not count either.
+    restricted = any(code in codes for codes in (assigned_by_type or {}).values() if codes)
     for activity in activities:
         value = _number(activity.get(code))
         if value is None:
             continue
         assigned = (assigned_by_type or {}).get(str(activity.get("type") or ""))
-        if assigned is not None and code not in assigned:
+        if (assigned is not None and code not in assigned) or (assigned is None and restricted):
             foreign += 1
             continue
         out.append((str(activity.get("start_date_local") or ""), value))
@@ -180,8 +182,9 @@ def aggregate_field(  # pylint: disable=too-many-arguments
     """Aggregate one custom field over activities according to its policy; None without values.
 
     ``assigned_by_type`` maps an activity type to the field codes assigned to its sport in the
-    Intervals.icu sport settings (None = unknown); values on activities of a sport without the
-    field (e.g. running dynamics stored as 0 on rides) are left out and counted. For estimates
+    Intervals.icu sport settings (None = no list); values on activities of a sport without the
+    field (e.g. running dynamics stored as 0 on rides or walks) are left out and counted. Sports
+    without an assignment list only count when the field is assigned to no sport at all. For estimates
     (trend policy) on a never-negative scale a stored 0 is the device's "no value" and is left out
     as well; elsewhere zeros are kept as stored and counted.
     """

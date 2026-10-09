@@ -140,14 +140,16 @@ def test_zeros_and_sport_foreign_values():
         {"start_date_local": "2026-10-01", "type": "Run", "GCT": 300.0, "VO2MaxGarmin": 50.0, "AerobicEffect": 0.0},
         {"start_date_local": "2026-10-02", "type": "Ride", "GCT": 0.0, "VO2MaxGarmin": 0.0, "AerobicEffect": 2.0},
         {"start_date_local": "2026-10-03", "type": "Run", "GCT": 310.0, "VO2MaxGarmin": 51.0, "AerobicEffect": 3.0},
+        {"start_date_local": "2026-10-04", "type": "Walk", "GCT": 0.0, "Mystery": 2.0},
     ]
-    assigned = {"Run": {"GCT", "VO2MaxGarmin", "AerobicEffect"}, "Ride": {"VO2MaxGarmin", "AerobicEffect"}}
+    assigned = {"Run": {"GCT", "VO2MaxGarmin", "AerobicEffect"}, "Ride": {"VO2MaxGarmin", "AerobicEffect"}, "Walk": None}
     aggs = aggregate_custom_fields(activities, DEFS, assigned_by_type=assigned)
-    assert aggs["GCT"]["mean"] == 305 and aggs["GCT"]["other_sport_values_ignored"] == 1
+    assert aggs["GCT"]["mean"] == 305 and aggs["GCT"]["other_sport_values_ignored"] == 2  # ride and walk zeros
+    assert aggs["Mystery"]["n"] == 1  # assigned to no sport: every value counts
     assert aggs["VO2MaxGarmin"]["min"] == 50 and aggs["VO2MaxGarmin"]["zeros_excluded"] == 1
     assert aggs["AerobicEffect"]["min"] == 0 and aggs["AerobicEffect"]["zero_values"] == 1  # a real 0 effect is kept
     text = format_aggregate("GCT", aggs["GCT"])
-    assert "1 value(s) from sports without this field ignored" in text
+    assert "2 value(s) from sports without this field ignored" in text
     assert "1 stored 0 left out as 'no value'" in format_aggregate("VO2MaxGarmin", aggs["VO2MaxGarmin"])
     unknown = aggregate_custom_fields(activities, DEFS)  # without sport settings every value counts
-    assert unknown["GCT"]["n"] == 3
+    assert unknown["GCT"]["n"] == 4
