@@ -86,14 +86,11 @@ def test_shared_client_closes_only_after_the_last_session(monkeypatch):
 
     async def scenario() -> list[bool]:
         states = []
-        first = api_client.setup_api_client(None)  # type: ignore[arg-type]
-        second = api_client.setup_api_client(None)  # type: ignore[arg-type]
-        await first.__aenter__()
-        await second.__aenter__()
-        await first.__aexit__(None, None, None)
-        states.append(fake.is_closed)
-        await second.__aexit__(None, None, None)
-        states.append(fake.is_closed)
+        async with api_client.setup_api_client(None):  # type: ignore[arg-type]
+            async with api_client.setup_api_client(None):  # type: ignore[arg-type]
+                pass
+            states.append(fake.is_closed)  # inner session ended, outer still active
+        states.append(fake.is_closed)  # last session ended
         return states
 
     assert asyncio.run(scenario()) == [False, True]
