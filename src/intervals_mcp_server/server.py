@@ -91,6 +91,12 @@ from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-
 )
 from intervals_mcp_server.tools.gear import get_gear_list  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.wellness import get_wellness_data  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.workout_library import (  # pylint: disable=wrong-import-position  # noqa: E402
+    add_event_from_library,
+    delete_library_workout,
+    create_library_workout,
+    get_workout_library,
+)
 from intervals_mcp_server.tools.power_curves import get_athlete_power_curves  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.hr_pace_curves import get_hr_curves, get_pace_curves  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.training_review import (  # pylint: disable=wrong-import-position  # noqa: E402
@@ -129,6 +135,10 @@ __all__ = [
     "get_pace_curves",
     "get_weekly_summary",
     "get_plan_compliance",
+    "get_workout_library",
+    "create_library_workout",
+    "add_event_from_library",
+    "delete_library_workout",
     "get_custom_items",
     "get_custom_item_by_id",
     "create_custom_item",
