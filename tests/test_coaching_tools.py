@@ -72,6 +72,7 @@ PATCH_TARGETS = (
     "intervals_mcp_server.tools.hr_pace_curves.make_intervals_request",
     "intervals_mcp_server.tools.power_curves.make_intervals_request",
     "intervals_mcp_server.tools.report.make_intervals_request",
+    "intervals_mcp_server.tools.training_load.make_intervals_request",
 )
 
 
