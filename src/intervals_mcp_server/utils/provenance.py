@@ -22,6 +22,8 @@ Facts used:
   source field, so a 0 in such a field is ambiguous ("zero placeholder").
 - Custom fields are computed when an activity is analysed: a field defined after the analysis
   has no value until the activity is reprocessed (or the value is written, e.g. by the bridge).
+  The definitions only carry the time of their last change (``updated``), so a field edited after
+  the analysis is reported the same way ("changed or defined after the analysis").
 - The activity list leaves filtered duplicates out, so an activity that is not listed on its
   day while a listed one starts within two minutes is a filtered duplicate.
 """
@@ -139,7 +141,8 @@ def source_summary(activity: dict[str, Any]) -> dict[str, Any]:
 
 
 def freshness(activity: dict[str, Any], defs: CustomFieldDefs | None = None, scope: set[str] | None = None) -> dict[str, Any]:
-    """Upload and analysis times relative to the end of the activity, and fields defined after the analysis."""
+    """Upload and analysis times relative to the end of the activity, and fields without a value whose
+    definition was changed (or created) after the analysis (the API gives only the last change time)."""
     start = parse_ts(activity.get("start_date"))
     elapsed = num(activity.get("elapsed_time"))
     end = start + timedelta(seconds=elapsed) if start and elapsed is not None else None
@@ -159,7 +162,7 @@ def freshness(activity: dict[str, Any], defs: CustomFieldDefs | None = None, sco
         "synced_utc": synced.isoformat() if synced else None, "analysed_utc": analysed.isoformat() if analysed else None,
         "upload_delay_s": rnd(upload_delay, 0), "analysed_after_upload_s": rnd(after_upload, 0),
         "reanalysed": after_upload is not None and after_upload > REANALYSED_AFTER_S,
-        "fields_defined_after_analysis": sorted(later),
+        "fields_changed_after_analysis": sorted(later),
     }
 
 
@@ -441,27 +444,36 @@ def listing_status(activity: dict[str, Any], listed: list[dict[str, Any]]) -> di
 
 def provenance_notes(
     activity: dict[str, Any], defs: CustomFieldDefs, expected: set[str] | None, intervals: list[dict[str, Any]] | None = None,
+    compact: bool = False,
 ) -> list[str]:
-    """Short provenance and data-quality notes from the payload and the field definitions."""
+    """Provenance and data-quality notes from the payload and the field definitions.
+
+    ``compact`` gives short forms and leaves out the source and the interval edits, which the compact
+    overview's "Data:" line already names.
+    """
     if is_strava_stub(activity):
         return [STRAVA_STUB_NOTE]
     notes = []
-    if activity.get("source"):
+    if activity.get("source") and not compact:
         info = source_summary(activity)
         notes.append(f"source: {info['text']}; {freshness_text(freshness(activity))}")
     recording = recording_summary(activity)
     if (recording["not_recorded_s"] or 0) > 60:
-        notes.append(f"{recording['recording_stops']} recording stop(s), {hms(recording['not_recorded_s'])} not recorded (elapsed vs recorded time)")
-    notes.extend(laps_and_intervals(activity, intervals)["notes"][:1])
+        notes.append(f"{recording['recording_stops']} recording stop(s), {hms(recording['not_recorded_s'])} not recorded"
+                     + ("" if compact else " (elapsed vs recorded time)"))
+    if not compact:
+        notes.extend(laps_and_intervals(activity, intervals)["notes"][:1])
     fields = field_inventory(activity, defs, expected)
     if fields["zero_placeholder"]:
-        notes.append(
-            "device-file fields stored as 0 (a real 0 or a source missing from the file, Intervals.icu stores 0 for both): "
-            + names(fields["zero_placeholder"], defs, 6)
-        )
-    later = freshness(activity, defs, expected)["fields_defined_after_analysis"]
+        lead = ("device-file fields stored as 0 (real or placeholder): " if compact else
+                "device-file fields stored as 0 (a real 0 or a source missing from the file, Intervals.icu stores 0 for both): ")
+        notes.append(lead + names(fields["zero_placeholder"], defs, 4 if compact else 6))
+    later = freshness(activity, defs, expected)["fields_changed_after_analysis"]
     if later:
-        notes.append("fields defined after this activity was analysed (no value until a reprocess or a write): " + names(later, defs, 6))
+        lead = ("fields changed after the analysis, no value: " if compact else
+                "fields without a value whose definition was changed or created after this activity was analysed "
+                "(no value until a reprocess or a write): ")
+        notes.append(lead + names(later, defs, 4 if compact else 6))
     return notes
 
 

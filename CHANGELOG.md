@@ -13,7 +13,8 @@ First public beta of the Futureweb fork. Based on upstream
 - `get_activity_data_audit` (new, read-only): provenance and data quality of one activity - source and
   file (Garmin Connect sync with the Garmin activity id, upload of a Garmin export, the Garmin
   Intervals Bridge's upload mode, Strava stubs that the API returns empty), upload delay after the end
-  and analysis time (re-analysed later), custom fields defined after the last analysis, filtered
+  and analysis time (re-analysed later), custom fields without a value whose definition changed after
+  the last analysis (the API only gives the last change time), filtered
   duplicates (not in the activity list while a listed activity starts within 2 min, same Garmin
   activity named), recording stops and gaps, FIT laps vs Intervals.icu intervals and what manual
   interval edits mean, device and sensor identity (power meter name/serial, battery, estimated power,
@@ -24,25 +25,35 @@ First public beta of the Futureweb fork. Based on upstream
   streams, expected fields). Three requests for one activity, one for a period.
 - `get_fueling_analysis` (new, read-only): carbs used (Intervals.icu estimate) and ingested in g and
   g/h, ingested share of used, kcal and kJ, fluid intake, sodium and sweat loss from custom fields
-  found by units and name (no vendor list); intake per hour only when a custom stream carries it.
-  Period mode for sessions of at least `min_minutes`: per sport family, duration and intensity
-  bucket with sample sizes, logging coverage (logged, stored 0, not logged) and Spearman
-  correlations; notes that used vs ingested is no 1:1 energy deficit; no targets.
+  found by units and name (no vendor list); a 0 in a device-file field (e.g. a Garmin sweat loss) is a
+  zero placeholder, shown as "0 stored" and left out of totals, differences and statistics; rates per
+  moving hour; intake per hour only when a custom stream carries it. Period mode for sessions of at
+  least `min_minutes`: per sport family, and within each family by duration and intensity bucket,
+  with sample sizes, logging coverage (logged, stored 0, not logged) and Spearman correlations per
+  family with n (computed from 8 sessions with intake logged, never pooled across sports); notes that
+  used vs ingested is no 1:1 energy deficit; no targets.
 - `get_activity_report` and `get_activity_details`: fueling line, weather line (temperature range,
   feels-like, wind in km/h from the m/s Intervals.icu stores, compass direction, head/tailwind share,
   clouds, rain in mm/h, device sensor next to the weather) and W′ balance (W′ and power-model W′, max
   depletion, lowest W′bal; in the report from the `w_bal` stream, requested with the other streams at
-  no extra cost: time below 75/50/25 % of W′, dips below 50 %, the interval that ended lowest); JSON
+  no extra cost: time below 75/50/25 % of W′, dips below 50 %, the interval that ended lowest). When
+  W′bal falls below 0 (depletion above W′) the ride exceeded the W′/CP model with the FTP and W′ set
+  for it: this is flagged as a model mismatch (`model_mismatch`) and no depletion percentages or
+  threshold times are presented as physiology. Compact views carry one short "Context:" line
+  (carb rates, sweat, temperature, wind, W′bal minimum); standard and full the full lines. JSON
   sections `fueling`, `weather`, `w_prime`, `provenance`. The report's data-quality notes name the
-  source and freshness, recording stops, manual interval edits, zero placeholders and fields defined
-  after the analysis; Strava stubs get a clear message instead of an empty analysis.
+  source and freshness, recording stops, manual interval edits, zero placeholders and fields changed
+  after the analysis (compact: short forms, source and edits only in the "Data:" line); Strava stubs
+  get a clear message instead of an empty analysis.
 - `get_activity_report(include_route_history=True)`: earlier activities on the same Intervals.icu
-  route (activity list filtered by `route_id`, bounded to 15, plus the route name; two requests) with
+  route (activity list filtered by `route_id`, the latest 16 activities on the route, plus the route
+  name; two requests; the text says when older activities were not loaded) with
   time, power, W/kg, HR, weather and start/end pairs such as stamina; rank by moving time and
   differences to the median of comparable activities (same sport family, distance within 5 %,
   elevation gain within 10 %).
 - `get_durability(temperature_source=...)`: the heat filter can use the activity's weather or
-  feels-like temperature instead of the device sensor; sessions list device and weather temperature.
+  feels-like temperature instead of the device sensor; sessions list device and weather temperature
+  (and feels-like when it drives the filter).
 - Fixed: the activity summary printed the wind speed (stored in m/s) as km/h.
 
 ### Changed (phase 5: coach test feedback)

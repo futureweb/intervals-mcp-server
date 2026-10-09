@@ -99,10 +99,10 @@ def _family_text(family: str, entry: dict[str, Any], ef: dict[str, Any], thresho
     return text
 
 
-def _temp_text(session: dict[str, Any]) -> str:
-    """'device 24 °C, weather 19 °C' (what exists), 'n/a °C' without either."""
-    parts = [f"{label} {fmt(session.get(key), 0, ' °C')}" for key, label in (("avg_temp_c", "device"), ("weather_temp_c", "weather"))
-             if session.get(key) is not None]
+def _temp_text(session: dict[str, Any], source: str | None = None) -> str:
+    """'device 24 °C, weather 19 °C' (what exists; plus feels-like when it drives the filter), 'n/a °C' without either."""
+    keys = [("avg_temp_c", "device"), ("weather_temp_c", "weather")] + ([("feels_like_c", "feels-like")] if source == "feels_like" else [])
+    parts = [f"{label} {fmt(session.get(key), 0, ' °C')}" for key, label in keys if session.get(key) is not None]
     return ", ".join(parts) if parts else "n/a °C"
 
 
@@ -128,7 +128,7 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:
                 lines.append(
                     f"    {s['date']} {family} {s['type']} '{s['name']}' ({s['id']}): {fmt(s['decoupling_pct'], 1, ' %', signed=True)}, "
                     f"{fmt(s['minutes'])} min, VI {fmt(s['variability_index'], 2)}, EF {fmt(s['efficiency_factor'], 2)}, "
-                    f"{_temp_text(s)}{', indoor' if s['indoor'] else ''}"
+                    f"{_temp_text(s, filters.get('temperature_source'))}{', indoor' if s['indoor'] else ''}"
                 )
         lines.append(
             f"Reference: {REFERENCES['decoupling']['text']} ({REFERENCES['decoupling']['source']}). Recent vs window: "

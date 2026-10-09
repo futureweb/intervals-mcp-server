@@ -213,9 +213,10 @@ def _activity_text(audit: dict[str, Any], detail_level: str) -> str:  # pylint: 
         lines.append(f"- {audit['note']}")
         return "\n".join(lines)
     lines.append(f"Freshness: {freshness_text(audit['freshness'])}")
-    later = audit["freshness"]["fields_defined_after_analysis"]
+    later = audit["freshness"]["fields_changed_after_analysis"]
     if later:
-        lines.append(f"  fields defined after the last analysis (no value until a reprocess or a write): {names(later, audit['_defs'])}")
+        lines.append("  fields without a value whose definition was changed or created after the last analysis (the API gives only "
+                     f"the last change time; no value until a reprocess or a write): {names(later, audit['_defs'])}")
     if audit["listing"]:
         lines.append(f"Listing: {audit['listing']['text']}")
     lines.append(f"Recording: {recording_text(audit['recording'])}")

@@ -36,6 +36,7 @@ from intervals_mcp_server.utils.custom_fields import index_custom_items  # pylin
 from intervals_mcp_server.utils.field_policy import start_end_pairs  # pylint: disable=wrong-import-position
 from intervals_mcp_server.utils.fueling import (  # pylint: disable=wrong-import-position
     activity_fueling,
+    correlation_text,
     fueling_fields,
     fueling_line,
     intake_distribution,
@@ -110,7 +111,7 @@ def test_freshness_and_fields_defined_after_the_analysis():
     """Upload delay after the end, re-analysis and fields whose definition is newer than the analysis."""
     info = freshness(FUELING_ACTIVITY, FIELDS, RIDE_EXPECTED)
     assert info["upload_delay_s"] == 100 and info["analysed_after_upload_s"] == 10500 and info["reanalysed"]
-    assert info["fields_defined_after_analysis"] == ["NewMetric"]
+    assert info["fields_changed_after_analysis"] == ["NewMetric"]
     assert freshness({"start_date": "x"})["upload_delay_s"] is None
 
 
@@ -175,7 +176,12 @@ def test_provenance_notes_for_the_report():
     assert "2:30 not recorded (elapsed vs recorded time)" in notes[1]
     assert notes[2].startswith("intervals were edited by hand")
     assert notes[3].endswith("Performance Condition [PerformanceCondition]")
-    assert notes[4] == "fields defined after this activity was analysed (no value until a reprocess or a write): New Metric [NewMetric]"
+    assert notes[4] == ("fields without a value whose definition was changed or created after this activity was analysed "
+                        "(no value until a reprocess or a write): New Metric [NewMetric]")
+    short = provenance_notes(FUELING_ACTIVITY, FIELDS, RIDE_EXPECTED, FUELING_INTERVALS, compact=True)
+    assert short == ["1 recording stop(s), 2:30 not recorded",
+                     "device-file fields stored as 0 (real or placeholder): Performance Condition [PerformanceCondition]",
+                     "fields changed after the analysis, no value: New Metric [NewMetric]"]
     assert provenance_notes(STRAVA_STUB, FIELDS, None)[0].startswith("Strava import: the Intervals.icu API returns only an empty stub")
     assert not provenance_notes({"id": "x"}, FIELDS, None)
 
@@ -217,6 +223,13 @@ def test_activity_fueling_rates_and_line():
         "fluid 1000 ml (Fluid intake, 500 ml/h) | sweat loss 1400 ml (Sweat loss, 700 ml/h) | sodium 800 mg (Sodium, 400 mg/h) | "
         "fluid minus sweat loss -400 ml | 1800 kcal, 1500 kJ work"
     )
+    placeholder = activity_fueling({"moving_time": 7200, "Sweatloss": 0.0, "FluidIntake": 1.0}, FIELDS)
+    assert placeholder["sweat_loss"][0]["status"] == "zero_placeholder" and placeholder["sweat_loss"][0]["amount"] is None
+    assert placeholder["fluid_minus_sweat_ml"] is None
+    line = fueling_line(placeholder) or ""
+    assert "sweat loss 0 stored (Sweat loss: placeholder or real 0, not counted)" in line and "fluid minus" not in line
+    manual = activity_fueling({"moving_time": 7200, "Sweatloss": 900.0, "FluidIntake": 0.0}, FIELDS)
+    assert manual["fluid_intake"][0]["status"] == "zero" and manual["fluid_minus_sweat_ml"] == -900
     zero = activity_fueling({"moving_time": 3600, "carbs_used": 100, "carbs_ingested": 0}, FIELDS)
     assert zero["carbs_ingested_status"] == "zero" and "ingested 0 g (0 g/h, 0 % of used) (a stored 0)" in fueling_line(zero)
     missing = activity_fueling({"moving_time": 3600, "carbs_used": 100, "Sweatloss": "NaN"}, FIELDS)
@@ -236,15 +249,23 @@ def test_intake_distribution_cumulative_and_events():
 
 def test_period_fueling_groups_and_coverage():
     """Long sessions only; logged, zero and missing intake counted; buckets by duration and intensity; Spearman from 5 pairs."""
-    result = period_fueling(FUELING_PERIOD, FIELDS, 90 * 60)
+    placeholder = {"id": "p9", "type": "Ride", "start_date_local": "2026-09-29T09:00:00", "moving_time": 7200, "Sweatloss": 0.0}
+    result = period_fueling(FUELING_PERIOD + [placeholder], FIELDS, 90 * 60)
     overall = result["overall"]
-    assert overall["sessions"] == 7 and overall["ingested_logged"] == 5 and overall["ingested_zero"] == 1 and overall["ingested_not_logged"] == 1
+    assert overall["sessions"] == 8 and overall["ingested_logged"] == 5 and overall["ingested_zero"] == 1 and overall["ingested_not_logged"] == 2
     assert overall["ingested_g_per_h"]["n"] == 5 and overall["with_carbs_used"] == 6
-    assert set(result["by_sport_family"]) == {"cycling", "running"}
-    assert result["by_duration"]["< 2 h"]["sessions"] == 3 and result["by_duration"][">= 4 h"]["sessions"] == 1
-    assert result["by_intensity"]["IF >= 0.85"]["ingested_zero"] == 1
-    assert result["spearman_ingested_vs_duration"] == 0.9
-    assert period_fueling(FUELING_PERIOD[:2], FIELDS, 0)["spearman_ingested_vs_duration"] is None
+    assert overall["zero_placeholders"] == 1 and overall["sweat_loss_ml_per_h"]["n"] == 6
+    assert set(result["by_sport_family"]) == {"cycling", "running"} and result["rates"] == "per moving hour"
+    cycling = result["by_sport_family"]["cycling"]
+    assert cycling["by_duration"]["< 2 h"]["sessions"] == 2 and cycling["by_duration"][">= 4 h"]["sessions"] == 1
+    assert cycling["by_intensity"]["IF >= 0.85"]["ingested_zero"] == 1
+    assert cycling["correlations"]["ingested_vs_duration"] == {"n": 4, "rho": None} and cycling["correlations"]["min_n"] == 8
+    assert result["by_sport_family"]["running"]["by_duration"]["< 2 h"]["sessions"] == 1
+    rides = [{"id": f"r{i}", "type": "Ride", "start_date_local": f"2026-08-{i + 1:02d}T09:00:00", "moving_time": 3600 * (1.5 + i / 2),
+              "icu_intensity": 60 + i, "carbs_ingested": 30 * (1.5 + i / 2) * (1 + i / 10)} for i in range(9)]
+    correlations = period_fueling(rides, {}, 0)["by_sport_family"]["cycling"]["correlations"]
+    assert correlations["ingested_vs_duration"] == {"n": 9, "rho": 1.0} and correlations["ingested_vs_intensity"] == {"n": 9, "rho": 1.0}
+    assert correlation_text(correlations) == "Spearman ingested g/h vs duration 1.00 (n 9), vs IF 1.00 (n 9) (association only)"
 
 
 # ---------------------------------------------------------------------- weather, W′, route
@@ -274,6 +295,13 @@ def test_wprime_summary_with_stream_and_intervals():
         "W′ 20.0 kJ (power model 21.0 kJ): max depletion 16.0 kJ (80 %), lowest W′bal 4.0 kJ (20 %); "
         "time below 75 % 2:30, 50 % 2:30, 25 % 0:50 (2 dip(s) below 50 %); lowest at the end of interval 4 (11:40, 0:50 @ 450 W): 4.0 kJ"
     )
+    assert summary["model_mismatch"] is False and summary["note"] is None
+    mismatch = wprime_summary({"icu_w_prime": 18000, "icu_max_wbal_depletion": 27200}, None, [18000, -100, -9200, 5000], [0, 1, 2, 3])
+    assert mismatch["model_mismatch"] and mismatch["stream"]["seconds_below_zero"] == 2
+    text = wprime_line(mismatch) or ""
+    assert text.startswith("W′ 18.0 kJ: max depletion 27.2 kJ, W′bal below 0 for 0:02. W′bal fell below 0: this ride exceeded the W′/CP model")
+    assert "151 %" not in text and "below 25 %" not in text
+    assert wprime_summary({"icu_w_prime": 18000, "icu_max_wbal_depletion": 19000})["model_mismatch"]
     calm = wprime_summary({"icu_w_prime": 20000, "icu_max_wbal_depletion": 1000}, None, [20000, 19000], [0, 1])
     assert wprime_line(calm).endswith("W′bal never below 75 %")
     assert wprime_summary({"type": "Hike"}) is None and wprime_line(None) is None
@@ -295,6 +323,10 @@ def test_route_history_comparison():
     assert lines[1] == "This activity: moving 2:00:00, rank 2 of 3 by moving time (fastest earlier 1:56:40, median 2:00:50, -0:50 vs median)"
     assert "  2026-09-20 i40 Ride | moving 2:05:00 | 60.5 km | +790 m | avg 170 W / NP 185 W (2.24 W/kg) | HR 138 | 12 °C, headwind 30 % | stamina 100→60" in lines
     assert route_history_lines(route_history(FUELING_ACTIVITY, ROUTE_LIST[:1]))[0] == "Route 77: no earlier activity of the same sport family on this route."
+    capped = route_history_lines(dict(route_history(FUELING_ACTIVITY, ROUTE_LIST, pairs, truncated=True), route_name="Lake loop"))
+    assert capped[0].startswith("Route 77 'Lake loop': the 3 most recent earlier activities of the same sport family (only the latest 16 "
+                                "activities on the route are loaded; older ones are not compared)")
+    assert capped[1].startswith("This activity: moving 2:00:00, rank 2 of 3 by moving time among them (fastest earlier")
     failed = dict(route_history(FUELING_ACTIVITY, []), error="boom")
     assert route_history_lines(failed) == ["Route 77: the activity list could not be loaded (boom)."]
 
@@ -308,7 +340,8 @@ def test_get_activity_data_audit_single(monkeypatch):
     assert result.startswith("Data audit of i50 'Long ride' (Ride) 2026-10-08 09:00 local (UTC+02:00)")
     assert "Source: Garmin Connect sync, FIT file, Garmin activity 123456789, also on Strava (987); device Edge 1040" in result
     assert "Freshness: uploaded 2 min after the end; last analysed 2:55 h after the upload (re-analysed later" in result
-    assert "fields defined after the last analysis (no value until a reprocess or a write): New Metric [NewMetric]" in result
+    assert ("fields without a value whose definition was changed or created after the last analysis (the API gives only the last "
+            "change time; no value until a reprocess or a write): New Metric [NewMetric]") in result
     assert "Listing: listed in the activity list; no other listed activity starts within 2 min" in result
     assert "Recording: elapsed 2:03:20, recorded 2:00:50, moving 2:00:00; 1 recording stop(s), 2:30 not recorded (gaps > 5 s in the time stream: 1, longest 1:41 at 9:59)" in result
     assert "Laps and intervals: 3 FIT lap(s), 5 Intervals.icu interval(s) (3 work), edited by hand" in result
@@ -371,7 +404,7 @@ def test_get_fueling_analysis_single_and_period(monkeypatch):
     intake = [{"type": "time", "data": [0, 1800, 3600, 5400]}, {"type": "CarbsEaten", "data": [0, 30, 60, 120]}]
     _routes(monkeypatch, calls, **{"/activity/": activity, "/streams": intake})
     result = asyncio.run(get_fueling_analysis("i50"))
-    assert result.startswith("Fueling of i50 'Long ride' (Ride) 2026-10-08 09:00 local (UTC+02:00), moving 2:00:00, IF 0.72")
+    assert result.startswith("Fueling of i50 'Long ride' (Ride) 2026-10-08 09:00 local (UTC+02:00), moving 2:00:00, IF 0.72; rates per moving hour")
     assert "Fueling: carbs used ~300 g (Intervals.icu estimate, 150 g/h)" in result
     assert "Intake over time from Carbs eaten [CarbsEaten] (cumulative): hour 1 30 g, hour 2 90 g" in result
     assert "Note: carbs_used is Intervals.icu's estimate" in result
@@ -385,13 +418,16 @@ def test_get_fueling_analysis_single_and_period(monkeypatch):
     calls.clear()
     _routes(monkeypatch, calls, **{"/activities": FUELING_PERIOD})
     period = asyncio.run(get_fueling_analysis(start_date="2026-09-01", end_date="2026-09-30"))
-    assert period.startswith("Fueling for athlete i1, 2026-09-01 to 2026-09-30: 7 sessions of at least 90 min (of 8 activities)")
-    assert "Overall: 7 sessions, intake logged on 5 (0 g stored on 1, not logged on 1); ingested median" in period
-    assert "  >= 4 h: 1 session, intake logged on 1" in period and "Spearman (sessions with intake logged): ingested g/h vs duration 0.9" in period
+    assert period.startswith("Fueling for athlete i1, 2026-09-01 to 2026-09-30: 7 sessions of at least 90 min (of 8 activities); rates per moving hour")
+    assert "Overall (all sports): 7 sessions, intake logged on 5 (0 g stored on 1, not logged on 1); ingested median" in period
+    assert "\ncycling: 6 sessions" in period and "\nrunning: 1 session," in period
+    assert "  >= 4 h (moving time): 1 session, intake logged on 1" in period
+    assert "  Spearman ingested g/h vs duration not computed (n 4 < 8), vs IF not computed (n 4 < 8) (association only)" in period
     assert "2026-09-20 p5 Ride 'Ride p5' (2:00:00, IF 0.88)" in period
     assert {"Sweatloss", "FluidIntake", "SodiumMg"} <= set(calls[-1][1]["fields"].split(","))
     rides = asyncio.run(get_fueling_analysis(start_date="2026-09-01", end_date="2026-09-30", sport_types="Ride", detail_level="compact"))
-    assert "cycling" not in rides and "Sessions:" not in rides
+    assert rides.splitlines()[1].startswith("cycling: 5 sessions") and "Overall" not in rides
+    assert "Sessions:" not in rides and "(moving time)" not in rides and "Spearman" not in rides
     compact_json = json.loads(asyncio.run(get_fueling_analysis(start_date="2026-09-01", end_date="2026-09-30", output_format="json", detail_level="compact")))
     assert "rows" not in compact_json and compact_json["overall"]["sessions"] == 7
     assert asyncio.run(get_fueling_analysis(min_minutes=-1)).startswith("Error")
@@ -418,7 +454,9 @@ def test_get_activity_report_context_and_route_history(monkeypatch):
     assert payload["w_prime"]["stream"]["dips_below_50_pct"] == 2 and payload["fueling"]["carbs_used_g"] == 300
     assert payload["weather"]["wind_from"] == "SW" and payload["provenance"]["freshness"]["reanalysed"] is True
     compact = asyncio.run(get_activity_report("i50", detail_level="compact"))
-    assert "Fueling:" in compact and "== Same route" not in compact
+    assert ("Context: carbs used ~150 g/h (estimate) | ingested 60 g/h | sweat 700 ml/h | fluid 500 ml/h | 18 °C, wind 9 km/h SW, "
+            "headwind 40 %, rain 0.5 mm/h | W′bal min 20 %, 2:30 below 50 %") in compact
+    assert "Fueling:" not in compact and "== Same route" not in compact and "- source:" not in compact
     _routes(monkeypatch, **{"/activity/": dict(FUELING_ACTIVITY, route_id=None)})
     assert "== Same route\nNo Intervals.icu route for this activity (routes need GPS)" in asyncio.run(
         get_activity_report("i50", include_route_history=True, detail_level="compact"))
@@ -433,9 +471,9 @@ def test_get_activity_details_context(monkeypatch):
     _routes(monkeypatch)
     compact = asyncio.run(get_activity_details("i50", detail_level="compact"))
     lines = compact.splitlines()
-    assert len(lines) == 8 and lines[4].startswith("Fueling: carbs used ~300 g") and lines[5].startswith("Weather 18.0 °C")
-    assert "| W′ 20.0 kJ (power model 21.0 kJ): max depletion 16.0 kJ (80 %), lowest W′bal 4.0 kJ (20 %)" in lines[5]
-    assert lines[7].startswith("Data: Garmin Connect sync, intervals edited, 5 streams (1 custom)")
+    assert len(lines) == 7 and lines[4] == ("Context: carbs used ~150 g/h (estimate) | ingested 60 g/h | sweat 700 ml/h | fluid 500 ml/h | "
+                                            "18 °C, wind 9 km/h SW, headwind 40 %, rain 0.5 mm/h | W′bal min 20 %")
+    assert lines[6].startswith("Data: Garmin Connect sync, intervals edited, 5 streams (1 custom)")
     standard = asyncio.run(get_activity_details("i50"))
     assert "Avg Wind Speed: 2.5 m/s (9 km/h)" in standard
     assert "\nFueling, weather, W′ and source:\n- Fueling: carbs used ~300 g" in standard
@@ -462,4 +500,8 @@ def test_get_durability_weather_temperature(monkeypatch):
     weather = asyncio.run(get_durability(start_date="2026-09-20", end_date="2026-10-05", temperature_source="weather"))
     assert "average temperature (weather) <= 25 °C" in weather and "qualifying 2" in weather
     assert "'Hot sensor' (d1): +3.0 %, 67 min, VI 1.05, EF 1.30, device 31 °C, weather 22 °C" in weather
+    activities[0]["average_feels_like"] = 24.0
+    feels = asyncio.run(get_durability(start_date="2026-09-20", end_date="2026-10-05", temperature_source="feels_like"))
+    assert "average temperature (weather feels-like) <= 25 °C" in feels
+    assert "'Hot sensor' (d1): +3.0 %, 67 min, VI 1.05, EF 1.30, device 31 °C, weather 22 °C, feels-like 24 °C" in feels
     assert asyncio.run(get_durability(temperature_source="air")).startswith("Error: temperature_source")

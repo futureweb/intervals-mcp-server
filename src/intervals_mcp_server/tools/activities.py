@@ -96,10 +96,49 @@ def context_lines(activity: dict[str, Any], defs: CustomFieldDefs, wprime: dict[
     return lines
 
 
+def compact_context_line(activity: dict[str, Any], defs: CustomFieldDefs, wprime: dict[str, Any] | None = None) -> str | None:
+    """One short line with fueling rates, weather and W′ for compact views (full lines: context_lines)."""
+    figures = activity_fueling(activity, defs)
+    parts = []
+    if figures["carbs_used_g_per_h"] is not None:
+        parts.append(f"carbs used ~{figures['carbs_used_g_per_h']:.0f} g/h (estimate)")
+    status = figures["carbs_ingested_status"]
+    if status == "value" and figures["carbs_ingested_g_per_h"] is not None:
+        parts.append(f"ingested {figures['carbs_ingested_g_per_h']:.0f} g/h")
+    elif status == "zero":
+        parts.append("ingested 0 g stored")
+    elif figures["carbs_used_g"] is not None:
+        parts.append("ingested not logged")
+    for key, label in (("sweat_loss", "sweat"), ("fluid_intake", "fluid")):
+        parts.extend(f"{label} {row['per_hour']:.0f} ml/h" for row in figures[key] if row["per_hour"] is not None)
+    weather = weather_summary(activity)
+    if weather and not weather["indoor"] and weather["temp_c"] is not None:
+        text = f"{weather['temp_c']:.0f} °C"
+        if weather["wind_km_h"] is not None:
+            text += f", wind {weather['wind_km_h']:.0f} km/h" + (f" {weather['wind_from']}" if weather["wind_from"] else "")
+        if weather["headwind_pct"] is not None:
+            text += f", headwind {weather['headwind_pct']:.0f} %"
+        if weather["max_rain_mm_h"]:
+            text += f", rain {weather['max_rain_mm_h']:g} mm/h"
+        parts.append(text)
+    summary = wprime if wprime is not None else wprime_summary(activity)
+    if summary and summary.get("model_mismatch"):
+        parts.append("W′bal below 0 (W′/CP model mismatch)")
+    elif summary and summary.get("min_w_bal_pct") is not None:
+        text = f"W′bal min {summary['min_w_bal_pct']:.0f} %"
+        below = ((summary.get("stream") or {}).get("seconds_below_pct") or {}).get("50")
+        parts.append(text + (f", {hms(below)} below 50 %" if below else ""))
+    return "Context: " + " | ".join(parts) if parts else None
+
+
 def _compact_details(
-    activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None, wprime: dict[str, Any] | None = None
+    activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None, wprime: dict[str, Any] | None = None,
+    full_context: bool = False,
 ) -> str:
-    """Token-efficient activity view: key numbers, thresholds, fueling, weather and W′, assigned custom fields, data quality."""
+    """Token-efficient activity view: key numbers, thresholds, fueling, weather and W′, assigned custom fields, data quality.
+
+    ``full_context`` prints the full fueling and weather/W′ lines instead of the one-line summary.
+    """
     if is_strava_stub(activity):
         return f"{activity.get('name', 'Unnamed')} ({activity.get('id')}) {format_local_start(activity)}\n{STRAVA_STUB_NOTE}"
     gear = activity.get("_resolved_gear_name") or (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("_resolved_gear_name")
@@ -118,13 +157,19 @@ def _compact_details(
         f"device {activity.get('device_name') or 'unknown'}, power meter {activity.get('power_meter') or 'unknown'}"
         + (f", power fields {', '.join(str(p) for p in activity['power_field_names'])}" if activity.get("power_field_names") else ""),
     ]
-    lines.extend(context_lines(activity, defs, wprime))
+    if full_context:
+        lines.extend(context_lines(activity, defs, wprime))
+    else:
+        line = compact_context_line(activity, defs, wprime)
+        if line:
+            lines.append(line)
     custom = format_custom_field_lines(activity, defs, prefix="", only=assigned)
     if custom:
         lines.append("Custom fields" + (" (assigned to this sport)" if assigned is not None else "") + ": " + "; ".join(custom[:14]) + (" ..." if len(custom) > 14 else ""))
     quality = []
     if activity.get("source"):
-        quality.append(source_summary(activity)["label"])
+        info = source_summary(activity)
+        quality.append(info["origin"] or info["label"])
     if activity.get("icu_intervals_edited"):
         quality.append("intervals edited")
     if activity.get("icu_sync_error"):

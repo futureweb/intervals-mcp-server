@@ -24,6 +24,11 @@ from intervals_mcp_server.utils.sports import hms, is_indoor, sport_family
 
 RECORDING_GAP_S = 5  # a jump in the time stream larger than this is a recording pause
 WBAL_THRESHOLDS_PCT = (75, 50, 25)
+MODEL_MISMATCH_NOTE = (
+    "W′bal fell below 0: this ride exceeded the W′/CP model with the FTP (used as CP) and W′ set for it (one of them too "
+    "low for this activity), so a depletion above 100 % and the times below the thresholds reflect the model fit, not a "
+    "real depletion"
+)
 MAX_ROUTE_HISTORY = 15
 ROUTE_DISTANCE_TOLERANCE_PCT = 5.0
 ROUTE_ELEVATION_TOLERANCE_PCT = 10.0
@@ -156,6 +161,7 @@ def _wbal_stream_stats(values: list[Any], time_data: list[Any], reference: float
     for pct in WBAL_THRESHOLDS_PCT:
         limit = reference * pct / 100
         below[str(pct)] = sum(durations[index] for index, value in valid if value < limit)
+    below_zero = sum(durations[index] for index, value in valid if value < 0)
     dips, inside = 0, False
     half = reference * 0.5
     for _, value in valid:
@@ -167,6 +173,7 @@ def _wbal_stream_stats(values: list[Any], time_data: list[Any], reference: float
     return {
         "samples": len(valid), "min_j": rnd(low_value, 0), "min_pct": rnd(low_value / reference * 100, 0), "min_at_s": at,
         "seconds_below_pct": {k: rnd(v, 0) for k, v in below.items()}, "dips_below_50_pct": dips,
+        "seconds_below_zero": rnd(below_zero, 0),
     }
 
 
@@ -195,6 +202,10 @@ def wprime_summary(
     ``w_bal`` / ``time_data`` are the samples of the ``w_bal`` and ``time`` streams (optional):
     they add the time below 75 / 50 / 25 % of W′ (pauses not counted) and the number of
     separate dips below 50 %.
+
+    A depletion larger than W′ (W′bal below 0) is no real depletion beyond 100 %: the ride did not
+    fit the W′/CP model with the FTP (used as CP) and W′ set for it. ``model_mismatch`` flags that;
+    the percentages and times below the thresholds then describe the model fit, not physiology.
     """
     w_prime = num(activity.get("icu_w_prime"))
     depletion = num(activity.get("icu_max_wbal_depletion"))
@@ -213,7 +224,13 @@ def wprime_summary(
     if has_stream:
         reference = w_prime or max(v for v in (num(x) for x in w_bal or []) if v is not None)
         out["stream"] = _wbal_stream_stats(list(w_bal or []), list(time_data or []), reference)
+    stream_min = (out["stream"] or {}).get("min_j")
+    out["model_mismatch"] = bool(
+        (depletion is not None and w_prime and depletion > w_prime) or (stream_min is not None and stream_min < 0)
+    )
+    out["note"] = MODEL_MISMATCH_NOTE if out["model_mismatch"] else None
     return out
+
 
 
 def _kj(value: Any) -> str:
@@ -227,11 +244,16 @@ def wprime_line(summary: dict[str, Any] | None) -> str | None:
     text = f"W′ {_kj(summary['w_prime_j'])}"
     if summary["model_w_prime_j"] is not None:
         text += f" (power model {_kj(summary['model_w_prime_j'])})"
+    stream = summary.get("stream")
+    if summary.get("model_mismatch"):
+        text += f": max depletion {_kj(summary['max_depletion_j'])}" if summary["max_depletion_j"] is not None else ""
+        if stream and stream.get("seconds_below_zero"):
+            text += f", W′bal below 0 for {hms(stream['seconds_below_zero'])}"
+        return f"{text}. {MODEL_MISMATCH_NOTE[0].upper()}{MODEL_MISMATCH_NOTE[1:]}."
     if summary["max_depletion_j"] is not None:
         text += f": max depletion {_kj(summary['max_depletion_j'])}"
         if summary["max_depletion_pct"] is not None:
             text += f" ({summary['max_depletion_pct']:.0f} %), lowest W′bal {_kj(summary['min_w_bal_j'])} ({summary['min_w_bal_pct']:.0f} %)"
-    stream = summary.get("stream")
     if stream:
         below = stream["seconds_below_pct"]
         spans = [f"{pct} % {hms(below[str(pct)])}" for pct in WBAL_THRESHOLDS_PCT if below[str(pct)]]
@@ -313,7 +335,7 @@ def _median(rows: list[dict[str, Any]], key: str) -> float | None:
 
 def route_history(  # pylint: disable=too-many-locals
     reference: dict[str, Any], candidates: list[dict[str, Any]], pairs: list[tuple[str, str, str]] | None = None,
-    limit: int = MAX_ROUTE_HISTORY,
+    limit: int = MAX_ROUTE_HISTORY, truncated: bool = False,
 ) -> dict[str, Any]:
     """Earlier activities on the reference's route, compared with the reference.
 
@@ -347,7 +369,7 @@ def route_history(  # pylint: disable=too-many-locals
             stats[f"reference_minus_median_{key}"] = rnd(ref[key] - median, 2)
     return {
         "route_id": reference.get("route_id"), "reference": ref, "earlier": rows[:limit],
-        "earlier_total": len(rows), "other_sports": len(earlier) - len(same), "stats": stats,
+        "earlier_total": len(rows), "other_sports": len(earlier) - len(same), "stats": stats, "truncated": truncated,
         "comparability": (
             f"same sport family ({family}), distance within {ROUTE_DISTANCE_TOLERANCE_PCT:g} % and elevation gain within "
             f"{ROUTE_ELEVATION_TOLERANCE_PCT:g} % of the reference count for the statistics"
@@ -390,14 +412,17 @@ def route_history_lines(history: dict[str, Any], detail_level: str = "standard")
         return [f"Route {history['route_id']}: no earlier activity of the same sport family on this route{other}."]
     lines = [
         f"Route {history['route_id']}" + (f" '{history['route_name']}'" if history.get("route_name") else "")
-        + f": {total} earlier activit{'y' if total == 1 else 'ies'} of the same sport family"
+        + (f": the {total} most recent earlier activit{'y' if total == 1 else 'ies'} of the same sport family (only the latest "
+           f"{MAX_ROUTE_HISTORY + 1} activities on the route are loaded; older ones are not compared)"
+           if history.get("truncated") else f": {total} earlier activit{'y' if total == 1 else 'ies'} of the same sport family")
         + (f" ({history['other_sports']} of other sports not compared)" if history["other_sports"] else "")
         + f"; {stats['n']} comparable ({history['comparability']})."
     ]
     if stats.get("rank_by_moving_time"):
         delta = stats.get("reference_minus_median_moving_time_s")
         lines.append(
-            f"This activity: moving {hms(ref['moving_time_s'])}, rank {stats['rank_by_moving_time']} of {stats['of']} by moving time "
+            f"This activity: moving {hms(ref['moving_time_s'])}, rank {stats['rank_by_moving_time']} of {stats['of']} by moving time"
+            + (" among them" if history.get("truncated") else "") + " "
             f"(fastest earlier {hms(stats['fastest_moving_time_s'])}, median {hms(stats['median_moving_time_s'])}"
             + (f", {'+' if delta >= 0 else '-'}{hms(abs(delta))} vs median" if delta is not None else "") + ")"
         )

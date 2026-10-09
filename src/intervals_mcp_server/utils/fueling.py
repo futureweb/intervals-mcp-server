@@ -8,15 +8,20 @@ one total, no timestamps). Energy comes as ``calories`` (kcal, device or Interva
 custom fields; they are found generically by units and words of the definition (a volume field
 named "sweat ..." is a sweat loss, a volume field named "fluid / drink / bottle / water /
 intake ..." an intake, a mg field named "sodium / salt" a sodium intake), nothing is tied to a
-vendor. Values are reported as stored: null means not logged, a stored 0 stays 0 and is
-counted separately. No targets or prescriptions.
+vendor. Null means not logged. A 0 in a custom field filled from the device file (FIT source
+or script, e.g. a Garmin sweat loss) is a zero placeholder: Intervals.icu stores 0 when the file
+lacks the source, so it is reported as "0 stored" and left out of totals, differences and
+statistics; a 0 in a manual field and a stored ``carbs_ingested`` of 0 stay 0 (the latter counted
+separately). Rates are per moving hour. Correlations are computed per sport family (intensity
+comes from power on rides and from HR or pace elsewhere) and only from MIN_CORRELATION_N
+sessions on. No targets or prescriptions.
 """
 
 import math
 import statistics
 from typing import Any
 
-from intervals_mcp_server.utils.custom_fields import CustomFieldDefs
+from intervals_mcp_server.utils.custom_fields import CustomFieldDefs, is_device_file_field
 from intervals_mcp_server.utils.field_policy import field_words
 from intervals_mcp_server.utils.load_metrics import intensity_factor, num, rnd
 from intervals_mcp_server.utils.sports import hms, sport_family
@@ -40,6 +45,7 @@ _VOLUME_TO_ML = {"ml": 1.0, "milliliter": 1.0, "millilitre": 1.0, "l": 1000.0, "
                  "liters": 1000.0, "litres": 1000.0, "fl oz": 29.5735, "oz": 29.5735, "cl": 10.0, "dl": 100.0}
 _MASS_TO_MG = {"mg": 1.0, "g": 1000.0}
 DURATION_BUCKETS_H = ((0.0, 2.0, "< 2 h"), (2.0, 3.0, "2-3 h"), (3.0, 4.0, "3-4 h"), (4.0, math.inf, ">= 4 h"))
+MIN_CORRELATION_N = 8
 INTENSITY_BUCKETS = ((0.0, 0.65, "IF < 0.65"), (0.65, 0.75, "IF 0.65-0.75"), (0.75, 0.85, "IF 0.75-0.85"), (0.85, math.inf, "IF >= 0.85"))
 FUELING_LIST_FIELDS = (
     "id,name,type,start_date_local,moving_time,elapsed_time,carbs_used,carbs_ingested,calories,icu_joules,"
@@ -89,10 +95,14 @@ def _custom_values(activity: dict[str, Any], defs: CustomFieldDefs, codes: list[
         if code not in activity:
             continue
         amount = _amount(defs[code], activity.get(code), factors)
+        status = "not logged" if amount is None else ("zero" if amount == 0 else "value")
+        stored = activity.get(code) if amount is not None else None
+        if status == "zero" and is_device_file_field(defs[code]):
+            status, amount = "zero_placeholder", None  # 0 = source missing from the file, or a real 0
         rows.append({
-            "code": code, "name": defs[code].get("name"), "stored": activity.get(code) if amount is not None else None,
+            "code": code, "name": defs[code].get("name"), "stored": stored,
             "units": defs[code].get("units"), "amount": rnd(amount, 0), "per_hour": _per_hour(amount, hours),
-            "status": "not logged" if amount is None else ("zero" if amount == 0 else "value"),
+            "status": status,
         })
     return rows
 
@@ -139,7 +149,7 @@ def _g(value: Any) -> str:
     return "n/a" if value is None else f"{value:.0f} g"
 
 
-def fueling_line(figures: dict[str, Any], prefix: str = "Fueling: ") -> str | None:
+def fueling_line(figures: dict[str, Any], prefix: str = "Fueling: ") -> str | None:  # pylint: disable=too-many-branches
     """'Fueling: carbs used ~258 g (est., 178 g/h) | ingested 50 g (34 g/h, 19 % of used) | sweat loss 827 ml (568 ml/h) | 1142 kcal, 1014 kJ'."""
     if not has_fueling_data(figures) and figures.get("calories_kcal") is None:
         return None
@@ -158,6 +168,8 @@ def fueling_line(figures: dict[str, Any], prefix: str = "Fueling: ") -> str | No
         parts.append(text + (f" ({', '.join(extra)})" if extra else "") + (" (a stored 0)" if status == "zero" else ""))
     for key, label, unit in (("fluid_intake", "fluid", "ml"), ("sweat_loss", "sweat loss", "ml"), ("sodium", "sodium", "mg")):
         for row in figures[key]:
+            if row["status"] == "zero_placeholder":
+                parts.append(f"{label} 0 stored ({row['name']}: placeholder or real 0, not counted)")
             if row["amount"] is None:
                 continue
             rate = f", {row['per_hour']:.0f} {unit}/h" if row["per_hour"] is not None else ""
@@ -218,21 +230,23 @@ def _group(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ingested = [r["carbs_ingested_g_per_h"] for r in rows if r["carbs_ingested_status"] == "value" and r["carbs_ingested_g_per_h"] is not None]
     used = [r["carbs_used_g_per_h"] for r in rows if r["carbs_used_g_per_h"] is not None]
     share = [r["ingested_pct_of_used"] for r in rows if r["carbs_ingested_status"] == "value" and r["ingested_pct_of_used"] is not None]
-    sweat = [s["per_hour"] for r in rows for s in r["sweat_loss"] if s["per_hour"] is not None and s["amount"]]
-    fluid = [f["per_hour"] for r in rows for f in r["fluid_intake"] if f["per_hour"] is not None and f["amount"]]
+    sweat = [s["per_hour"] for r in rows for s in r["sweat_loss"] if s["per_hour"] is not None]
+    fluid = [f["per_hour"] for r in rows for f in r["fluid_intake"] if f["per_hour"] is not None]
     return {
         "sessions": len(rows),
         "ingested_logged": sum(1 for r in rows if r["carbs_ingested_status"] == "value"),
         "ingested_zero": sum(1 for r in rows if r["carbs_ingested_status"] == "zero"),
         "ingested_not_logged": sum(1 for r in rows if r["carbs_ingested_status"] == "not logged"),
         "with_carbs_used": len(used),
+        "zero_placeholders": sum(1 for r in rows for key in ("sweat_loss", "fluid_intake", "sodium")
+                                 for item in r[key] if item["status"] == "zero_placeholder"),
         "ingested_g_per_h": _describe(ingested), "used_g_per_h": _describe(used),
         "ingested_pct_of_used": _describe(share), "sweat_loss_ml_per_h": _describe(sweat), "fluid_ml_per_h": _describe(fluid),
     }
 
 
 def _spearman(pairs: list[tuple[float, float]]) -> float | None:
-    if len(pairs) < 5:
+    if len(pairs) < MIN_CORRELATION_N:
         return None
 
     def ranks(values: list[float]) -> list[float]:
@@ -255,28 +269,55 @@ def _spearman(pairs: list[tuple[float, float]]) -> float | None:
         return None
 
 
+def _correlations(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Spearman rank correlation of ingested g/h with duration and with IF within one sport family."""
+    logged = [r for r in rows if r["carbs_ingested_status"] == "value" and r["carbs_ingested_g_per_h"] is not None]
+    duration = [(r["hours"], r["carbs_ingested_g_per_h"]) for r in logged if r["hours"]]
+    intensity = [(r["intensity_factor"], r["carbs_ingested_g_per_h"]) for r in logged if r["intensity_factor"] is not None]
+    return {
+        "min_n": MIN_CORRELATION_N,
+        "ingested_vs_duration": {"n": len(duration), "rho": _spearman(duration)},
+        "ingested_vs_intensity": {"n": len(intensity), "rho": _spearman(intensity)},
+    }
+
+
+def _family_block(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        **_group(rows),
+        "by_duration": {label: _group([r for r in rows if _bucket(r["hours"], DURATION_BUCKETS_H) == label])
+                        for _, _, label in DURATION_BUCKETS_H},
+        "by_intensity": {label: _group([r for r in rows if _bucket(r["intensity_factor"], INTENSITY_BUCKETS) == label])
+                         for _, _, label in INTENSITY_BUCKETS},
+        "correlations": _correlations(rows),
+    }
+
+
 def period_fueling(activities: list[dict[str, Any]], defs: CustomFieldDefs | None, min_moving_s: float) -> dict[str, Any]:
-    """Fueling rows of the sessions of at least ``min_moving_s`` and statistics overall, per sport family,
-    per duration bucket and per intensity bucket (sample sizes and logging coverage included)."""
+    """Fueling rows of the sessions of at least ``min_moving_s``, statistics overall and, per sport
+    family, by duration bucket, by intensity bucket and Spearman correlations (sample sizes, logging
+    coverage and the minimum n included). Buckets and correlations never mix sport families."""
     rows = [activity_fueling(a, defs) for a in activities if (num(a.get("moving_time")) or 0) >= min_moving_s]
     rows.sort(key=lambda r: r["date"], reverse=True)
     by_family: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_family.setdefault(sport_family(row["type"]), []).append(row)
-    logged = [r for r in rows if r["carbs_ingested_status"] == "value" and r["carbs_ingested_g_per_h"] is not None]
     return {
         "rows": rows,
         "overall": _group(rows),
-        "by_sport_family": {family: _group(group) for family, group in sorted(by_family.items())},
-        "by_duration": {label: _group([r for r in rows if _bucket(r["hours"], DURATION_BUCKETS_H) == label])
-                        for _, _, label in DURATION_BUCKETS_H},
-        "by_intensity": {label: _group([r for r in rows if _bucket(r["intensity_factor"], INTENSITY_BUCKETS) == label])
-                         for _, _, label in INTENSITY_BUCKETS},
-        "spearman_ingested_vs_duration": _spearman([(r["hours"], r["carbs_ingested_g_per_h"]) for r in logged if r["hours"]]),
-        "spearman_ingested_vs_intensity": _spearman(
-            [(r["intensity_factor"], r["carbs_ingested_g_per_h"]) for r in logged if r["intensity_factor"] is not None]
-        ),
+        "by_sport_family": {family: _family_block(group) for family, group in sorted(by_family.items())},
+        "min_correlation_n": MIN_CORRELATION_N,
+        "rates": "per moving hour",
     }
+
+
+def correlation_text(correlations: dict[str, Any]) -> str:
+    """'Spearman ingested g/h vs duration 0.28 (n 15), vs IF 0.63 (n 15)' or why it is not computed."""
+    parts = []
+    for key, label in (("ingested_vs_duration", "vs duration"), ("ingested_vs_intensity", "vs IF")):
+        item = correlations[key]
+        parts.append(f"{label} {item['rho']:.2f} (n {item['n']})" if item["rho"] is not None
+                     else f"{label} not computed (n {item['n']} < {correlations['min_n']})")
+    return "Spearman ingested g/h " + ", ".join(parts) + " (association only)"
 
 
 def _stat(desc: dict[str, Any] | None, unit: str) -> str:
@@ -301,6 +342,8 @@ def group_text(label: str, group: dict[str, Any]) -> str:
         text += f"; sweat loss {_stat(group['sweat_loss_ml_per_h'], 'ml/h')}"
     if group["fluid_ml_per_h"]:
         text += f"; fluid {_stat(group['fluid_ml_per_h'], 'ml/h')}"
+    if group.get("zero_placeholders"):
+        text += f"; {group['zero_placeholders']} device-file 0 value(s) left out as placeholders"
     return text
 
 

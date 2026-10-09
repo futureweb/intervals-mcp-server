@@ -256,7 +256,7 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str
                 "limit": MAX_ROUTE_HISTORY + 1, "fields": ",".join([ROUTE_FIELDS, *codes])},
     )
     candidates = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
-    history = route_history(activity, candidates, pairs)
+    history = route_history(activity, candidates, pairs, truncated=len(candidates) >= MAX_ROUTE_HISTORY + 1)
     route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}", api_key=api_key)
     history["route_name"] = route.get("name") if isinstance(route, dict) and "error" not in route else None
     if isinstance(result, dict) and "error" in result:
@@ -290,9 +290,10 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     for activities without intervals (or on request); and data-quality notes (unknown sensors,
     gear streams whose values are gear positions rather than tooth counts, counter and
     other-sport streams left out). Use the specialised tools for the full detail of any
-    section. The overview carries a fueling line (carbs used/ingested per hour, sweat loss,
-    energy), weather (temperature, feels-like, wind, head/tailwind share) and W′ balance (max
-    depletion, time below 75/50/25 % of W′ from the w_bal stream); the data-quality notes name
+    section. The overview carries fueling (carbs used/ingested per hour, sweat loss, energy),
+    weather (temperature, feels-like, wind, head/tailwind share) and W′ balance (max depletion,
+    time below 75/50/25 % of W′ from the w_bal stream; W′bal below 0 is flagged as a W′/CP model
+    mismatch), as one short context line in compact; the data-quality notes name
     the source, upload/analysis times, recording stops and zero placeholders (full audit:
     get_activity_data_audit). include_route_history adds earlier activities on the same
     Intervals.icu route (time, power, W/kg, HR, weather, stamina; two extra requests). Read-only.
@@ -371,7 +372,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     want_climbs = include_climbs if include_climbs is not None else (not intervals or (activity.get("total_elevation_gain") or 0) > 500)
     climbs = _climb_summary(streams, activity.get("type"), None if detail_level == "full" else MAX_CLIMBS) if want_climbs and streams else None
     notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution,
-                           provenance_notes(activity, field_defs, expected, intervals))
+                           provenance_notes(activity, field_defs, expected, intervals, compact=detail_level == "compact"))
     route, route_calls = await _route_history(activity, athlete_id, api_key, field_defs) if include_route_history else (None, 0)
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)
 
@@ -407,7 +408,8 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
         }
         return json.dumps(payload, ensure_ascii=False, default=str)
 
-    overview = _compact_details(activity, field_defs, None if detail_level == "full" else assigned, wprime)
+    overview = _compact_details(activity, field_defs, None if detail_level == "full" else assigned, wprime,
+                                full_context=detail_level != "compact")
     sections = ["== Overview", overview]
     route_lines = route_history_lines(route, detail_level) if route else (
         ["No Intervals.icu route for this activity (routes need GPS)"] if include_route_history else [])

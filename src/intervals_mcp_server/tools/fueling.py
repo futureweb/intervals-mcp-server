@@ -20,8 +20,10 @@ from intervals_mcp_server.utils.fueling import (
     CARBS_NOTE,
     FUELING_LIST_FIELDS,
     INTAKE_WORDS,
+    MIN_CORRELATION_N,
     TIMING_NOTE,
     activity_fueling,
+    correlation_text,
     fueling_fields,
     fueling_line,
     group_text,
@@ -82,7 +84,8 @@ async def _single(activity_id: str, athlete_id: str | None, api_key: str | None)
 def _single_text(payload: dict[str, Any], detail_level: str) -> str:
     activity, figures = payload["activity"], payload["fueling"]
     lines = [f"Fueling of {activity['id']} '{activity['name']}' ({activity['type']}) {activity['start']}, "
-             f"moving {hms(figures['moving_time_s'])}" + (f", IF {figures['intensity_factor']:.2f}" if figures["intensity_factor"] is not None else "")]
+             f"moving {hms(figures['moving_time_s'])}" + (f", IF {figures['intensity_factor']:.2f}" if figures["intensity_factor"] is not None else "")
+             + "; rates per moving hour"]
     lines.append(fueling_line(figures) or "Fueling: no carbohydrate, fluid or energy values stored")
     found = payload["fields_found"]
     missing = [label for key, label in (("fluid_intake", "fluid intake"), ("sodium", "sodium"), ("sweat_loss", "sweat loss")) if not found[key]]
@@ -123,28 +126,28 @@ async def _period(  # pylint: disable=too-many-arguments,too-many-positional-arg
     summary = period_fueling(activities, defs, min_minutes * 60)
     return {"athlete_id": athlete_id, "start": start.isoformat(), "end": end.isoformat(), "sport_types": sport_types,
             "min_minutes": min_minutes, "activities_in_period": len(activities), **summary, "fields_found": roles,
-            "notes": [CARBS_NOTE, TIMING_NOTE, "Spearman rank correlation: association only, not causation."], "api_calls": 1}
+            "notes": [CARBS_NOTE, TIMING_NOTE, f"Spearman rank correlation per sport family, from {MIN_CORRELATION_N} sessions with "
+                      "intake logged on; association only, not causation."], "api_calls": 1}
 
 
 def _period_text(payload: dict[str, Any], detail_level: str) -> str:
     rows = payload["rows"]
     lines = [f"Fueling for athlete {payload['athlete_id']}, {payload['start']} to {payload['end']}: {len(rows)} sessions of at least "
              f"{payload['min_minutes']:g} min (of {payload['activities_in_period']} activities"
-             + (f", types {payload['sport_types']}" if payload["sport_types"] else "") + ")"]
+             + (f", types {payload['sport_types']}" if payload["sport_types"] else "") + "); rates per moving hour"]
     if not rows:
         return lines[0] + "."
-    lines.append(group_text("Overall", payload["overall"]))
-    if len(payload["by_sport_family"]) > 1:
-        lines.extend(group_text(f"  {family}", group) for family, group in payload["by_sport_family"].items())
+    families = payload["by_sport_family"]
+    if len(families) > 1:
+        lines.append(group_text("Overall (all sports)", payload["overall"]))
+    for family, block in families.items():
+        lines.append(group_text(family, block))
+        if detail_level == "compact":
+            continue
+        lines.extend(group_text(f"  {label} (moving time)", group) for label, group in block["by_duration"].items() if group["sessions"])
+        lines.extend(group_text(f"  {label}", group) for label, group in block["by_intensity"].items() if group["sessions"])
+        lines.append(f"  {correlation_text(block['correlations'])}")
     if detail_level != "compact":
-        lines.append("By duration (moving time):")
-        lines.extend(group_text(f"  {label}", group) for label, group in payload["by_duration"].items() if group["sessions"])
-        lines.append("By intensity factor:")
-        lines.extend(group_text(f"  {label}", group) for label, group in payload["by_intensity"].items() if group["sessions"])
-        rho_d, rho_i = payload["spearman_ingested_vs_duration"], payload["spearman_ingested_vs_intensity"]
-        if rho_d is not None or rho_i is not None:
-            lines.append(f"Spearman (sessions with intake logged): ingested g/h vs duration {rho_d if rho_d is not None else 'n/a'}, "
-                         f"vs intensity {rho_i if rho_i is not None else 'n/a'} (association only)")
         shown = rows if detail_level == "full" else rows[:STANDARD_ROWS]
         lines.append("Sessions:")
         lines.extend(f"  {row_text(row)}" for row in shown)
