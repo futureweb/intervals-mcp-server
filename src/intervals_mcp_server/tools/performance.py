@@ -13,6 +13,7 @@ number of API calls made so the caller can keep an eye on the rate limit.
 
 import json
 import math
+import re
 from datetime import date, timedelta
 from typing import Any
 
@@ -20,9 +21,9 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date
-from intervals_mcp_server.utils.sports import family_types, format_pace, hms, is_indoor, sport_family
+from intervals_mcp_server.utils.sports import SPORT_FAMILIES, family_types, format_pace, hms, is_indoor, sport_family
 from intervals_mcp_server.utils.streams import find_stream
-from intervals_mcp_server.utils.work_sets import interval_secs, matches_pattern, pattern_of, set_summary, split_work
+from intervals_mcp_server.utils.work_sets import INTENSITY_TOL_PTS, interval_secs, matches_pattern, pattern_of, set_summary, split_work
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -652,7 +653,90 @@ def _reps_params(min_reps: int | None, max_reps: int | None) -> dict[str, int] |
     return reps
 
 
-def _interval_search_block(activity: dict[str, Any], gear_map: dict[str, str]) -> str:
+SUMMARY_PATTERN = re.compile(r"^\s*(\d+)x\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\s+(\d+(?:\.\d+)?)\s*([a-z/%]*)\s*$", re.IGNORECASE)
+
+
+def _parse_duration(text: str) -> int:
+    total = 0
+    for value, unit in re.findall(r"(\d+)([hms])", text):
+        total += int(value) * {"h": 3600, "m": 60, "s": 1}[unit]
+    return total
+
+
+def parse_interval_summary(summary: Any) -> list[dict[str, Any]]:
+    """Intervals.icu interval_summary entries ("3x 10m 250w") as count / secs / value / units."""
+    groups = []
+    for item in summary if isinstance(summary, list) else []:
+        match = SUMMARY_PATTERN.match(str(item))
+        if not match:
+            continue
+        groups.append({"count": int(match.group(1)), "secs": _parse_duration(match.group(2)),
+                       "value": float(match.group(3)), "units": match.group(4).lower()})
+    return groups
+
+
+def _best_group(
+    activity: dict[str, Any], params: dict[str, Any], reference: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The interval_summary group that best matches the search window (or the reference pattern)."""
+    ftp = _num(activity.get("icu_ftp"))
+    best: tuple[float, dict[str, Any]] | None = None
+    centre_secs = reference["secs"] if reference else (params["minSecs"] + params["maxSecs"]) / 2
+    centre_pct = reference.get("pct_ftp") if reference else (params["minIntensity"] + params["maxIntensity"]) / 2
+    for group in parse_interval_summary(activity.get("interval_summary")):
+        if not params["minSecs"] * 0.9 <= group["secs"] <= params["maxSecs"] * 1.1:
+            continue
+        pct = group["value"] / ftp * 100 if group["units"] == "w" and ftp else None
+        closeness = 1 - min(1.0, abs(group["secs"] - centre_secs) / max(centre_secs, 1))
+        if pct is not None and centre_pct:
+            closeness += 1 - min(1.0, abs(pct - centre_pct) / 15)
+        if best is None or closeness > best[0]:
+            best = (closeness, {**group, "pct_ftp": round(pct, 1) if pct is not None else None})
+    return best[1] if best else None
+
+
+def _comparability(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    activity: dict[str, Any], params: dict[str, Any], reference: dict[str, Any] | None, anchor: dict[str, Any] | None,
+    ftp_tolerance_pct: float, gear_map: dict[str, str],
+) -> dict[str, Any]:
+    """Score 0-100 of how comparable an activity is, with the reasons (pattern, sport, gear, FTP context)."""
+    group = _best_group(activity, params, reference)
+    parts: list[tuple[float, float]] = []  # (score, weight)
+    notes: list[str] = []
+    if group:
+        centre = reference["secs"] if reference else (params["minSecs"] + params["maxSecs"]) / 2
+        parts.append((1 - min(1.0, abs(group["secs"] - centre) / max(centre, 1)), 2.0))
+        if reference and reference.get("count"):
+            parts.append((1 - min(1.0, abs(group["count"] - reference["count"]) / reference["count"]), 1.0))
+        if reference and reference.get("pct_ftp") is not None and group.get("pct_ftp") is not None:
+            parts.append((1 - min(1.0, abs(group["pct_ftp"] - reference["pct_ftp"]) / 15), 2.0))
+        notes.append(f"best match {group['count']}x {hms(group['secs'])} {group['value']:g}{group['units']}"
+                     + (f" ({group['pct_ftp']:.0f}% FTP)" if group.get("pct_ftp") is not None else ""))
+    else:
+        parts.append((0.3, 2.0))
+        notes.append("no interval group of the searched length in the summary")
+    if anchor:
+        same_type = str(activity.get("type")) == str(anchor.get("type"))
+        parts.append((1.0 if same_type else 0.8, 1.0))
+        if not same_type:
+            notes.append(f"{activity.get('type')} vs {anchor.get('type')}")
+        gear, anchor_gear = _gear_id(activity), _gear_id(anchor)
+        if gear and anchor_gear:
+            parts.append((1.0 if gear == anchor_gear else 0.6, 1.0))
+            notes.append("same gear" if gear == anchor_gear else f"other gear {_gear_label(activity, gear_map)}: watts from another power meter, compare % FTP only")
+        ftp, anchor_ftp = _num(activity.get("icu_ftp")), _num(anchor.get("icu_ftp"))
+        if ftp and anchor_ftp:
+            diff = (ftp - anchor_ftp) / anchor_ftp * 100
+            parts.append((1.0 if abs(diff) <= ftp_tolerance_pct else 0.6, 1.0))
+            if abs(diff) > ftp_tolerance_pct:
+                notes.append(f"other FTP context {ftp:.0f} vs {anchor_ftp:.0f} W ({diff:+.0f}%)")
+    score = sum(s * w for s, w in parts) / sum(w for _, w in parts)
+    if anchor is not None and str(activity.get("id")) == str(anchor.get("id")):
+        notes.insert(0, "reference" if reference else "newest result (context)")
+    return {"score": round(score * 100), "notes": notes, "best_group": group}
+
+
+def _interval_search_block(activity: dict[str, Any], gear_map: dict[str, str], comparability: dict[str, Any] | None = None) -> str:
     summary = activity.get("interval_summary")
     summary_text = "; ".join(str(s) for s in summary) if isinstance(summary, list) and summary else "n/a"
     details = [
@@ -662,17 +746,62 @@ def _interval_search_block(activity: dict[str, Any], gear_map: dict[str, str]) -
         f"intensity {_fmt(_num(activity.get('icu_intensity')), 0, '%')}",
         f"FTP {_fmt(_num(activity.get('icu_ftp')), 0, 'W')}",
         f"gear {_gear_label(activity, gear_map)}",
+        f"power meter {activity.get('power_meter') or 'unknown'}",
         f"compliance {_fmt(_num(activity.get('compliance')), 0, '%')}",
     ]
-    return f"{_activity_label(activity)}\n  " + ", ".join(details)
+    text = f"{_activity_label(activity)}\n  " + ", ".join(details)
+    if comparability:
+        text += f"\n  comparability {comparability['score']}/100: " + "; ".join(comparability["notes"])
+    return text
+
+
+async def _reference_pattern(api: _Api, activity_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    """(activity, main-set pattern, error) of a reference activity."""
+    fetched, error = await _activities_by_ids(api, [activity_id])
+    if error or not fetched:
+        return None, None, error or f"Reference activity {activity_id} not found."
+    activity = fetched[0]
+    intervals, error = await _intervals_of(api, activity_id)
+    if error:
+        return activity, None, error
+    ftp = _num(activity.get("icu_ftp"))
+    main = set_summary(split_work(intervals, ftp)["main"], ftp)
+    if not main.get("count"):
+        return activity, None, f"Reference activity {activity_id} has no WORK intervals to derive a pattern from."
+    return activity, pattern_of(main), None
+
+
+def _family_filter(
+    found: list[dict[str, Any]], sport_types: str | None, reference: dict[str, Any] | None
+) -> tuple[str | None, str, dict[str, int]]:
+    """(sport filter, description, other families found) for the default sport family."""
+    if sport_types and sport_types.strip().lower() == "all":
+        return None, "all sports (explicit)", {}
+    if sport_types:
+        return sport_types, f"sports {sport_types}", {}
+    families: dict[str, int] = {}
+    for activity in found:
+        family = sport_family(activity.get("type"))
+        families[family] = families.get(family, 0) + 1
+    if reference is not None:
+        chosen = sport_family(reference.get("type"))
+        source = "the reference activity"
+    elif families:
+        chosen = max(families, key=lambda f: families[f])
+        source = "most results"
+    else:
+        return None, "all sports", {}
+    others = {f: n for f, n in families.items() if f != chosen}
+    types = ",".join(SPORT_FAMILIES.get(chosen, (chosen,)))
+    return types, f"sport family {chosen} (default from {source})", others
 
 
 @tool("read")
-async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    min_secs: int,
-    max_secs: int,
-    min_intensity: float,
-    max_intensity: float,
+async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
+    min_secs: int | None = None,
+    max_secs: int | None = None,
+    min_intensity: float | None = None,
+    max_intensity: float | None = None,
     target: str | None = None,
     min_reps: int | None = None,
     max_reps: int | None = None,
@@ -684,35 +813,53 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    reference_activity_id: str | None = None,
+    ftp_range: str | None = None,
+    ftp_tolerance_pct: float = 5.0,
+    sort_by: str | None = None,
 ) -> str:
-    """Find activities containing intervals of a given length and intensity (% of FTP)
+    """Find activities containing intervals of a given length and intensity (% of FTP), ranked by comparability
 
     Wraps the Intervals.icu interval search: activities with WORK intervals between min_secs
     and max_secs long at min_intensity-max_intensity percent of FTP, optionally restricted to
     a workout target (POWER, HR or PACE; this is the target type, not the sport) and a repeat
-    count. Use it to find comparable sessions ("all rides with 3 or more 8-12 min efforts at
-    95-105%") before comparing them with compare_workouts or get_activity_intervals. The API
-    has no date, sport or gear filter, so those are applied here on the returned list (more
-    results are requested from the API when such a filter is set). Per activity: date, sport,
-    name, id, the interval summary, moving time, load, intensity, FTP at the time, gear name
-    and compliance. One API call (plus one for the gear catalog).
+    count. With reference_activity_id the window is derived from that activity's main work set
+    (e.g. 3 x 10 min threshold: interval length ±25 %, intensity ±8 % of FTP; explicit values
+    override) and results are ranked by comparability with it. Defaults: the sport family of the
+    reference activity, otherwise the family with the most results (cycling, running ...);
+    other families are counted, not silently dropped; sport_types="all" keeps the previous
+    cross-sport behaviour. Per activity: date, sport, name, id, the interval summary, moving
+    time, load, intensity, FTP at the time, gear, power meter and compliance, plus a
+    comparability score 0-100 with its reasons (matching interval group, same sport type,
+    same gear, FTP context within ftp_tolerance_pct of the reference or newest result).
+    Absolute watts of different bikes / power meters are not comparable; compare % of FTP
+    across gear. The API has no date, sport or gear filter, so those are applied here on the
+    returned list (more results are requested from the API). One API call (plus two for a
+    reference activity and one for the gear catalog).
 
     Args:
-        min_secs: Minimum interval length in seconds
-        max_secs: Maximum interval length in seconds
+        min_secs: Minimum interval length in seconds (required unless reference_activity_id is given)
+        max_secs: Maximum interval length in seconds (required unless reference_activity_id is given)
         min_intensity: Minimum intensity in % of FTP (0-300, whole percent; decimals are rounded down)
         max_intensity: Maximum intensity in % of FTP (0-300, whole percent; decimals are rounded up)
         target: Workout target type POWER, HR or PACE (optional)
         min_reps: Minimum number of matching repetitions in the activity (optional)
         max_reps: Maximum number of matching repetitions in the activity (optional)
-        limit: Maximum number of activities to return, newest first (optional, default 20)
+        limit: Maximum number of activities to return (optional, default 20)
         start_date: Keep only activities on or after this local date YYYY-MM-DD (optional)
         end_date: Keep only activities on or before this local date YYYY-MM-DD (optional)
-        sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide" (optional)
+        sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide"; "all" for every
+            sport (optional, default: sport family of the reference or of most results)
         gear_id: Keep only activities done on this gear id (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        reference_activity_id: Activity whose main work set defines the search window and the
+            comparability ranking (optional)
+        ftp_range: Keep only activities whose FTP at the time is in this range, e.g. "225-240" (optional)
+        ftp_tolerance_pct: FTP difference to the reference (or newest result) flagged as another
+            FTP context (optional, default 5)
+        sort_by: "comparability" (default with a reference) or "date" (newest first, default otherwise)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -720,24 +867,50 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     date_error = _validate_optional_dates(start_date, end_date)
     if date_error:
         return date_error
-    filters = _filter_text(sport_types, gear_id, start_date, end_date)
-    api_limit = min(limit * 5, MAX_SEARCH_RESULTS) if filters else limit
+    ftp_bounds = _parse_range(ftp_range, "ftp_range")
+    if isinstance(ftp_bounds, str):
+        return ftp_bounds
+    order = (sort_by or ("comparability" if reference_activity_id else "date")).strip().lower()
+    if order not in ("comparability", "date"):
+        return "Error: sort_by must be 'comparability' or 'date'."
+    api = _Api(api_key)
+    reference: dict[str, Any] | None = None
+    pattern: dict[str, Any] | None = None
+    if reference_activity_id:
+        reference, pattern, error = await _reference_pattern(api, reference_activity_id)
+        if error or pattern is None:
+            return error or f"Reference activity {reference_activity_id} has no pattern."
+        min_secs = min_secs if min_secs is not None else max(1, round(pattern["secs"] * 0.75))
+        max_secs = max_secs if max_secs is not None else round(pattern["secs"] * 1.25)
+        if pattern.get("pct_ftp") is not None:
+            min_intensity = min_intensity if min_intensity is not None else max(0.0, pattern["pct_ftp"] - INTENSITY_TOL_PTS)
+            max_intensity = max_intensity if max_intensity is not None else pattern["pct_ftp"] + INTENSITY_TOL_PTS
+        elif min_intensity is None or max_intensity is None:
+            return (f"Error: reference activity {reference_activity_id} has no power-based work intensity; "
+                    "pass min_intensity and max_intensity.")
+    if min_secs is None or max_secs is None or min_intensity is None or max_intensity is None:
+        return "Error: pass min_secs, max_secs, min_intensity and max_intensity, or a reference_activity_id."
     params = _interval_search_params(
-        min_secs, max_secs, min_intensity, max_intensity, target, min_reps, max_reps, max(api_limit, limit)
+        min_secs, max_secs, min_intensity, max_intensity, target, min_reps, max_reps, max(min(limit * 5, MAX_SEARCH_RESULTS), limit)
     )
     if isinstance(params, str):
         return params
-
-    api = _Api(api_key)
     result = await api.get(f"/athlete/{athlete_id_to_use}/activities/interval-search", params)
     error = _error(result, "interval search")
     if error:
         return error
     found = _list_of_dicts(result)
-    selected = _select_activities(
-        found, sport_types=sport_types, gear_id=gear_id, start_date=start_date, end_date=end_date, limit=limit
-    )
+    sport_filter, sport_text, other_families = _family_filter(found, sport_types, reference)
+    selected = _select_activities(found, sport_types=sport_filter, gear_id=gear_id, start_date=start_date, end_date=end_date)
+    if ftp_bounds:
+        selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key) if selected else {}
+    anchor = reference or (selected[0] if selected else None)
+    scored = [(a, _comparability(a, params, pattern, anchor, ftp_tolerance_pct, gear_map)) for a in selected]
+    if order == "comparability":
+        scored.sort(key=lambda item: (item[1]["score"], str(item[0].get("start_date_local") or "")), reverse=True)
+    scored = scored[:limit]
+    filters = ", ".join(p for p in (_filter_text(None, gear_id, start_date, end_date), sport_text, f"FTP {ftp_range}" if ftp_range else "") if p)
 
     criteria = (
         f"{params['minSecs']}-{params['maxSecs']} s at {params['minIntensity']}-{params['maxIntensity']}% of FTP"
@@ -748,26 +921,41 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "criteria": criteria, "api_params": params,
-            "returned_by_api": len(found), "filters": filters or None,
+            "returned_by_api": len(found), "filters": filters or None, "other_sport_families": other_families,
+            "reference": {"activity_id": reference_activity_id, "pattern": pattern} if reference else None,
+            "sort_by": order,
             "activities": [
                 {
                     **_activity_json(activity, gear_map),
-                    "rpe": activity.get("icu_rpe"), "feel": activity.get("feel"),
+                    "rpe": activity.get("icu_rpe"), "feel": activity.get("feel"), "power_meter": activity.get("power_meter"),
                     "compliance": activity.get("compliance"), "interval_summary": activity.get("interval_summary"),
+                    "comparability": comp,
                 }
-                for activity in selected
+                for activity, comp in scored
             ],
             "api_calls": api.calls,
         }
         return json.dumps(payload, ensure_ascii=False)
     lines = [f"Interval search for athlete {athlete_id_to_use}: {criteria}, limit {limit}"]
-    if filters:
-        lines.append(f"API returned {len(found)} activities; client-side filters ({filters}) keep {len(selected)}.")
-    else:
-        lines.append(f"API returned {len(found)} activities, newest first.")
-    lines.extend(_interval_search_block(activity, gear_map) for activity in selected)
-    if not selected:
+    if pattern:
+        lines.append(
+            f"Reference {reference_activity_id}: {pattern['count']} x {hms(pattern['secs'])}"
+            + (f" @ {pattern['pct_ftp']:.0f}% FTP" if pattern.get("pct_ftp") is not None else "")
+            + " (search window derived from its main work set unless given explicitly)"
+        )
+    lines.append(
+        f"API returned {len(found)} activities; filters ({filters}) keep {len(selected)}; "
+        + ("ranked by comparability." if order == "comparability" else "newest first.")
+    )
+    if other_families:
+        lines.append(
+            "Also found in other sports (not shown, % of FTP is sport-specific; sport_types='all' to include): "
+            + ", ".join(f"{family} {count}" for family, count in sorted(other_families.items()))
+        )
+    lines.extend(_interval_search_block(activity, gear_map, comp) for activity, comp in scored)
+    if not scored:
         lines.append("No matching activities.")
+    lines.append("Absolute watts of different bikes / power meters are not comparable; compare % of FTP across gear.")
     lines.append("Call get_activity_intervals(activity_id) for the per-interval details (power, HR, cadence, timing).")
     lines.append(f"API calls: {api.calls} {GEAR_CALL_NOTE}")
     return "\n".join(lines)
@@ -924,6 +1112,8 @@ def _round_pct(value: float | None) -> float | None:
 
 TREND_LABELS = (
     ("avg_watts", "power (time-weighted avg)", "W", 0),
+    ("avg_watts_same_gear", "power on the reference gear only", "W", 0),
+    ("w_per_bpm_same_gear", "W/bpm on the reference gear only", "", 2),
     ("avg_hr", "HR (time-weighted avg)", "bpm", 0),
     ("max_hr", "max HR", "bpm", 0),
     ("cadence", "cadence", "rpm", 0),
@@ -1128,9 +1318,17 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         row["not_comparable_reason"] = reason
     compared = [r for r in rows if r["comparable"] or not comparable_only]
     trend_keys = [t for t in TREND_LABELS if include_rpe or t[0] != "rpe_whole_activity"]
+    base_keys = [t for t in trend_keys if not t[0].endswith("_same_gear")]
     comparable_rows = [r for r in rows if r["comparable"]]
-    trends = [t for key, *_ in trend_keys if (t := _trend(comparable_rows, key))]
+    trends = [t for key, *_ in base_keys if (t := _trend(comparable_rows, key))]
     notes = _comparability_notes(comparable_rows)
+    gears = {row.get("gear_id") for row in comparable_rows}
+    if len(gears) > 1 and ref_row.get("gear_id"):
+        same_gear = [row for row in comparable_rows if row.get("gear_id") == ref_row.get("gear_id")]
+        for key in ("avg_watts", "w_per_bpm"):
+            trend = _trend(same_gear, key)
+            if trend:
+                trends.append({**trend, "key": f"{key}_same_gear", "gear_id": ref_row.get("gear_id")})
 
     if output_format.strip().lower() == "json":
         payload = {

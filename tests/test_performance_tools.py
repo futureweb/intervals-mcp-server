@@ -310,20 +310,25 @@ def test_compare_best_efforts_limit_cap_and_errors(monkeypatch):
 
 # --------------------------------------------------------- find_similar_intervals
 def test_find_similar_intervals_params_and_text(monkeypatch):
-    """The search parameters are mapped to the API names; each activity gets a summary block."""
+    """The search parameters are mapped to the API names; by default only the dominant sport family is kept
+    (the run is counted, not silently dropped); each activity gets a summary block with gear, power meter
+    and a comparability score."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(find_similar_intervals(480, 720, 95, 105, target="power", min_reps=3, limit=10))
     assert calls[0][0] == "/athlete/i1/activities/interval-search"
-    assert calls[0][1] == {"minSecs": 480, "maxSecs": 720, "minIntensity": 95, "maxIntensity": 105, "limit": 10, "type": "POWER", "minReps": 3}
+    assert calls[0][1] == {"minSecs": 480, "maxSecs": 720, "minIntensity": 95, "maxIntensity": 105, "limit": 50, "type": "POWER", "minReps": 3}
     assert result.startswith("Interval search for athlete i1: 480-720 s at 95-105% of FTP, target POWER, reps 3-any, limit 10")
-    assert "API returned 4 activities, newest first." in result
-    lines = result.split("\n")
-    assert lines[2] == "2026-10-01 Ride 'Sweet Spot 3x20' (a4)"
-    assert lines[3] == "  intervals: 3x 10m 250w, moving 1:00:00, load 90, intensity 85 %, FTP 235 W, gear Road Bike (b1), compliance 95 %"
-    assert "2026-09-10 Run 'Tempo run' (a2)" in result and "gear no gear" in result
-    assert "Call get_activity_intervals(activity_id)" in result
+    assert "API returned 4 activities; filters (sport family cycling (default from most results)) keep 3; newest first." in result
+    assert "Also found in other sports (not shown, % of FTP is sport-specific; sport_types='all' to include): running 1" in result
+    assert "2026-10-01 Ride 'Sweet Spot 3x20' (a4)\n  intervals: 3x 10m 250w, moving 1:00:00, load 90, intensity 85 %, FTP 235 W, gear Road Bike (b1), power meter unknown, compliance 95 %" in result
+    assert "comparability 100/100: newest result (context); best match 3x 10:00 250w (106% FTP); same gear" in result
+    assert "other gear Gravel Bike (b2): watts from another power meter, compare % FTP only" in result
+    assert "Tempo run" not in result
+    assert "Absolute watts of different bikes / power meters are not comparable" in result
     assert result.endswith("API calls: 1 (plus 1 for the gear catalog unless cached)")
+    everything = asyncio.run(find_similar_intervals(480, 720, 95, 105, sport_types="all"))
+    assert "2026-09-10 Run 'Tempo run' (a2)" in everything and "gear no gear" in everything
 
 
 def test_find_similar_intervals_client_filters_and_json(monkeypatch):
@@ -334,14 +339,43 @@ def test_find_similar_intervals_client_filters_and_json(monkeypatch):
         480, 720, 95, 105, start_date="2026-09-05", end_date="2026-09-30", sport_types="run,gravelride", limit=5,
     ))
     assert calls[0][1]["limit"] == 25
-    assert "API returned 4 activities; client-side filters (dates 2026-09-05 to 2026-09-30, sports run,gravelride) keep 2." in result
+    assert "API returned 4 activities; filters (dates 2026-09-05 to 2026-09-30, sports run,gravelride) keep 2; newest first." in result
     assert "(a3)" in result and "(a2)" in result and "(a1)" not in result and "(a4)" not in result
     payload = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, gear_id="b1", limit=5, output_format="json")))
     assert [a["id"] for a in payload["activities"]] == ["a4", "a1"]
     assert payload["activities"][0]["gear_name"] == "Road Bike"
     assert payload["activities"][0]["interval_summary"] == ["3x 10m 250w"]
-    assert payload["returned_by_api"] == 4 and payload["filters"] == "gear b1"
+    assert payload["returned_by_api"] == 4 and payload["filters"].startswith("gear b1")
     assert payload["api_params"]["limit"] == 25
+    assert payload["activities"][1]["comparability"]["score"] == 100  # FTP 225 vs 235 W is within 5 %
+    strict = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, gear_id="b1", ftp_tolerance_pct=2, output_format="json")))
+    assert "other FTP context 225 vs 235 W (-4%)" in strict["activities"][1]["comparability"]["notes"]
+    assert strict["activities"][1]["comparability"]["score"] < 100
+    narrow = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, ftp_range="230-240", output_format="json")))
+    assert {a["id"] for a in narrow["activities"]} == {"a3", "a4"}
+
+
+def test_find_similar_intervals_reference_activity(monkeypatch):
+    """A reference activity defines the window (interval length ±25 %, intensity ±8 % of FTP), the sport
+    family and the ranking by comparability."""
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    payload = json.loads(asyncio.run(find_similar_intervals(reference_activity_id="a4", output_format="json")))
+    assert [c[0] for c in calls[:3]] == ["/activity/a4", "/activity/a4/intervals", "/athlete/i1/activities/interval-search"]
+    assert payload["api_params"]["minSecs"] == 900 and payload["api_params"]["maxSecs"] == 1500
+    assert payload["api_params"]["minIntensity"] == 94 and payload["api_params"]["maxIntensity"] == 111
+    assert payload["reference"]["pattern"] == {"count": 3, "secs": 1200, "pct_ftp": 102.1}
+    assert payload["sort_by"] == "comparability" and payload["other_sport_families"] == {"running": 1}
+    assert [a["id"] for a in payload["activities"]][0] == "a4"
+    text = asyncio.run(find_similar_intervals(reference_activity_id="a4", min_secs=500))
+    assert "Reference a4: 3 x 20:00 @ 102% FTP" in text and "500-1500 s" in text
+    assert asyncio.run(find_similar_intervals()).startswith("Error: pass min_secs, max_secs")
+    assert asyncio.run(find_similar_intervals(reference_activity_id="a2")).startswith("Error: reference activity a2 has no power-based work intensity")
+    _install_router(monkeypatch, overrides={"/intervals": {"icu_intervals": []}})
+    assert asyncio.run(find_similar_intervals(reference_activity_id="a4")).startswith("Reference activity a4 has no WORK intervals")
+    assert asyncio.run(find_similar_intervals(480, 720, 95, 105, sort_by="x")).startswith("Error: sort_by")
+    _install_router(monkeypatch, overrides={"/activity/": ERROR})
+    assert asyncio.run(find_similar_intervals(reference_activity_id="zz")) == "Error fetching activity zz: boom"
 
 
 def test_find_similar_intervals_validation_and_api_error(monkeypatch):
@@ -499,6 +533,7 @@ def test_compare_workouts_filters_reference_and_flags(monkeypatch):
     mixed = asyncio.run(compare_workouts(query="Threshold"))
     assert "power meter Assioma Duo, gear Gravel Bike (b2)" in mixed
     assert "Note: Different gear (b1, b2) / power meters (Assioma Duo): watts come from sensors that are not calibrated against each other" in mixed
+    assert "power on the reference gear only: 240 W -> 250 W" in mixed
     same_bike = json.loads(asyncio.run(compare_workouts(query="Threshold", gear_id="b1", output_format="json")))
     assert {r["id"] for r in same_bike["activities"]} == {"t1", "t4", "t5"}
     assert not any(note.startswith("Different gear") for note in same_bike["notes"])
