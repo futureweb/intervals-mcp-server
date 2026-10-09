@@ -130,7 +130,7 @@ def _work_vs_plan(work: list[dict[str, Any]], pace_units: str | None) -> str:
     span = {"kind": kind, "low": min(t["low"] for t in targets), "high": None if None in highs else max(highs),
             "units": "bpm" if kind == "hr" else "W"}
     if kind == "pace":
-        actual = "/".join(format_pace(v, pace_units) for v in values)
+        actual = ", ".join(format_pace(v, pace_units) for v in values)
     else:
         actual = "/".join(f"{v:.0f}" for v in values) + f" {span['units']}"
     return f"; work steps {actual} vs {target_text(span, pace_units)} planned"
