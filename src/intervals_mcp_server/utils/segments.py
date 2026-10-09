@@ -50,6 +50,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import CustomFieldDefs, format_value, is_missing
+from intervals_mcp_server.utils.sports import cadence_text, is_foot_sport
 from intervals_mcp_server.utils.streams import (
     FOOT_SPORTS,
     describe_stream,
@@ -1018,6 +1019,8 @@ def detect_segments(  # pylint: disable=too-many-arguments,too-many-locals
             "min_grade_distance_m": defaults.min_grade_distance_m, "plausible_grade_pct": defaults.plausible_grade_pct,
             "stationary_speed_m_s": defaults.stationary_speed_m_s, "slow_vertical_m_per_h": defaults.slow_vertical_m_per_h,
             "hysteresis_m": hysteresis_m, "show_raw_grade": show_raw_grade,
+            "sport": str(sport) if sport else None,
+            "cadence_units": "spm (2 x stored per-leg value)" if is_foot_sport(sport) else "rpm",
         },
         "hidden_streams": profile.hidden_streams or {},
     }
@@ -1054,7 +1057,7 @@ def _grade(value: Any) -> str:
     return "not determinable" if value is None else f"{format_value(value)} %"
 
 
-def _segment_line(number: int, segment: dict[str, Any], show_raw: bool = False) -> str:
+def _segment_line(number: int, segment: dict[str, Any], show_raw: bool = False, sport: Any = None) -> str:
     """The one-line description of a segment (a grade that cannot be computed is 'not determinable')."""
     grade = f"avg grade {_grade(segment['avg_grade_pct'])}"
     if show_raw:
@@ -1082,7 +1085,7 @@ def _segment_line(number: int, segment: dict[str, Any], show_raw: bool = False) 
         f"power avg {_fmt(segment['avg_watts'])} W, NP {_fmt(segment['normalized_power'])} W, "
         f"max {_fmt(segment['max_watts'])} W",
         f"HR avg {_fmt(segment['avg_hr'])}, max {_fmt(segment['max_hr'])} bpm",
-        f"cadence {_fmt(segment['avg_cadence_nonzero'])} rpm",
+        f"cadence {cadence_text(segment['avg_cadence_nonzero'], sport)}",
         f"speed {_kmh(segment['avg_speed_m_s'])}",
     ]
     return "; ".join(parts)
@@ -1179,7 +1182,7 @@ def format_segments(
     segments = result.get("segments") or []
     show_raw = bool((result.get("settings") or {}).get("show_raw_grade"))
     for number, segment in enumerate(segments[:max_segments], 1):
-        lines.append(_segment_line(number, segment, show_raw))
+        lines.append(_segment_line(number, segment, show_raw, (result.get("settings") or {}).get("sport")))
         confidence = segment.get("grade_confidence") or {}
         if confidence.get("reasons"):
             lines.append(f"  grade confidence {confidence['level']}: " + "; ".join(confidence["reasons"]))

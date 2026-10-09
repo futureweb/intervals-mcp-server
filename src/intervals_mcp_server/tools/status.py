@@ -286,7 +286,9 @@ def usage_guide() -> str:
         "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts).\n"
         "6. Planning: get_sport_settings / get_training_zones, get_training_plan, get_workout_library, "
         "validate_workout, then (if the write class is enabled) add_or_update_event.\n"
-        "Conventions: times are local and UTC with timezone; 'no value' = null/NaN; a 0 in a device-file field may "
+        "Conventions: times are local (timezone name when stored, else the UTC offset) and UTC; run/walk/hike "
+        "cadence in steps per minute (spm = 2 x the stored per-leg value, shown as stored), bike cadence in rpm; "
+        "temperatures in °C; 'no value' = null/NaN; a 0 in a device-file field may "
         "mean the source field was absent; Intervals.icu load is never mixed with device loads; custom fields come "
         "from the athlete's own definitions; most tools accept output_format='json' and detail_level.\n"
     )

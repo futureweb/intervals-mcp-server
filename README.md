@@ -177,6 +177,13 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 **Resources:** `intervals://guide` (how to use the tools), `intervals://custom-items` (your
 custom item definitions).
 
+**Output conventions:** start times are shown local with the timezone name when Intervals.icu
+stores one, otherwise with the UTC offset derived from the local and UTC start, plus UTC; run,
+walk and hike cadence in steps per minute (`spm`, 2 x the per-leg value Intervals.icu stores,
+which is shown as stored), bike cadence in rpm; temperatures in °C (a temperature custom field
+without units takes the unit its sibling temperature fields agree on); missing values are `n/a`,
+never 0.
+
 ## Quick start
 
 Requirements: Python 3.12+, [uv](https://github.com/astral-sh/uv), an Intervals.icu API key

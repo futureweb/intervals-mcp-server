@@ -20,6 +20,7 @@ for a particular device or vendor.
 
 import json
 import math
+import re
 from typing import Any
 
 ACTIVITY_FIELD = "ACTIVITY_FIELD"
@@ -228,6 +229,35 @@ def apply_units_overrides(index: CustomItemIndex, overrides: dict[str, str]) -> 
             if code in overrides:
                 definition["units"] = overrides[code]
                 definition["units_source"] = "override"
+    return index
+
+
+_TEMPERATURE_UNITS = {"°c": "°C", "c": "°C", "celsius": "°C", "°f": "°F", "f": "°F", "fahrenheit": "°F"}
+
+
+def _is_temperature(definition: dict[str, Any]) -> bool:
+    text = f"{definition.get('name') or ''} {definition.get('code') or ''}".lower()
+    return "temperature" in text or bool(re.search(r"(^|[^a-z])temp([^a-z]|$)", text))
+
+
+def infer_temperature_units(index: CustomItemIndex) -> CustomItemIndex:
+    """Give numeric temperature fields without units the unit of the other temperature fields.
+
+    A device bridge may define "Min. Temperature" and "Avg. Temperature" with °C but leave the
+    unit of "Max. Temperature" empty. When all temperature fields of an item type that carry a
+    unit agree on it, the ones without a unit get it, marked units_source='inferred'. Nothing
+    is assumed when no temperature field has a unit or the units differ.
+    """
+    for defs in index.values():
+        temperatures = [d for d in defs.values() if d.get("value_type") in (None, "numeric") and _is_temperature(d)]
+        known = {_TEMPERATURE_UNITS.get(str(d.get("units")).strip().lower()) for d in temperatures if d.get("units")}
+        if len(known) != 1 or None in known:
+            continue
+        unit = known.pop()
+        for definition in temperatures:
+            if not definition.get("units"):
+                definition["units"] = unit
+                definition["units_source"] = "inferred"
     return index
 
 

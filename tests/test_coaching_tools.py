@@ -255,7 +255,7 @@ def test_get_activity_details_json_and_thresholds(monkeypatch):
     """Details JSON carries the raw activity, custom fields with status and the thresholds snapshot."""
     _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY})
     text = asyncio.run(get_activity_details("i1"))
-    assert "Date: 2026-10-06T17:36:22 local / 2026-10-06T15:36:22Z UTC" in text
+    assert "Date: 2026-10-06T17:36:22 local (UTC+02:00) / 2026-10-06T15:36:22Z UTC" in text
     assert "Thresholds used for this activity" in text
     assert "FTP 234 W (icu_ftp, setting at the time)" in text
     assert "Power zones (% FTP, upper bounds): Z1 ≤55% (0-129 W)" in text
@@ -619,7 +619,7 @@ def test_detail_levels_details_intervals_snapshot(monkeypatch):
 
     compact_iv = asyncio.run(get_activity_intervals("i1", detail_level="compact", stream_types="Stamina"))
     assert compact_iv.startswith("Intervals of i1 (analysed True):")
-    assert "[2] WORK | 5:00 (10:00-15:00, idx 600-900) | avg 242 W NP n/a max 260 | HR 155/160 | cad 88 | streams Stamina 88→82.0 (min 82.0)" in compact_iv
+    assert "[2] WORK | 5:00 (10:00-15:00, idx 600-900) | avg 242 W NP n/a max 260 | HR 155/160 | cad 88 rpm | streams Stamina 88→82.0 (min 82.0)" in compact_iv
     full_iv = asyncio.run(get_activity_intervals("i1", detail_level="full"))
     assert "Stream Metrics (samples 600-899):" in full_iv and "Garmin Stamina [Stamina]" in full_iv
 
@@ -774,6 +774,38 @@ def test_get_activity_intervals_shows_time_beyond_the_plan(monkeypatch):
         get_activity_intervals("i1", planned_workout_doc=doc))
     plain = asyncio.run(get_activity_intervals("i1", detail_level="compact"))
     assert "plan step" not in plain and "Plan:" not in asyncio.run(get_activity_intervals("i1"))
+
+
+def test_run_cadence_in_steps_per_minute_and_units(monkeypatch):
+    """Phase 5 (E): foot sports show spm (2 x the stored per-leg cadence), rides rpm; temperatures with °C or n/a;
+    running dynamics only for foot sports; local start with the UTC offset."""
+    run = dict(EXECUTION_ACTIVITY, id="i2", type="Run", average_cadence=73.565, average_step_length=920.0,
+               average_stance_time=300.0, average_temp=29.04, max_temp=33, min_temp=None)
+    run_intervals = {"id": "i2", "analyzed": True, "icu_groups": [], "icu_intervals": [
+        {"type": "WORK", "label": None, "start_index": 0, "end_index": 600, "elapsed_time": 600, "moving_time": 600,
+         "average_cadence": 80.0, "min_cadence": 0, "max_cadence": 92.5, "average_step_length": 1000.0, "average_temp": 21.0},
+    ]}
+    _install_router(monkeypatch, {"/activity/": run, "/intervals": run_intervals})
+    details = asyncio.run(get_activity_details("i2"))
+    assert "Cadence: 147 spm (73.6 rpm as stored)" in details
+    assert "Average Temp: 29 °C" in details and "Max Temp: 33 °C" in details and "Min Temp: n/a" in details
+    assert "Running Dynamics:" in details and "Cadence: 147 spm (73.6 rpm as stored, per leg)" in details
+    compact = asyncio.run(get_activity_details("i2", detail_level="compact"))
+    assert "2026-10-06 17:36 local (UTC+02:00)" in compact and "cadence 147 spm (74 rpm as stored)" in compact
+    intervals = asyncio.run(get_activity_intervals("i2"))
+    assert "Cadence: Avg 160, Min 0, Max 185 spm (as stored per leg: 80 / 0 / 92.5 rpm)" in intervals
+    assert "Temperature: 21 °C (Weather: n/a, Feels like: n/a)" in intervals
+    assert "cad 160 spm (80 rpm as stored)" in asyncio.run(get_activity_intervals("i2", detail_level="compact"))
+    payload = json.loads(asyncio.run(get_activity_intervals("i2", output_format="json")))
+    assert payload["activity_type"] == "Run" and payload["intervals"][0]["average_cadence_spm"] == 160
+    # A ride keeps rpm and shows no running dynamics although Intervals.icu stores a step length.
+    ride = dict(EXECUTION_ACTIVITY, average_cadence=88.2, average_step_length=2874.0)
+    ride_intervals = dict(run_intervals, id="i1")
+    _install_router(monkeypatch, {"/activity/": ride, "/intervals": ride_intervals})
+    ride_details = asyncio.run(get_activity_details("i1"))
+    assert "Cadence: 88.2 rpm" in ride_details and "Running Dynamics" not in ride_details
+    ride_iv = asyncio.run(get_activity_intervals("i1"))
+    assert "Cadence: Avg 80, Min 0, Max 92.5 rpm" in ride_iv and "Running Dynamics" not in ride_iv
 
 
 def test_get_training_plan_empty_and_unknown(monkeypatch):

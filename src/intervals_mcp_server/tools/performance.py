@@ -22,7 +22,16 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date
-from intervals_mcp_server.utils.sports import SPORT_FAMILIES, family_types, format_pace, hms, is_indoor, sport_family
+from intervals_mcp_server.utils.sports import (
+    SPORT_FAMILIES,
+    cadence_text,
+    family_types,
+    format_pace,
+    hms,
+    is_foot_sport,
+    is_indoor,
+    sport_family,
+)
 from intervals_mcp_server.utils.streams import find_stream
 from intervals_mcp_server.utils.work_sets import INTENSITY_TOL_PTS, interval_secs, matches_pattern, pattern_of, set_summary, split_work
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
@@ -1198,7 +1207,7 @@ def _row_text(row: dict[str, Any], include_rpe: bool) -> list[str]:
         _set_text(main),
         f"{_fmt(main.get('avg_watts'), 0, 'W')} (NP {_fmt(main.get('np_watts'), 0, 'W')})",
         f"HR {_fmt(main.get('avg_hr'), 0)}/max {_fmt(main.get('max_hr'), 0)} bpm",
-        f"cad {_fmt(main.get('cadence'), 0)}",
+        f"cad {cadence_text(main.get('cadence'), row.get('type'))}",
         f"{_fmt(main.get('w_per_bpm'), 2)} W/bpm",
         f"FTP {_fmt(_num(row['ftp']), 0, 'W')}",
         row["power_source"],
@@ -1434,8 +1443,12 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         ))
     if trends:
         lines.append(f"Trends over the {len(comparable_rows)} comparable activities (first -> last):")
+        foot = bool(comparable_rows) and all(is_foot_sport(row.get("type")) for row in comparable_rows)
         for trend in trends:
             label, units, digits = next((lab, u, d) for k, lab, u, d in trend_keys if k == trend["key"])
+            if trend["key"] == "cadence" and foot:  # stored per leg: show steps per minute
+                trend = {**trend, **{k: trend[k] * 2 for k in ("first", "last", "min", "max") if trend.get(k) is not None}}
+                label, units = "cadence (steps/min = 2 x stored per-leg value)", "spm"
             pct = f" ({trend['pct']:+.1f} %)" if trend.get("pct") is not None else ""
             reliability = "" if trend["reliable"] else f"; only {trend['n']} activities, not reliable"
             lines.append(

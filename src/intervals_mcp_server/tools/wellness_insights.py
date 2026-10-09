@@ -24,7 +24,7 @@ from intervals_mcp_server.utils.custom_fields import (
 )
 from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.formatting import event_type_label
-from intervals_mcp_server.utils.sports import hms
+from intervals_mcp_server.utils.sports import format_local_start, hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 from intervals_mcp_server.utils.wellness_stats import (
     compute_correlation,
@@ -223,7 +223,7 @@ def _activity_line(activity: dict[str, Any], defs: CustomFieldDefs) -> str:
         if activity.get(key) is not None:
             loads.append(f"{label}{activity[key]}")
     text = (
-        f"  {str(activity.get('start_date_local', ''))[:16]} {activity.get('type', '?')} '{activity.get('name', 'unnamed')}' ({activity.get('id')}): "
+        f"  {format_local_start(activity)} {activity.get('type', '?')} '{activity.get('name', 'unnamed')}' ({activity.get('id')}): "
         f"{hms(activity.get('moving_time'))}, load {activity.get('icu_training_load', 'n/a')} (Intervals.icu{', ' + '/'.join(loads) if loads else ''})"
     )
     if activity.get("icu_intensity") is not None:

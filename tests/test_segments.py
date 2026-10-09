@@ -327,7 +327,7 @@ def test_format_segments_report():
     assert "  Garmin Stamina [Stamina] (point): start " in text
     assert "  RearGear: start 17" in text
     assert "[3] Descent" in text
-    assert "cadence n/a rpm" in text
+    assert "cadence n/a;" in text
     assert "Pauses (2, 319 s total):" in text
     assert "  recording stop 14:59-16:59 (idx 899-900): 120 s" in text
     assert "  stationary 23:39-26:58 (idx 1300-1500): 199 s" in text
@@ -351,7 +351,7 @@ def test_format_segments_writes_missing_values_as_na_and_long_times():
     }
     text = format_segments(result)
     assert "[1] Other 1:02:03-2:02:02 (idx 0-2): +n/a m / -n/a m over n/a, avg grade not determinable, max not determinable;" in text
-    assert "power avg n/a W, NP n/a W, max n/a W; HR avg n/a, max n/a bpm; cadence n/a rpm; speed n/a" in text
+    assert "power avg n/a W, NP n/a W, max n/a W; HR avg n/a, max n/a bpm; cadence n/a; speed n/a" in text
     assert "VAM" not in text
     assert text.endswith("Pauses: none detected")
 

@@ -63,26 +63,106 @@ def to_utc_iso(value: Any) -> str | None:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def utc_offset(activity: dict[str, Any]) -> str | None:
+    """UTC offset of the local start ('+02:00') derived from the local and the UTC start; None when unknown."""
+    local_raw = activity.get("start_date_local")
+    utc_raw = activity.get("start_date") or activity.get("startTime")
+    if not isinstance(local_raw, str) or not isinstance(utc_raw, str):
+        return None
+    try:
+        local = datetime.fromisoformat(local_raw.replace("Z", "+00:00"))
+        utc = datetime.fromisoformat(utc_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if local.tzinfo is not None:  # an explicit offset wins
+        offset = local.utcoffset()
+        minutes = int(offset.total_seconds() // 60) if offset is not None else 0
+    else:
+        if utc.tzinfo is None:
+            utc = utc.replace(tzinfo=timezone.utc)
+        delta = local - utc.astimezone(timezone.utc).replace(tzinfo=None)
+        minutes = int(round(delta.total_seconds() / 900)) * 15  # offsets are multiples of 15 minutes
+    if abs(minutes) > 14 * 60:
+        return None
+    sign = "+" if minutes >= 0 else "-"
+    hours, rest = divmod(abs(minutes), 60)
+    return f"{sign}{hours:02d}:{rest:02d}"
+
+
 def start_times(activity: dict[str, Any]) -> dict[str, Any]:
-    """Local start, UTC start and timezone of an activity payload as explicit fields."""
+    """Local start, UTC start, timezone and UTC offset of an activity payload as explicit fields."""
     utc_raw = activity.get("start_date") or activity.get("startTime")
     return {
         "start_time_local": activity.get("start_date_local"),
         "start_time_utc": to_utc_iso(utc_raw) or utc_raw,
         "timezone": activity.get("timezone"),
+        "utc_offset": utc_offset(activity),
     }
 
 
+def local_zone_label(activity: dict[str, Any]) -> str:
+    """'Europe/Vienna, UTC+02:00', 'UTC+02:00' or '' (timezone name when stored, offset from local vs UTC)."""
+    parts = [str(activity["timezone"])] if activity.get("timezone") else []
+    offset = utc_offset(activity)
+    if offset:
+        parts.append(f"UTC{offset}")
+    return ", ".join(parts)
+
+
 def format_start_times(activity: dict[str, Any]) -> str:
-    """'2026-10-06T17:36:22 local (Europe/Vienna) / 2026-10-06T15:36:22Z UTC' from what is present."""
+    """'2026-10-06T17:36:22 local (Europe/Vienna, UTC+02:00) / 2026-10-06T15:36:22Z UTC' from what is present."""
     times = start_times(activity)
     parts: list[str] = []
     if times["start_time_local"]:
-        tz_note = f" ({times['timezone']})" if times["timezone"] else ""
-        parts.append(f"{times['start_time_local']} local{tz_note}")
+        zone = local_zone_label(activity)
+        parts.append(f"{times['start_time_local']} local" + (f" ({zone})" if zone else ""))
     if times["start_time_utc"]:
         parts.append(f"{times['start_time_utc']} UTC")
     return " / ".join(parts) if parts else "Unknown"
+
+
+def format_local_start(activity: dict[str, Any]) -> str:
+    """'2026-10-06 17:36 local (UTC+02:00)' for compact views; 'date unknown' without a local start."""
+    local = str(activity.get("start_date_local") or "")[:16].replace("T", " ")
+    if not local:
+        return "date unknown"
+    zone = local_zone_label(activity)
+    return f"{local} local" + (f" ({zone})" if zone else "")
+
+
+# Activity types whose cadence Intervals.icu stores per leg (strides per minute, like rpm);
+# devices such as Garmin report steps per minute (spm) = 2 x the stored value.
+FOOT_SPORTS = ("run", "trailrun", "virtualrun", "walk", "hike", "snowshoe")
+
+
+def is_foot_sport(activity_type: Any) -> bool:
+    """True for running, walking and hiking types (cadence stored per leg)."""
+    return str(activity_type or "").strip().lower() in FOOT_SPORTS
+
+
+def cadence_spm(value: Any, activity_type: Any) -> float | None:
+    """Steps per minute (2 x the stored value) for foot sports; None otherwise or when missing."""
+    if not is_foot_sport(activity_type) or isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return float(value) * 2
+
+
+def cadence_text(value: Any, activity_type: Any, digits: int = 0) -> str:
+    """'88 rpm' (bike), '147 spm (74 rpm as stored)' (foot sports, steps = 2 x stored) or 'n/a'."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return "n/a"
+    spm = cadence_spm(value, activity_type)
+    if spm is not None:
+        return f"{spm:.0f} spm ({value:.{digits}f} rpm as stored)"
+    return f"{value:.{digits}f} rpm"
+
+
+def temperature_text(value: Any, digits: int = 1) -> str:
+    """'16.5 °C' or 'n/a' (a missing temperature never becomes 0)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return "n/a"
+    rounded = round(float(value), digits)
+    return f"{int(rounded) if rounded.is_integer() else rounded} °C"
 
 
 def _numeric(values: Any) -> list[float]:

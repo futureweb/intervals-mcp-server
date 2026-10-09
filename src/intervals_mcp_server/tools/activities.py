@@ -29,7 +29,7 @@ from intervals_mcp_server.utils.custom_fields import (
     is_missing,
 )
 from intervals_mcp_server.utils.execution import plan_position, plan_steps, planned_step_map, planned_step_text
-from intervals_mcp_server.utils.sports import hms, start_times
+from intervals_mcp_server.utils.sports import cadence_spm, cadence_text, format_local_start, format_start_times, hms, start_times
 from intervals_mcp_server.utils.formatting import (
     format_activity_details,
     format_activity_message,
@@ -76,13 +76,14 @@ def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: 
     """Token-efficient activity view: key numbers, thresholds, assigned custom fields, data quality."""
     gear = activity.get("_resolved_gear_name") or (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("_resolved_gear_name")
     lines = [
-        f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_start_times_short(activity)}",
+        f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_local_start(activity)}",
         f"Time {hms(activity.get('moving_time'))} moving / {hms(activity.get('elapsed_time'))} elapsed | "
         f"{(activity.get('distance') or 0) / 1000:.1f} km | +{activity.get('total_elevation_gain') or 0:.0f} m"
         + (f" | gear {gear}" if gear else ""),
         f"Load {_n(activity.get('icu_training_load'))} (Intervals.icu; power {_n(activity.get('power_load'))} / HR {_n(activity.get('hr_load'))} / pace {_n(activity.get('pace_load'))}) | "
         f"IF {_n(activity.get('icu_intensity'))}% | NP {_n(activity.get('icu_weighted_avg_watts'))} W | avg {_n(activity.get('icu_average_watts'))} W | "
-        f"HR avg {_n(activity.get('average_heartrate'))} max {_n(activity.get('max_heartrate'))} | cadence {_n(activity.get('average_cadence'))}",
+        f"HR avg {_n(activity.get('average_heartrate'))} max {_n(activity.get('max_heartrate'))} | "
+        f"cadence {cadence_text(activity.get('average_cadence'), activity.get('type'))}",
         f"Feel {_n(activity.get('feel'))}/5 | RPE {_n(activity.get('icu_rpe'))}/10 | compliance "
         + (f"{_n(activity.get('compliance'))}%" if _n(activity.get("compliance")) != "n/a" else "n/a") + " | "
         f"FTP used {_n(activity.get('icu_ftp'))} W, eFTP {_n(activity.get('icu_rolling_ftp'))} W, LTHR {_n(activity.get('lthr'))} | "
@@ -123,9 +124,8 @@ def _n(value: Any, digits: int = 0) -> str:
 
 
 def format_start_times_short(activity: dict[str, Any]) -> str:
-    """'2026-10-06 17:36 local' for compact views."""
-    local = str(activity.get("start_date_local") or "")[:16].replace("T", " ")
-    return f"{local} local" if local else "date unknown"
+    """'2026-10-06 17:36 local (UTC+02:00)' for compact views (see utils.sports.format_local_start)."""
+    return format_local_start(activity)
 
 
 def _json_safe(value: Any) -> Any:
@@ -164,6 +164,7 @@ def activity_record(activity: dict[str, Any]) -> dict[str, Any]:
             "average_hr_bpm": activity.get("average_heartrate"),
             "max_hr_bpm": activity.get("max_heartrate"),
             "average_cadence": activity.get("average_cadence"),
+            "average_cadence_spm": cadence_spm(activity.get("average_cadence"), activity.get("type")),
             "average_speed_m_s": activity.get("average_speed"),
             "feel": activity.get("feel"),
             "rpe": activity.get("icu_rpe", activity.get("perceived_exertion")),
@@ -183,7 +184,7 @@ def activity_record(activity: dict[str, Any]) -> dict[str, Any]:
 def _compact_line(activity: dict[str, Any]) -> str:
     """One line per activity for token-efficient listings."""
     parts = [
-        str(activity.get("start_date_local", ""))[:16],
+        format_local_start(activity),
         str(activity.get("id")),
         str(activity.get("type", "?")),
         f"'{activity.get('name', 'unnamed')}'",
@@ -664,8 +665,13 @@ def _compact_intervals(
     streams: list[dict[str, Any]] | None,
     stream_defs: CustomFieldDefs,
     plan_map: dict[int, dict[str, Any]] | None = None,
+    activity_type: Any = None,
 ) -> str:
-    """One line per interval and group with the key numbers and compact custom data (and the planned step)."""
+    """One line per interval and group with the key numbers and compact custom data (and the planned step).
+
+    Cadence is shown on the sport's basis when ``activity_type`` is known (steps per minute for
+    foot sports, rpm otherwise).
+    """
     lines = [f"Intervals of {result.get('id')} (analysed {result.get('analyzed', 'n/a')}):"]
     intervals = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
     for index, interval in enumerate(intervals, 1):
@@ -678,7 +684,7 @@ def _compact_intervals(
         if interval.get("average_heartrate") is not None:
             parts.append(f"HR {interval['average_heartrate']}/{interval.get('max_heartrate', 'n/a')}")
         if interval.get("average_cadence") is not None:
-            parts.append(f"cad {interval['average_cadence']:.0f}")
+            parts.append(f"cad {cadence_text(interval['average_cadence'], activity_type)}")
         if interval.get("average_speed"):
             parts.append(f"{interval['average_speed'] * 3.6:.1f} km/h")
         if interval.get("intensity") is not None:
@@ -712,15 +718,20 @@ def _fmt_short(value: Any) -> str:
     return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
 
 
-async def _planned_step_types(  # pylint: disable=too-many-locals
-    activity_id: str, intervals: list[dict[str, Any]], api_key: str | None, planned_workout_doc: dict[str, Any] | None
+async def _activity_payload(activity_id: str, api_key: str | None) -> dict[str, Any] | None:
+    """The activity (for its sport and thresholds); None when it cannot be loaded."""
+    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    activity = result[0] if isinstance(result, list) and result else result
+    return activity if isinstance(activity, dict) and activity and "error" not in activity else None
+
+
+async def _planned_step_types(
+    activity: dict[str, Any] | None, intervals: list[dict[str, Any]], api_key: str | None, planned_workout_doc: dict[str, Any] | None
 ) -> tuple[dict[int, dict[str, Any]], str]:
     """Planned step matched to each interval index (alignment by order, duration and target) and the plan source."""
     from intervals_mcp_server.tools.analysis import _get_event, _threshold_context  # pylint: disable=import-outside-toplevel,protected-access
 
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
-    activity = result[0] if isinstance(result, list) and result else result
-    if not isinstance(activity, dict) or "error" in activity:
+    if activity is None:
         return {}, "activity could not be loaded"
     steps: Any = None
     source = ""
@@ -768,6 +779,9 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
 
     This endpoint returns detailed metrics for each interval in an activity, including power, heart rate,
     cadence, speed, and environmental data. It also includes grouped intervals if applicable.
+    Cadence follows the sport (one extra call for the activity): foot sports show steps per
+    minute (2 x the per-leg value Intervals.icu stores, which is labelled as stored), other
+    sports rpm; running dynamics are only shown for foot sports. Missing temperatures are n/a.
 
     Custom interval fields defined by the athlete are listed per interval with display
     name, technical code, value and units. With stream_types the raw samples of the given
@@ -854,11 +868,14 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
                 streams = [s for s in streams if s.get("type") in requested]
             stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
 
+    # The intervals carry no sport: the activity tells how to show cadence (steps per minute on foot).
+    activity = await _activity_payload(activity_id, api_key)
+    activity_type = activity.get("type") if activity else None
     plan_map: dict[int, dict[str, Any]] = {}
     plan_source = ""
     if include_planned_types or planned_workout_doc:
         plan_map, plan_source = await _planned_step_types(
-            activity_id, [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)], api_key, planned_workout_doc
+            activity, [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)], api_key, planned_workout_doc
         )
 
     if output_format.strip().lower() == "json":
@@ -866,9 +883,15 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
         payload = {
             "id": result.get("id"),
             "analyzed": result.get("analyzed"),
+            "activity_type": activity_type,
+            "cadence_note": (
+                "average/min/max_cadence are stored per leg (rpm); average_cadence_spm = steps per minute (2 x)"
+                if cadence_spm(1, activity_type) else None
+            ),
             "intervals": [
                 {
                     **interval,
+                    "average_cadence_spm": cadence_spm(interval.get("average_cadence"), activity_type),
                     "custom_fields": [r for r in custom_fields_json(interval, interval_field_defs) if r["status"] in ("value", "zero")],
                     "stream_metrics": _interval_stream_metrics(interval, streams or [], stream_defs),
                     **(
@@ -888,7 +911,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
         listed = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
         plan_text = "\n" + "\n".join(_plan_mapping_lines(listed, plan_map, plan_source))
     if detail_level == "compact":
-        return _compact_intervals(result, interval_field_defs, streams, stream_defs, plan_map) + note + plan_text
+        return _compact_intervals(result, interval_field_defs, streams, stream_defs, plan_map, activity_type) + note + plan_text
 
     # Format the intervals data
     return (
@@ -901,6 +924,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
                 index: planned_step_text(plan_map.get(index), plan_position(plan_map, index))
                 for index in range(len(result.get("icu_intervals") or []))
             } if plan_map else None,
+            activity_type=activity_type,
         )
         + note
         + plan_text
@@ -1061,7 +1085,7 @@ def _format_stream_listing(
 
     output = (
         f"Streams available for activity {activity_id} ('{activity.get('name', 'Unnamed')}', "
-        f"start {activity.get('start_date_local', 'unknown')}, "
+        f"start {format_start_times(activity)}, "
         f"elapsed {activity.get('elapsed_time', 'N/A')} s):\n"
     )
     power_fields = activity.get("power_field_names")
