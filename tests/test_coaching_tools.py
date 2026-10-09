@@ -821,3 +821,13 @@ def test_get_training_plan_empty_and_unknown(monkeypatch):
     assert "Assigned plan: unknown (the training plan could not be read: 403 Forbidden)" in unknown
     payload = json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-01-01", output_format="json")))
     assert payload["training_plan_error"] == "403 Forbidden" and payload["phases"] == []
+
+
+def test_recovery_baseline_line_without_percentage():
+    """ANA-16: a baseline mean of 0 (e.g. a custom balance metric) has no percentage, but no crash."""
+    from intervals_mcp_server.tools.wellness_insights import _baseline_lines  # pylint: disable=import-outside-toplevel
+
+    entries = [{"id": f"2026-09-{day:02d}", "Balance": -100 if day % 2 else 100} for day in range(1, 21)]
+    entries.append({"id": "2026-09-21", "Balance": 0})
+    line = _baseline_lines(entries, ["Balance"])[0]
+    assert "vs baseline +0.00 (% n/a, z +0.00)" in line

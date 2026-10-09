@@ -337,7 +337,9 @@ def test_get_coach_context_text_and_json(monkeypatch):
     assert "Coach context for athlete i1 at 2026-10-09 (load windows end 2026-10-08" in result
     assert "Load: 7 d 350 (5 sessions, 3 days with load 0) | 28 d 1400 (350/week) | ratio 1.00 (inside 0.8-1.3)" in result
     assert "Intensity 7 d: " in result and "Intensity 28 d: " in result
-    assert "HRV 7-d mean 35 ms (n 7) vs 42-d" in result and "resting HR 7-d mean 50 bpm" in result
+    # ANA-14: the baseline is the 42 days before the compared 7 days (not pulled towards 35 by them)
+    assert "HRV 7-d mean 35 ms (n 7) vs prior 42-d 42 (n 42): -7.0 ms" in result and "resting HR 7-d mean 50 bpm" in result
+    assert "z = difference / SD of the 7-d means in the prior 42 d" in result
     assert "Durability 28 d: cycling decoupling median" in result
     assert "Top sessions 7 d: 10-03 Ride 180 min load 150" in result
     assert "Planned 2026-10-10 to 2026-10-16: 3 workouts, load 200 (1 without planned load)" in result
@@ -350,6 +352,10 @@ def test_get_coach_context_text_and_json(monkeypatch):
     payload = json.loads(asyncio.run(get_coach_context(end_date="2026-10-01", output_format="json")))
     assert payload["plan"] is None and payload["load_end"] == "2026-10-01"
     assert payload["recovery"]["hrv"]["baseline_n"] > 0 and payload["coverage"]["sessions_without_load"] == 4
+    hrv = json.loads(asyncio.run(get_coach_context(output_format="json")))["recovery"]["hrv"]
+    assert hrv["baseline_end"] == "2026-10-02" and hrv["baseline_mean"] == 42.02
+    assert hrv["z"] < 0 and hrv["sd_7d_means"] < hrv["baseline_sd"]
+    assert abs(hrv["z"]) > abs(hrv["diff"] / hrv["baseline_sd"])  # a 7-day mean varies less than single days
     assert "sessions" not in payload["durability"]["by_sport"]["cycling"]
     assert asyncio.run(get_coach_context(end_date="2026-10-10")).startswith("Error: end_date lies in the future")
 
