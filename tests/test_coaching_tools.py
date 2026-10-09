@@ -730,7 +730,7 @@ def test_get_activity_intervals_planned_step_types(monkeypatch):
     plain = asyncio.run(get_activity_intervals("i1"))
     assert "Planned step" not in plain and not any("/events/" in c[0] for c in calls)
     text = asyncio.run(get_activity_intervals("i1", include_planned_types=True, detail_level="compact"))
-    assert "Planned step per interval (event 5 ('2x5 min Threshold'); the Intervals.icu type is kept as stored):" in text
+    assert "Planned step per interval (event 5 ('2x5 min Threshold'); the Intervals.icu type is kept as stored;" in text
     assert "  [3] Intervals.icu WORK | plan step 3 rest 2:00 <- type differs from the plan" in text
     assert "  [2] Intervals.icu WORK | plan step 2 work 5:00\n" in text
     payload = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=EVENT_DATA["workout_doc"], output_format="json")))
@@ -739,6 +739,41 @@ def test_get_activity_intervals_planned_step_types(monkeypatch):
     _install_router(monkeypatch, {"/activity/": unpaired, "/intervals": labelled_work})
     assert "Planned step types: not available (no planned workout paired with this activity)." in asyncio.run(
         get_activity_intervals("i1", include_planned_types=True))
+
+
+def test_get_activity_intervals_shows_time_beyond_the_plan(monkeypatch):
+    """Phase 5 (C): an interval longer than its planned step shows the planned duration and the time beyond the plan."""
+    extended = [dict(i) for i in EXECUTION_INTERVALS["icu_intervals"]]
+    extended[-1].update(end_index=2518, end_time=2518, elapsed_time=1078, moving_time=1078)  # cooldown 5:00 ridden 17:58
+    data = {"id": "i1", "analyzed": True, "icu_groups": [], "icu_intervals": extended}
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/intervals": data})
+    doc = EVENT_DATA["workout_doc"]
+    compact = asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, detail_level="compact"))
+    line = next(row for row in compact.splitlines() if row.startswith("[6] WORK 'Cooldown'"))
+    assert line.endswith(
+        "plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan "
+        "(additional training after the plan)"
+    )
+    assert "  [6] Intervals.icu WORK | plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan" in compact
+    assert next(row for row in compact.splitlines() if row.startswith("[2] WORK")).endswith("| plan step 2 work 5:00")
+    standard = asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc))
+    assert "[6] Cooldown (WORK)\nPlan: plan step 6 cooldown 5:00, actual 17:58: first 5:00 inside the plan, 12:58 beyond the plan" in standard
+    payload = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, output_format="json")))
+    step = payload["intervals"][5]["planned_step"]
+    assert step["duration"] == 300 and step["span_actual_s"] == 1078 and step["beyond_plan_s"] == 778
+    assert step["beyond_plan_counted_as"] == "additional training after the plan"
+    assert payload["intervals"][1]["planned_step"]["beyond_plan_s"] is None  # 5:00 as planned
+    assert payload["intervals"][5]["plan_position"] == "planned_step"
+    trailing = [dict(i) for i in extended] + [dict(extended[-1], label=None, type="WORK", start_index=2518, end_index=2600, elapsed_time=82, moving_time=82)]
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/intervals": dict(data, icu_intervals=trailing)})
+    after = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=doc, output_format="json")))
+    assert after["intervals"][6]["planned_step"] is None and after["intervals"][6]["plan_position"] == "after_plan"
+    assert "  [7] Intervals.icu WORK | no planned step (after the plan: additional training)" in asyncio.run(
+        get_activity_intervals("i1", planned_workout_doc=doc, detail_level="compact"))
+    assert "[7] Interval 7 (WORK)\nPlan: no planned step (after the plan: additional training)" in asyncio.run(
+        get_activity_intervals("i1", planned_workout_doc=doc))
+    plain = asyncio.run(get_activity_intervals("i1", detail_level="compact"))
+    assert "plan step" not in plain and "Plan:" not in asyncio.run(get_activity_intervals("i1"))
 
 
 def test_get_training_plan_empty_and_unknown(monkeypatch):

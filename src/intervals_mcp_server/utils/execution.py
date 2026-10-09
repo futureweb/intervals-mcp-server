@@ -539,6 +539,79 @@ def align(planned: list[dict[str, Any]], intervals: list[dict[str, Any]]) -> lis
     return pairs
 
 
+def planned_step_map(
+    planned: list[dict[str, Any]], intervals: list[dict[str, Any]], tolerances: Tolerances | None = None
+) -> dict[int, dict[str, Any]]:
+    """Planned step matched to each interval index, with the time beyond the planned duration.
+
+    Without streams: the alignment of ``align_spans`` and the intervals' moving time (elapsed
+    time when missing). A matched span (one or several consecutive intervals) longer than the
+    planned duration plus the tolerance gets ``beyond_plan_s`` on each of its intervals, counted
+    as in ``analyze``: after the last matched step as additional training after the plan,
+    earlier as extra time inside the plan. Nothing is changed on Intervals.icu.
+    """
+    tol = tolerances or Tolerances()
+    spans = _spans(intervals, Profile([]))
+    alignment = align_spans(planned, intervals)
+    matched = [indices for p_idx, indices in alignment if p_idx is not None and indices]
+    last_matched = matched[-1][-1] if matched else None
+    mapping: dict[int, dict[str, Any]] = {}
+    for p_idx, indices in alignment:
+        if p_idx is None or not indices:
+            continue
+        step = planned[p_idx]
+        duration = step.get("duration")
+        actual = sum(spans[i].active for i in indices)
+        entry: dict[str, Any] = {
+            "index": step["index"], "kind": step["kind"], "duration": duration,
+            "span_intervals": [i + 1 for i in indices], "span_actual_s": round(actual, 1),
+            "beyond_plan_s": None, "beyond_plan_counted_as": None,
+        }
+        if duration and actual > duration + tol.duration_allowance(duration):
+            entry["beyond_plan_s"] = round(actual - duration, 1)
+            entry["beyond_plan_counted_as"] = (
+                "additional training after the plan" if indices[-1] == last_matched else "extra time inside the plan"
+            )
+        for i_idx in indices:
+            mapping[i_idx] = entry
+    return mapping
+
+
+UNPLANNED_TEXT = {
+    "before_plan": "no planned step (before the plan)",
+    "after_plan": "no planned step (after the plan: additional training)",
+    "extra_inside_plan": "no planned step (extra inside the plan)",
+}
+
+
+def plan_position(mapping: dict[int, dict[str, Any]], index: int) -> str:
+    """Where an interval lies relative to the matched plan: planned_step, before_plan, after_plan or extra_inside_plan."""
+    if index in mapping:
+        return "planned_step"
+    if not mapping:
+        return "no_plan"
+    if index < min(mapping):
+        return "before_plan"
+    if index > max(mapping):
+        return "after_plan"
+    return "extra_inside_plan"
+
+
+def planned_step_text(step: dict[str, Any] | None, position: str = "extra_inside_plan") -> str:
+    """'plan step 7 cooldown 10:00, actual 17:58: 7:58 beyond the plan (...)' for interval listings."""
+    if not step:
+        return UNPLANNED_TEXT.get(position, "no planned step (extra)")
+    text = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}"
+    if step.get("beyond_plan_s"):
+        span = step.get("span_intervals") or []
+        merged = f" (intervals {span[0]}-{span[-1]})" if len(span) > 1 else ""
+        text += (
+            f", actual {hms(step.get('span_actual_s'))}{merged}: first {hms(step.get('duration'))} inside the plan, "
+            f"{hms(step['beyond_plan_s'])} beyond the plan ({step.get('beyond_plan_counted_as')})"
+        )
+    return text
+
+
 # ------------------------------------------------------------------- slice metrics
 def _fade_pct(values: list[Any]) -> float | None:
     """Second half mean vs first half mean in percent (negative = fading)."""

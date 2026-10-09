@@ -847,7 +847,7 @@ def format_custom_item_details(item: dict[str, Any]) -> str:
 
 def _format_interval_block(index: int, interval: dict[str, Any]) -> str:
     """Render the standard metrics of one interval."""
-    return f"""[{index}] {interval.get("label", f"Interval {index}")} ({interval.get("type", "Unknown")})
+    return f"""[{index}] {interval.get("label") or f"Interval {index}"} ({interval.get("type", "Unknown")})
 Duration: {interval.get("elapsed_time", 0)} seconds (moving: {interval.get("moving_time", 0)} seconds)
 Distance: {interval.get("distance", 0)} meters
 Start-End Indices: {interval.get("start_index", 0)}-{interval.get("end_index", 0)}
@@ -963,6 +963,7 @@ def format_intervals(
     interval_field_defs: CustomFieldDefs | None = None,
     streams: list[dict[str, Any]] | None = None,
     stream_defs: CustomFieldDefs | None = None,
+    plan_lines: dict[int, str] | None = None,
 ) -> str:
     """Format intervals data into a readable string with all available fields.
 
@@ -974,6 +975,7 @@ def format_intervals(
             each interval's start_index..end_index (and over all member intervals of a
             group) are appended per metric stream
         stream_defs: ACTIVITY_STREAM definitions keyed by code (labels and units)
+        plan_lines: Planned step text per interval index (0-based), shown under the interval header
 
     Returns:
         A formatted string representation of the intervals data
@@ -992,7 +994,11 @@ Analyzed: {intervals_data.get("analyzed", "N/A")}
         result += "Individual Intervals:\n\n"
 
         for i, interval in enumerate(intervals, 1):
-            result += _format_interval_block(i, interval)
+            block = _format_interval_block(i, interval)
+            if plan_lines is not None:
+                header, rest = block.split("\n", 1)
+                block = f"{header}\nPlan: {plan_lines.get(i - 1, 'no planned step (extra)')}\n{rest}"
+            result += block
             dynamics = format_running_dynamics(interval, indent="  ")
             if dynamics:
                 result += "Running Dynamics:\n" + dynamics + "\n\n"

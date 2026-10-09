@@ -28,6 +28,7 @@ from intervals_mcp_server.utils.custom_fields import (
     format_custom_field_lines,
     is_missing,
 )
+from intervals_mcp_server.utils.execution import plan_position, plan_steps, planned_step_map, planned_step_text
 from intervals_mcp_server.utils.sports import hms, start_times
 from intervals_mcp_server.utils.formatting import (
     format_activity_details,
@@ -662,8 +663,9 @@ def _compact_intervals(
     interval_defs: CustomFieldDefs,
     streams: list[dict[str, Any]] | None,
     stream_defs: CustomFieldDefs,
+    plan_map: dict[int, dict[str, Any]] | None = None,
 ) -> str:
-    """One line per interval and group with the key numbers and compact custom data."""
+    """One line per interval and group with the key numbers and compact custom data (and the planned step)."""
     lines = [f"Intervals of {result.get('id')} (analysed {result.get('analyzed', 'n/a')}):"]
     intervals = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
     for index, interval in enumerate(intervals, 1):
@@ -692,6 +694,8 @@ def _compact_intervals(
             ]
             if compact:
                 parts.append("streams " + ", ".join(compact))
+        if plan_map:
+            parts.append(planned_step_text(plan_map.get(index - 1), plan_position(plan_map, index - 1)))
         lines.append(" | ".join(parts))
     for group in result.get("icu_groups") or []:
         if isinstance(group, dict):
@@ -713,7 +717,6 @@ async def _planned_step_types(  # pylint: disable=too-many-locals
 ) -> tuple[dict[int, dict[str, Any]], str]:
     """Planned step matched to each interval index (alignment by order, duration and target) and the plan source."""
     from intervals_mcp_server.tools.analysis import _get_event, _threshold_context  # pylint: disable=import-outside-toplevel,protected-access
-    from intervals_mcp_server.utils.execution import align_spans, plan_steps  # pylint: disable=import-outside-toplevel
 
     result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
     activity = result[0] if isinstance(result, list) and result else result
@@ -731,25 +734,22 @@ async def _planned_step_types(  # pylint: disable=too-many-locals
             source = f"event {event.get('id')} ('{event.get('name')}')"
     if not isinstance(steps, list):
         return {}, "no planned workout paired with this activity"
-    planned = plan_steps(steps, _threshold_context(activity))
-    mapping: dict[int, dict[str, Any]] = {}
-    for p_idx, indices in align_spans(planned, intervals):
-        for i_idx in indices if p_idx is not None else []:
-            step = planned[p_idx]  # type: ignore[index]
-            mapping[i_idx] = {"index": step["index"], "kind": step["kind"], "duration": step.get("duration")}
-    return mapping, source
+    return planned_step_map(plan_steps(steps, _threshold_context(activity)), intervals), source
 
 
 def _plan_mapping_lines(intervals: list[dict[str, Any]], mapping: dict[int, dict[str, Any]], source: str) -> list[str]:
     if not mapping:
         return [f"Planned step types: not available ({source})."]
-    lines = [f"Planned step per interval ({source}; the Intervals.icu type is kept as stored):"]
+    lines = [
+        f"Planned step per interval ({source}; the Intervals.icu type is kept as stored; an interval longer than its "
+        "planned step is split as in analyze_workout_execution - the first part is the plan, the rest is reported as "
+        "beyond the plan):"
+    ]
     for index, interval in enumerate(intervals):
         step = mapping.get(index)
-        planned = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}" if step else "no planned step (extra)"
         expected = "WORK" if step and step["kind"] == "work" else "RECOVERY"
         flag = " <- type differs from the plan" if step and step["kind"] in ("work", "rest") and interval.get("type") != expected else ""
-        lines.append(f"  [{index + 1}] Intervals.icu {interval.get('type', '?')} | {planned}{flag}")
+        lines.append(f"  [{index + 1}] Intervals.icu {interval.get('type', '?')} | {planned_step_text(step, plan_position(mapping, index))}{flag}")
     return lines
 
 
@@ -794,7 +794,10 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             every custom stream when stream_types is not given)
         include_planned_types: Also show the planned step (type) matched to each interval from the
             paired event or planned_workout_doc; the Intervals.icu WORK/RECOVERY type is kept as
-            stored (optional, default False; one or two extra API calls)
+            stored. An interval longer than its planned step (plus the tolerance of
+            analyze_workout_execution) shows the planned duration and the time beyond the plan
+            on its line and in JSON (planned_step.beyond_plan_s) (optional, default False; one or
+            two extra API calls)
         planned_workout_doc: Workout document with "steps" to match against (optional; implies
             include_planned_types)
     """
@@ -868,7 +871,10 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
                     **interval,
                     "custom_fields": [r for r in custom_fields_json(interval, interval_field_defs) if r["status"] in ("value", "zero")],
                     "stream_metrics": _interval_stream_metrics(interval, streams or [], stream_defs),
-                    **({"planned_step": plan_map.get(index)} if include_planned_types or planned_workout_doc else {}),
+                    **(
+                        {"planned_step": plan_map.get(index), "plan_position": plan_position(plan_map, index)}
+                        if include_planned_types or planned_workout_doc else {}
+                    ),
                 }
                 for index, interval in enumerate(intervals)
             ],
@@ -882,7 +888,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
         listed = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
         plan_text = "\n" + "\n".join(_plan_mapping_lines(listed, plan_map, plan_source))
     if detail_level == "compact":
-        return _compact_intervals(result, interval_field_defs, streams, stream_defs) + note + plan_text
+        return _compact_intervals(result, interval_field_defs, streams, stream_defs, plan_map) + note + plan_text
 
     # Format the intervals data
     return (
@@ -891,6 +897,10 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             interval_field_defs=interval_field_defs,
             streams=streams,
             stream_defs=stream_defs,
+            plan_lines={
+                index: planned_step_text(plan_map.get(index), plan_position(plan_map, index))
+                for index in range(len(result.get("icu_intervals") or []))
+            } if plan_map else None,
         )
         + note
         + plan_text
