@@ -9,6 +9,37 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (phase 4: training load and intensity)
+- Training load and intensity metrics as separate read-only tools, after the coach report proposed
+  by [morritter](https://github.com/morritter) in upstream
+  [#150](https://github.com/mvilanova/intervals-mcp-server/pull/150) (metric set, edge cases and
+  filters adopted; re-implemented as reusable tools with sample sizes and without verdicts):
+  - `get_training_load`: acute and chronic Intervals.icu load (default 7 / 28 days, configurable),
+    acute:chronic ratio (coupled daily means), Foster monotony and strain over the last 7 days with
+    rest days as 0, the 7-day load as a share of the chronic weekly mean (deload-like at <= 80 %), the
+    same per sport family with the primary sport and its own monotony (cross-training floor), ISO
+    week table with rest days, weekly monotony/strain and deload-like weeks, CTL/ATL/form/ramp (today
+    recomputed without planned but not yet done workouts), device loads summed separately on their
+    own scale. With the default end date and no activity today the windows end yesterday.
+  - `get_intensity_distribution`: three-zone model from power, HR or pace zones with a documented
+    mapping by zone count (power 7: Z1-Z2 | Z3 | Z4-Z7, HR/pace 7: Z1-Z2 | Z3-Z4 | Z5-Z7, 5 and 3
+    zones), `zone_basis` auto (power for cycling, HR then pace otherwise), polarization index after
+    Treff et al. 2019 (Z3 < 1 %, Z1 = 0, Z2 = 0 edge cases), class with zone order, hard sessions
+    and days (>= 10 min in Z3 or IF >= 0.85 on >= 20 min), drift between the halves of the period,
+    per sport family and ISO week, coverage of sessions and moving time with zones.
+  - `get_durability`: aerobic decoupling of steady long sessions with a quality filter (duration,
+    pauses, HR, power/variability index, temperature, indoor/outdoor) and excluded sessions per
+    reason, median and quartiles per sport, count above 5 %, last 7 days vs window with a +/- 1 pp
+    band, efficiency factor trend with a +/- 2 % band and a note when several bikes are involved.
+  - `get_load_projection`: CTL/ATL/form projected day by day over the planned WORKOUT loads with
+    the 42/7-day model (configurable), planned workouts without load reported, races, Intervals.icu's
+    own projection for comparison and a model check against the stored values.
+  - `get_coach_context`: compact weekly overview (about 2k characters) of load, fitness, intensity
+    (7 and 28 days), recovery markers against 42-day baselines (numbers only), durability, top
+    sessions and the plan of the next 7 days; three API calls.
+- Prompt `training_load_review`; `weekly_training_review` and the `intervals://guide` resource
+  mention the new tools.
+
 ### Added (client integration)
 - MCP tool annotations derived from the permission class (`readOnlyHint`, `destructiveHint`,
   `openWorldHint`), so clients such as ChatGPT run read-only tools without asking and request a
