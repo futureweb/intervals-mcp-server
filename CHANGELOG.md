@@ -9,6 +9,11 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (client integration)
+- MCP tool annotations derived from the permission class (`readOnlyHint`, `destructiveHint`,
+  `openWorldHint`), so clients such as ChatGPT run read-only tools without asking and request a
+  confirmation for writes, deletions and admin tools.
+
 ### Security
 - Dependencies updated: MCP SDK 1.30 (minimum 1.28.1), Starlette 1.7, python-multipart 0.0.32,
   cryptography 50, anyio 4.15, PyJWT 2.15 and others (Dependabot advisories).

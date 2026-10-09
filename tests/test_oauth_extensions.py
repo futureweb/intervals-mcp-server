@@ -625,3 +625,21 @@ def test_transport_security_allows_the_public_host(tmp_path):
         tokens = provider._issue_tokens("c", ["mcp"], "g", None)  # pylint: disable=protected-access
         headers = {"Authorization": f"Bearer {tokens.access_token}", "Accept": "application/json, text/event-stream"}
         assert public.post("/mcp", json={}, headers=headers | {"Host": "evil.example.com"}).status_code == 421
+
+
+def test_tools_carry_annotations_per_permission_class():
+    """Read tools are marked read-only, deletions and admin tools destructive (client confirmation)."""
+    from intervals_mcp_server.mcp_instance import PERMISSION_ANNOTATIONS, mcp, tool_permissions  # pylint: disable=import-outside-toplevel
+
+    registered = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    classes = tool_permissions()
+    assert registered, "no tools registered"
+    for name, info in registered.items():
+        expected = PERMISSION_ANNOTATIONS[classes.get(name, "read")]
+        annotations = info.annotations
+        assert annotations is not None, name
+        assert annotations.readOnlyHint == expected["readOnlyHint"], name
+        assert annotations.openWorldHint is False, name
+    assert registered["get_activity_details"].annotations.readOnlyHint is True
+    assert PERMISSION_ANNOTATIONS["destructive"]["destructiveHint"] is True
+    assert PERMISSION_ANNOTATIONS["write"]["destructiveHint"] is False
