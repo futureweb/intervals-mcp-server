@@ -4,6 +4,8 @@ Activity-related MCP tools for Intervals.icu.
 This module contains tools for retrieving and managing athlete activities.
 """
 
+# pylint: disable=too-many-lines
+
 import json
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,15 +14,18 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import (
-    resolve_gear_for_activity,
     resolve_gear_for_activities,
+    resolve_gear_for_activity,
 )
 from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_FIELD,
     ACTIVITY_STREAM,
     INTERVAL_FIELD,
     CustomFieldDefs,
+    custom_fields_json,
+    is_missing,
 )
+from intervals_mcp_server.utils.sports import hms, start_times
 from intervals_mcp_server.utils.formatting import (
     format_activity_details,
     format_activity_message,
@@ -29,6 +34,7 @@ from intervals_mcp_server.utils.formatting import (
 )
 from intervals_mcp_server.utils.streams import (
     DEFAULT_STREAM_TYPES,
+    NON_METRIC_STREAM_TYPES,
     describe_stream,
     find_stream,
     format_stats,
@@ -44,11 +50,186 @@ from intervals_mcp_server.utils.streams import (
 from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_date_params
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
 STREAM_OUTPUT_FORMATS = ("summary", "full", "json")
+# Fields requested from the API for compact / JSON activity listings (keeps payloads small).
+ACTIVITY_LIST_FIELDS = (
+    "id,start_date_local,start_date,timezone,type,sub_type,name,description,moving_time,elapsed_time,"
+    "distance,total_elevation_gain,icu_training_load,hr_load,power_load,pace_load,icu_intensity,"
+    "icu_average_watts,icu_weighted_avg_watts,average_heartrate,max_heartrate,average_cadence,"
+    "average_speed,feel,icu_rpe,perceived_exertion,gear,gear_id,trainer,device_name,power_meter,tags,"
+    "icu_ctl,icu_atl,icu_ftp,paired_event_id,compliance"
+)
+SORT_KEYS = ("date_desc", "date_asc", "distance", "moving_time", "load")
+DETAIL_LEVELS = ("summary", "compact")
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively replace NaN with None so json.dumps emits valid JSON."""
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and is_missing(value):
+        return None
+    return value
+
+
+def activity_record(activity: dict[str, Any]) -> dict[str, Any]:
+    """Machine-readable activity summary with explicit units and both start times."""
+    gear = activity.get("gear")
+    gear_id = gear.get("id") if isinstance(gear, dict) else activity.get("gear_id")
+    return _json_safe(
+        {
+            "id": activity.get("id"),
+            "name": activity.get("name"),
+            "type": activity.get("type"),
+            "sub_type": activity.get("sub_type"),
+            **start_times(activity),
+            "moving_time_s": activity.get("moving_time"),
+            "elapsed_time_s": activity.get("elapsed_time"),
+            "distance_m": activity.get("distance"),
+            "elevation_gain_m": activity.get("total_elevation_gain"),
+            "training_load_intervals": activity.get("icu_training_load"),
+            "power_load": activity.get("power_load"),
+            "hr_load": activity.get("hr_load"),
+            "pace_load": activity.get("pace_load"),
+            "intensity_pct": activity.get("icu_intensity"),
+            "average_power_w": activity.get("icu_average_watts"),
+            "weighted_avg_power_w": activity.get("icu_weighted_avg_watts"),
+            "average_hr_bpm": activity.get("average_heartrate"),
+            "max_hr_bpm": activity.get("max_heartrate"),
+            "average_cadence": activity.get("average_cadence"),
+            "average_speed_m_s": activity.get("average_speed"),
+            "feel": activity.get("feel"),
+            "rpe": activity.get("icu_rpe", activity.get("perceived_exertion")),
+            "gear_id": gear_id,
+            "gear_name": activity.get("_resolved_gear_name"),
+            "trainer": activity.get("trainer"),
+            "device_name": activity.get("device_name"),
+            "power_meter": activity.get("power_meter"),
+            "tags": activity.get("tags"),
+            "ftp_w": activity.get("icu_ftp"),
+            "paired_event_id": activity.get("paired_event_id"),
+            "compliance_pct": activity.get("compliance"),
+        }
+    )
+
+
+def _compact_line(activity: dict[str, Any]) -> str:
+    """One line per activity for token-efficient listings."""
+    parts = [
+        str(activity.get("start_date_local", ""))[:16],
+        str(activity.get("id")),
+        str(activity.get("type", "?")),
+        f"'{activity.get('name', 'unnamed')}'",
+        hms(activity.get("moving_time")),
+    ]
+    distance = activity.get("distance")
+    if isinstance(distance, (int, float)):
+        parts.append(f"{distance / 1000:.1f} km")
+    if isinstance(activity.get("total_elevation_gain"), (int, float)):
+        parts.append(f"+{activity['total_elevation_gain']:.0f} m")
+    if activity.get("icu_training_load") is not None:
+        loads = "/".join(
+            f"{label}{activity[key]}" for key, label in (("power_load", "P"), ("hr_load", "H"), ("pace_load", "Pa")) if activity.get(key) is not None
+        )
+        parts.append(f"load {activity['icu_training_load']}" + (f" ({loads})" if loads else ""))
+    if activity.get("icu_average_watts") is not None:
+        parts.append(f"avg {activity['icu_average_watts']} W" + (f" NP {activity['icu_weighted_avg_watts']}" if activity.get("icu_weighted_avg_watts") else ""))
+    if activity.get("average_heartrate") is not None:
+        parts.append(f"HR {activity['average_heartrate']}")
+    if activity.get("feel") is not None or activity.get("icu_rpe") is not None:
+        parts.append(f"feel {activity.get('feel', '-')}/5 RPE {activity.get('icu_rpe', '-')}")
+    gear_name = activity.get("_resolved_gear_name")
+    if gear_name:
+        parts.append(f"gear {gear_name}")
+    if activity.get("power_meter"):
+        parts.append(f"PM {activity['power_meter']}")
+    if activity.get("trainer"):
+        parts.append("trainer")
+    return " | ".join(parts)
+
+
+def _sort_activities(activities: list[dict[str, Any]], sort_by: str) -> list[dict[str, Any]]:
+    key = {
+        "date_desc": lambda a: str(a.get("start_date_local", "")),
+        "date_asc": lambda a: str(a.get("start_date_local", "")),
+        "distance": lambda a: a.get("distance") or 0,
+        "moving_time": lambda a: a.get("moving_time") or 0,
+        "load": lambda a: a.get("icu_training_load") or 0,
+    }[sort_by]
+    return sorted(activities, key=key, reverse=sort_by != "date_asc")
+
+
+def _activity_gear_id(activity: dict[str, Any]) -> str:
+    gear = activity.get("gear")
+    if isinstance(gear, dict) and gear.get("id"):
+        return str(gear["id"])
+    return str(activity.get("gear_id") or "")
+
+
+async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
+    athlete_id: str,
+    api_key: str | None,
+    dates: tuple[str, str],
+    limit: int,
+    include_unnamed: bool,
+    sport_types: str | None,
+    gear_id: str | None,
+    sort_by: str,
+    offset: int,
+    detail_level: str,
+    output_format: str,
+) -> str:
+    """Filtered, sorted and paginated activity listing (compact / summary / json)."""
+    if sort_by not in SORT_KEYS:
+        return f"Error: sort_by must be one of {', '.join(SORT_KEYS)}."
+    if detail_level not in DETAIL_LEVELS:
+        return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."
+    if output_format not in ("text", "json"):
+        return "Error: output_format must be 'text' or 'json'."
+    if offset < 0 or limit < 1:
+        return "Error: offset must be >= 0 and limit >= 1."
+    params: dict[str, Any] = {"oldest": dates[0], "newest": dates[1]}
+    if detail_level == "compact" or output_format == "json":
+        params["fields"] = ACTIVITY_LIST_FIELDS
+    result = await make_intervals_request(url=f"/athlete/{athlete_id}/activities", api_key=api_key, params=params)
+    if isinstance(result, dict) and "error" in result:
+        return f"Error fetching activities: {result.get('message', 'Unknown error')}"
+    activities = _parse_activities_from_result(result)
+    if not include_unnamed:
+        activities = _filter_named_activities(activities)
+    wanted = {t.strip().lower() for t in (sport_types or "").split(",") if t.strip()}
+    if wanted:
+        activities = [a for a in activities if str(a.get("type", "")).lower() in wanted]
+    if gear_id:
+        activities = [a for a in activities if _activity_gear_id(a) == str(gear_id)]
+    total = len(activities)
+    page = _sort_activities(activities, sort_by)[offset : offset + limit]
+    await resolve_gear_for_activities(page, athlete_id=athlete_id, api_key=api_key)
+    filters = ", ".join(
+        f for f in (f"types {sport_types}" if sport_types else "", f"gear {gear_id}" if gear_id else "", f"sort {sort_by}") if f
+    )
+    next_offset = offset + limit if offset + limit < total else None
+    if output_format == "json":
+        return json.dumps(
+            {"start_date": dates[0], "end_date": dates[1], "total": total, "offset": offset, "limit": limit,
+             "next_offset": next_offset, "activities": [activity_record(a) for a in page]},
+            ensure_ascii=False,
+        )
+    if not page:
+        return f"No activities match ({filters}) for athlete {athlete_id} between {dates[0]} and {dates[1]}."
+    header = f"Activities {offset + 1}-{offset + len(page)} of {total} ({dates[0]} to {dates[1]}; {filters}):\n"
+    if detail_level == "compact":
+        body = "\n".join(_compact_line(a) for a in page)
+    else:
+        body = "\n".join(format_activity_summary(a) for a in page)
+    footer = f"\nNext page: offset={next_offset}" if next_offset is not None else ""
+    return header + body + footer
 # Selectors of get_activity_streams / get_activity_intervals that fetch every stream.
 _ALL_STREAM_SELECTORS = ("all", "custom")
 
@@ -200,24 +381,40 @@ async def _fetch_streams(
     return streams, None
 
 
-@mcp.tool()
-async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches,too-many-positional-arguments
+@tool("read")
+async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches,too-many-positional-arguments,too-many-locals
     athlete_id: str | None = None,
     api_key: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 10,
     include_unnamed: bool = False,
+    sport_types: str | None = None,
+    gear_id: str | None = None,
+    sort_by: str = "date_desc",
+    offset: int = 0,
+    detail_level: str = "summary",
+    output_format: str = "text",
 ) -> str:
     """Get a list of activities for an athlete from Intervals.icu
+
+    Supports filtering by sport type and gear, sorting, pagination and compact or JSON
+    output for large date ranges (e.g. comparing all rides on one bike over a season).
+    Without the optional filters the classic summary listing is returned.
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
         end_date: End date in YYYY-MM-DD format (optional, defaults to today)
-        limit: Maximum number of activities to return (optional, defaults to 10)
+        limit: Maximum number of activities to return per page (optional, defaults to 10)
         include_unnamed: Whether to include unnamed activities (optional, defaults to False)
+        sport_types: Comma-separated activity types to keep, e.g. "Ride,GravelRide" (optional)
+        gear_id: Only activities done on this gear, e.g. "b12472159" (optional; see get_gear_list)
+        sort_by: "date_desc" (default), "date_asc", "distance", "moving_time" or "load"
+        offset: Number of matching activities to skip for pagination (optional, default 0)
+        detail_level: "summary" (default, full text block per activity) or "compact" (one line each)
+        output_format: "text" (default) or "json" (records with explicit units, local and UTC start)
     """
     # Resolve athlete ID and date parameters
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -225,6 +422,12 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         return error_msg
 
     start_date, end_date = resolve_date_params(start_date, end_date)
+
+    if any((sport_types, gear_id, sort_by != "date_desc", offset, detail_level != "summary", output_format != "text")):
+        return await _list_activities_filtered(
+            athlete_id_to_use, api_key, (start_date, end_date), limit, include_unnamed,
+            sport_types, gear_id, sort_by, offset, detail_level, output_format,
+        )
 
     # Fetch more activities if we need to filter out unnamed ones
     api_limit = limit * 3 if not include_unnamed else limit
@@ -271,12 +474,13 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
     return _format_activities_response(activities, athlete_id_to_use, include_unnamed)
 
 
-@mcp.tool()
+@tool("read")
 async def get_activity_details(
     activity_id: str,
     api_key: str | None = None,
     include_custom_fields: bool = True,
     include_all_fields: bool = False,
+    output_format: str = "text",
 ) -> str:
     """Get detailed information for a specific activity from Intervals.icu
 
@@ -296,6 +500,8 @@ async def get_activity_details(
         include_all_fields: Also list every other non-empty field of the raw activity payload
             that is not part of the standard summary, e.g. time in zones, running dynamics,
             power meter details, available stream types (optional, default False)
+        output_format: "text" (default) or "json" (raw activity, explicit start times, gear name,
+            thresholds snapshot and every custom field with value/units/status)
     """
     # Call the Intervals.icu API
     result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
@@ -324,6 +530,26 @@ async def get_activity_details(
             ACTIVITY_FIELD, api_key, activity_data.get("icu_athlete_id")
         )
 
+    if output_format.strip().lower() == "json":
+        return json.dumps(
+            _json_safe(
+                {
+                    "activity": {k: v for k, v in activity_data.items() if k not in ("skyline_chart_bytes", "_resolved_gear_name")},
+                    "times": start_times(activity_data),
+                    "gear_name": activity_data.get("_resolved_gear_name"),
+                    "custom_fields": custom_fields_json(activity_data, custom_field_defs or {}),
+                    "thresholds": {
+                        k: activity_data.get(k)
+                        for k in ("icu_ftp", "icu_rolling_ftp", "icu_pm_ftp", "icu_pm_cp", "icu_w_prime", "icu_pm_w_prime",
+                                  "icu_pm_p_max", "lthr", "athlete_max_hr", "icu_resting_hr", "threshold_pace", "icu_weight",
+                                  "icu_power_zones", "icu_hr_zones", "pace_zones", "power_meter", "power_meter_serial",
+                                  "power_field_names", "device_name")
+                    },
+                }
+            ),
+            ensure_ascii=False,
+        )
+
     return format_activity_details(
         activity_data,
         custom_field_defs=custom_field_defs,
@@ -331,12 +557,30 @@ async def get_activity_details(
     )
 
 
-@mcp.tool()
+def _interval_stream_metrics(
+    interval: dict[str, Any], streams: list[dict[str, Any]], stream_defs: CustomFieldDefs
+) -> dict[str, Any]:
+    """Per-stream statistics over an interval's sample range (JSON output)."""
+    start, end = interval.get("start_index"), interval.get("end_index")
+    if not (isinstance(start, int) and isinstance(end, int) and end > start):
+        return {}
+    out: dict[str, Any] = {}
+    for stream in streams:
+        if stream.get("type") in NON_METRIC_STREAM_TYPES:
+            continue
+        info = describe_stream(stream, stream_defs)
+        stats = range_stats(stream.get("data") or [], [(start, end)])
+        out[info["type"]] = {"name": info["label"], "units": info["units"], **stats}
+    return out
+
+
+@tool("read")
 async def get_activity_intervals(
     activity_id: str,
     api_key: str | None = None,
     stream_types: str | None = None,
     include_custom_fields: bool = True,
+    output_format: str = "text",
 ) -> str:
     """Get interval data for a specific activity from Intervals.icu
 
@@ -361,6 +605,8 @@ async def get_activity_intervals(
             activity plus secondary_power; "all" = every stream. Use list_activity_streams to
             see what is available. (optional, default: no stream metrics)
         include_custom_fields: List custom interval fields per interval (optional, default True)
+        output_format: "text" (default) or "json" (raw intervals and groups plus custom fields
+            and per-interval stream statistics)
     """
     # Call the Intervals.icu API
     result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
@@ -378,6 +624,13 @@ async def get_activity_intervals(
         key in result for key in ["icu_intervals", "icu_groups"]
     ):
         return f"No interval data or unrecognized format for activity {activity_id}."
+
+    if not (result.get("icu_intervals") or result.get("icu_groups")):
+        return (
+            f"Intervals.icu has no intervals or groups for activity {activity_id} (no laps/structure detected). "
+            "Use analyze_climbs for an automatic segmentation into climbs, descents and pauses, or "
+            "get_activity_streams for the raw samples."
+        )
 
     interval_field_defs: CustomFieldDefs = {}
     if include_custom_fields:
@@ -399,6 +652,24 @@ async def get_activity_intervals(
                     s for s in streams if s.get("custom") or s.get("type") == "secondary_power"
                 ]
             stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
+
+    if output_format.strip().lower() == "json":
+        intervals = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
+        payload = {
+            "id": result.get("id"),
+            "analyzed": result.get("analyzed"),
+            "intervals": [
+                {
+                    **interval,
+                    "custom_fields": [r for r in custom_fields_json(interval, interval_field_defs) if r["status"] in ("value", "zero")],
+                    "stream_metrics": _interval_stream_metrics(interval, streams or [], stream_defs),
+                }
+                for interval in intervals
+            ],
+            "groups": [g for g in result.get("icu_groups") or [] if isinstance(g, dict)],
+            "note": note.strip() or None,
+        }
+        return json.dumps(_json_safe(payload), ensure_ascii=False)
 
     # Format the intervals data
     return (
@@ -466,7 +737,7 @@ def _render_stream_rows(  # pylint: disable=too-many-arguments,too-many-position
     return header + body + note
 
 
-@mcp.tool()
+@tool("read")
 async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     activity_id: str,
     api_key: str | None = None,
@@ -582,7 +853,7 @@ def _format_stream_listing(
     return output
 
 
-@mcp.tool()
+@tool("read")
 async def list_activity_streams(
     activity_id: str,
     api_key: str | None = None,
@@ -630,7 +901,7 @@ async def list_activity_streams(
     return _format_stream_listing(activity_id, activity, available, streams, stream_defs)
 
 
-@mcp.tool()
+@tool("read")
 async def get_activity_messages(activity_id: str, api_key: str | None = None) -> str:
     """Get messages (notes/comments) for a specific activity from Intervals.icu
 
@@ -662,7 +933,7 @@ async def get_activity_messages(activity_id: str, api_key: str | None = None) ->
     return output
 
 
-@mcp.tool()
+@tool("write")
 async def add_activity_message(
     activity_id: str,
     content: str,
@@ -695,7 +966,7 @@ async def add_activity_message(
     return f"Message appears to have been added to activity {activity_id}, but no ID was returned. Please verify manually."
 
 
-@mcp.tool()
+@tool("write")
 async def update_activity(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     activity_id: str,
     rpe: int | None = None,

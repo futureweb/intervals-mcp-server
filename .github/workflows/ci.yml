@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Reused by release.yml so that a tag is only released after the same checks.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Tests only use these placeholder values; no real credentials are required.
+  API_KEY: test
+  ATHLETE_ID: i1
+
+jobs:
+  checks:
+    name: Checks (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies (locked)
+        run: uv sync --all-extras --locked
+
+      - name: Lint (ruff)
+        run: uv run --locked ruff check .
+
+      - name: Type check (mypy)
+        run: uv run --locked mypy src tests
+
+      - name: Test (pytest)
+        run: uv run --locked pytest -q
+
+  pylint:
+    # Informational only: pylint has a few pre-existing messages that are not
+    # gates. The job is reported but never fails the workflow.
+    name: Pylint (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies (locked)
+        run: uv sync --all-extras --locked
+
+      - name: Analyse the code with pylint
+        run: uv run --locked --with pylint pylint --disable=C0301 $(git ls-files '*.py')

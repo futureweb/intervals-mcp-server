@@ -6,6 +6,7 @@ including request management, error handling, and client lifecycle.
 """
 
 from json import JSONDecodeError
+import asyncio
 import json
 import logging
 import sys
@@ -19,6 +20,23 @@ from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 from intervals_mcp_server.config import get_config
 
 logger = logging.getLogger("intervals_icu_mcp_server")
+
+# Transient statuses that are retried with a short back-off (Retry-After is honoured).
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 3
+MAX_RETRY_DELAY_S = 30.0
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before the next attempt (Retry-After header or exponential back-off)."""
+    header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+    if header:
+        try:
+            return min(MAX_RETRY_DELAY_S, max(0.0, float(header)))
+        except ValueError:
+            pass
+    return min(MAX_RETRY_DELAY_S, 1.5 * (2**attempt))
+
 
 # Create a single AsyncClient instance for all requests (lazily initialized)
 # This can be monkeypatched via server.httpx_client for testing
@@ -149,7 +167,7 @@ def _parse_response(
     return response_data
 
 
-async def make_intervals_request(
+async def make_intervals_request(  # pylint: disable=too-many-locals
     url: str,
     api_key: str | None = None,
     params: dict[str, Any] | None = None,
@@ -196,11 +214,10 @@ async def make_intervals_request(
             timeout=30.0,
         )
 
-    try:
+    async def _send_with_client_recovery() -> httpx.Response:
         client = await _get_httpx_client()
-
         try:
-            response = await _send_request(client)
+            return await _send_request(client)
         except RuntimeError as runtime_error:
             # httpx closes the client when the underlying connection is severed;
             # recreate the shared client lazily and retry once.
@@ -210,7 +227,18 @@ async def make_intervals_request(
             global httpx_client  # pylint: disable=global-statement  # noqa: PLW0603 - we intentionally manage the shared client here
             httpx_client = None
             client = await _get_httpx_client()
-            response = await _send_request(client)
+            return await _send_request(client)
+
+    try:
+        response = await _send_with_client_recovery()
+        for attempt in range(MAX_ATTEMPTS - 1):
+            status = getattr(response, "status_code", 200)
+            if status not in RETRY_STATUSES:
+                break
+            delay = _retry_delay(response, attempt)
+            logger.warning("Intervals.icu answered %s for %s; retrying in %.1f s", status, url, delay)
+            await asyncio.sleep(delay)
+            response = await _send_with_client_recovery()
 
         return _parse_response(response, full_url)
     except httpx.HTTPStatusError as e:

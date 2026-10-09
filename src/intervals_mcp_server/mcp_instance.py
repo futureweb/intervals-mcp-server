@@ -6,12 +6,13 @@ the server module and tool modules without creating cyclic imports.
 """
 
 import os
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 
 from intervals_mcp_server.api.client import setup_api_client
+from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 
 # FastMCP passes explicit defaults (e.g. host="127.0.0.1", port=8000) to its
 # settings model, which take precedence over FASTMCP_* environment variables.
@@ -55,3 +56,42 @@ def fastmcp_settings_from_env(environ: Mapping[str, str] | None = None) -> dict[
 mcp: FastMCP = FastMCP(  # pylint: disable=invalid-name
     "intervals-icu", lifespan=setup_api_client, **fastmcp_settings_from_env()
 )
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+# Permission class of every tool defined with @tool(...), registered or not.
+_TOOL_PERMISSIONS: dict[str, str] = {}
+# Tools that were not registered because their class is not enabled.
+_DISABLED_TOOLS: dict[str, str] = {}
+
+
+def tool(permission: str = "read", **kwargs: Any) -> Callable[[F], F]:
+    """Register an MCP tool only when its permission class is enabled.
+
+    Classes: "read" (never changes anything), "write" (creates or edits calendar
+    entries, notes, RPE/feel, subjective wellness), "destructive" (deletes data) and
+    "admin" (configuration and mass operations). The enabled classes come from the
+    MCP_PERMISSIONS environment variable (default: read). A tool of a disabled class
+    is not exposed to clients at all; the Python function stays importable.
+    """
+    if permission not in PERMISSION_CLASSES:
+        raise ValueError(f"Unknown permission class {permission!r}; use one of {PERMISSION_CLASSES}")
+
+    def decorator(func: F) -> F:
+        _TOOL_PERMISSIONS[func.__name__] = permission
+        if permission in get_config().permissions:
+            return cast(F, mcp.tool(**kwargs)(func))
+        _DISABLED_TOOLS[func.__name__] = permission
+        return func
+
+    return decorator
+
+
+def tool_permissions() -> dict[str, str]:
+    """Permission class per defined tool name."""
+    return dict(_TOOL_PERMISSIONS)
+
+
+def disabled_tools() -> dict[str, str]:
+    """Tools hidden from clients because their permission class is not enabled."""
+    return dict(_DISABLED_TOOLS)

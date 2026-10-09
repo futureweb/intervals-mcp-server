@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions, ideas and configuration help
+    url: https://github.com/futureweb/intervals-mcp-server/discussions
+    about: Usage questions, client configurations and ideas belong in GitHub Discussions.
+  - name: Report a security vulnerability
+    url: https://github.com/futureweb/intervals-mcp-server/security/policy
+    about: Never report security problems in a public issue. Read the security policy and use private vulnerability reporting.
+  - name: Intervals.icu API questions
+    url: https://forum.intervals.icu/
+    about: Questions about the Intervals.icu API or the Intervals.icu service itself belong in the Intervals.icu forum.

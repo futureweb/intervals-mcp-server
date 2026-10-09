@@ -1,0 +1,108 @@
+name: Bug report
+description: Something does not work as documented
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Before you post, remove every secret and all personal data.** Never paste your
+        `API_KEY`. Redact your athlete ID (write `i12345`), names, e-mail addresses, GPS
+        coordinates and health values from logs and screenshots. Reports containing real
+        credentials or athlete data will be edited or deleted.
+
+        Security vulnerabilities must **not** be reported here. Please follow the
+        [security policy](https://github.com/futureweb/intervals-mcp-server/security/policy).
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and of what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The tool that was called and its arguments (with placeholders), or the prompt you gave the client.
+      placeholder: |
+        1. Start the server with `MCP_TRANSPORT=stdio`
+        2. Ask the client to call `get_activities` with `start_date=2024-01-01`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Server log and/or client error. Redact secrets and athlete data first. This field is rendered as code automatically.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: Release tag, PyPI version or git commit (`git rev-parse --short HEAD`).
+      placeholder: v1.2.3
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      options:
+        - uv (git checkout)
+        - pip / uvx (futureweb-intervals-mcp from PyPI)
+        - Docker (ghcr.io/futureweb/intervals-mcp-server)
+        - Other (describe in the bug description)
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport (MCP_TRANSPORT)
+      options:
+        - stdio (default)
+        - sse
+        - streamable-http
+    validations:
+      required: true
+  - type: input
+    id: permissions
+    attributes:
+      label: Permission class (MCP_PERMISSIONS)
+      description: Leave empty if you run with the default read-only class.
+      placeholder: default
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Desktop
+        - Claude Code
+        - ChatGPT
+        - Cursor
+        - Other (describe in the bug description)
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.6"
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.1 / Ubuntu 24.04 / Windows 11"
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have removed all secrets (API keys) and all personal or athlete data from this report.
+          required: true
+        - label: I have searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I can reproduce this with the latest release.

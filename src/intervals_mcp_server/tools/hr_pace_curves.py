@@ -15,7 +15,7 @@ from intervals_mcp_server.utils.formatting import format_hr_curves, format_pace_
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -155,7 +155,7 @@ async def _fetch_curves(
     return [c for c in curve_list if isinstance(c, dict)], None
 
 
-@mcp.tool()
+@tool("read")
 async def get_hr_curves(
     activity_type: str = "Run",
     durations: list[int] | None = None,
@@ -200,7 +200,7 @@ async def get_hr_curves(
     return format_hr_curves(extracted, activity_type)
 
 
-@mcp.tool()
+@tool("read")
 async def get_pace_curves(
     activity_type: str = "Run",
     distances: list[float] | None = None,

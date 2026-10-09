@@ -18,7 +18,7 @@ from intervals_mcp_server.utils.sports import format_pace, zone_ranges
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -288,8 +288,8 @@ def _setting_json(setting: dict[str, Any], gear_map: dict[str, str], eftp: dict[
     return row
 
 
-@mcp.tool()
-async def get_athlete_profile(
+@tool("read")
+async def get_athlete_profile(  # pylint: disable=too-many-locals,too-many-branches
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
@@ -382,8 +382,8 @@ async def get_athlete_profile(
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def get_sport_settings(
+@tool("read")
+async def get_sport_settings(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches
     athlete_id: str | None = None,
     api_key: str | None = None,
     sport_type: str | None = None,
@@ -428,8 +428,8 @@ async def get_sport_settings(
     return "\n\n".join(blocks)
 
 
-@mcp.tool()
-async def get_training_zones(
+@tool("read")
+async def get_training_zones(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     athlete_id: str | None = None,
     api_key: str | None = None,
     sport_type: str | None = None,

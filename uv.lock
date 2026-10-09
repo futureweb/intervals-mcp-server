@@ -205,6 +205,42 @@ wheels = [
 ]
 
 [[package]]
+name = "futureweb-intervals-mcp"
+version = "1.0.0b1"
+source = { editable = "." }
+dependencies = [
+    { name = "httpx" },
+    { name = "mcp", extra = ["cli"] },
+    { name = "python-dotenv" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "hatch" },
+    { name = "mypy" },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-mock" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hatch", marker = "extra == 'dev'" },
+    { name = "httpx", specifier = ">=0.25.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.4.0,<2.0.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
+    { name = "pre-commit", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.5" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
+    { name = "pytest-mock", marker = "extra == 'dev'", specifier = "==3.12.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -330,42 +366,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
 ]
-
-[[package]]
-name = "intervals-mcp-server"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "httpx" },
-    { name = "mcp", extra = ["cli"] },
-    { name = "python-dotenv" },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "hatch" },
-    { name = "mypy" },
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-mock" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "hatch", marker = "extra == 'dev'" },
-    { name = "httpx", specifier = ">=0.25.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.4.0,<2.0.0" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.5" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
-    { name = "pytest-mock", marker = "extra == 'dev'", specifier = "==3.12.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
-]
-provides-extras = ["dev"]
 
 [[package]]
 name = "jaraco-classes"

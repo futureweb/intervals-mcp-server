@@ -1,0 +1,54 @@
+name: Feature request
+description: Suggest a new tool or an improvement to an existing one
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem first and the solution you have in mind second.
+        Keep real athlete data out of the examples.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do with Intervals.icu through an MCP client that is not possible or awkward today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: The tool(s) or change you would like to see, including example arguments and the shape of the result.
+    validations:
+      required: true
+  - type: input
+    id: endpoint
+    attributes:
+      label: Intervals.icu API endpoint(s)
+      description: If known, the endpoint(s) from https://intervals.icu/api-docs.html the feature would use.
+      placeholder: GET /api/v1/athlete/{id}/activities
+  - type: dropdown
+    id: access
+    attributes:
+      label: Data access
+      description: Tools that write or delete data are gated behind an explicit opt-in (`MCP_PERMISSIONS`) and need extra review.
+      options:
+        - Read-only (fetches data)
+        - Write (creates or updates data)
+        - Destructive (deletes data)
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to achieve the same thing, and why they are not good enough.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched the existing issues and discussions for a similar request.
+          required: true
+        - label: I am willing to open a pull request for this.

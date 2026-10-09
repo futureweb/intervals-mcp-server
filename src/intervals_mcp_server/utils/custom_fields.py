@@ -57,6 +57,7 @@ def normalize_custom_item(item: dict[str, Any]) -> dict[str, Any] | None:
         "description": item.get("description") or content.get("short_description"),
         "fit_source": content.get("fit_session_field") or content.get("fit_record_field"),
         "has_script": bool(content.get("script")),
+        "aggregate": content.get("aggregate"),
     }
 
 
@@ -152,8 +153,11 @@ def format_field_value(definition: dict[str, Any], value: Any) -> str:
     return text
 
 
-def value_status(definition: dict[str, Any] | None, payload: dict[str, Any], code: str) -> str:
-    """Classify a custom field on a payload: 'value', 'zero', 'missing' (null/NaN) or 'absent' (no key)."""
+def value_status(_definition: dict[str, Any] | None, payload: dict[str, Any], code: str) -> str:
+    """Classify a custom field on a payload: 'value', 'zero', 'missing' (null/NaN) or 'absent' (no key).
+
+    The definition is accepted for symmetry with the other helpers (future per-type rules).
+    """
     if code not in payload:
         return "absent"
     value = payload[code]

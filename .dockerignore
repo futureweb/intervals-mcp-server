@@ -1,0 +1,41 @@
+# Build context for the Dockerfile. The image only copies pyproject.toml,
+# uv.lock, README.md, LICENSE and src/; everything else is excluded to keep the
+# context small and, above all, to make sure that no secrets (.env*) or local
+# data can ever end up in an image layer.
+.git
+.github
+.gitignore
+.cursor
+.claude
+.venv
+venv
+env
+
+# Secrets and local configuration: never bake these into an image
+.env
+.env.*
+*.log
+.gitconfig
+.pypirc
+
+# Tooling caches and build output
+__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.hypothesis
+build
+dist
+*.egg-info
+
+# Not needed at runtime
+tests
+docs
+Dockerfile
+.dockerignore
+.pre-commit-config.yaml
+AGENTS.md
+CONTRIBUTING.md
+SECURITY.md
+MANIFEST.in

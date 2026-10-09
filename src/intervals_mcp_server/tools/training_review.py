@@ -14,7 +14,7 @@ from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -108,7 +108,7 @@ def _format_week(week: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool("read")
 async def get_weekly_summary(
     start_date: str,
     end_date: str,
@@ -326,7 +326,7 @@ def _build_compliance_report(  # pylint: disable=too-many-locals
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool("read")
 async def get_plan_compliance(
     start_date: str,
     end_date: str,

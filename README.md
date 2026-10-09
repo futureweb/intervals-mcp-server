@@ -1,406 +1,203 @@
-# Intervals.icu MCP Server
+# Futureweb Intervals MCP
 
-Model Context Protocol (MCP) server for connecting Claude and ChatGPT with the Intervals.icu API. It provides tools for authentication and data retrieval for activities, events, wellness data, power curves, and custom items.
+**Advanced Intervals.icu MCP server with Garmin-enriched metrics, full custom streams, recovery
+insights and endurance performance analysis.**
 
-If you find the Model Context Protocol (MCP) server useful, please consider supporting its continued development with a donation.
+[![CI](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 
-## Requirements
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets ChatGPT, Claude
+and other MCP clients read and analyse your [Intervals.icu](https://intervals.icu) data the way
+a coach would: activities with every custom field and stream, intervals, wellness with personal
+baselines, thresholds and zones, planned-vs-executed workouts, climbs, dual power meters,
+nutrition and weight trends, weekly and monthly summaries, and the calendar.
 
-- Python 3.12 or higher
-- [Model Context Protocol (MCP) Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-- httpx
-- python-dotenv
+> Community-maintained fork of [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server).
+> Not affiliated with Intervals.icu or Garmin. Works with any standard Intervals.icu account;
+> the optional [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge)
+> adds the Garmin metrics that are otherwise filtered out. All training data and credentials
+> stay under your control: the server runs where you run it and talks only to the
+> Intervals.icu API.
 
-## Setup
+## What sets it apart
 
-### 1. Install uv (recommended)
+- **Every custom item, resolved dynamically.** Custom activity fields, interval fields, streams
+  and wellness fields are read from your account's definitions and shown with name, code,
+  value and units: training effect, EPOC, recovery time, VO₂max, performance condition,
+  stamina, sweat loss, running dynamics, gear selection, Body Battery, sleep stages … whatever
+  is there. Nothing device-specific is hard-coded; null, NaN, zero and absent are distinguished.
+- **Streams at full resolution.** Any stream as summary, CSV or JSON, sliced by index or time,
+  downsampled and paged; per-interval statistics of custom streams (e.g. stamina drop per interval).
+- **Coaching analysis, no black boxes.** Recovery snapshot with 42-day baselines, wellness
+  trends and correlations, planned-vs-executed workout analysis, climb/descent segmentation,
+  dual power meter comparison, nutrition/calorie/weight trends, training summaries with the
+  Intervals.icu load kept apart from device loads. Statistics only; the interpretation is yours.
+- **Safe by default.** Tools are grouped into permission classes (`read`, `write`,
+  `destructive`, `admin`); only `read` is exposed unless you enable more. Secrets are never
+  logged. See [SECURITY.md](SECURITY.md).
+- **Built on the community's work.** Includes the best upstream pull requests (weekly summary
+  and plan compliance, HR/pace curves, workout library, bulk calendar events, update tools)
+  with their authors credited in the history; see [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md)
+  and [docs/FEATURE_COMPARISON.md](docs/FEATURE_COMPARISON.md).
 
-**macOS/Linux:**
+## Quick start
+
+Requirements: Python 3.12+, [uv](https://github.com/astral-sh/uv), an Intervals.icu API key
+(Intervals.icu → Settings → Developer Settings) and your athlete ID (`i123456`).
+
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-**Windows (PowerShell):**
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-After installation, find the full path to `uv` — you'll need it later when configuring Claude Desktop:
-
-```powershell
-where.exe uv
-# Example output: C:\Users\<USERNAME>\.local\bin\uv.exe
-```
-
-### 2. Clone this repository
-
-```bash
-git clone https://github.com/mvilanova/intervals-mcp-server.git
+git clone https://github.com/futureweb/intervals-mcp-server.git
 cd intervals-mcp-server
+uv sync --locked
+cp .env.example .env                       # fill API_KEY and ATHLETE_ID
+uv run futureweb-intervals-mcp --doctor    # checks configuration and API access
+uv run futureweb-intervals-mcp             # starts the server on stdio
 ```
 
-### 3. Create and activate a virtual environment
+Run without cloning (from git until the package is on PyPI):
 
 ```bash
-# Create virtual environment with Python 3.12
-uv venv --python 3.12
-
-# Activate virtual environment
-# On macOS/Linux:
-source .venv/bin/activate
-# On Windows:
-.venv\Scripts\activate
+uvx --from git+https://github.com/futureweb/intervals-mcp-server futureweb-intervals-mcp --version
 ```
 
-### 4. Sync project dependencies
+Docker (image published by the release workflow to `ghcr.io/futureweb/intervals-mcp-server`):
 
 ```bash
-uv sync
+docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:latest
 ```
 
-### 5. Set up environment variables
+## Configuration
 
-Make a copy of `.env.example` and name it `.env` by running the following command:
+All settings are environment variables (a `.env` file in the working directory is loaded
+automatically; see [.env.example](.env.example)).
 
-**macOS/Linux:**
-```bash
-cp .env.example .env
-```
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `API_KEY` | – | Intervals.icu API key (required) |
+| `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
+| `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
+| `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `http` |
+| `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address for `sse`/`http` |
+| `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
 
-**Windows (PowerShell):**
-```powershell
-Copy-Item .env.example .env
-```
+### Permission classes
 
-Then edit the `.env` file and set your Intervals.icu athlete id and API key:
+| Class | Tools | Enable with |
+| --- | --- | --- |
+| `read` | everything that only reads (activities, streams, wellness, analysis, curves, calendar, library, status) | default |
+| `write` | `add_or_update_event`, `add_or_update_note`, `add_activity_message`, `update_activity`, `update_wellness`, `create_library_workout`, `add_event_from_library` | `MCP_PERMISSIONS=read,write` |
+| `destructive` | `delete_event`, `delete_events_by_date_range`, `delete_custom_item`, `delete_library_workout` | `MCP_PERMISSIONS=read,write,destructive` |
+| `admin` | `create_custom_item`, `update_custom_item`, `add_events_bulk` | `MCP_PERMISSIONS=all` |
 
-```
-API_KEY=your_intervals_api_key_here
-ATHLETE_ID=your_athlete_id_here
-```
+Tools of a disabled class are not registered at all; `get_server_status` lists what is enabled
+and hidden.
 
-#### Getting your Intervals.icu API Key
+## Connecting a client
 
-1. Log in to your Intervals.icu account
-2. Go to Settings > API
-3. Generate a new API key
+### Claude Desktop / Claude Code (stdio)
 
-#### Finding your Athlete ID
-
-Your athlete ID is typically visible in the URL when you're logged into Intervals.icu. It looks like:
-
-- `https://intervals.icu/athlete/i12345/...` where `i12345` is your athlete ID
-
-## Updating
-
-This project is actively developed, with new features and fixes added regularly. To stay up to date, follow these steps:
-
-### 1. Pull the latest changes from `main`
-
-> ⚠️ Make sure you don't have uncommitted changes before running this command.
-
-**macOS/Linux:**
-```bash
-git checkout main && git pull
-```
-
-**Windows (PowerShell):**
-```powershell
-git checkout main; git pull
-```
-
-### 2. Update Python dependencies
-
-Activate your virtual environment and sync dependencies:
-
-**macOS/Linux:**
-```bash
-source .venv/bin/activate
-uv sync
-```
-
-**Windows (PowerShell):**
-```powershell
-.venv\Scripts\activate
-uv sync
-```
-
-### Troubleshooting
-
-If Claude Desktop fails due to configuration changes, follow these steps:
-
-1. Delete the existing `Intervals.icu` entry in `claude_desktop_config.json`.
-2. Reconfigure Claude Desktop from the `intervals-mcp-server` directory.
-
-**macOS/Linux:**
-```bash
-mcp install src/intervals_mcp_server/server.py --name "Intervals.icu" --with-editable . --env-file .env
-```
-
-**Windows:** Re-add the entry manually as described in the [Windows configuration section](#windows).
-
-#### Common errors
-
-**`spawn uv ENOENT`** — Claude Desktop cannot find the `uv` executable. Use the full path to `uv` in the `command` field. Run `which uv` (macOS/Linux) or `where.exe uv` (Windows) to get it.
-
-**`spawn /Users/... ENOENT` on Windows** — The config file contains a macOS/Linux-style path. Replace it with the correct Windows path using backslashes as described in the [Windows configuration section](#windows) below.
-
-**Windows Store install: config changes not taking effect** — You may be editing the wrong config file. Claude Desktop installed from the Microsoft Store reads from `AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json`, not `AppData\Roaming\Claude\`.
-
-## Usage with Claude
-
-### 1. Configure Claude Desktop
-
-To use this server with Claude Desktop, you need to add it to your Claude Desktop configuration.
-
-#### macOS/Linux
-
-1. Run the following from the `intervals-mcp-server` directory to configure Claude Desktop:
-
-```bash
-mcp install src/intervals_mcp_server/server.py --name "Intervals.icu" --with-editable . --env-file .env
-```
-
-2. If you open your Claude Desktop App configuration file `claude_desktop_config.json`, it should look like this:
+`claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows:
+`%APPDATA%\Claude\`):
 
 ```json
 {
   "mcpServers": {
-    "Intervals.icu": {
-      "command": "/Users/<USERNAME>/.local/bin/uv",
-      "args": [
-        "run",
-        "--with",
-        "mcp[cli]",
-        "--with-editable",
-        "/path/to/intervals-mcp-server",
-        "mcp",
-        "run",
-        "/path/to/intervals-mcp-server/src/intervals_mcp_server/server.py"
-      ],
-      "env": {
-        "INTERVALS_API_BASE_URL": "https://intervals.icu/api/v1",
-        "ATHLETE_ID": "<YOUR_ATHLETE_ID>",
-        "API_KEY": "<YOUR_API_KEY>",
-        "LOG_LEVEL": "INFO"
-      }
+    "intervals-icu": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/intervals-mcp-server", "run", "futureweb-intervals-mcp"],
+      "env": { "API_KEY": "your_key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read,write" }
     }
   }
 }
 ```
 
-Where `/path/to/` is the path to the `intervals-mcp-server` code folder in your system.
+On Windows use double backslashes in paths and the full path to `uv.exe` (`where.exe uv`).
+Claude Code: `claude mcp add intervals-icu -- uv --directory /path/to/intervals-mcp-server run futureweb-intervals-mcp`.
 
-#### Windows
-
-The `mcp install` command may fail on Windows due to environment or permission issues. Instead, configure Claude Desktop manually:
-
-1. Find the Claude Desktop config file. If Claude Desktop was installed from the **Microsoft Store**, the config is located at:
-
-   ```
-   C:\Users\<USERNAME>\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json
-   ```
-
-   If installed via the standard installer, it may be at:
-
-   ```
-   C:\Users\<USERNAME>\AppData\Roaming\Claude\claude_desktop_config.json
-   ```
-
-   If the file or folder does not exist, create it.
-
-2. Add the following entry to `claude_desktop_config.json`, replacing the placeholders with your actual values:
-
-```json
-{
-  "mcpServers": {
-    "Intervals.icu": {
-      "command": "C:\\Users\\<USERNAME>\\.local\\bin\\uv.exe",
-      "args": [
-        "run",
-        "--with",
-        "mcp[cli]",
-        "--with-editable",
-        "C:\\path\\to\\intervals-mcp-server",
-        "mcp",
-        "run",
-        "C:\\path\\to\\intervals-mcp-server\\src\\intervals_mcp_server\\server.py"
-      ],
-      "env": {
-        "INTERVALS_API_BASE_URL": "https://intervals.icu/api/v1",
-        "ATHLETE_ID": "<YOUR_ATHLETE_ID>",
-        "API_KEY": "<YOUR_API_KEY>",
-        "LOG_LEVEL": "INFO"
-      }
-    }
-  }
-}
-```
-
-- Use double backslashes (`\\`) for all Windows paths in JSON.
-- To find the full path to `uv.exe`, run `where.exe uv` in PowerShell.
-- To find the full path to the cloned repository, run `pwd` from inside the `intervals-mcp-server` folder.
-
-> **Note for Windows Store installs:** Claude Desktop installed from the Microsoft Store sandboxes its config under `AppData\Local\Packages\...`. Editing `AppData\Roaming\Claude\claude_desktop_config.json` will have no effect — make sure you edit the correct file.
-
-3. Restart Claude Desktop.
-
-### 2. Use the MCP server with Claude
-
-Once the server is running and Claude Desktop is configured, you can use the following tools to ask questions about your past and future activities, events, and wellness data.
-
-- `get_activities`: Retrieve a list of activities
-- `get_activity_details`: Get detailed information for a specific activity, including every custom activity field with value and units (`include_all_fields=True` adds all remaining payload fields)
-- `get_activity_intervals`: Get detailed interval data for a specific activity, including custom interval fields and, with `stream_types`, per-interval statistics of any stream (e.g. stamina drop, second power meter)
-- `get_activity_streams`: Get raw data streams for a specific activity: any standard or custom stream, as summary or at full sample resolution (CSV or JSON) with slicing and downsampling
-- `list_activity_streams`: List the standard and custom streams an activity has, with names and units
-- `get_activity_details`: Get detailed information for a specific activity
-- `get_activity_intervals`: Get detailed interval data for a specific activity
-- `get_activity_streams`: Get raw data streams (power, heart rate, etc.) for a specific activity
-- `update_activity`: **Writes data.** Update an activity's RPE (1-10), feel (1-5, 1 = Strong ... 5 = Weak), name and/or description; only the passed fields are changed
-- `get_athlete_power_curves`: Get best power output curves for selected durations and time periods
-- `get_hr_curves`: Get best average heart rate curves for selected durations and time periods
-- `get_pace_curves`: Get best time/pace curves (min/km, min/100m for swims; optional GAP) for selected distances and time periods
-- `get_wellness_data`: Fetch wellness data
-- `get_weekly_summary`: Weekly training summary per ISO week and sport (sessions, time, distance, load, HR zones) with end-of-week CTL/ATL/form
-- `get_plan_compliance`: Compare planned workouts with executed activities (completed, missed, upcoming, unplanned, deviations)
-- `update_wellness`: Update subjective wellness fields (soreness, fatigue, stress, mood, motivation, injury, comments) for a day (writes data; only passed fields are changed)
-- `get_events`: Retrieve upcoming events (workouts, races, etc.)
-- `get_event_by_id`: Get detailed information for a specific event
-- `add_or_update_event`: Create or update an event (workout, race, note, etc.)
-- `add_events_bulk`: WRITES: create many events (workouts/notes) in one call via the bulk endpoint
-- `delete_event`: Delete a specific event
-- `get_workout_library`: List workout library folders/plans and their workouts (optionally filtered by folder)
-- `create_library_workout`: Create a workout template in the workout library (writes data)
-- `add_event_from_library`: Schedule a library workout on the calendar (writes data)
-- `delete_library_workout`: Permanently delete a workout from the library (writes data)
-- `delete_events_by_date_range`: Delete events within a date range
-- `get_custom_items`: Get custom items (charts, custom fields, zones, etc.) for an athlete
-- `get_custom_item_by_id`: Get detailed information for a specific custom item
-- `create_custom_item`: Create a new custom item for an athlete
-- `update_custom_item`: Update an existing custom item
-- `delete_custom_item`: Delete a custom item
-
-### Custom fields and streams (device metrics)
-
-Intervals.icu stores the values of custom items the athlete has defined (for example metrics a Garmin device writes such as training effect, EPOC, recovery time, VO2max, performance condition, stamina, sweat loss, grade adjusted speed or gear selection) as plain keys of the activity, interval and wellness payloads, named by the item's code. The tools resolve those keys against the athlete's custom item definitions (`/athlete/{id}/custom-item`, cached per process) and report each value with its display name, technical code, units and select label. Nothing is hard-coded: whatever is defined in the account is picked up.
-
-- `get_activity_details(activity_id)` lists all custom activity fields that have a value. `null`/`NaN` is reported as "no value"; a `0` in a field filled from the device file is marked, because Intervals.icu stores `0` when the source field is absent from the file.
-- `list_activity_streams(activity_id)` shows which standard and custom streams exist; `include_stats=True` adds per-stream statistics.
-- `get_activity_streams(activity_id, stream_types="time,watts,heartrate,Stamina", output_format="full")` returns sample-aligned rows (`index,time,...`) at full resolution; `start_index`/`end_index` (or `start_time`/`end_time`), `downsample` and `max_points` page through long activities. `output_format="json"` returns the same selection as JSON arrays. `stream_types="all"` fetches every stream.
-- `get_activity_intervals(activity_id, stream_types="Stamina,secondary_power")` evaluates the given streams over each interval's sample range (start, end, min, max, mean, delta, non-null samples); `"custom"` selects every custom stream plus the second power meter.
-- `get_wellness_data(include_all_fields=True)` labels custom wellness fields with name and units.
-
-## Usage with ChatGPT
-
-ChatGPT’s beta MCP connectors can also talk to this server over the SSE transport.
-
-1. Start the server in SSE mode so it exposes the `/sse` and `/messages/` endpoints:
-
-   ```bash
-   export FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8765 MCP_TRANSPORT=sse FASTMCP_LOG_LEVEL=INFO
-   python src/intervals_mcp_server/server.py
-   ```
-
-   The supported network variables are `FASTMCP_HOST`, `FASTMCP_PORT`, `FASTMCP_LOG_LEVEL`, `FASTMCP_MOUNT_PATH`, `FASTMCP_SSE_PATH` and `FASTMCP_STREAMABLE_HTTP_PATH`. They work the same way with `MCP_TRANSPORT=streamable-http` (endpoint `/mcp` by default). Use `FASTMCP_HOST=0.0.0.0` to listen on all interfaces, e.g. inside Docker — note that the server has no built-in authentication.
-
-   The startup log prints the full URLs (for example `http://127.0.0.1:8765/sse`). ChatGPT needs that public URL, so forward the port with a tool such as `ngrok http 8765` if you are not exposing the server directly.
-
-2. In ChatGPT, open **Settings → Features → Custom MCP Connectors** and click **Add**. Fill in:
-
-   - **Name**: `Intervals.icu`
-   - **MCP Server URL**: `https://<your-public-host>/sse`
-   - **Authentication**: leave as _No authentication_ unless you have protected your tunnel.
-
-   You can reuse the same `ngrok http 8765` tunnel URL here; just ensure it forwards to the host/port you exported above.
-
-3. Save the connector and open a new chat. ChatGPT will keep the SSE connection open and POST follow-up requests to the `/messages/` endpoint announced by the server. If you restart the MCP server or tunnel, rerun the SSE command and update the connector URL if it changes.
-
-## Development and testing
-
-Install development dependencies and run the test suite with:
+### ChatGPT and other remote clients (SSE / HTTP)
 
 ```bash
-uv sync --all-extras
-pytest -v tests
+MCP_TRANSPORT=sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8000 uv run futureweb-intervals-mcp
 ```
 
-### Running the server locally
+The server has no authentication of its own. Keep it bound to localhost and put an
+authenticating reverse proxy (basic auth, mTLS or an OAuth-aware proxy with TLS) in front of
+`/sse` and `/messages/` before you give ChatGPT (Settings → Connectors → custom MCP) or any
+other remote client the URL. Never expose the SSE/HTTP transport directly on a public
+interface. See [SECURITY.md](SECURITY.md).
 
-To start the server manually (useful when developing or testing), run:
+## Tools
+
+All tools accept `athlete_id` / `api_key` overrides and most accept `output_format="json"`.
+
+**Activities & streams**
+- `get_activities` – list with sport/gear filters, sorting, pagination, compact or JSON output
+- `get_activity_details` – summary, thresholds used (FTP, eFTP, LTHR, zones, power meter), running dynamics, every custom field with units
+- `get_activity_intervals` – intervals and groups, custom interval fields, per-interval statistics of any stream (`stream_types="custom"`)
+- `list_activity_streams` / `get_activity_streams` – discover and fetch any stream (summary, CSV, JSON; slicing, downsampling, paging)
+- `get_activity_messages`, `add_activity_message`\*, `update_activity`\* (RPE, feel, name, description)
+
+**Analysis**
+- `analyze_workout_execution` – planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina)
+- `analyze_climbs` – climbs, descents and pauses from the streams with power, NP, HR, VAM, grade and custom streams per segment
+- `compare_power_streams` – sample-aligned comparison of two power meters (offset, bands, stable windows, drift, lag, best efforts)
+- `get_training_summary` – totals per week/month/sport/gear with separate load sources, time in zones, feel/RPE, custom field aggregates
+- `get_weekly_summary`, `get_plan_compliance` – quick weekly review and planned-vs-done overview
+- `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves`
+
+**Wellness & recovery**
+- `get_wellness_data` – daily records; `include_all_fields=True` adds every custom wellness field with its name and units
+- `get_recovery_snapshot` – today and the previous days, baselines, recent activities and planned sessions in one call
+- `get_wellness_trends` – rolling means, baselines, outliers, week-over-week, correlations, eFTP per sport
+- `get_nutrition_summary` – intake, device burn, balance (logged days only), weight trend, training load per day
+- `update_wellness`\* – subjective scores and comments
+
+**Athlete, thresholds, gear**
+- `get_athlete_profile`, `get_sport_settings`, `get_training_zones`
+- `get_gear_list`, `get_gear_details`
+
+**Calendar & workouts**
+- `get_events`, `get_event_by_id` (with the full workout document), `add_or_update_event`\*, `add_or_update_note`\*, `add_events_bulk`\*\*\*, `delete_event`\*\*, `delete_events_by_date_range`\*\*
+- `validate_workout`, `preview_workout` – check a workout document before writing it
+- `get_workout_library`, `create_library_workout`\*, `add_event_from_library`\*, `delete_library_workout`\*\*
+
+**Custom items & server**
+- `get_custom_items`, `get_custom_item_by_id`, `create_custom_item`\*\*\*, `update_custom_item`\*\*\*, `delete_custom_item`\*\*
+- `get_server_status` – version, permissions, hidden tools, API check, custom item counts (also `--doctor` on the command line)
+
+\* write · \*\* destructive · \*\*\* admin
+
+**Prompts** (reusable workflows for MCP clients that support them): `recovery_check`,
+`workout_analysis`, `weekly_planning`.
+
+## Garmin Intervals Bridge
+
+Since Garmin started filtering the FIT files it sends to partners, Intervals.icu no longer
+receives Garmin's own metrics. The [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge)
+restores them into the custom fields and streams you define; this MCP then shows them
+everywhere. The bridge is optional and the MCP never contacts Garmin itself. Details and
+worked examples: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
+
+## Development
 
 ```bash
-mcp run src/intervals_mcp_server/server.py
+uv sync --all-extras --locked
+uv run --locked pytest -q          # tests use synthetic fixtures, no credentials needed
+uv run --locked ruff check .
+uv run --locked mypy src tests
+uv run --locked --with pylint pylint --disable=C0301 $(git ls-files '*.py')   # advisory
 ```
 
-#### Enabling debug logging
+CI runs ruff, mypy and pytest on Python 3.12 and 3.13; releases are built from tags
+([docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)). Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).
+Please never put real athlete data, API keys or hostnames into issues, fixtures or logs.
 
-To capture server logs for debugging, wrap the command in a shell and redirect stderr to a file.
+## Credits and license
 
-**macOS/Linux** — modify your `claude_desktop_config.json` like this:
-
-```json
-{
-  "mcpServers": {
-    "Intervals.icu": {
-      "command": "/bin/bash",
-      "args": [
-        "-c",
-        "/Users/<USERNAME>/.local/bin/uv run --with 'mcp[cli]' --with-editable /path/to/intervals-mcp-server mcp run /path/to/intervals-mcp-server/src/intervals_mcp_server/server.py 2>> /path/to/intervals-mcp-server/mcp-server.log"
-      ],
-      "env": {
-        "INTERVALS_API_BASE_URL": "https://intervals.icu/api/v1",
-        "ATHLETE_ID": "<YOUR_ATHLETE_ID>",
-        "API_KEY": "<YOUR_API_KEY>",
-        "LOG_LEVEL": "INFO"
-      }
-    }
-  }
-}
-```
-
-Then tail the log file to see output in real-time:
-
-```bash
-tail -f /path/to/intervals-mcp-server/mcp-server.log
-```
-
-**Windows** — modify your `claude_desktop_config.json` like this:
-
-```json
-{
-  "mcpServers": {
-    "Intervals.icu": {
-      "command": "powershell",
-      "args": [
-        "-Command",
-        "C:\\Users\\<USERNAME>\\.local\\bin\\uv.exe run --with 'mcp[cli]' --with-editable C:\\path\\to\\intervals-mcp-server mcp run C:\\path\\to\\intervals-mcp-server\\src\\intervals_mcp_server\\server.py 2>> C:\\path\\to\\intervals-mcp-server\\mcp-server.log"
-      ],
-      "env": {
-        "INTERVALS_API_BASE_URL": "https://intervals.icu/api/v1",
-        "ATHLETE_ID": "<YOUR_ATHLETE_ID>",
-        "API_KEY": "<YOUR_API_KEY>",
-        "LOG_LEVEL": "INFO"
-      }
-    }
-  }
-}
-```
-
-Then monitor the log file in real-time using PowerShell:
-
-```powershell
-Get-Content C:\path\to\intervals-mcp-server\mcp-server.log -Wait
-```
-
-## License
-
-The GNU General Public License v3.0
-
-## Featured
-
-### Glama.ai
-
-<a href="https://glama.ai/mcp/servers/@mvilanova/intervals-mcp-server">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@mvilanova/intervals-mcp-server/badge" alt="Intervals.icu Server MCP server" />
-</a>
+Original project by [Marc Vilanova](https://github.com/mvilanova) and contributors. This fork
+integrates community pull requests by arnold-maderthaner (#140, #142–#147), biochaos (#131)
+and kokostitiahah (#149); thank you. Licensed under the GNU General Public License v3.0, see
+[LICENSE](LICENSE). Intervals.icu and Garmin are trademarks of their respective owners and are
+used only to describe compatibility.

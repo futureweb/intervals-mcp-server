@@ -115,6 +115,32 @@ from intervals_mcp_server.tools.custom_items import (  # pylint: disable=wrong-i
     get_custom_items,
     update_custom_item,
 )
+from intervals_mcp_server.tools.athlete import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_athlete_profile,
+    get_sport_settings,
+    get_training_zones,
+)
+from intervals_mcp_server.tools.gear import get_gear_details  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.analysis import (  # pylint: disable=wrong-import-position  # noqa: E402
+    analyze_workout_execution,
+    compare_power_streams,
+)
+from intervals_mcp_server.tools.climbs import analyze_climbs  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.wellness_insights import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_nutrition_summary,
+    get_recovery_snapshot,
+    get_wellness_trends,
+)
+from intervals_mcp_server.tools.summary import get_training_summary  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.workout_check import (  # pylint: disable=wrong-import-position  # noqa: E402
+    preview_workout,
+    validate_workout,
+)
+from intervals_mcp_server.tools.status import (  # pylint: disable=wrong-import-position  # noqa: E402
+    format_status,
+    get_server_status,
+    server_status,
+)
 
 # Re-export make_intervals_request and httpx_client for backward compatibility
 # pylint: disable=duplicate-code  # This __all__ list is intentionally similar to tools/__init__.py
@@ -152,14 +178,51 @@ __all__ = [
     "create_custom_item",
     "update_custom_item",
     "delete_custom_item",
+    "get_athlete_profile",
+    "get_sport_settings",
+    "get_training_zones",
+    "get_gear_details",
+    "analyze_workout_execution",
+    "analyze_climbs",
+    "compare_power_streams",
+    "get_nutrition_summary",
+    "get_recovery_snapshot",
+    "get_wellness_trends",
+    "get_training_summary",
+    "preview_workout",
+    "validate_workout",
+    "get_server_status",
 ]
 
 
-# Run the server
-if __name__ == "__main__":
+def _cli() -> bool:
+    """Handle --version / --doctor; returns True when the process should exit."""
+    import asyncio  # pylint: disable=import-outside-toplevel
+    import sys  # pylint: disable=import-outside-toplevel
+
+    from intervals_mcp_server import __version__  # pylint: disable=import-outside-toplevel
+
+    if "--version" in sys.argv:
+        print(__version__)
+        return True
+    if "--doctor" in sys.argv:
+        print(format_status(asyncio.run(server_status())))
+        return True
+    return False
+
+
+def main() -> None:
+    """Console entry point: handle CLI flags, validate the configuration and start the server."""
+    if _cli():
+        raise SystemExit(0)
     # Validate ATHLETE_ID when server starts (not at import time to allow tests)
     validate_athlete_id(config.athlete_id)
 
     # Setup transport and start server
     selected_transport = setup_transport()
     start_server(mcp, selected_transport)
+
+
+# Run the server
+if __name__ == "__main__":
+    main()

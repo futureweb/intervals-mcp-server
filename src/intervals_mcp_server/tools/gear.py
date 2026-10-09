@@ -24,7 +24,7 @@ from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -149,7 +149,7 @@ async def resolve_gear_for_activities(
             )
 
 
-@mcp.tool()
+@tool("read")
 async def get_gear_list(
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -207,8 +207,8 @@ def _gear_stats_line(item: dict[str, Any]) -> str:
     return f"{dist}, {hours}, {item.get('activities', '?')} activities"
 
 
-@mcp.tool()
-async def get_gear_details(
+@tool("read")
+async def get_gear_details(  # pylint: disable=too-many-locals,too-many-branches
     gear_id: str,
     athlete_id: str | None = None,
     api_key: str | None = None,

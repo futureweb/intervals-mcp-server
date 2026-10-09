@@ -30,6 +30,8 @@ class Config:
     # Display units for custom item codes whose definition has none or unspecific ones,
     # e.g. {"Stamina": "%"}; configured via CUSTOM_UNITS_OVERRIDES="Stamina=%,RecoveryTime=h".
     custom_units_overrides: dict[str, str] = field(default_factory=dict)
+    # Enabled tool permission classes (MCP_PERMISSIONS="read,write"); default read-only.
+    permissions: frozenset[str] = frozenset({"read"})
 
 
 _config_instance: Config | None = None  # pylint: disable=invalid-name
@@ -60,7 +62,31 @@ def load_config() -> Config:
         intervals_api_base_url=intervals_api_base_url,
         user_agent=user_agent,
         custom_units_overrides=parse_units_overrides(os.getenv("CUSTOM_UNITS_OVERRIDES", "")),
+        permissions=parse_permissions(os.getenv("MCP_PERMISSIONS", "read")),
     )
+
+
+PERMISSION_CLASSES: tuple[str, ...] = ("read", "write", "destructive", "admin")
+
+
+def parse_permissions(raw: str) -> frozenset[str]:
+    """Parse MCP_PERMISSIONS ("read,write", "all", "" = read) into the enabled classes.
+
+    Raises:
+        ValueError: If an unknown class name is given.
+    """
+    names = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not names:
+        return frozenset({"read"})
+    if "all" in names:
+        return frozenset(PERMISSION_CLASSES)
+    unknown = sorted(names - set(PERMISSION_CLASSES))
+    if unknown:
+        raise ValueError(
+            f"MCP_PERMISSIONS contains unknown class(es) {', '.join(unknown)}; "
+            f"use a comma-separated subset of {', '.join(PERMISSION_CLASSES)} or 'all'"
+        )
+    return frozenset(names | {"read"})
 
 
 def parse_units_overrides(raw: str) -> dict[str, str]:

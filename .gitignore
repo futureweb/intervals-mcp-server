@@ -183,3 +183,8 @@ TODO
 .claude/
 .DS_Store
 CLAUDE.md
+
+# Local runtime configuration (never commit real credentials)
+.env
+.env.*
+!.env.example

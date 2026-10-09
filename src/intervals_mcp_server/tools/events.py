@@ -24,7 +24,7 @@ from intervals_mcp_server.utils.validation import (
 )
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -144,7 +144,7 @@ def _event_json(event: dict[str, Any], include_workout_doc: bool = False) -> dic
     return row
 
 
-@mcp.tool()
+@tool("read")
 async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -218,7 +218,7 @@ async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-
     return events_summary
 
 
-@mcp.tool()
+@tool("read")
 async def get_event_by_id(
     event_id: str,
     athlete_id: str | None = None,
@@ -268,7 +268,7 @@ async def get_event_by_id(
     return format_event_details(result)
 
 
-@mcp.tool()
+@tool("destructive")
 async def delete_event(
     event_id: str,
     athlete_id: str | None = None,
@@ -317,7 +317,7 @@ async def _fetch_events_for_deletion(
     return events, None
 
 
-@mcp.tool()
+@tool("destructive")
 async def delete_events_by_date_range(
     start_date: str,
     end_date: str,
@@ -347,7 +347,7 @@ async def delete_events_by_date_range(
     return f"Deleted {deleted_count} events. Failed to delete {len(failed_events)} events: {failed_events}"
 
 
-@mcp.tool()
+@tool("write")
 async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     workout_type: str,
     name: str,
@@ -446,7 +446,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
         return f"Error: {e}"
 
 
-@mcp.tool()
+@tool("write")
 async def add_or_update_note(
     name: str,
     description: str,
@@ -611,7 +611,7 @@ def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=to
     return body
 
 
-@mcp.tool()
+@tool("admin")
 async def add_events_bulk(
     events: list[dict[str, Any]],
     athlete_id: str | None = None,

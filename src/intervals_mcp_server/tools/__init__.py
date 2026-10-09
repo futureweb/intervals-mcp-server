@@ -38,7 +38,25 @@ from intervals_mcp_server.tools.hr_pace_curves import (  # noqa: F401
     get_hr_curves,
     get_pace_curves,
 )
-from intervals_mcp_server.tools.gear import get_gear_list  # noqa: F401
+from intervals_mcp_server.tools.gear import get_gear_details, get_gear_list  # noqa: F401
+from intervals_mcp_server.tools.athlete import (  # noqa: F401
+    get_athlete_profile,
+    get_sport_settings,
+    get_training_zones,
+)
+from intervals_mcp_server.tools.analysis import (  # noqa: F401
+    analyze_workout_execution,
+    compare_power_streams,
+)
+from intervals_mcp_server.tools.climbs import analyze_climbs  # noqa: F401
+from intervals_mcp_server.tools.wellness_insights import (  # noqa: F401
+    get_nutrition_summary,
+    get_recovery_snapshot,
+    get_wellness_trends,
+)
+from intervals_mcp_server.tools.summary import get_training_summary  # noqa: F401
+from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: F401
+from intervals_mcp_server.tools.status import get_server_status  # noqa: F401
 from intervals_mcp_server.tools.training_review import (  # noqa: F401
     get_plan_compliance,
     get_weekly_summary,
@@ -91,6 +109,20 @@ __all__ = [
     "get_hr_curves",
     "get_pace_curves",
     "get_gear_list",
+    "get_gear_details",
+    "get_athlete_profile",
+    "get_sport_settings",
+    "get_training_zones",
+    "analyze_workout_execution",
+    "analyze_climbs",
+    "compare_power_streams",
+    "get_nutrition_summary",
+    "get_recovery_snapshot",
+    "get_wellness_trends",
+    "get_training_summary",
+    "preview_workout",
+    "validate_workout",
+    "get_server_status",
     "get_wellness_data",
     "get_weekly_summary",
     "get_plan_compliance",

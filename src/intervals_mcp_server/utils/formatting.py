@@ -4,6 +4,8 @@ Formatting utilities for Intervals.icu MCP Server
 This module contains formatting functions for handling data from the Intervals.icu API.
 """
 
+# pylint: disable=too-many-lines
+
 import json
 from datetime import datetime
 from typing import Any
@@ -197,7 +199,7 @@ def _format_activity_other_fields(activity: _KeyTracker) -> list[str]:
     return lines
 
 
-def _format_thresholds(activity: dict[str, Any]) -> str:
+def _format_thresholds(activity: dict[str, Any]) -> str:  # pylint: disable=too-many-branches
     """Thresholds, zones and power source stored with the activity (historical snapshot)."""
     lines: list[str] = []
     ftp = activity.get("icu_ftp")

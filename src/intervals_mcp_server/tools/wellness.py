@@ -16,12 +16,12 @@ from intervals_mcp_server.utils.validation import (
 )
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
 
-@mcp.tool()
+@tool("read")
 async def get_wellness_data(
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -103,7 +103,7 @@ _SUBJECTIVE_SCALE_MIN = 1
 _SUBJECTIVE_SCALE_MAX = 4
 
 
-@mcp.tool()
+@tool("write")
 async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     date: str,
     soreness: int | None = None,

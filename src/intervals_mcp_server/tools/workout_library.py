@@ -18,7 +18,7 @@ from intervals_mcp_server.utils.validation import (
 )
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import mcp  # noqa: F401
+from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
@@ -97,7 +97,7 @@ async def _fetch_folders(
     return folders, None
 
 
-@mcp.tool()
+@tool("read")
 async def get_workout_library(
     folder: str | None = None,
     athlete_id: str | None = None,
@@ -184,7 +184,7 @@ async def _resolve_folder_id(
     )
 
 
-@mcp.tool()
+@tool("write")
 async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     name: str,
     sport_type: str,
@@ -247,7 +247,7 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     return f"No library workout created for athlete {athlete_id_to_use}."
 
 
-@mcp.tool()
+@tool("write")
 async def add_event_from_library(
     workout_id: str,
     date: str,
@@ -308,7 +308,7 @@ async def add_event_from_library(
     return f"No event created for athlete {athlete_id_to_use}."
 
 
-@mcp.tool()
+@tool("destructive")
 async def delete_library_workout(
     workout_id: str,
     athlete_id: str | None = None,
