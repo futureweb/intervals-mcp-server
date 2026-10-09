@@ -122,7 +122,7 @@ def make_app(env: dict[str, str], web: FakeWeb | None = None, intervals: FakeInt
 
     install_login_routes(mcp, provider)
     app = build_http_app(mcp, transport, provider=provider)
-    return mcp, provider, TestClient(app, follow_redirects=False)
+    return mcp, provider, TestClient(app, base_url="http://127.0.0.1:8000", follow_redirects=False)
 
 
 def pkce_pair() -> tuple[str, str]:
@@ -570,7 +570,7 @@ def test_combined_app_serves_mcp_with_bearer(tmp_path):
         "method": "initialize",
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}},
     }
-    with TestClient(client.app, follow_redirects=False) as http:
+    with TestClient(client.app, base_url="http://127.0.0.1:8000", follow_redirects=False) as http:
         response = http.post("/mcp", headers=headers, json=init)
         assert response.status_code == 200, response.text
         assert "serverInfo" in response.text
@@ -598,3 +598,30 @@ def test_public_client_can_revoke_without_client_secret(tmp_path):
     refused = client.post("/revoke", data={"token": other.refresh_token, "client_id": confidential["client_id"]})
     assert refused.status_code == 401
     assert asyncio.run(provider.load_access_token(other.access_token)) is not None
+
+
+def test_transport_security_allows_the_public_host(tmp_path):
+    """Behind a reverse proxy that keeps the Host header, the public host must be accepted."""
+    from intervals_mcp_server.mcp_instance import transport_security_from_env  # pylint: disable=import-outside-toplevel
+
+    assert transport_security_from_env({}) is None
+    security = transport_security_from_env({"MCP_PUBLIC_URL": "https://mcp.example.com", "FASTMCP_ALLOWED_HOSTS": "legacy.example.com"})
+    assert security is not None and security.enable_dns_rebinding_protection
+    assert "mcp.example.com" in security.allowed_hosts and "legacy.example.com" in security.allowed_hosts
+    assert "127.0.0.1:*" in security.allowed_hosts and "https://mcp.example.com" in security.allowed_origins
+    off = transport_security_from_env({"FASTMCP_ALLOWED_HOSTS": "*"})
+    assert off is not None and not off.enable_dns_rebinding_protection
+
+    config = oauth_config_from_env(make_env(tmp_path))
+    provider = SingleUserOAuthProvider(config, fetch=FakeWeb(), intervals_exchange=FakeIntervals())
+    mcp = IntervalsFastMCP(
+        "hosts", auth_server_provider=provider, auth=auth_settings(config),
+        transport_security=transport_security_from_env({"MCP_PUBLIC_URL": "https://mcp.example.com"}),
+    )
+    install_login_routes(mcp, provider)
+    app = build_http_app(mcp, "http+sse", provider=provider)
+    with TestClient(app, base_url="https://mcp.example.com", follow_redirects=False) as public:
+        assert public.post("/mcp", json={}).status_code == 401  # host accepted, token missing
+        tokens = provider._issue_tokens("c", ["mcp"], "g", None)  # pylint: disable=protected-access
+        headers = {"Authorization": f"Bearer {tokens.access_token}", "Accept": "application/json, text/event-stream"}
+        assert public.post("/mcp", json={}, headers=headers | {"Host": "evil.example.com"}).status_code == 421

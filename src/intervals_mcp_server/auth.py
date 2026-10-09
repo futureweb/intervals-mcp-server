@@ -1019,6 +1019,11 @@ def oauth_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
 
 def auth_settings(config: OAuthConfig) -> AuthSettings:
     """The MCP SDK auth settings for *config* (issuer, resource, registration, scopes)."""
+    extra: dict[str, Any] = {}
+    if "validate_token_resource" in AuthSettings.model_fields:
+        # The provider checks the audience itself (same origin as MCP_PUBLIC_URL, so /mcp and
+        # /sse tokens and clients that send no resource indicator keep working).
+        extra["validate_token_resource"] = False
     return AuthSettings(
         issuer_url=AnyHttpUrl(config.public_url),
         resource_server_url=AnyHttpUrl(config.public_url),
@@ -1029,6 +1034,7 @@ def auth_settings(config: OAuthConfig) -> AuthSettings:
         ),
         revocation_options=RevocationOptions(enabled=True),
         required_scopes=[SCOPE],
+        **extra,
     )
 
 
