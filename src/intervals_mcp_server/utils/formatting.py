@@ -696,6 +696,12 @@ def _format_workout_doc(doc: dict[str, Any]) -> str:
             lines.append("Planned Time in Zones: " + ", ".join(parts))
     return "\n".join(lines)
 
+    # Only shown when the event carries the flag; it is null on most events.
+    if event.get("indoor") is not None:
+        summary += f"\nIndoor: {event['indoor']}"
+
+    return summary
+
 
 def format_event_details(event: dict[str, Any]) -> str:
     """Format detailed event information into a readable string."""
@@ -718,6 +724,11 @@ Description: {event.get("description", "No description")}"""
         event_details += f"\nUpdated: {event['updated']}"
     if isinstance(event.get("workout_doc"), dict):
         event_details += _format_workout_doc(event["workout_doc"])
+
+    # Only shown when the event carries the flag; it is null on most events.
+    if event.get("indoor") is not None:
+        event_details += f"""
+Indoor: {event["indoor"]}"""
 
     # Check if it's a workout-based event
     if "workout" in event and event["workout"]:
