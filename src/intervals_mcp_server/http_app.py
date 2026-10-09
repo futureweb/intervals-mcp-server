@@ -71,6 +71,47 @@ class IssuerParameterMiddleware:  # pylint: disable=too-few-public-methods
         await self.app(scope, receive, send_with_iss)
 
 
+class PublicClientRevocationMiddleware:  # pylint: disable=too-few-public-methods
+    """Let public clients use ``/revoke`` without sending ``client_secret``.
+
+    The MCP SDK's revocation request model declares ``client_secret: str | None`` without a
+    default, which makes the field mandatory, so a public client (``token_endpoint_auth_method
+    none``, e.g. ChatGPT) gets ``400 invalid_request``. An absent field is added as an empty
+    value; the SDK then authenticates exactly as before (a client with a secret still needs it).
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        body = b""
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            body += message.get("body", b"")
+            more = message.get("more_body", False)
+            if len(body) > 64 * 1024:
+                break
+        fields = parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)
+        if "client_secret" not in {name for name, _ in fields}:
+            body = urlencode(fields + [("client_secret", "")]).encode("utf-8")
+        sent = False
+
+        async def replay() -> Message:
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
 def add_issuer(location: str, issuer: str) -> str:
     """Append ``iss`` to an authorization response URL that has ``code`` or ``error``."""
     parts = urlsplit(location)
@@ -139,6 +180,7 @@ def _apply_oauth(app: Starlette, provider: SingleUserOAuthProvider, settings: Au
     }
     _replace_route(routes, PRM_PATH, _json_route(PRM_PATH, resource))
     _wrap_route(routes, "/authorize", lambda inner: IssuerParameterMiddleware(inner, config.metadata_issuer))
+    _wrap_route(routes, "/revoke", PublicClientRevocationMiddleware)
     if config.private_key_jwt and provider.metadata_clients.enabled:
         audiences = {
             config.issuer,

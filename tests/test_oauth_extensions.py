@@ -579,3 +579,22 @@ def test_combined_app_serves_mcp_with_bearer(tmp_path):
 def test_build_http_app_rejects_unknown_transport(tmp_path):
     with pytest.raises(ValueError, match="transport"):
         make_app(make_env(tmp_path), transport="websocket")
+
+
+def test_public_client_can_revoke_without_client_secret(tmp_path):
+    """The SDK requires client_secret on /revoke; public clients must not need it."""
+    _, provider, client = make_app(make_env(tmp_path))
+    client_id = register(client)
+    tokens = provider._issue_tokens(client_id, ["mcp"], "grant", ISSUER + "/")  # pylint: disable=protected-access
+    assert asyncio.run(provider.load_access_token(tokens.access_token)) is not None
+    response = client.post("/revoke", data={"token": tokens.refresh_token, "client_id": client_id})
+    assert response.status_code == 200, response.text
+    assert asyncio.run(provider.load_access_token(tokens.access_token)) is None
+    confidential = client.post(
+        "/register",
+        json={"redirect_uris": [DCR_REDIRECT], "token_endpoint_auth_method": "client_secret_post"},
+    ).json()
+    other = provider._issue_tokens(confidential["client_id"], ["mcp"], "g2", None)  # pylint: disable=protected-access
+    refused = client.post("/revoke", data={"token": other.refresh_token, "client_id": confidential["client_id"]})
+    assert refused.status_code == 401
+    assert asyncio.run(provider.load_access_token(other.access_token)) is not None
