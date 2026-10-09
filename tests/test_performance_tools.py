@@ -576,3 +576,26 @@ def test_get_fatigue_resistance_json_validation_and_errors(monkeypatch):
     assert asyncio.run(get_fatigue_resistance()) == "Error fetching athlete power curves: boom"
     _install_router(monkeypatch, overrides={"/sport-settings": ERROR})
     assert "Error fetching sport settings: boom; kJ thresholds unknown." in asyncio.run(get_fatigue_resistance())
+
+
+def test_find_similar_intervals_sends_whole_numbers(monkeypatch):
+    """Float bounds (MCP clients send 90 as 90.0) become integers; fractions widen the range."""
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    result = asyncio.run(find_similar_intervals(480.0, 720.0, 90.0, 105.4))  # type: ignore[arg-type]
+    params = calls[0][1]
+    assert params["minIntensity"] == 90 and params["maxIntensity"] == 106
+    assert all(isinstance(params[k], int) for k in ("minSecs", "maxSecs", "minIntensity", "maxIntensity", "limit"))
+    assert "480-720 s at 90-106% of FTP" in result
+
+
+def test_find_similar_intervals_through_mcp_layer(monkeypatch):
+    """Calling the registered tool via FastMCP (argument validation included) sends integer intensities."""
+    from intervals_mcp_server.mcp_instance import mcp  # pylint: disable=import-outside-toplevel
+
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    asyncio.run(mcp.call_tool("find_similar_intervals", {"min_secs": 480, "max_secs": 720, "min_intensity": 90, "max_intensity": 105}))
+    params = calls[0][1]
+    assert params["minIntensity"] == 90 and isinstance(params["minIntensity"], int)
+    assert params["maxIntensity"] == 105 and isinstance(params["maxIntensity"], int)

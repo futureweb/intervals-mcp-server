@@ -12,6 +12,7 @@ number of API calls made so the caller can keep an eye on the rate limit.
 # pylint: disable=too-many-lines
 
 import json
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -620,9 +621,12 @@ def _interval_search_params(  # pylint: disable=too-many-arguments
         return "Error: min_secs must be greater than 0 and not greater than max_secs."
     if not 0 <= min_intensity <= max_intensity <= MAX_INTENSITY:
         return f"Error: intensities must satisfy 0 <= min_intensity <= max_intensity <= {MAX_INTENSITY} (% of FTP)."
+    # The endpoint only accepts whole numbers ("90.0" is rejected with 422), and MCP clients
+    # send 90 as 90.0 for a float parameter. Widen fractional bounds to whole percent.
     params: dict[str, Any] = {
-        "minSecs": min_secs, "maxSecs": max_secs, "minIntensity": min_intensity, "maxIntensity": max_intensity,
-        "limit": limit,
+        "minSecs": int(min_secs), "maxSecs": int(max_secs),
+        "minIntensity": math.floor(min_intensity), "maxIntensity": math.ceil(max_intensity),
+        "limit": int(limit),
     }
     if target:
         target_value = target.strip().upper()
@@ -699,8 +703,8 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     Args:
         min_secs: Minimum interval length in seconds
         max_secs: Maximum interval length in seconds
-        min_intensity: Minimum intensity in % of FTP (0-300)
-        max_intensity: Maximum intensity in % of FTP (0-300)
+        min_intensity: Minimum intensity in % of FTP (0-300, whole percent; decimals are rounded down)
+        max_intensity: Maximum intensity in % of FTP (0-300, whole percent; decimals are rounded up)
         target: Workout target type POWER, HR or PACE (optional)
         min_reps: Minimum number of matching repetitions in the activity (optional)
         max_reps: Maximum number of matching repetitions in the activity (optional)
@@ -739,7 +743,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key) if selected else {}
 
     criteria = (
-        f"{min_secs}-{max_secs} s at {min_intensity:g}-{max_intensity:g}% of FTP"
+        f"{params['minSecs']}-{params['maxSecs']} s at {params['minIntensity']}-{params['maxIntensity']}% of FTP"
         + (f", target {params['type']}" if "type" in params else "")
         + (f", reps {min_reps if min_reps is not None else 'any'}-{max_reps if max_reps is not None else 'any'}"
            if min_reps is not None or max_reps is not None else "")
