@@ -13,14 +13,16 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_FIELD,
     ACTIVITY_STREAM,
+    assigned_codes,
     custom_fields_json,
     format_custom_field_lines,
 )
-from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps
+from intervals_mcp_server.utils.execution import DETAIL_LEVELS, Tolerances, analyze, format_execution, plan_steps
 from intervals_mcp_server.utils.power_compare import (
     compare_power_streams as compute_power_comparison,
     comparison_to_json,
@@ -156,6 +158,31 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
 
 
 # ------------------------------------------------------------- workout execution
+def tolerances_from_args(
+    duration_tolerance_pct: float | None,
+    start_tolerance_s: float | None,
+    pause_tolerance_s: float | None,
+    detail_level: str = "standard",
+) -> Tolerances | str:
+    """Tolerances of the execution analysis from optional tool arguments, or an error string.
+
+    Also validates the detail level shared by the execution and report tools.
+    """
+    if detail_level not in DETAIL_LEVELS:
+        return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."
+    defaults = Tolerances()
+    values = {
+        "duration_pct": defaults.duration_pct if duration_tolerance_pct is None else float(duration_tolerance_pct),
+        "start_shift_s": defaults.start_shift_s if start_tolerance_s is None else float(start_tolerance_s),
+        "pause_s": defaults.pause_s if pause_tolerance_s is None else float(pause_tolerance_s),
+    }
+    if not 0 <= values["duration_pct"] <= 100:
+        return "Error: duration_tolerance_pct must be between 0 and 100."
+    if values["start_shift_s"] < 0 or values["pause_s"] < 0:
+        return "Error: start_tolerance_s and pause_tolerance_s must not be negative."
+    return Tolerances(duration_pct=values["duration_pct"], start_shift_s=values["start_shift_s"], pause_s=values["pause_s"])
+
+
 def _threshold_context(activity: dict[str, Any]) -> dict[str, Any]:
     return {
         "ftp": activity.get("icu_ftp"),
@@ -242,23 +269,36 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     planned_workout_doc: dict[str, Any] | None = None,
     suggest_matches: bool = True,
     output_format: str = "text",
+    detail_level: str = "standard",
+    duration_tolerance_pct: float | None = None,
+    start_tolerance_s: float | None = None,
+    pause_tolerance_s: float | None = None,
 ) -> str:
     """Compare a planned workout with how it was actually executed (or analyse the intervals alone)
 
     Uses, in this order, the given planned_workout_doc, the given event_id, or the event
     paired with the activity, together with the intervals Intervals.icu detected. Planned
     steps (repeats expanded) are aligned with the actual intervals by order, duration and
-    target; for each step it reports planned vs actual duration, the target range (resolved
-    to W, bpm or pace from the thresholds stored with the activity), the actual average,
-    below/in/above target and the time within the target range (±5%), HR start/end and the
-    HR drop in the first minute of the following interval, cadence, power/speed fade,
-    Pw:HR drift for steady efforts of 10 min or more, and the change of every custom stream
-    (e.g. stamina) during the step. Training done after the last planned step (a longer
-    ride home, an extra effort) is reported as additional training with its own metrics
-    and is not counted against the plan. Without a plan the same metrics are reported per
-    detected interval; for an unpaired activity up to three planned workouts of the same
-    days are suggested as possible matches (read-only, nothing is paired or changed). The
-    content of a deleted event is never reconstructed; pass planned_workout_doc instead.
+    target intensity (never by interval names); a step may also match two or three
+    consecutive intervals of the same intensity (an effort split by a lap or a stop).
+    Planned steps are capped at their planned duration: when an interval is longer than
+    its step (beyond the tolerance), it is split logically (analysis only, nothing on
+    Intervals.icu changes); the planned part is evaluated against the plan from the samples
+    and the remainder is reported separately. For each step: planned vs actual (moving)
+    duration, the target range (resolved to W, bpm or pace), the actual average, below/in/
+    above target with the offset from the exact range, time within the target range (±5%),
+    HR start/end, the HR drop in the first minute after work steps, cadence, power/speed
+    fade, Pw:HR drift for work steps of 10 min or more, the change of every custom stream
+    (e.g. stamina; clock counters and other-sport streams are left out) and notes on clear
+    deviations (short, too long, off target, paused, shifted). The Intervals.icu interval
+    type is kept and shown next to the planned step type when they differ. Everything after
+    the end of the last planned step (e.g. a cool-down continued for the ride home, extra
+    sprints) is reported as additional training with its own metrics, kJ share, estimated
+    load and the extra efforts it contains, and is not counted against the plan; riding
+    before the first step is reported the same way. Without a plan the same metrics are
+    reported per detected interval; for an unpaired activity up to three planned workouts
+    of the same days are suggested (read-only, nothing is paired or changed). The content
+    of a deleted event is never reconstructed; pass planned_workout_doc instead.
 
     Args:
         activity_id: The Intervals.icu activity ID
@@ -270,7 +310,18 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
         suggest_matches: For unpaired activities without a plan, list candidate events of the
             same days as a read-only suggestion (optional, default True)
         output_format: "text" (default) or "json"
+        detail_level: "compact" (one line per step plus the summary), "standard" (default) or
+            "full" (also counter and other-sport custom streams)
+        duration_tolerance_pct: How much longer/shorter (in % of the step, at least 30 s) a step
+            may be before it is split or flagged as short (optional, default 10)
+        start_tolerance_s: Steps starting more than this many seconds away from the plan
+            timeline are flagged (optional, default 120)
+        pause_tolerance_s: Recording pauses inside a step up to this many seconds are not
+            flagged (optional, default 60); durations are always compared on moving time
     """
+    tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
+    if isinstance(tolerances, str):
+        return tolerances
     activity, error = await _get_activity(activity_id, api_key)
     if error or activity is None:
         return error or "Error"
@@ -301,10 +352,13 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     if not planned and not paired and suggest_matches and athlete_id:
         candidates = await _match_candidates(athlete_id, activity, api_key)
 
-    result = analyze(planned, intervals, streams)
+    context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
+               "include_all_streams": detail_level == "full"}
+    result = analyze(planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
-    device_lines = format_custom_field_lines(activity, field_defs, prefix="")
+    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    device_lines = format_custom_field_lines(activity, field_defs, prefix="", only=assigned)
     header = f"Workout execution for {_activity_header(activity)}"
     if planned:
         header += f"\nPlan source: {plan_source}"
@@ -329,8 +383,8 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
         extras.append(f"load {activity['icu_training_load']} (Intervals.icu)")
     if extras:
         header += "\n" + ", ".join(extras)
-    if device_lines:
-        header += "\nDevice/custom fields: " + "; ".join(device_lines)
+    if device_lines and detail_level != "compact":
+        header += "\nDevice/custom fields" + (" (assigned to the sport)" if assigned is not None else "") + ": " + "; ".join(device_lines)
 
     if output_format.strip().lower() == "json":
         payload = {
@@ -344,10 +398,12 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
             "plan_source": plan_source or None,
             "match_candidates": candidates,
             "thresholds": _threshold_context(activity),
-            "custom_fields": [row for row in custom_fields_json(activity, field_defs) if row["status"] in ("value", "zero")],
+            "custom_fields": [row for row in custom_fields_json(activity, field_defs, assigned) if row["status"] in ("value", "zero")],
             "summary": result["summary"],
             "rows": result["rows"],
             "extension": result.get("extension"),
+            "pre_plan": result.get("pre_plan"),
+            "hidden_streams": result.get("hidden_streams"),
         }
         return json.dumps(payload, ensure_ascii=False)
-    return format_execution(result, header, pace_based)
+    return format_execution(result, header, pace_based, detail_level)

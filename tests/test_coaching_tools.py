@@ -285,7 +285,9 @@ def test_analyze_workout_execution_with_plan(monkeypatch):
     assert "Workout execution for Threshold Ride (i1, Ride" in result
     assert "Plan source: event 5 ('2x5 min Threshold', 2026-10-06)" in result
     assert "Intervals.icu compliance 101%, RPE 7/10, feel 3/5, load 41 (Intervals.icu)" in result
-    assert "Device/custom fields: Aerobic Effect [AerobicEffect]: 3.1; EPOC [EPOC]: 80.5 ml/kg" in result
+    # Only the custom fields assigned to the sport (sport settings activity_field_ids) are listed.
+    assert "Device/custom fields (assigned to the sport): EPOC [EPOC]: 80.5 ml/kg" in result
+    assert "AerobicEffect" not in result
     assert "Plan: 6 steps, 29:00 planned | Actual: 6 intervals, 29:00 in total | matched 6" in result
     assert "extended beyond the plan" not in result
     assert "work steps in target: 2/2" in result

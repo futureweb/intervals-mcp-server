@@ -82,7 +82,7 @@ def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: 
         f"Load {_n(activity.get('icu_training_load'))} (Intervals.icu; power {_n(activity.get('power_load'))} / HR {_n(activity.get('hr_load'))} / pace {_n(activity.get('pace_load'))}) | "
         f"IF {_n(activity.get('icu_intensity'))}% | NP {_n(activity.get('icu_weighted_avg_watts'))} W | avg {_n(activity.get('icu_average_watts'))} W | "
         f"HR avg {_n(activity.get('average_heartrate'))} max {_n(activity.get('max_heartrate'))} | cadence {_n(activity.get('average_cadence'))}",
-        f"Feel {activity.get('feel', 'n/a')}/5 | RPE {activity.get('icu_rpe', 'n/a')}/10 | compliance {activity.get('compliance', 'n/a')} | "
+        f"Feel {activity.get('feel', 'n/a')}/5 | RPE {activity.get('icu_rpe', 'n/a')}/10 | compliance {_n(activity.get('compliance'))}% | "
         f"FTP used {activity.get('icu_ftp', 'n/a')} W, eFTP {activity.get('icu_rolling_ftp', 'n/a')} W, LTHR {activity.get('lthr', 'n/a')} | "
         f"device {activity.get('device_name') or 'unknown'}, power meter {activity.get('power_meter') or 'unknown'}"
         + (f", power fields {', '.join(str(p) for p in activity['power_field_names'])}" if activity.get("power_field_names") else ""),
