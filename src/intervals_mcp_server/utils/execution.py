@@ -539,7 +539,7 @@ def align(planned: list[dict[str, Any]], intervals: list[dict[str, Any]]) -> lis
     return pairs
 
 
-def planned_step_map(
+def planned_step_map(  # pylint: disable=too-many-locals
     planned: list[dict[str, Any]], intervals: list[dict[str, Any]], tolerances: Tolerances | None = None
 ) -> dict[int, dict[str, Any]]:
     """Planned step matched to each interval index, with the time beyond the planned duration.
@@ -1091,7 +1091,7 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
     }
 
 
-def analyze(  # pylint: disable=too-many-locals
+def analyze(  # pylint: disable=too-many-locals,too-many-statements
     planned: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
     streams: list[dict[str, Any]],

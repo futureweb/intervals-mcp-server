@@ -4,6 +4,7 @@ Sport-related formatting helpers: pace, durations, zones and start times.
 Kept free of API access so they can be used by formatters and tests alike.
 """
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -142,14 +143,14 @@ def is_foot_sport(activity_type: Any) -> bool:
 
 def cadence_spm(value: Any, activity_type: Any) -> float | None:
     """Steps per minute (2 x the stored value) for foot sports; None otherwise or when missing."""
-    if not is_foot_sport(activity_type) or isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    if not is_foot_sport(activity_type) or isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
         return None
     return float(value) * 2
 
 
 def cadence_text(value: Any, activity_type: Any, digits: int = 0) -> str:
     """'88 rpm' (bike), '147 spm (74 rpm as stored)' (foot sports, steps = 2 x stored) or 'n/a'."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
         return "n/a"
     spm = cadence_spm(value, activity_type)
     if spm is not None:
@@ -159,7 +160,7 @@ def cadence_text(value: Any, activity_type: Any, digits: int = 0) -> str:
 
 def temperature_text(value: Any, digits: int = 1) -> str:
     """'16.5 °C' or 'n/a' (a missing temperature never becomes 0)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
         return "n/a"
     rounded = round(float(value), digits)
     return f"{int(rounded) if rounded.is_integer() else rounded} °C"

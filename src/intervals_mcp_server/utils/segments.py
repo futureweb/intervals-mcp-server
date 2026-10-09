@@ -666,7 +666,7 @@ def _quality_flags(  # pylint: disable=too-many-arguments,too-many-positional-ar
     return flags
 
 
-def _grade_confidence(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _grade_confidence(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     thresholds: _Thresholds, segment: dict[str, Any], pauses: list[dict[str, Any]],
     slow: list[dict[str, Any]], start: int, end: int,
 ) -> dict[str, Any]:

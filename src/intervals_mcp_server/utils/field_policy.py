@@ -332,7 +332,7 @@ def _num_text(value: Any) -> str:
     return str(int(rounded)) if rounded.is_integer() else str(rounded)
 
 
-def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) -> str:
+def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) -> str:  # pylint: disable=too-many-branches
     """One compact text item for an aggregate (units appended, policy-specific wording)."""
     units = f" {agg['units']}" if agg.get("units") else ""
     head = f"{agg.get('name') or code} [{code}]"

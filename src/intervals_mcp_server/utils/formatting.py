@@ -986,7 +986,7 @@ def _format_interval_extras(  # pylint: disable=too-many-arguments,too-many-posi
     return "\n".join(lines) + "\n\n"
 
 
-def format_intervals(
+def format_intervals(  # pylint: disable=too-many-locals
     intervals_data: dict[str, Any],
     interval_field_defs: CustomFieldDefs | None = None,
     streams: list[dict[str, Any]] | None = None,

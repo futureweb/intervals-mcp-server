@@ -182,11 +182,7 @@ def test_apply_units_overrides_marks_source():
 
 def test_temperature_fields_without_units_get_the_shared_unit():
     """Phase 5 (E): 'Max. Temperature' without units follows the °C of the other temperature fields."""
-    from intervals_mcp_server.utils.custom_fields import (  # pylint: disable=import-outside-toplevel
-        format_field_value,
-        index_custom_items,
-        infer_temperature_units,
-    )
+    from intervals_mcp_server.utils.custom_fields import infer_temperature_units  # pylint: disable=import-outside-toplevel
 
     def item(item_id, name, code, units):
         return {"id": item_id, "type": "ACTIVITY_FIELD", "name": name, "content": {"code": code, "type": "numeric", "units": units}}
