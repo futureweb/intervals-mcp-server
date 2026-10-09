@@ -292,6 +292,8 @@ def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) 
         text = f"{head} sum {_num_text(agg['sum'])}{units} (n {agg['n']}, {_num_text(agg['per_session_mean'])}{units}/session)"
     elif kind == "device_load_sum":
         text = f"{head} device load sum {_num_text(agg['sum'])}{units} (n {agg['n']}, device scale)"
+    elif agg["n"] == 1:
+        text = f"{head} {_num_text(agg['mean'])}{units} (n 1)"
     elif kind == "trend":
         change = f", change {agg['change']:+g}{units} since {agg['first_date']}" if agg.get("change") is not None else ""
         text = (
@@ -301,8 +303,8 @@ def format_aggregate(code: str, agg: dict[str, Any], show_reason: bool = False) 
     else:
         primary = agg.get("primary") or "mean"
         lead = f"{primary} {_num_text(agg[primary])}{units}"
-        rest = [f"{k} {_num_text(agg[k])}" for k in ("mean", "median", "min", "max") if k != primary]
-        text = f"{head} {lead} ({', '.join(rest)}{units}; n {agg['n']})"
+        rest = [f"{k} {_num_text(agg[k])}" for k in ("mean", "median") if k != primary]
+        text = f"{head} {lead} ({', '.join(rest)}, range {_num_text(agg['min'])}-{_num_text(agg['max'])}{units}; n {agg['n']})"
     extras = []
     if agg.get("zeros_excluded"):
         extras.append(f"{agg['zeros_excluded']} stored 0 left out as 'no value'")

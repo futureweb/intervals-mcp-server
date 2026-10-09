@@ -228,7 +228,8 @@ def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-ar
             notes.append(f"{stream_type}: {note}")
     hidden = (execution or {}).get("hidden_streams") or {}
     if hidden:
-        notes.append("not evaluated per step: " + ", ".join(f"{code} ({why})" for code, why in sorted(hidden.items())))
+        notes.append("custom streams left out of the per-step / per-interval statistics: "
+                     + ", ".join(f"{code} ({why})" for code, why in sorted(hidden.items())))
     return notes
 
 

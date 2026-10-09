@@ -863,12 +863,15 @@ def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
 
 
 def _efforts(spans: list[_Span], ftp: float | None) -> list[dict[str, Any]]:
-    """Intervals worth listing separately: WORK intervals and anything at >= 90 % FTP."""
+    """Intervals worth listing separately: at >= 90 % FTP when power and FTP are known, else WORK intervals."""
     listed = []
     for span in spans:
         iv = span.interval
         watts = _num(iv.get("average_watts"))
-        hard = str(iv.get("type")) == "WORK" or (ftp and watts is not None and watts >= EXTRA_EFFORT_MIN_FTP * ftp)
+        if ftp and watts is not None:
+            hard = watts >= EXTRA_EFFORT_MIN_FTP * ftp
+        else:
+            hard = str(iv.get("type")) == "WORK"
         if not hard:
             continue
         listed.append({

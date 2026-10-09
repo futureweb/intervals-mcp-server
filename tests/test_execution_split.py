@@ -223,3 +223,15 @@ def test_analyze_workout_execution_tool_extended_ride(monkeypatch):
     assert asyncio.run(analyze_workout_execution("i9", duration_tolerance_pct=150)).startswith("Error: duration_tolerance_pct")
     report = asyncio.run(get_activity_report("i9", planned_workout_doc=PLAN_65))
     assert "first 10:00 of 17:58" in report and "Additional training after the plan: 22:07" in report
+
+
+def test_easy_work_labelled_interval_after_the_plan_is_not_an_extra_effort():
+    """Intervals.icu may label easy riding WORK; with FTP known only efforts >= 90 % FTP are listed."""
+    segments = [("WORK", 1020, 150, 120), ("WORK", 600, 240, 150), ("WORK", 240, 120, 130), ("WORK", 600, 242, 155),
+                ("WORK", 240, 120, 130), ("WORK", 600, 244, 158), ("WORK", 600, 110, 120), ("WORK", 777, 138, 116)]
+    streams, intervals = build_ride(segments)
+    result = analyze(plan_steps(PLAN_65["steps"], CONTEXT), intervals, streams, context=CONTEXT)
+    assert result["extension"]["duration_s"] == 777 and result["extension"]["efforts"] == []
+    assert result["rows"][2]["type_note"] == "Intervals.icu type WORK, planned rest"
+    no_ftp = analyze(plan_steps(PLAN_65["steps"], CONTEXT), intervals, streams, context={"activity_type": "Ride"})
+    assert [e["average_watts"] for e in no_ftp["extension"]["efforts"]] == [138]  # without FTP the WORK label decides
