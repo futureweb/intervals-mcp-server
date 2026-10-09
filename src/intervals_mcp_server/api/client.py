@@ -82,31 +82,42 @@ async def _get_httpx_client() -> httpx.AsyncClient:
     return httpx_client
 
 
+_ACTIVE_SESSIONS = 0
+
+
 @asynccontextmanager
 async def setup_api_client(_app: FastMCP):
     """
-    Context manager to ensure the shared httpx client is closed when the server stops.
+    Lifespan of one MCP session: the shared httpx client is closed when the LAST session ends.
+
+    FastMCP runs this lifespan once per session (SSE connection or streamable HTTP session),
+    so closing on every exit would break the requests of other sessions still in flight.
 
     Args:
         _app (FastMCP): The MCP server application instance.
     """
+    global _ACTIVE_SESSIONS  # pylint: disable=global-statement  # noqa: PLW0603 - process-wide session counter
+    _ACTIVE_SESSIONS += 1
     try:
         yield
     finally:
-        # Close the module-level httpx_client
-        if httpx_client and not httpx_client.is_closed:
-            await httpx_client.aclose()
+        _ACTIVE_SESSIONS -= 1
+        if _ACTIVE_SESSIONS <= 0:
+            _ACTIVE_SESSIONS = 0
+            await _close_shared_clients()
 
-        # Also close server.httpx_client if it exists (for test compatibility)
-        # This ensures monkeypatched clients in tests are properly closed
-        try:
-            server_module = sys.modules.get("intervals_mcp_server.server")
-            if server_module and hasattr(server_module, "httpx_client"):
-                server_client = getattr(server_module, "httpx_client", None)
-                if server_client is not None and not server_client.is_closed:
-                    await server_client.aclose()
-        except (AttributeError, ImportError):
-            pass
+
+async def _close_shared_clients() -> None:
+    """Close the module-level client (and a monkeypatched server client in tests)."""
+    if httpx_client and not httpx_client.is_closed:
+        await httpx_client.aclose()
+    try:
+        server_module = sys.modules.get("intervals_mcp_server.server")
+        server_client = getattr(server_module, "httpx_client", None) if server_module else None
+        if server_client is not None and not server_client.is_closed:
+            await server_client.aclose()
+    except (AttributeError, ImportError):
+        pass
 
 
 def _get_error_message(error_code: int, error_text: str) -> str:
@@ -160,6 +171,36 @@ def _prepare_request_config(
     return full_url, auth, headers, None
 
 
+# Path segments of API URLs are built from tool arguments (activity, event, workout ids).
+# Only plain identifier characters are allowed, so an argument such as "../athlete/i1" or
+# "1?oldest=2000-01-01" cannot reach another endpoint (httpx resolves dot segments and a
+# "?" would start a query string).
+_SEGMENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.,~:")
+# Fields that must never reach a tool output (e.g. the raw athlete object carries the key).
+SECRET_FIELDS = frozenset({"icu_api_key", "api_key", "apiKey", "password", "access_token", "refresh_token", "client_secret", "secret"})
+
+
+def unsafe_path_reason(url: str) -> str | None:
+    """Why *url* is not a safe API path, or None when every segment is a plain identifier."""
+    if not url.startswith("/"):
+        return "path must start with '/'"
+    for segment in url[1:].split("/"):
+        if segment in ("", ".", ".."):
+            return "empty or dot path segment"
+        if not set(segment) <= _SEGMENT_CHARS:
+            return "invalid characters in an identifier"
+    return None
+
+
+def scrub_secrets(value: Any) -> Any:
+    """Recursively drop secret fields from API data before it reaches a tool."""
+    if isinstance(value, dict):
+        return {k: scrub_secrets(v) for k, v in value.items() if k not in SECRET_FIELDS}
+    if isinstance(value, list):
+        return [scrub_secrets(v) for v in value]
+    return value
+
+
 def _parse_response(
     response: httpx.Response, full_url: str
 ) -> dict[str, Any] | list[dict[str, Any]]:
@@ -174,7 +215,7 @@ def _parse_response(
         logger.error("Invalid JSON in response from: %s", full_url)
         return {"error": True, "message": "Invalid JSON in response"}
     response.raise_for_status()
-    return response_data
+    return scrub_secrets(response_data)
 
 
 async def make_intervals_request(  # pylint: disable=too-many-locals
@@ -197,6 +238,11 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
     Returns:
         dict[str, Any] | list[dict[str, Any]]: The parsed JSON response from the API, or an error dict.
     """
+    reason = unsafe_path_reason(url)
+    if reason:
+        logger.warning("Rejected API path built from tool arguments (%s)", reason)
+        return {"error": True, "message": f"Invalid identifier: {reason}. Use the plain id (e.g. i123456789 or 123456)."}
+
     # Prepare request configuration
     full_url, auth, headers, error_msg = _prepare_request_config(url, api_key, method)
     if error_msg:
