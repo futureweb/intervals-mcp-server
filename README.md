@@ -264,6 +264,7 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - `get_wellness_data`: Fetch wellness data
 - `get_weekly_summary`: Weekly training summary per ISO week and sport (sessions, time, distance, load, HR zones) with end-of-week CTL/ATL/form
 - `get_plan_compliance`: Compare planned workouts with executed activities (completed, missed, upcoming, unplanned, deviations)
+- `update_wellness`: Update subjective wellness fields (soreness, fatigue, stress, mood, motivation, injury, comments) for a day (writes data; only passed fields are changed)
 - `get_events`: Retrieve upcoming events (workouts, races, etc.)
 - `get_event_by_id`: Get detailed information for a specific event
 - `add_or_update_event`: Create or update an event (workout, race, note, etc.)

@@ -36,6 +36,7 @@ Usage:
         - delete_event
         - delete_events_by_date_range
         - get_wellness_data
+        - update_wellness
         - get_athlete_power_curves
         - get_hr_curves
         - get_pace_curves
@@ -101,6 +102,7 @@ from intervals_mcp_server.tools.workout_library import (  # pylint: disable=wron
     create_library_workout,
     get_workout_library,
 )
+from intervals_mcp_server.tools.wellness import get_wellness_data, update_wellness  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.power_curves import get_athlete_power_curves  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.hr_pace_curves import get_hr_curves, get_pace_curves  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.training_review import (  # pylint: disable=wrong-import-position  # noqa: E402
@@ -136,6 +138,7 @@ __all__ = [
     "get_gear_list",
     "add_events_bulk",
     "get_wellness_data",
+    "update_wellness",
     "get_athlete_power_curves",
     "get_hr_curves",
     "get_pace_curves",

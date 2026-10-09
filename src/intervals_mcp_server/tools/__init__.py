@@ -50,6 +50,7 @@ from intervals_mcp_server.tools.workout_library import (  # noqa: F401
     create_library_workout,
     get_workout_library,
 )
+from intervals_mcp_server.tools.wellness import get_wellness_data, update_wellness  # noqa: F401
 
 
 def register_tools(mcp_instance: FastMCP) -> None:
@@ -98,4 +99,5 @@ __all__ = [
     "create_library_workout",
     "add_event_from_library",
     "delete_library_workout",
+    "update_wellness",
 ]
