@@ -22,9 +22,11 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date
+from intervals_mcp_server.utils.custom_fields import is_missing
 from intervals_mcp_server.utils.sports import (
     SPORT_FAMILIES,
     cadence_text,
+    default_pace_units,
     family_types,
     format_pace,
     hms,
@@ -125,8 +127,8 @@ def _numbers(csv: str | None, name: str) -> list[int] | str:
 
 
 def _num(value: Any) -> float | None:
-    """Float of a numeric value; None for null, bool or text."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """Float of a numeric value; None for null, NaN, bool or text."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value):
         return None
     return float(value)
 
@@ -356,12 +358,30 @@ def _time_at(time_data: list[Any], index: Any) -> float | None:
     return _num(time_data[min(max(index, 0), len(time_data) - 1)])
 
 
+def _end_time(time_data: list[Any], end: Any) -> float | None:
+    """End of the window [start, end) (``end`` exclusive, as Intervals.icu best efforts).
+
+    The time of the first sample after the window when it follows without a recording
+    pause, else one second after the last sample of the window; a pause right after the
+    window is therefore not counted as part of it.
+    """
+    if not time_data or isinstance(end, bool) or not isinstance(end, int) or end <= 0:
+        return _time_at(time_data, end)
+    last = _num(time_data[min(end, len(time_data)) - 1])
+    following = _num(time_data[end]) if end < len(time_data) else None
+    if last is None:
+        return _time_at(time_data, end)
+    if following is not None and 0 < following - last <= RECORDING_GAP_S:
+        return following
+    return last + 1
+
+
 def _paused_secs(time_data: list[Any], start: Any, end: Any) -> float:
-    """Seconds of recording pauses (time jumps > 5 s) between two sample indices."""
+    """Seconds of recording pauses (time jumps > 5 s) inside the window [start, end)."""
     if not time_data or not isinstance(start, int) or not isinstance(end, int) or isinstance(start, bool):
         return 0.0
     paused = 0.0
-    for index in range(max(start, 0), min(end, len(time_data) - 1)):
+    for index in range(max(start, 0), min(end, len(time_data)) - 1):
         current, following = _num(time_data[index]), _num(time_data[index + 1])
         if current is not None and following is not None and following - current > RECORDING_GAP_S:
             paused += following - current - 1
@@ -379,26 +399,27 @@ def _request_label(requested: dict[str, int]) -> str:
     return _duration_label(requested["duration"])
 
 
-def _effort_row(
-    effort: dict[str, Any], stream: str, time_data: list[Any], rank: int, requested: dict[str, int]
+def _effort_row(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    effort: dict[str, Any], stream: str, time_data: list[Any], rank: int, requested: dict[str, int], pace_units: str | None = None
 ) -> dict[str, Any]:
     average = _num(effort.get("average"))
     start, end = effort.get("start_index"), effort.get("end_index")
+    end_secs = _end_time(time_data, end)
     return {
         "requested": requested,
         "available": True,
         "rank": rank,
         "average": round(average, 2) if average is not None else None,
         "units": STREAM_UNITS.get(stream),
-        "pace": format_pace(average) if stream == "velocity_smooth" and average else None,
+        "pace": format_pace(average, pace_units) if stream == "velocity_smooth" and average else None,
         "duration": effort.get("duration"),
         "distance": effort.get("distance"),
         "start_index": start,
         "end_index": end,
         "start_secs": _time_at(time_data, start),
-        "end_secs": _time_at(time_data, end),
+        "end_secs": end_secs,
         "start": _position(time_data, start),
-        "end": _position(time_data, end),
+        "end": hms(end_secs) if end_secs is not None else f"index {end}",
         "paused_s_in_window": _paused_secs(time_data, start, end),
     }
 
@@ -441,8 +462,10 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
     end_index in other tools) and the duration/distance covered. Use it to find the peak 5 s /
     1 min / 5 min / 20 min power of a ride, the fastest kilometre of a run (stream
     velocity_smooth with distances) or the highest sustained heart rate. Durations longer than
-    the activity are reported as not available. One API call per duration or distance plus one
-    for the time stream.
+    the activity are reported as not available. The window ends with its last sample (the end
+    index is exclusive), so a pause right after the effort is not counted inside it. One API
+    call per duration or distance plus one for the time stream (and one for the sport's pace
+    units with velocity_smooth).
 
     Args:
         activity_id: The Intervals.icu activity ID
@@ -469,6 +492,10 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
 
     api = _Api(api_key)
     time_data = _time_stream(await api.get(f"/activity/{activity_id}/streams", {"types": "time"}))
+    pace_units = None
+    if stream == "velocity_smooth":  # pace in the sport's units (per 100 m for swims)
+        activity = await api.get(f"/activity/{activity_id}")
+        pace_units = default_pace_units(activity.get("type") if isinstance(activity, dict) else None)
     base: dict[str, Any] = {"stream": stream, "count": count}
     if exclude_intervals:
         base["excludeIntervals"] = "true"
@@ -494,7 +521,7 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
             })
             continue
         rows.extend(
-            _effort_row(effort, stream, time_data, rank, {key: value})
+            _effort_row(effort, stream, time_data, rank, {key: value}, pace_units)
             for rank, effort in enumerate(efforts, 1)
             if isinstance(effort, dict)
         )
