@@ -26,7 +26,11 @@ First public beta of the Futureweb fork. Based on upstream
 - Plan statistics per ISO week for the calendar plan and the scenario: sessions, hours, longest
   session (and its share of the race's planned duration), rest days and monotony; weeks with a
   CTL ramp above 5-8 per week (Friel 2015), monotony above 2.0 (Foster 1998) or no rest day
-  (Meeusen et al. 2013) are listed as outside the commonly cited range, nothing more.
+  (Meeusen et al. 2013) are listed as outside the commonly cited range, nothing more. Identical
+  daily loads (monotony undefined, maximal) are flagged too; weeks without durations say "hours n/a".
+- `get_load_projection` reports race days at the start of the day (before the race's own load),
+  like the target day; days, weeks, the end and the lowest form are labelled as end-of-day values
+  (JSON `value_basis`, races `basis`).
 
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list

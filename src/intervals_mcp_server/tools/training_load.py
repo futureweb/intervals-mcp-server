@@ -51,6 +51,7 @@ from intervals_mcp_server.utils.load_metrics import (
     weekly_rows,
 )
 from intervals_mcp_server.utils.plan_simulation import (
+    IDENTICAL_LOADS,
     LOAD_FORMULA,
     PLAN_REFERENCES,
     ScenarioError,
@@ -520,13 +521,29 @@ def _planned_counts(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             "without_load": sum(1 for v in loads if v is None), "load": rnd(sum(v or 0.0 for v in loads), 0)}
 
 
-def _variant(
-    rows: list[dict[str, Any]], today: date, loads: dict[date, float], sessions: list[dict[str, Any]],
-    races: list[dict[str, Any]], race_minutes: float | None,
+VALUE_BASIS = {
+    "days": "end of day: includes that day's load, as Intervals.icu's wellness values (days, weeks, end, lowest form)",
+    "races_and_target": "start of day: the end of the day before, so the race's own load does not count",
+}
+NO_STATE = dict.fromkeys(("ctl", "atl", "form", "form_pct_of_ctl"))
+
+
+def _by_date(rows: list[dict[str, Any]], base: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Projection rows by ISO date, with the start values on the base day (the start of a race today)."""
+    return {base["date"]: base, **{r["date"]: r for r in rows}}
+
+
+def _variant(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    rows: list[dict[str, Any]], base: dict[str, Any], today: date, loads: dict[date, float],
+    sessions: list[dict[str, Any]], races: list[dict[str, Any]], race_minutes: float | None,
 ) -> dict[str, Any]:
-    """End values, extremes, plan weeks, race days and days of one projection (calendar plan or scenario)."""
+    """End values, extremes, plan weeks, race days and days of one projection (calendar plan or scenario).
+
+    Days, weeks, the end and the lowest form are end-of-day values (the day's load included);
+    race days are reported at the start of the day, like the target day.
+    """
     projected = [r for r in rows if r["date"] >= today.isoformat()]
-    by_date = {r["date"]: r for r in rows}
+    by_date = _by_date(rows, base)
     last = projected[-1]
     return {
         "end": {**{k: last[k] for k in ("date", "ctl", "atl", "form")},
@@ -536,9 +553,9 @@ def _variant(
                             key=lambda r: r["ramp"], default={"date": None, "ramp": None}),
         "weeks": plan_weeks(projected, loads, sessions, race_minutes),
         "races": [
-            {"date": str(r.get("start_date_local"))[:10], "category": r.get("category"), "name": r.get("name"),
-             **{k: by_date.get(str(r.get("start_date_local"))[:10], {}).get(k) for k in ("ctl", "atl", "form")}}
-            for r in sorted(races, key=lambda r: str(r.get("start_date_local")))
+            {"date": day.isoformat(), "category": r.get("category"), "name": r.get("name"), "basis": "start_of_day",
+             **(state_at_start(by_date, day) or NO_STATE)}
+            for r in sorted(races, key=lambda r: str(r.get("start_date_local"))) if (day := activity_day(r)) is not None
         ],
         "days": projected,
     }
@@ -689,18 +706,18 @@ def _simulation_section(
 
 
 def _target_section(
-    target: dict[str, Any], form_range: tuple[float, float, str] | None, rows: list[dict[str, Any]],
-    scenario_rows: list[dict[str, Any]] | None, search: dict[str, Any] | None,
+    target: dict[str, Any], form_range: tuple[float, float, str] | None, rows: dict[str, dict[str, Any]],
+    scenario_rows: dict[str, dict[str, Any]] | None, search: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Start-of-day values on the target day for the calendar plan (and the scenario), the range and the search."""
     day = target["date"]
     info: dict[str, Any] = {
         **target, "date": day.isoformat(), "event_minutes": rnd(target["event_minutes"], 0), "available": True,
         "basis": "start of the target day (end of the day before)",
-        "baseline": state_at_start({r["date"]: r for r in rows}, day),
+        "baseline": state_at_start(rows, day),
     }
     if scenario_rows is not None:
-        info["scenario"] = state_at_start({r["date"]: r for r in scenario_rows}, day)
+        info["scenario"] = state_at_start(scenario_rows, day)
     if form_range and search is not None:
         info["range"] = {"low": form_range[0], "high": form_range[1], "unit": form_range[2]}
         for key in ("baseline", "scenario") if scenario_rows is not None else ("baseline",):
@@ -720,6 +737,9 @@ def _trim_simulation(payload: dict[str, Any], detail_level: str) -> None:
 
 
 # ------------------------------------------------------------------ text
+
+
+RACE_BASIS = "start of day, before the race's own load"
 
 
 def _state(state: dict[str, Any] | None) -> str:
@@ -792,6 +812,13 @@ def _target_lines(target: dict[str, Any], has_scenario: bool) -> list[str]:
     return lines
 
 
+def _hours_text(week: dict[str, Any]) -> str:
+    missing = week["sessions_without_duration"]
+    if week["hours"] is None:
+        return f"hours n/a ({missing} session(s) without duration)"
+    return f"{fmt(week['hours'], 1)} h" + (f" (+{missing} session(s) without duration)" if missing else "")
+
+
 def _week_stats(week: dict[str, Any]) -> str:
     sports = ", ".join(f"{family} {fmt(value)}" for family, value in week["by_sport"].items()) or "none"
     longest = week["longest_session"]
@@ -800,13 +827,17 @@ def _week_stats(week: dict[str, Any]) -> str:
         share = f", {fmt(longest['pct_of_target_event'])} % of the target event" if longest["pct_of_target_event"] is not None else ""
         long_text = f"longest {fmt(longest['minutes'] / 60, 1)} h ({longest['date'][5:]}{share})"
     estimated = f", {week['estimated_sessions']} estimated" if week["estimated_sessions"] else ""
-    return (f"{week['sessions']} sessions{estimated} ({sports}), {fmt(week['hours'], 1)} h, {long_text}, "
-            f"rest days {week['rest_days']}, monotony {fmt(week['monotony'], 2)}")
+    mono = fmt(week["monotony"], 2)
+    if week["monotony_note"] == IDENTICAL_LOADS:
+        mono = "undefined (identical daily loads, maximal)"
+    return (f"{week['sessions']} sessions{estimated} ({sports}), {_hours_text(week)}, {long_text}, "
+            f"rest days {week['rest_days']}, monotony {mono}")
 
 
 CHECK_TEXT = {
     "ramp": lambda e: f"ramp {fmt(e['value'], 1, signed=True)} (above 5-8 [1])",
-    "monotony": lambda e: f"monotony {fmt(e['value'], 2)} (above 2.0 [2])",
+    "monotony": lambda e: (f"monotony {fmt(e['value'], 2)}" if e["value"] is not None
+                           else "monotony undefined, identical daily loads") + " (above 2.0 [2])",
     "rest_days": lambda e: f"{e['value']} rest days (below 1 [3])",
 }
 
@@ -855,15 +886,15 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
     if end_row:
         icu = payload["intervals_icu_end"]
         lines.append(
-            f"End {end_row['date']}: CTL {fmt(end_row['ctl'], 1)} | ATL {fmt(end_row['atl'], 1)} | form "
+            f"End of {end_row['date']}: CTL {fmt(end_row['ctl'], 1)} | ATL {fmt(end_row['atl'], 1)} | form "
             f"{fmt(end_row['form'], 1, signed=True)}"
             + (f" (Intervals.icu's own projection: CTL {fmt(icu['ctl'], 1)}, ATL {fmt(icu['atl'], 1)})" if icu else "")
         )
         lowest = payload["lowest_form"]
-        lines.append(f"Lowest projected form {fmt(lowest['form'], 1, signed=True)} on {lowest['date']}; highest 7-day ramp "
+        lines.append(f"Lowest projected form (end of day) {fmt(lowest['form'], 1, signed=True)} on {lowest['date']}; highest 7-day ramp "
                      f"{fmt(payload['highest_ramp']['ramp'], 1, signed=True)} on {payload['highest_ramp']['date']}")
     if detail_level != "compact":
-        lines.append("Weeks (values at the last day of the week):")
+        lines.append("Weeks (values at the end of the week's last day):")
         for week in payload["weeks"]:
             missing = f", {week['planned_without_load']} without load" if week["planned_without_load"] else ""
             lines.append(
@@ -873,7 +904,7 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
                 f" | {_week_stats(week)}"
             )
     if payload["races"]:
-        lines.append("Races: " + "; ".join(
+        lines.append(f"Races ({RACE_BASIS}): " + "; ".join(
             f"{r['date']} {r['category']} '{r['name']}': CTL {fmt(r['ctl'], 1)}, ATL {fmt(r['atl'], 1)}, form {fmt(r['form'], 1, signed=True)}"
             for r in payload["races"]
         ))
@@ -885,7 +916,7 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
     elif flagged_weeks:
         lines.append(f"Plan checks: {len(flagged_weeks)} week metric(s) outside the commonly cited range (details at standard).")
     if detail_level == "full":
-        lines.append("Days: " + ", ".join(
+        lines.append("Days (end of day): " + ", ".join(
             f"{d['date'][5:]} load {fmt(d['load'])} CTL {fmt(d['ctl'], 1)} form {fmt(d['form'], 1, signed=True)}" for d in payload["days"]
         ))
     lines.append(_model_check_line(payload["model_check"]))
@@ -932,9 +963,10 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
         "Assumptions: " + "; ".join(payload["assumptions"]) + ".",
         f"Start (end of {start['date']}, Intervals.icu): CTL {fmt(start['ctl'], 1)} | ATL {fmt(start['atl'], 1)} | "
         f"form {fmt(start['form'], 1, signed=True)}",
-        f"End {end['date']}: scenario {_state(end['scenario'])}; calendar plan {_state(end['baseline'])}; difference CTL "
+        f"End of {end['date']}: scenario {_state(end['scenario'])}; calendar plan {_state(end['baseline'])}; difference CTL "
         f"{fmt(end['difference']['ctl'], 1, signed=True)}, form {fmt(end['difference']['form'], 1, signed=True)}",
-        f"Lowest form: scenario {fmt(sim['lowest_form']['form'], 1, signed=True)} on {sim['lowest_form']['date']}, calendar plan "
+        f"Lowest form (end of day, that day's load included): scenario {fmt(sim['lowest_form']['form'], 1, signed=True)} on "
+        f"{sim['lowest_form']['date']}, calendar plan "
         f"{fmt(payload['lowest_form']['form'], 1, signed=True)} on {payload['lowest_form']['date']}; highest 7-day ramp: scenario "
         f"{fmt(sim['highest_ramp']['ramp'], 1, signed=True)}, calendar plan {fmt(payload['highest_ramp']['ramp'], 1, signed=True)}",
     ]
@@ -950,7 +982,7 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
             + (f", longest session {fmt(longest['minutes'] / 60, 1)} h ({longest['date']})" if longest else "")
         )
     if detail_level != "compact":
-        lines.append("Weeks, scenario vs calendar plan (values at the last day of the week):")
+        lines.append("Weeks, scenario vs calendar plan (values at the end of the week's last day):")
         for scenario_week, plan_week in zip(sim["weeks"], payload["weeks"], strict=True):
             partial = "" if scenario_week["complete"] else f", partial {scenario_week['days']} d"
             lines.append(
@@ -967,12 +999,13 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
         lines.append(f"Plan checks: {counts['scenario']} week metric(s) of the scenario and {counts['baseline']} of the calendar "
                      "plan outside the commonly cited range (details at standard).")
     if sim["races"]:
-        lines.append("Races (scenario): " + "; ".join(
-            f"{r['date']} {r['category']} '{r['name']}': CTL {fmt(r['ctl'], 1)}, form {fmt(r['form'], 1, signed=True)}"
-            for r in sim["races"]
+        lines.append(f"Races ({RACE_BASIS}): " + "; ".join(
+            f"{r['date']} {r['category']} '{r['name']}': scenario CTL {fmt(r['ctl'], 1)}, form {fmt(r['form'], 1, signed=True)}; "
+            f"calendar plan CTL {fmt(b['ctl'], 1)}, form {fmt(b['form'], 1, signed=True)}"
+            for r, b in zip(sim["races"], payload["races"], strict=True)
         ))
     if detail_level == "full":
-        lines.append("Scenario days: " + ", ".join(
+        lines.append("Scenario days (end of day): " + ", ".join(
             f"{d['date'][5:]} load {fmt(d['load'])} CTL {fmt(d['ctl'], 1)} form {fmt(d['form'], 1, signed=True)}" for d in sim["days"]
         ))
         lines.append("Proposed sessions: " + ("; ".join(
@@ -1008,8 +1041,9 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     Exponential model from the Intervals.icu CTL/ATL at the end of yesterday (time constants 42/7 d): today's completed
     load, then the planned load of the WORKOUT events (workouts without one are reported). Reports end values, lowest
     form, highest ramp, ISO weeks (load per sport, sessions, hours, longest session, rest days, monotony, CTL/ATL/form/
-    ramp), race days, Intervals.icu's own projection, a model check and weeks outside commonly cited ranges (ramp 5-8
-    CTL/week, monotony > 2.0, < 1 rest day; with sources). `scenario` simulates sessions NOT in the calendar and
+    ramp), all end of day; race days at the start of the day; Intervals.icu's projection, a model check and weeks
+    outside commonly cited ranges (ramp 5-8 CTL/week, monotony > 2.0, < 1 rest day; with sources). `scenario` simulates
+    sessions NOT in the calendar and
     compares with the calendar plan. A target day (target_date or the next RACE_A) gets CTL/form at the start of the
     day; with `target_form`, a grid search over the load of the last `taper_days` days. Arithmetic, no verdict.
 
@@ -1084,13 +1118,14 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     start_ctl, start_atl = num(base.get("ctl")) or 0.0, num(base.get("atl")) or 0.0
     rows = project_fitness(start_ctl, start_atl, base_day, loads, end, ctl_history, ctl_days, atl_days)
     race_minutes = target["event_minutes"] if target else None
-    baseline = _variant(rows, today, loads, completed_list + calendar, races, race_minutes)
+    base_row = {"date": base_day.isoformat(), "ctl": rnd(start_ctl, 1), "atl": rnd(start_atl, 1), "form": rnd(start_ctl - start_atl, 1)}
+    baseline = _variant(rows, base_row, today, loads, completed_list + calendar, races, race_minutes)
     _calendar_week_extras(baseline["weeks"], workouts, wellness)
     end_icu = wellness.get(end, {})
     payload: dict[str, Any] = {
         "athlete_id": athlete_id_to_use, "from": today.isoformat(), "to": end.isoformat(),
         "ctl_days": ctl_days, "atl_days": atl_days, "mode": "simulation" if parsed else "projection",
-        "start": {"date": base_day.isoformat(), "ctl": rnd(start_ctl, 1), "atl": rnd(start_atl, 1), "form": rnd(start_ctl - start_atl, 1)},
+        "start": dict(base_row), "value_basis": VALUE_BASIS,
         "today": {"date": today.isoformat(), "completed_load": rnd(completed, 0),
                   "planned_load": rnd(sum(activity_load(e) or 0.0 for e in workouts.get(today, [])), 0)},
         "planned": _planned_counts(calendar),
@@ -1111,7 +1146,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         scenario_sessions = completed_list + kept + parsed["sessions"]
         scenario_loads = add_session_loads(history, scenario_sessions)
         scenario_rows = project_fitness(start_ctl, start_atl, base_day, scenario_loads, end, ctl_history, ctl_days, atl_days)
-        simulated = _variant(scenario_rows, today, scenario_loads, scenario_sessions, races, race_minutes)
+        simulated = _variant(scenario_rows, base_row, today, scenario_loads, scenario_sessions, races, race_minutes)
         payload["simulation"] = _simulation_section(parsed, kept, dropped, simulated)
         payload["comparison"] = _comparison(baseline, simulated)
         payload["checks"]["scenario"] = flagged(simulated["weeks"])
@@ -1123,7 +1158,9 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
             (start_ctl, start_atl), base_day, scenario_loads, target["date"], today + timedelta(days=1), taper_days,
             form_range, ctl_days, atl_days,
         ) if form_range else None
-        payload["target"] = _target_section(target, form_range, rows, scenario_rows, search)
+        payload["target"] = _target_section(
+            target, form_range, _by_date(rows, base_row), _by_date(scenario_rows, base_row) if scenario_rows else None, search
+        )
     elif form_range:
         payload["target"] = {"available": False,
                              "note": "no target day: pass target_date or add a RACE_A event to the calendar (within 180 days)"}

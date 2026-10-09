@@ -31,6 +31,7 @@ from intervals_mcp_server.utils.load_metrics import (
     activity_load,
     day_range,
     iso_week,
+    model_step,
     monotony,
     num,
     rnd,
@@ -40,6 +41,8 @@ from intervals_mcp_server.utils.sports import sport_family
 Session = dict[str, Any]
 
 LOAD_FORMULA = "load = hours x IF^2 x 100"
+IDENTICAL_LOADS = "identical daily loads (SD 0): monotony undefined, maximal"
+NO_SPORT = "sport not given"
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 # Default session days (Monday = 0) for a template with n sessions per week.
 DEFAULT_DAYS: dict[int, tuple[int, ...]] = {
@@ -155,6 +158,8 @@ def _parse_session(entry: Any, where: str, first: date, last: date) -> Session:
         load, estimated = _number(entry["load"], f"{where}.load", 0, MAX_SESSION_LOAD), False
     elif minutes is not None and intensity is not None:
         load, estimated = estimate_load(minutes, intensity), True
+        if load > MAX_SESSION_LOAD:
+            raise ScenarioError(f"{where}: the estimated load {load:.0f} exceeds {MAX_SESSION_LOAD:g}.")
     else:
         raise ScenarioError(f"{where}: give 'load', or 'duration_min' and 'intensity_factor' to estimate it ({LOAD_FORMULA}).")
     return {
@@ -234,6 +239,8 @@ def _parse_template(  # pylint: disable=too-many-locals
         if hours is None or intensity is None:
             raise ScenarioError(f"{where}: give the weekly 'load', or 'hours' and 'intensity_factor' to estimate it ({LOAD_FORMULA}).")
         loads = [estimate_load(h * 60, intensity) for h in hours]
+        if max(loads) > MAX_WEEK_LOAD:
+            raise ScenarioError(f"{where}: the estimated weekly load {max(loads):.0f} exceeds {MAX_WEEK_LOAD:g}.")
     days, long_day = _template_days(entry, where)
     count = len(days)
     share = None
@@ -408,6 +415,9 @@ def _outside(week: dict[str, Any]) -> list[dict[str, Any]]:
         outside.append({"metric": "ramp", "value": ramp, "position": "above", "range": [low, high]})
     if week["monotony"] is not None and week["monotony"] > PLAN_REFERENCES["monotony"]["high"]:
         outside.append({"metric": "monotony", "value": week["monotony"], "position": "above", "range": [None, 2.0]})
+    elif week["monotony_note"] == IDENTICAL_LOADS:
+        # SD 0: mean / SD is undefined and grows without bound as the days become identical.
+        outside.append({"metric": "monotony", "value": None, "position": "above", "range": [None, 2.0], "note": IDENTICAL_LOADS})
     if week["complete"] and week["rest_days"] < PLAN_REFERENCES["rest_days"]["min"]:
         outside.append({"metric": "rest_days", "value": week["rest_days"], "position": "below", "range": [1, None]})
     return outside
@@ -433,9 +443,11 @@ def plan_weeks(  # pylint: disable=too-many-locals
     ``rows`` are ``project_fitness`` rows (one per day), ``loads`` the daily loads behind
     them and ``sessions`` the sessions on those days. Rest days are days without any
     session (a session without load is not a rest day). Monotony needs at least 5 days and
-    3 days with load, the rest-day check a complete week. Weeks outside a commonly cited
-    range (ramp above 5-8, monotony above 2.0, no rest day) are listed in
-    ``outside_commonly_cited_range`` (statistics, no verdict).
+    3 days with load, the rest-day check a complete week. Identical daily loads (SD 0) leave
+    Foster's monotony undefined; that is the most monotonous case, so it is noted
+    (``monotony_note``) and flagged. Weeks outside a commonly cited range (ramp above 5-8,
+    monotony above 2.0, no rest day) are listed in ``outside_commonly_cited_range``
+    (statistics, no verdict). Hours are None when no session of the week has a duration.
     """
     by_day: dict[date, list[Session]] = defaultdict(list)
     for session in sessions:
@@ -450,12 +462,17 @@ def plan_weeks(  # pylint: disable=too-many-locals
         week_sessions = [s for d in days for s in by_day.get(d, [])]
         sports: dict[str, list[float]] = defaultdict(list)
         for session in week_sessions:
-            sports[sport_family(session["sport"])] += [] if session["load"] is None else [session["load"]]
+            family = sport_family(session["sport"]) if session["sport"] else NO_SPORT
+            sports[family] += [] if session["load"] is None else [session["load"]]
         minutes = [s["minutes"] for s in week_sessions if s["minutes"]]
         last, lowest = week_rows[-1], min(week_rows, key=lambda r: r["form"])
-        week_monotony = (
-            monotony(daily) if len(days) >= MIN_WEEK_DAYS_MONOTONY and sum(1 for v in daily if v > 0) >= MIN_ACTIVE_DAYS_MONOTONY else None
-        )
+        qualifies = len(days) >= MIN_WEEK_DAYS_MONOTONY and sum(1 for v in daily if v > 0) >= MIN_ACTIVE_DAYS_MONOTONY
+        week_monotony = monotony(daily) if qualifies else None
+        note = None
+        if not qualifies:
+            note = f"needs {MIN_WEEK_DAYS_MONOTONY} days and {MIN_ACTIVE_DAYS_MONOTONY} days with load"
+        elif week_monotony is None:
+            note = IDENTICAL_LOADS
         week = {
             "week": label, "start": days[0].isoformat(), "end": days[-1].isoformat(), "days": len(days),
             "complete": len(days) == 7, "load": rnd(sum(daily), 0),
@@ -464,10 +481,11 @@ def plan_weeks(  # pylint: disable=too-many-locals
             "sessions": len(week_sessions), "sessions_without_load": sum(1 for s in week_sessions if s["load"] is None),
             "estimated_sessions": sum(1 for s in week_sessions if s["estimated"]),
             "by_sport": {f: rnd(sum(v), 0) if v else None for f, v in sorted(sports.items(), key=lambda kv: -sum(kv[1]))},
-            "hours": rnd(sum(minutes) / 60, 1), "sessions_without_duration": len(week_sessions) - len(minutes),
+            "hours": rnd(sum(minutes) / 60, 1) if minutes or not week_sessions else None,
+            "sessions_without_duration": len(week_sessions) - len(minutes),
             "longest_session": _longest(week_sessions, race_minutes),
             "rest_days": sum(1 for d in days if not by_day.get(d)),
-            "monotony": rnd(week_monotony, 2),
+            "monotony": rnd(week_monotony, 2), "monotony_note": note,
         }
         week["outside_commonly_cited_range"] = _outside(week)
         out.append(week)
@@ -559,18 +577,17 @@ def solve_target(  # pylint: disable=too-many-arguments,too-many-positional-argu
     base = {"range": [low, high], "unit": unit, "taper_days": taper_days}
     if window_start > window_end:
         return {**base, "available": False, "note": "no day between tomorrow and the target day to vary"}
-    a_ctl, a_atl = 1 - math.exp(-1 / ctl_days), 1 - math.exp(-1 / atl_days)
     ctl, atl = start
     for day in day_range(base_day + timedelta(days=1), window_start - timedelta(days=1)):
         load = loads.get(day, 0.0)
-        ctl, atl = ctl + (load - ctl) * a_ctl, atl + (load - atl) * a_atl
+        ctl, atl = model_step(ctl, load, ctl_days), model_step(atl, load, atl_days)
     window = day_range(window_start, window_end)
     planned = [loads.get(d, 0.0) for d in window]
 
     def run(values: list[float]) -> tuple[float, float]:
         c, a = ctl, atl
         for load in values:
-            c, a = c + (load - c) * a_ctl, a + (load - a) * a_atl
+            c, a = model_step(c, load, ctl_days), model_step(a, load, atl_days)
         return c, a
 
     planned_sum = sum(planned)

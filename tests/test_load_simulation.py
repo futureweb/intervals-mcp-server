@@ -447,7 +447,7 @@ def test_simulation_compact_and_full_text(monkeypatch):
     assert "Weeks, scenario vs calendar plan" not in compact
     assert "Plan checks: 0 week metric(s) of the scenario and 0 of the calendar plan" in compact
     full = asyncio.run(get_load_projection(scenario=SCENARIO, detail_level="full"))
-    assert "Scenario days: 10-09 load 100" in full and "Proposed sessions: 2026-10-10 Ride load 196 (estimated), 240 min" in full
+    assert "Scenario days (end of day): 10-09 load 100" in full and "Proposed sessions: 2026-10-10 Ride load 196 (estimated), 240 min" in full
 
 
 def test_simulation_through_mcp_layer(monkeypatch):
@@ -460,3 +460,78 @@ def test_simulation_through_mcp_layer(monkeypatch):
     }))
     text = json.dumps(result, default=str)
     assert "SIMULATION (what-if" in text and "Target form range +0 to +20" in text
+
+
+def test_race_day_values_use_one_convention(monkeypatch):
+    """Regression (review P6-20-1): race lines and the target block give the same start-of-day form for one race;
+    the end-of-day row of the race day (with a race session in the scenario) is labelled as such."""
+    _setup(monkeypatch)
+    payload = json.loads(asyncio.run(get_load_projection(target_form="5,15", output_format="json")))
+    race, target = payload["races"][0], payload["target"]
+    assert race["basis"] == "start_of_day" and target["date"] == race["date"] == "2026-10-18"
+    assert (race["ctl"], race["atl"], race["form"]) == (target["baseline"]["ctl"], target["baseline"]["atl"], target["baseline"]["form"])
+    race_day_row = next(d for d in payload["days"] if d["date"] == "2026-10-18")
+    assert race_day_row["form"] != race["form"]  # end of day: one more day of decay
+    assert payload["value_basis"]["races_and_target"].startswith("start of day")
+    text = asyncio.run(get_load_projection(target_form="5,15"))
+    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo': CTL 42.0, ATL 32.1, form +9.9" in text
+    assert "start of day: CTL 42.0 | ATL 32.1 | form +9.9" in text
+    assert "End of 2026-11-06:" in text and "Lowest projected form (end of day)" in text
+    with_race = [{"date": "2026-10-18", "load": 300, "sport": "Ride", "name": "Gran Fondo"}]
+    sim = json.loads(asyncio.run(get_load_projection(scenario=with_race, output_format="json", detail_level="full")))
+    sim_race, sim_target = sim["simulation"]["races"][0], sim["target"]["scenario"]
+    assert sim_race["form"] == sim_target["form"] == sim["races"][0]["form"]  # the race's own load does not count
+    end_of_race_day = next(d for d in sim["simulation"]["days"] if d["date"] == "2026-10-18")
+    assert end_of_race_day["form"] < sim_race["form"] - 10
+    sim_text = asyncio.run(get_load_projection(scenario=with_race))
+    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo': scenario CTL" in sim_text
+    assert "Lowest form (end of day, that day's load included): scenario" in sim_text
+
+
+def test_race_today_starts_from_the_intervals_values(monkeypatch):
+    """A race today is reported at the start of today, i.e. the Intervals.icu values at the end of yesterday."""
+    events = [dict(e, start_date_local="2026-10-09T00:00:00") if e["category"] == "RACE_A" else e for e in EVENTS]
+    _setup(monkeypatch, {"/events": events})
+    payload = json.loads(asyncio.run(get_load_projection(output_format="json")))
+    race, start = payload["races"][0], payload["start"]
+    assert start["date"] == "2026-10-08" and (race["ctl"], race["atl"], race["form"]) == (start["ctl"], start["atl"], start["form"])
+
+
+def test_plan_weeks_missing_durations_sports_and_identical_loads():
+    """Review P6-20-2/3: hours n/a without durations, 'sport not given', identical daily loads flagged as maximal."""
+    monday = date(2026, 10, 12)
+    sessions = [_session(monday + timedelta(days=i), 70.0) for i in range(7)]
+    sessions[0]["sport"] = None
+    loads = {s["date"]: 70.0 for s in sessions}
+    rows = _rows(loads, start=monday - timedelta(days=1), days=7, ctl=70.0, atl=70.0)
+    week = ps.plan_weeks(rows, loads, sessions)[0]
+    assert week["hours"] is None and week["sessions_without_duration"] == 7
+    assert week["by_sport"] == {"cycling": 420, "sport not given": 70}
+    assert week["monotony"] is None and week["monotony_note"] == ps.IDENTICAL_LOADS
+    monotony_flag = next(e for e in week["outside_commonly_cited_range"] if e["metric"] == "monotony")
+    assert monotony_flag["value"] is None and monotony_flag["position"] == "above"
+    partial_rows = rows[2:]  # 5 identical days: flagged although the rest-day check does not apply
+    partial = ps.plan_weeks(partial_rows, loads, sessions)[0]
+    assert {e["metric"] for e in partial["outside_commonly_cited_range"]} == {"monotony"}
+    mixed = [dict(s, minutes=60.0) if i < 3 else s for i, s in enumerate(sessions)]
+    assert ps.plan_weeks(rows, loads, mixed)[0]["hours"] == 3.0
+    few = ps.plan_weeks(rows[:4], loads, sessions)[0]
+    assert few["monotony_note"].startswith("needs 5 days")
+
+
+def test_template_text_without_durations_and_identical_loads(monkeypatch):
+    """The week line says hours n/a and monotony undefined; the check names the week."""
+    _setup(monkeypatch)
+    text = asyncio.run(get_load_projection(scenario={"calendar": "none", "weekly": {"load": 490, "sessions": 7}},
+                                           end_date="2026-10-18"))
+    assert ("scenario: 7 sessions (cycling 490), hours n/a (7 session(s) without duration), longest n/a, rest days 0, "
+            "monotony undefined (identical daily loads, maximal)") in text
+    assert "2026-W42 monotony undefined, identical daily loads (above 2.0 [2])" in text
+
+
+def test_estimated_loads_are_capped():
+    """Review P6-20-4: an estimate may not exceed the caps that apply to a given load."""
+    with pytest.raises(ps.ScenarioError, match="estimated load 5400 exceeds 1500"):
+        ps.parse_scenario([{"date": "2026-10-10", "duration_min": 1440, "intensity_factor": 1.5}], TODAY, LAST)
+    with pytest.raises(ps.ScenarioError, match="estimated weekly load 9000 exceeds 5000"):
+        ps.parse_scenario({"weekly": {"hours": 90, "intensity_factor": 1.0}}, TODAY, LAST)
