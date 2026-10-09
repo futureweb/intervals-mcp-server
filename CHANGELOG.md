@@ -199,6 +199,11 @@ First public beta of the Futureweb fork. Based on upstream
   user, security policy, issue and PR templates, documentation (`docs/`).
 
 ### Fixed
+- Security: identifiers from tool arguments can no longer leave their URL path segment (e.g.
+  `../athlete/i1` or `1?oldest=...` reached other endpoints, including the raw athlete object);
+  secret fields such as `icu_api_key` are removed from every API response.
+- The shared HTTP client was closed whenever any MCP session ended (FastMCP runs the lifespan per
+  session), breaking requests of other sessions in flight; it now closes after the last session.
 - POST requests are no longer retried after 500/502/503/504: Intervals.icu may already have created the
   event, so a retry could duplicate it. POST is retried only on 429; GET/PUT/DELETE as before.
 - `add_or_update_event` / `add_or_update_note` updates are partial: only passed fields are sent, so an
