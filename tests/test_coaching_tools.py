@@ -285,7 +285,9 @@ def test_analyze_workout_execution_with_plan(monkeypatch):
     assert "Workout execution for Threshold Ride (i1, Ride" in result
     assert "Plan source: event 5 ('2x5 min Threshold', 2026-10-06)" in result
     assert "Intervals.icu compliance 101%, RPE 7/10, feel 3/5, load 41 (Intervals.icu)" in result
-    assert "Device/custom fields: Aerobic Effect [AerobicEffect]: 3.1; EPOC [EPOC]: 80.5 ml/kg" in result
+    # Only the custom fields assigned to the sport (sport settings activity_field_ids) are listed.
+    assert "Device/custom fields (assigned to the sport): EPOC [EPOC]: 80.5 ml/kg" in result
+    assert "AerobicEffect" not in result
     assert "Plan: 6 steps, 29:00 planned | Actual: 6 intervals, 29:00 in total | matched 6" in result
     assert "extended beyond the plan" not in result
     assert "work steps in target: 2/2" in result
@@ -432,7 +434,7 @@ def test_get_training_summary_groups(monkeypatch):
     assert "- Ride: 1 sessions, 1:21:01, 40.4 km, load 90" in result
     assert "- gear Canyon Ultimate (b1): 1 sessions" in result
     assert "feel 2: 1, 3: 1, 4: 1 | RPE mean 5.0 | sessions >= 3 h: 0 | longest 1:51:48 ('Grail gravel')" in result
-    assert "Custom fields (e.g. device loads, kept separate from Intervals.icu load): Aerobic Effect [AerobicEffect] mean 3.4 (n 2)" in result
+    assert "Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept separate from the Intervals.icu load): Aerobic Effect [AerobicEffect] 3.3 (n 1) (1 value(s) from sports without this field ignored)" in result  # not assigned to Ride
     epoc = asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json"))
     assert json.loads(epoc)["overall"]["custom_fields"].get("EPOC") is None  # no EPOC values in the fixtures
     assert "End of period (2026-10-09): CTL 65.8, ATL 66.0, form -0.2, ramp 1.0" in result
@@ -660,3 +662,94 @@ def test_get_activity_report_single_call(monkeypatch):
     assert payload["execution"]["summary"]["actual_intervals"] == 9
     assert payload["power_check"] is None
     assert payload["api_calls"] == 3
+
+
+# ----------------------------------------------------- phase 3: wellness periods
+def test_get_wellness_trends_separates_period_lookback_and_baseline(monkeypatch):
+    """Regression: requested period, fetched history and baseline are stated separately and the
+    day counts per metric refer to the requested period; native metrics carry units."""
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    result = asyncio.run(get_wellness_trends(start_date="2026-09-20", end_date="2026-10-09", metrics="hrv,restingHR,readiness"))
+    assert result.startswith(
+        "Wellness trends for athlete i1, 2026-09-20 to 2026-10-09: 20 days requested; 62 days fetched (2026-08-09 to "
+        "2026-10-09, including a 42-day lookback for rolling windows and the baseline); personal baseline = the 42 days ending 2026-10-09"
+    )
+    assert "hrv (ms): period 2026-09-20 to 2026-10-09, 20 days, 20 with values, 0 missing" in result
+    assert "restingHR (bpm): period 2026-09-20 to 2026-10-09, 20 days" in result
+    assert "readiness (/100): period" in result
+    assert "Personal baseline (42 days 2026-08-29 to 2026-10-09, n=30)" in result
+    wellness_call = next(c for c in calls if "/wellness" in c[0])
+    assert wellness_call[1]["oldest"] == "2026-08-09"
+    payload = json.loads(asyncio.run(get_wellness_trends(start_date="2026-09-20", end_date="2026-10-09", metrics="hrv", output_format="json")))
+    assert payload["windows"]["requested"]["days"] == 20 and payload["windows"]["fetched"]["days"] == 62
+    assert payload["metrics"][0]["days_total"] == 20 and payload["metrics"][0]["units"] == "ms"
+
+
+# ------------------------------------------------- phase 3: report levels and checks
+def test_get_activity_report_levels_and_data_quality(monkeypatch):
+    """compact = core numbers + key findings + data quality; no fake power-meter comparison without
+    a usable second stream; identical streams are reported, gear positions are not called teeth."""
+    from intervals_mcp_server.server import get_activity_report  # pylint: disable=import-outside-toplevel
+
+    gear_items = CUSTOM_ITEMS_DATA + [{"id": 20, "type": "ACTIVITY_STREAM", "name": "RearGear",
+                                       "content": {"code": "RearGear", "type": "numeric", "units": "cog", "script": "..."}}]
+    primary = EXECUTION_STREAMS[1]["data"]
+    gear = {"type": "RearGear", "custom": True, "data": [(i // 100) % 11 + 1 for i in range(len(primary))]}
+    identical = EXECUTION_STREAMS + [{"type": "secondary_power", "custom": False, "data": list(primary)}, gear]
+    activity = dict(EXECUTION_ACTIVITY, stream_types=EXECUTION_ACTIVITY["stream_types"] + ["secondary_power", "RearGear"],
+                    icu_training_load=41, TrainingLoad=55.0)
+    _install_router(monkeypatch, {"/activity/": activity, "/streams": identical, "/custom-item": gear_items})
+    standard = asyncio.run(get_activity_report("i1"))
+    assert "== Second power meter check" not in standard
+    assert "- both power streams are identical (the same sensor recorded twice); no comparison" in standard
+    assert "- RearGear: values 1-11 look like gear positions (index), not tooth counts; units 'cog' from the definition are not applied" in standard
+    compact = asyncio.run(get_activity_report("i1", detail_level="compact"))
+    assert "== Key findings" in compact and "== Plan vs execution" not in compact
+    assert "- Plan: 6/6 steps executed; work steps 242/240 W vs 240-250 W planned (2/2 within ±5%" in compact
+    assert len(compact) < len(standard) / 2
+    full = asyncio.run(get_activity_report("i1", detail_level="full"))
+    assert "Aerobic Effect [AerobicEffect]" in full  # every custom field, not only the ones assigned to the sport
+    assert "Aerobic Effect" not in standard
+    sparse = EXECUTION_STREAMS + [{"type": "secondary_power", "custom": False, "data": [None] * (len(primary) - 100) + [200] * 100}]
+    _install_router(monkeypatch, {"/activity/": activity, "/streams": sparse})
+    assert "- second power stream has only 100 usable samples paired with the primary; no comparison" in asyncio.run(get_activity_report("i1"))
+    payload = json.loads(asyncio.run(get_activity_report("i1", detail_level="compact", output_format="json")))
+    assert payload["power_check"]["status"] == "insufficient" and payload["key_findings"]
+    assert "rows" not in payload["execution"]
+    assert asyncio.run(get_activity_report("i1", detail_level="x")).startswith("Error: detail_level")
+
+
+def test_get_activity_intervals_planned_step_types(monkeypatch):
+    """The Intervals.icu type is kept as stored; the planned step type is shown separately on request."""
+    labelled_work = {"id": "i1", "analyzed": True, "icu_groups": [],
+                     "icu_intervals": [dict(i, type="WORK") for i in EXECUTION_INTERVALS["icu_intervals"]]}
+    calls = []
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/intervals": labelled_work}, calls=calls)
+    plain = asyncio.run(get_activity_intervals("i1"))
+    assert "Planned step" not in plain and not any("/events/" in c[0] for c in calls)
+    text = asyncio.run(get_activity_intervals("i1", include_planned_types=True, detail_level="compact"))
+    assert "Planned step per interval (event 5 ('2x5 min Threshold'); the Intervals.icu type is kept as stored):" in text
+    assert "  [3] Intervals.icu WORK | plan step 3 rest 2:00 <- type differs from the plan" in text
+    assert "  [2] Intervals.icu WORK | plan step 2 work 5:00\n" in text
+    payload = json.loads(asyncio.run(get_activity_intervals("i1", planned_workout_doc=EVENT_DATA["workout_doc"], output_format="json")))
+    assert payload["intervals"][2]["type"] == "WORK" and payload["intervals"][2]["planned_step"]["kind"] == "rest"
+    unpaired = {k: v for k, v in EXECUTION_ACTIVITY.items() if k != "paired_event_id"}
+    _install_router(monkeypatch, {"/activity/": unpaired, "/intervals": labelled_work})
+    assert "Planned step types: not available (no planned workout paired with this activity)." in asyncio.run(
+        get_activity_intervals("i1", include_planned_types=True))
+
+
+def test_get_training_plan_empty_and_unknown(monkeypatch):
+    """No assigned plan and no plan events give a clear empty answer; an unreadable plan is 'unknown', not 'none'."""
+    from intervals_mcp_server.server import get_training_plan  # pylint: disable=import-outside-toplevel
+
+    _install_router(monkeypatch, {"/training-plan": {"training_plan_id": None}, "/events": [], "/fitness-model-events": []})
+    text = asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-01-01"))
+    assert "Assigned plan: none (no Intervals.icu training plan is applied to this athlete)" in text
+    assert "No plan phases, weekly targets, races or fitness-model events in this range." in text
+    _install_router(monkeypatch, {"/training-plan": {"error": True, "message": "403 Forbidden"}, "/events": [], "/fitness-model-events": []})
+    unknown = asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-01-01"))
+    assert "Assigned plan: unknown (the training plan could not be read: 403 Forbidden)" in unknown
+    payload = json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-01-01", output_format="json")))
+    assert payload["training_plan_error"] == "403 Forbidden" and payload["phases"] == []

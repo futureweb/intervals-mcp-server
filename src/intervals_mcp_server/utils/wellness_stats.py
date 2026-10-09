@@ -39,6 +39,33 @@ SERIES_TAIL_DAYS = 14
 NUTRITION_TAIL_DAYS = 7
 # Minimum number of values before z-score outliers are reported.
 MIN_VALUES_FOR_OUTLIERS = 7
+# Baselines with fewer values and correlations with fewer pairs are flagged as small samples.
+MIN_BASELINE_VALUES = 14
+MIN_RELIABLE_PAIRS = 30
+# Native metrics for which a stored 0 is physiologically impossible and means "no value".
+ZERO_MEANS_MISSING = frozenset({
+    "hrv", "hrvSDNN", "restingHR", "avgSleepingHR", "respiration", "spO2", "weight", "bodyFat",
+    "sleepSecs", "sleepScore", "readiness", "vo2max",
+})
+# Display units of native wellness metrics (custom fields carry their own units).
+NATIVE_UNITS: dict[str, str] = {
+    "hrv": "ms", "hrvSDNN": "ms", "restingHR": "bpm", "avgSleepingHR": "bpm", "respiration": "breaths/min",
+    "spO2": "%", "readiness": "/100", "sleepScore": "/100", "weight": "kg", "bodyFat": "%", "sleepSecs": "s",
+    "steps": "steps", "kcalConsumed": "kcal", "vo2max": "ml/kg/min", "systolic": "mmHg", "diastolic": "mmHg",
+    "bloodGlucose": "mmol/L", "lactate": "mmol/L", "hydrationVolume": "l", "carbohydrates": "g", "protein": "g",
+    "fatTotal": "g", "abdomen": "cm", "baevskySI": "", "ctl": "", "atl": "", "rampRate": "",
+}
+
+
+def metric_units(metric: str, definition_units: str | None = None) -> str | None:
+    """Display units of a wellness metric: custom definition units, native map, eFTP in W."""
+    if definition_units:
+        return definition_units
+    if metric.startswith(("eftp_", "pMax_")):
+        return "W"
+    if metric.startswith("wPrime_"):
+        return "J"
+    return NATIVE_UNITS.get(metric) or None
 
 DateValue = tuple[date, float | None]
 
@@ -270,34 +297,79 @@ def _outliers(series: list[DateValue], threshold: float) -> list[dict[str, Any]]
     return found
 
 
-def compute_metric_trend(
+def _as_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def compute_metric_trend(  # pylint: disable=too-many-arguments,too-many-locals
     entries: list[dict[str, Any]],
     metric: str,
     windows: tuple[int, ...] = (7, 14, 42),
     baseline_days: int = 42,
     outlier_z: float = 2.5,
+    *,
+    period_start: Any = None,
+    period_end: Any = None,
 ) -> dict[str, Any]:
-    """Trend statistics of one wellness metric over the calendar range of the entries.
+    """Trend statistics of one wellness metric.
 
-    The baseline covers the last ``baseline_days`` calendar days (available values
-    only, ``n`` tells how many). ``latest_vs_baseline`` compares the latest value with
-    the baseline mean (z uses the baseline stdev). Rolling means are trailing means
-    over the available values of the last ``window`` calendar days, both for the
-    latest day (``rolling``) and for every day of the range (``series``).
+    ``period_start`` / ``period_end`` (ISO dates) select the requested analysis period; the
+    entries may reach further back (lookback) so that rolling windows and the baseline at
+    the start of the period have data. Day counts, statistics, outliers, the latest value
+    and the per-day series cover the requested period only; the baseline covers the last
+    ``baseline_days`` calendar days ending at the period end (available values only, ``n``
+    tells how many, ``small_sample`` flags fewer than 14); rolling means are trailing means
+    over the available values of the last ``window`` calendar days, lookback included.
+    Without a period the whole range of the entries is the period. For native metrics in
+    ``ZERO_MEANS_MISSING`` a stored 0 is treated as missing and counted.
     """
-    series = metric_series(entries, metric)
-    values = _values(series)
-    present = [(day, value) for day, value in series if value is not None]
+    full = metric_series(entries, metric)
+    zeros_missing = 0
+    if metric in ZERO_MEANS_MISSING:
+        cleaned: list[DateValue] = []
+        for day, value in full:
+            if value == 0:
+                zeros_missing += 1
+                value = None
+            cleaned.append((day, value))
+        full = cleaned
+    start, end = _as_date(period_start), _as_date(period_end)
+    if end is not None:
+        full = [item for item in full if item[0] <= end]
+    fetched = {"start": full[0][0].isoformat() if full else None, "end": full[-1][0].isoformat() if full else None, "days": len(full)}
+    if start is not None:
+        full_start = full[0][0] if full else start
+        if full_start > start:  # the entries start inside the period: count the empty days before
+            full = [(start + timedelta(days=offset), None) for offset in range((full_start - start).days)] + full
+    period = [item for item in full if start is None or item[0] >= start]
+    if start is not None and end is not None:
+        days_total = (end - start).days + 1
+    else:
+        days_total = len(period)
+    values = _values(period)
+    present = [(day, value) for day, value in period if value is not None]
     latest = _point(present[-1] if present else None)
-    baseline = _baseline(series, baseline_days)
-    rolling_rows = _trailing_means(series, windows)
+    baseline = _baseline(full, baseline_days)
+    baseline["start"] = (full[-1][0] - timedelta(days=baseline_days - 1)).isoformat() if full else None
+    baseline["end"] = full[-1][0].isoformat() if full else None
+    baseline["small_sample"] = baseline["n"] < MIN_BASELINE_VALUES
+    rolling_rows = _trailing_means(full, windows)[len(full) - len(period):]
     return {
         "metric": metric,
-        "start": series[0][0].isoformat() if series else None,
-        "end": series[-1][0].isoformat() if series else None,
-        "days_total": len(series),
+        "start": start.isoformat() if start else (period[0][0].isoformat() if period else None),
+        "end": end.isoformat() if end else (period[-1][0].isoformat() if period else None),
+        "days_total": days_total,
         "days_with_value": len(values),
-        "days_missing": len(series) - len(values),
+        "days_missing": days_total - len(values),
+        "zeros_treated_as_missing": zeros_missing,
+        "fetched": fetched,
         "latest": latest,
         "stats": describe(values),
         "baseline": baseline,
@@ -305,13 +377,13 @@ def compute_metric_trend(
             latest["value"] if latest else None, baseline["mean"], baseline["stdev"]
         ),
         "windows": list(windows),
-        "rolling": {window: _window_summary(series, window) for window in windows},
-        "trend_7d_vs_prev_7d": _week_over_week(series),
+        "rolling": {window: _window_summary(full, window) for window in windows},
+        "trend_7d_vs_prev_7d": _week_over_week(full),
         "outlier_z": outlier_z,
-        "outliers": _outliers(series, outlier_z),
+        "outliers": _outliers(period, outlier_z),
         "series": [
             {"date": day.isoformat(), "value": value, "rolling": rolling}
-            for (day, value), rolling in zip(series, rolling_rows, strict=True)
+            for (day, value), rolling in zip(period, rolling_rows, strict=True)
         ],
     }
 
@@ -360,6 +432,7 @@ def compute_correlation(
         "lag_days": lag_days,
         "n": len(pairs),
         "min_pairs": min_pairs,
+        "small_sample": len(pairs) < MIN_RELIABLE_PAIRS,
         "pearson_r": _correlation(xs, ys, "linear") if enough else None,
         "spearman_rho": _correlation(xs, ys, "ranked") if enough else None,
         "note": CAUSATION_NOTE,
@@ -557,12 +630,12 @@ def _format_outliers(result: dict[str, Any], unit: str) -> str:
     """Outlier days with their z-scores on one line."""
     outliers = result["outliers"]
     if not outliers:
-        return f"Outliers (|z| >= {_fmt(result['outlier_z'], 1)}): none"
+        return f"Outliers in the period (|z| >= {_fmt(result['outlier_z'], 1)}): none"
     items = ", ".join(
         f"{item['date']} = {_fmt(item['value'])}{unit} (z {_fmt(item['z'], signed=True)})"
         for item in outliers
     )
-    return f"Outliers (|z| >= {_fmt(result['outlier_z'], 1)}): {items}"
+    return f"Outliers in the period (|z| >= {_fmt(result['outlier_z'], 1)}): {items}"
 
 
 def _format_series_tail(result: dict[str, Any], unit: str) -> list[str]:
@@ -579,30 +652,47 @@ def _format_series_tail(result: dict[str, Any], unit: str) -> list[str]:
         lines.append(f"  {row['date']}  {_fmt(row['value'])}  {_fmt(rolling)}")
     hidden = len(series) - len(rows)
     if hidden:
-        lines.append(f"  ... {hidden} earlier days not shown (series covers {len(series)} days)")
+        lines.append(f"  ... {hidden} earlier days of the period not shown (period covers {len(series)} days)")
     return lines
+
+
+def _unit_text(units: str | None) -> str:
+    if not units:
+        return ""
+    return units if units.startswith("/") else f" {units}"
 
 
 def format_metric_trend(result: dict[str, Any], units: str | None = None) -> str:
     """Render a ``compute_metric_trend`` result as compact text."""
-    unit = f" {units}" if units else ""
+    unit = _unit_text(units)
     latest = result["latest"]
+    baseline = result["baseline"]
+    head = (
+        f"{result['metric']}{f' ({units})' if units else ''}: period {result['start'] or 'n/a'} to {result['end'] or 'n/a'}, "
+        f"{result['days_total']} days, {result['days_with_value']} with values, {result['days_missing']} missing"
+    )
+    if result.get("zeros_treated_as_missing"):
+        head += f" ({result['zeros_treated_as_missing']} stored 0 treated as missing)"
+    baseline_head = (
+        f"Personal baseline ({baseline['days']} days"
+        + (f" {baseline['start']} to {baseline['end']}" if baseline.get("start") else "")
+        + f", n={baseline['n']})"
+    )
+    if baseline.get("small_sample"):
+        baseline_head += f" - small sample (fewer than {MIN_BASELINE_VALUES} values), not reliable"
     lines = [
-        f"{result['metric']} trend: {result['start'] or 'n/a'} to {result['end'] or 'n/a'}, "
-        f"{result['days_total']} days, {result['days_with_value']} with values, "
-        f"{result['days_missing']} missing",
+        head,
         f"Latest: {latest['date']} = {_fmt(latest['value'])}{unit}" if latest else "Latest: n/a",
-        f"Range stats: {_format_stats(result['stats'], unit)}",
-        f"Baseline (last {result['baseline']['days']}d, n={result['baseline']['n']}): "
-        f"mean {_fmt(result['baseline']['mean'])}{unit}, "
-        f"median {_fmt(result['baseline']['median'])}{unit}, "
-        f"stdev {_fmt(result['baseline']['stdev'])}",
+        f"Period stats: {_format_stats(result['stats'], unit)}",
+        f"{baseline_head}: mean {_fmt(baseline['mean'])}{unit}, median {_fmt(baseline['median'])}{unit}, "
+        f"stdev {_fmt(baseline['stdev'])}",
         f"Latest vs baseline: {_format_compare(result['latest_vs_baseline'], unit)}",
     ]
-    for window, rolling in result["rolling"].items():
-        lines.append(
-            f"Rolling {window}d: mean {_fmt(rolling['latest_mean'])}{unit} (n={rolling['latest_n']})"
-        )
+    rolling_parts = [
+        f"{window}d {_fmt(rolling['latest_mean'])}{unit} (n={rolling['latest_n']})"
+        for window, rolling in result["rolling"].items()
+    ]
+    lines.append(f"Rolling means at {result['end'] or 'n/a'} (lookback included): " + ", ".join(rolling_parts))
     lines.append(f"Last 7d vs previous 7d: {_format_week(result['trend_7d_vs_prev_7d'], unit)}")
     lines.append(_format_outliers(result, unit))
     lines.extend(_format_series_tail(result, unit))
@@ -619,6 +709,8 @@ def format_correlation(result: dict[str, Any]) -> str:
     header = f"Correlation {result['metric_a']} vs {result['metric_b']} ({lag_text}): n={result['n']}"
     if result["n"] < result["min_pairs"]:
         header += f" (fewer than {result['min_pairs']} paired days, no coefficients)"
+    elif result.get("small_sample"):
+        header += f" (small sample, fewer than {MIN_RELIABLE_PAIRS} paired days: indicative only)"
     return "\n".join(
         [
             header,

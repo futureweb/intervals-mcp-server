@@ -11,6 +11,7 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import (
     resolve_activity_type,
@@ -374,10 +375,16 @@ async def get_library_workout(
         return f"No library workout found with id {workout_id}."
     if output_format.strip().lower() == "json":
         return json.dumps(result, ensure_ascii=False)
+    def shown(key: str) -> Any:
+        value = result.get(key)
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value) or "none"
+        return "n/a" if value is None else value
+
     lines = [
-        f"Library workout {result.get('id')}: {result.get('name', 'unnamed')} ({result.get('type', '?')}, folder {result.get('folder_id')})",
-        f"Planned time {result.get('moving_time')} s, load {result.get('icu_training_load')}, intensity {result.get('icu_intensity')}, "
-        f"target {result.get('target')}, indoor {result.get('indoor')}, tags {result.get('tags')}, updated {result.get('updated')}",
+        f"Library workout {result.get('id')}: {result.get('name', 'unnamed')} ({result.get('type', '?')}, folder {shown('folder_id')})",
+        f"Planned time {hms(result.get('moving_time'))}, load {shown('icu_training_load')}, intensity {shown('icu_intensity')}, "
+        f"target {shown('target')}, indoor {shown('indoor')}, tags {shown('tags')}, updated {shown('updated')}",
     ]
     if result.get("description"):
         lines.append("Description / workout text:")
@@ -387,6 +394,6 @@ async def get_library_workout(
         try:
             lines.append("Steps (rendered):")
             lines.append(str(WorkoutDoc.from_dict({"steps": doc["steps"]})).strip())
-        except (ValueError, TypeError, KeyError):
-            lines.append(f"Steps (raw): {json.dumps(doc['steps'], ensure_ascii=False)}")
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:  # malformed or unsupported (nested repeats)
+            lines.append(f"Steps could not be rendered ({exc}); raw steps: {json.dumps(doc['steps'], ensure_ascii=False)}")
     return "\n".join(lines)

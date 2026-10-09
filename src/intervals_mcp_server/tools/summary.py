@@ -15,9 +15,11 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, is_missing
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, assigned_codes, is_missing
+from intervals_mcp_server.utils.field_policy import aggregate_custom_fields, format_aggregate, format_pair, pair_changes
 from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
@@ -72,29 +74,17 @@ def _zone_secs(activity: dict[str, Any], key: str) -> dict[str, float]:
     return out
 
 
-def _aggregate_custom(activities: list[dict[str, Any]], defs: CustomFieldDefs) -> dict[str, dict[str, Any]]:
-    """Aggregate numeric custom fields the way their definition says (SUM, MAX, MIN, else mean)."""
-    out: dict[str, dict[str, Any]] = {}
-    for code, definition in defs.items():
-        if definition.get("value_type") != "numeric":
-            continue
-        values = [float(a[code]) for a in activities if code in a and isinstance(a[code], (int, float)) and not is_missing(a[code])]
-        if not values:
-            continue
-        aggregate = str(definition.get("aggregate") or "").upper()
-        if aggregate == "SUM":
-            value, how = sum(values), "sum"
-        elif aggregate == "MAX":
-            value, how = max(values), "max"
-        elif aggregate == "MIN":
-            value, how = min(values), "min"
-        else:
-            value, how = sum(values) / len(values), "mean"
-        out[code] = {"name": definition.get("name"), "units": definition.get("units"), how: round(value, 2), "n": len(values)}
-    return out
+def _aggregate_custom(
+    activities: list[dict[str, Any]], defs: CustomFieldDefs, assigned_by_type: dict[str, set[str] | None] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Aggregate numeric custom fields by their policy (units / semantics / definition, see utils.field_policy)."""
+    return aggregate_custom_fields(activities, defs, get_config().custom_aggregate_overrides, assigned_by_type)
 
 
-def _summarize(activities: list[dict[str, Any]], defs: CustomFieldDefs, gear_map: dict[str, str]) -> dict[str, Any]:  # pylint: disable=too-many-locals
+def _summarize(  # pylint: disable=too-many-locals
+    activities: list[dict[str, Any]], defs: CustomFieldDefs, gear_map: dict[str, str],
+    assigned_by_type: dict[str, set[str] | None] | None = None,
+) -> dict[str, Any]:
     moving = sum(_num(a.get("moving_time")) for a in activities)
     power_tiz: dict[str, float] = defaultdict(float)
     hr_tiz: dict[str, float] = defaultdict(float)
@@ -146,7 +136,8 @@ def _summarize(activities: list[dict[str, Any]], defs: CustomFieldDefs, gear_map
         "long_sessions_3h_plus": sum(1 for a in activities if _num(a.get("moving_time")) >= LONG_SESSION_SECS),
         "longest_session": {"id": longest.get("id"), "name": longest.get("name"), "moving_time_s": longest.get("moving_time")} if longest else None,
         "trainer_sessions": sum(1 for a in activities if a.get("trainer")),
-        "custom_fields": _aggregate_custom(activities, defs),
+        "custom_fields": _aggregate_custom(activities, defs, assigned_by_type),
+        "custom_field_changes": pair_changes(activities, defs),
     }
 
 
@@ -165,7 +156,9 @@ def _fitness_at(wellness: list[dict[str, Any]], last_day: str) -> dict[str, Any]
     }
 
 
-def _format_group(name: str, s: dict[str, Any], fitness: dict[str, Any] | None, include_gear: bool) -> str:  # pylint: disable=too-many-locals
+def _format_group(  # pylint: disable=too-many-locals,too-many-branches
+    name: str, s: dict[str, Any], fitness: dict[str, Any] | None, include_gear: bool, detail_level: str = "standard"
+) -> str:
     lines = [
         f"{name}: {s['sessions']} sessions | {hms(s['moving_time_s'])} moving ({hms(s['elapsed_time_s'])} elapsed) | "
         f"{s['distance_m'] / 1000:.1f} km | +{s['elevation_gain_m']:.0f} m",
@@ -174,6 +167,12 @@ def _format_group(name: str, s: dict[str, Any], fitness: dict[str, Any] | None, 
     ]
     if fitness:
         lines.append(f"  End of period ({fitness['date']}): CTL {fitness['ctl']:.1f}, ATL {fitness['atl']:.1f}, form {fitness['form']}, ramp {fitness['ramp_rate']}")
+    if detail_level == "compact":
+        lines.append("  " + ", ".join(f"{sport} {int(v['sessions'])}x {hms(v['moving_time'])}" for sport, v in s["by_sport"].items()))
+        loads = [format_aggregate(code, agg) for code, agg in s["custom_fields"].items() if agg["policy"] == "device_load_sum"]
+        if loads:
+            lines.append("  Device loads (separate scale): " + "; ".join(loads))
+        return "\n".join(lines)
     if s["time_in_power_zones_s"]:
         lines.append("  Time in power zones: " + ", ".join(f"{z} {hms(v)}" for z, v in s["time_in_power_zones_s"].items() if v))
     if s["time_in_hr_zones_s"]:
@@ -195,11 +194,18 @@ def _format_group(name: str, s: dict[str, Any], fitness: dict[str, Any] | None, 
         extras.append(f"trainer sessions {s['trainer_sessions']}")
     lines.append("  " + " | ".join(extras))
     if s["custom_fields"]:
-        parts = []
-        for code, agg in s["custom_fields"].items():
-            how = next(k for k in ("sum", "max", "min", "mean") if k in agg)
-            parts.append(f"{agg['name']} [{code}] {how} {agg[how]}{(' ' + agg['units']) if agg.get('units') else ''} (n {agg['n']})")
-        lines.append("  Custom fields (e.g. device loads, kept separate from Intervals.icu load): " + "; ".join(parts))
+        shown = {code: agg for code, agg in s["custom_fields"].items() if detail_level == "full" or agg["policy"] != "none"}
+        parts = [format_aggregate(code, agg, show_reason=detail_level == "full") for code, agg in shown.items()]
+        skipped = [code for code in s["custom_fields"] if code not in shown]
+        if parts:
+            lines.append(
+                "  Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept "
+                "separate from the Intervals.icu load): " + "; ".join(parts)
+            )
+        if skipped:
+            lines.append(f"  Custom fields without a meaningful aggregate (not summed): {', '.join(skipped)}")
+    for pair in s.get("custom_field_changes") or []:
+        lines.append("  " + format_pair(pair))
     return "\n".join(lines)
 
 
@@ -213,6 +219,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    detail_level: str = "standard",
 ) -> str:
     """Training totals for a period grouped by week, month, sport, gear or in total (read-only)
 
@@ -221,9 +228,19 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     time-weighted intensity, CTL/ATL/form/ramp at the end of the period, time in power
     and HR zones, per-sport and per-gear splits, feel distribution and mean RPE,
     number of sessions of 3 h or more, the longest session, trainer sessions, and the
-    numeric custom activity fields aggregated as their definition prescribes (sum,
-    max, min or mean) so that e.g. a device training load stays separate from the
-    Intervals.icu load. For a quick per-week view see also get_weekly_summary.
+    numeric custom activity fields aggregated by a generic policy derived from their
+    units, meaning and definition: additive values (kcal, ml, distance, time) are summed,
+    device training loads / EPOC are summed but labelled as a device scale separate from
+    the Intervals.icu load, estimates and states (VO2max, performance condition, recovery
+    time, detected thresholds) get latest value, change and range, and per-activity values
+    (percentages such as stamina, scores, training effects, running dynamics, temperatures,
+    heart rate) get mean, median, min and max - they are never summed, even when the field
+    definition says SUM. Fields without units or a recognisable meaning get no aggregate.
+    Values of a field on activities whose sport does not have it assigned (sport settings,
+    e.g. running dynamics stored as 0 on rides) are ignored; for estimates a stored 0 means
+    "no value" and is left out. Paired "... at start" / "... at end" fields (e.g. stamina)
+    also get the typical start-to-end change. CUSTOM_AGGREGATE_OVERRIDES ("Code=sum|device_load_sum|trend|mean|none")
+    overrides the policy per field. For a quick per-week view see also get_weekly_summary.
 
     Args:
         start_date: Start date YYYY-MM-DD
@@ -234,10 +251,16 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        detail_level: "compact" (totals, loads, fitness, sessions per sport and device loads per
+            group), "standard" (default, everything above plus zones, gear, feel/RPE and custom
+            field aggregates) or "full" (standard plus the aggregation reason per custom field and
+            the fields without a meaningful aggregate)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
+    if detail_level not in ("compact", "standard", "full"):
+        return "Error: detail_level must be one of compact, standard, full."
     if group_by not in GROUPINGS:
         return f"Error: group_by must be one of {', '.join(GROUPINGS)}."
     end = end_date or get_default_end_date()
@@ -270,14 +293,18 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     )
     wellness = [w for w in wellness_result if isinstance(w, dict)] if isinstance(wellness_result, list) else []
 
+    assigned_by_type = {
+        sport: assigned_codes(defs, await assigned_field_ids(athlete_id_to_use, api_key, sport))
+        for sport in {str(a.get("type") or "") for a in activities} if sport
+    }
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for activity in sorted(activities, key=lambda a: str(a.get("start_date_local"))):
         groups[_group_key(activity, group_by, gear_map)].append(activity)
     rows: list[dict[str, Any]] = []
     for name, items in groups.items():
         last_day = max(str(a.get("start_date_local", ""))[:10] for a in items)
-        rows.append({"group": name, "summary": _summarize(items, defs, gear_map), "fitness_at_end": _fitness_at(wellness, last_day)})
-    overall = _summarize(activities, defs, gear_map)
+        rows.append({"group": name, "summary": _summarize(items, defs, gear_map, assigned_by_type), "fitness_at_end": _fitness_at(wellness, last_day)})
+    overall = _summarize(activities, defs, gear_map, assigned_by_type)
 
     if output_format.strip().lower() == "json":
         return json.dumps(
@@ -286,7 +313,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
             ensure_ascii=False,
         )
     text = f"Training summary for athlete {athlete_id_to_use}, {start_date} to {end}, grouped by {group_by}:\n\n"
-    text += "\n\n".join(_format_group(r["group"], r["summary"], r["fitness_at_end"], include_gear) for r in rows)
+    text += "\n\n".join(_format_group(r["group"], r["summary"], r["fitness_at_end"], include_gear, detail_level) for r in rows)
     if len(rows) > 1:
-        text += "\n\n" + _format_group("TOTAL", overall, _fitness_at(wellness, end), include_gear)
+        text += "\n\n" + _format_group("TOTAL", overall, _fitness_at(wellness, end), include_gear, detail_level)
     return text

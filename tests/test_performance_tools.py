@@ -179,7 +179,8 @@ def _install_router(monkeypatch, overrides=None, calls=None):
         if calls is not None:
             calls.append((url, params))
         for fragment, payload in ordered:
-            if fragment in (url or ""):
+            exact = fragment.endswith("$")  # "...$" matches the whole URL only
+            if (url == fragment[:-1]) if exact else fragment in (url or ""):
                 return payload(url, params) if callable(payload) else payload
         return {}
 
@@ -196,9 +197,11 @@ def test_get_best_efforts_text(monkeypatch):
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_best_efforts("a1", durations="5,300,3600", count=2))
     assert result.startswith("Best efforts for activity a1, stream watts (count 2):")
-    assert "Positions are h:mm:ss from the time stream" in result
-    assert "  5 s: #1 812.0 W from 1:40 to 1:45 (samples 100-105)" in result
-    assert "  5 min: #1 301.5 W from 28:20 to 36:40 (samples 1700-2000)" in result
+    # Regression: positions are elapsed time (the clock includes pauses), not "pauses excluded"
+    assert "Positions are elapsed h:mm:ss from the time stream (the clock includes recording pauses" in result
+    assert "pauses excluded" not in result
+    assert "  5 s: #1 812.0 W from 1:40 to 1:45 (samples 100-105)\n" in result
+    assert "  5 min: #1 301.5 W from 28:20 to 36:40 (samples 1700-2000) [window spans 3:20 of recording pause]" in result
     assert "#2 290.0 W from 6:40 to 11:40 (samples 400-700)" in result
     assert "  60 min: not available (longer than the activity or no data in this stream)" in result
     assert result.endswith("API calls: 4")
@@ -224,7 +227,7 @@ def test_get_best_efforts_json_and_query_params(monkeypatch):
     first = payload["efforts"][0]
     assert first["requested"] == {"duration": 300}
     assert first["units"] == "bpm" and first["pace"] is None
-    assert first["start_secs"] == 1700 and first["end_secs"] == 2200
+    assert first["start_secs"] == 1700 and first["end_secs"] == 2200 and first["paused_s_in_window"] == 200
     assert first["rank"] == 1 and payload["efforts"][1]["rank"] == 2
     assert calls[1][1] == {
         "stream": "heartrate", "count": 1, "excludeIntervals": "true", "startIndex": 10, "endIndex": 3000, "duration": 300,
@@ -310,20 +313,25 @@ def test_compare_best_efforts_limit_cap_and_errors(monkeypatch):
 
 # --------------------------------------------------------- find_similar_intervals
 def test_find_similar_intervals_params_and_text(monkeypatch):
-    """The search parameters are mapped to the API names; each activity gets a summary block."""
+    """The search parameters are mapped to the API names; by default only the dominant sport family is kept
+    (the run is counted, not silently dropped); each activity gets a summary block with gear, power meter
+    and a comparability score."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(find_similar_intervals(480, 720, 95, 105, target="power", min_reps=3, limit=10))
     assert calls[0][0] == "/athlete/i1/activities/interval-search"
-    assert calls[0][1] == {"minSecs": 480, "maxSecs": 720, "minIntensity": 95, "maxIntensity": 105, "limit": 10, "type": "POWER", "minReps": 3}
+    assert calls[0][1] == {"minSecs": 480, "maxSecs": 720, "minIntensity": 95, "maxIntensity": 105, "limit": 50, "type": "POWER", "minReps": 3}
     assert result.startswith("Interval search for athlete i1: 480-720 s at 95-105% of FTP, target POWER, reps 3-any, limit 10")
-    assert "API returned 4 activities, newest first." in result
-    lines = result.split("\n")
-    assert lines[2] == "2026-10-01 Ride 'Sweet Spot 3x20' (a4)"
-    assert lines[3] == "  intervals: 3x 10m 250w, moving 1:00:00, load 90, intensity 85 %, FTP 235 W, gear Road Bike (b1), compliance 95 %"
-    assert "2026-09-10 Run 'Tempo run' (a2)" in result and "gear no gear" in result
-    assert "Call get_activity_intervals(activity_id)" in result
+    assert "API returned 4 activities; filters (sport family cycling (default from most results)) keep 3; newest first." in result
+    assert "Also found in other sports (not shown, % of FTP is sport-specific; sport_types='all' to include): running 1" in result
+    assert "2026-10-01 Ride 'Sweet Spot 3x20' (a4)\n  intervals: 3x 10m 250w, moving 1:00:00, load 90, intensity 85 %, FTP 235 W, gear Road Bike (b1), power meter unknown, compliance 95 %" in result
+    assert "comparability 100/100: newest result (context); best match 3x 10:00 250w (106% FTP); same gear" in result
+    assert "other gear Gravel Bike (b2): watts from another power meter, compare % FTP only" in result
+    assert "Tempo run" not in result
+    assert "Absolute watts of different bikes / power meters are not comparable" in result
     assert result.endswith("API calls: 1 (plus 1 for the gear catalog unless cached)")
+    everything = asyncio.run(find_similar_intervals(480, 720, 95, 105, sport_types="all"))
+    assert "2026-09-10 Run 'Tempo run' (a2)" in everything and "gear no gear" in everything
 
 
 def test_find_similar_intervals_client_filters_and_json(monkeypatch):
@@ -334,14 +342,43 @@ def test_find_similar_intervals_client_filters_and_json(monkeypatch):
         480, 720, 95, 105, start_date="2026-09-05", end_date="2026-09-30", sport_types="run,gravelride", limit=5,
     ))
     assert calls[0][1]["limit"] == 25
-    assert "API returned 4 activities; client-side filters (dates 2026-09-05 to 2026-09-30, sports run,gravelride) keep 2." in result
+    assert "API returned 4 activities; filters (dates 2026-09-05 to 2026-09-30, sports run,gravelride) keep 2; newest first." in result
     assert "(a3)" in result and "(a2)" in result and "(a1)" not in result and "(a4)" not in result
     payload = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, gear_id="b1", limit=5, output_format="json")))
     assert [a["id"] for a in payload["activities"]] == ["a4", "a1"]
     assert payload["activities"][0]["gear_name"] == "Road Bike"
     assert payload["activities"][0]["interval_summary"] == ["3x 10m 250w"]
-    assert payload["returned_by_api"] == 4 and payload["filters"] == "gear b1"
+    assert payload["returned_by_api"] == 4 and payload["filters"].startswith("gear b1")
     assert payload["api_params"]["limit"] == 25
+    assert payload["activities"][1]["comparability"]["score"] == 100  # FTP 225 vs 235 W is within 5 %
+    strict = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, gear_id="b1", ftp_tolerance_pct=2, output_format="json")))
+    assert "other FTP context 225 vs 235 W (-4%)" in strict["activities"][1]["comparability"]["notes"]
+    assert strict["activities"][1]["comparability"]["score"] < 100
+    narrow = json.loads(asyncio.run(find_similar_intervals(480, 720, 95, 105, ftp_range="230-240", output_format="json")))
+    assert {a["id"] for a in narrow["activities"]} == {"a3", "a4"}
+
+
+def test_find_similar_intervals_reference_activity(monkeypatch):
+    """A reference activity defines the window (interval length ±25 %, intensity ±8 % of FTP), the sport
+    family and the ranking by comparability."""
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    payload = json.loads(asyncio.run(find_similar_intervals(reference_activity_id="a4", output_format="json")))
+    assert [c[0] for c in calls[:3]] == ["/activity/a4", "/activity/a4/intervals", "/athlete/i1/activities/interval-search"]
+    assert payload["api_params"]["minSecs"] == 900 and payload["api_params"]["maxSecs"] == 1500
+    assert payload["api_params"]["minIntensity"] == 94 and payload["api_params"]["maxIntensity"] == 111
+    assert payload["reference"]["pattern"] == {"count": 3, "secs": 1200, "pct_ftp": 102.1}
+    assert payload["sort_by"] == "comparability" and payload["other_sport_families"] == {"running": 1}
+    assert [a["id"] for a in payload["activities"]][0] == "a4"
+    text = asyncio.run(find_similar_intervals(reference_activity_id="a4", min_secs=500))
+    assert "Reference a4: 3 x 20:00 @ 102% FTP" in text and "500-1500 s" in text
+    assert asyncio.run(find_similar_intervals()).startswith("Error: pass min_secs, max_secs")
+    assert asyncio.run(find_similar_intervals(reference_activity_id="a2")).startswith("Error: reference activity a2 has no power-based work intensity")
+    _install_router(monkeypatch, overrides={"/intervals": {"icu_intervals": []}})
+    assert asyncio.run(find_similar_intervals(reference_activity_id="a4")).startswith("Reference activity a4 has no WORK intervals")
+    assert asyncio.run(find_similar_intervals(480, 720, 95, 105, sort_by="x")).startswith("Error: sort_by")
+    _install_router(monkeypatch, overrides={"/activity/": ERROR})
+    assert asyncio.run(find_similar_intervals(reference_activity_id="zz")) == "Error fetching activity zz: boom"
 
 
 def test_find_similar_intervals_validation_and_api_error(monkeypatch):
@@ -402,43 +439,126 @@ def test_get_activity_histogram_pace_validation_and_error(monkeypatch):
 
 
 # ------------------------------------------------------------- compare_workouts
-def test_compare_workouts_query_text(monkeypatch):
-    """Name search results are summarised per WORK intervals, oldest first, with a change line."""
+def _iv(kind, secs, watts, hr, max_hr=None, cad=90, start=0):
+    return {"type": kind, "elapsed_time": secs, "moving_time": secs, "average_watts": watts, "weighted_average_watts": watts,
+            "average_heartrate": hr, "max_heartrate": max_hr, "average_cadence": cad, "start_time": start}
+
+
+# Modelled on a 3 x 10 min threshold ride extended by a 50 s sprint and easy riding (FTP 234 W).
+THRESHOLD_RIDE = [
+    _iv("RECOVERY", 1021, 170, 122), _iv("WORK", 602, 249, 153, 161, 94, 1021), _iv("RECOVERY", 238, 121, 128),
+    _iv("WORK", 600, 249, 156, 165, 94, 1861), _iv("RECOVERY", 255, 130, 131), _iv("WORK", 601, 253, 160, 169, 96, 2716),
+    _iv("RECOVERY", 1078, 149, 125), _iv("WORK", 50, 432, 159, 169, 88, 4395), _iv("RECOVERY", 799, 180, 135),
+]
+THRESHOLD_ACTIVITIES = [
+    _activity("t1", "2026-08-01", "Ride", "b1", "Threshold 3x10", icu_ftp=230, icu_rpe=6),
+    _activity("t2", "2026-08-20", "GravelRide", "b2", "Threshold 4x6", icu_ftp=225, power_meter="Assioma"),
+    _activity("t3", "2026-09-01", "Run", None, "Threshold Run 3x10", icu_ftp=415),
+    _activity("t4", "2026-09-15", "Ride", "b1", "Threshold 3x10 again", icu_ftp=234, icu_rpe=5),
+    _activity("t5", "2026-10-09", "Ride", "b1", "Threshold 3x10 extended", icu_ftp=234, icu_rpe=3),
+]
+THRESHOLD_INTERVALS = {
+    "t1": [_iv("RECOVERY", 900, 150, 120), *[_iv("WORK", 600, 240, 158, 166, 92)] * 3, _iv("RECOVERY", 600, 140, 125)],
+    "t2": [*[_iv("WORK", 360, 240, 160, 168, 90)] * 4],
+    "t3": [*[_iv("WORK", 600, 390, 165, 172, 82)] * 3],
+    "t4": [*[_iv("WORK", 600, 245, 155, 163, 93)] * 3, _iv("WORK", 30, 600, 150, 160, 100)],
+    "t5": THRESHOLD_RIDE,
+}
+
+
+def _threshold_routes():
+    return {
+        "/search-full": THRESHOLD_ACTIVITIES,
+        "/intervals": lambda url, _p: {"icu_intervals": THRESHOLD_INTERVALS.get(_activity_id_of(url), [])},
+        "/activity/": lambda url, _p: {a["id"]: a for a in THRESHOLD_ACTIVITIES}.get(_activity_id_of(url), {}),
+    }
+
+
+def test_compare_workouts_separates_surges_and_sports(monkeypatch):
+    """Regression: 3 x 10 min (249/249/253 W) are no longer averaged with a 50 s 432 W sprint (296 W);
+    runs and gravel 4 x 6 min are not mixed in; means are time-weighted; RPE is whole-activity."""
     calls = []
-    _install_router(monkeypatch, calls=calls)
-    result = asyncio.run(compare_workouts(query="Sweet Spot", sport_types="Ride"))
-    assert calls[0] == ("/athlete/i1/activities/search-full", {"q": "Sweet Spot", "limit": 32})
-    assert [c[0] for c in calls[1:]] == ["/activity/a1/intervals", "/activity/a4/intervals"]
-    lines = result.split("\n")
-    assert lines[0] == "Workout comparison for athlete i1 (source name search 'Sweet Spot'; sports Ride; 2 of 4 activities, oldest first; limit 8):"
-    assert lines[2] == "Date | Activity | intervals | work time | avg W | NP | HR | cadence | Pw:HR | load | IF | FTP | RPE | feel"
-    assert lines[3] == "2026-09-01 | 'Sweet Spot 3x15' (a1, Ride) | 3 | 45:00 | 220 W | 222 W | 150 bpm | 88 rpm | 1.47 W/bpm | 70 | 85 % | 225 W | 7 | 3"
-    assert lines[4] == "2026-10-01 | 'Sweet Spot 3x20' (a4, Ride) | 3 | 1:00:00 | 240 W | 243 W | 155 bpm | 90 rpm | 1.55 W/bpm | 90 | 85 % | 235 W | 5 | 3"
-    assert lines[5].startswith("Change first -> last (2026-09-01 -> 2026-10-01): intervals 3 -> 3 (+0.0 %); work time 45:00 -> 1:00:00 (+33.3 %); avg W 220 W -> 240 W (+9.1 %)")
-    assert "Pw:HR 1.47 W/bpm -> 1.55 W/bpm (+5.4 %)" in result
-    assert "RPE 7 -> 5 (-28.6 %)" in result
-    assert result.endswith("API calls: 3")
+    _install_router(monkeypatch, overrides=_threshold_routes(), calls=calls)
+    payload = json.loads(asyncio.run(compare_workouts(query="Threshold", output_format="json")))
+    rows = {row["id"]: row for row in payload["activities"]}
+    assert set(rows) == {"t1", "t2", "t4", "t5"}  # cycling family of the newest activity; the run is not fetched
+    t5 = rows["t5"]["main_set"]
+    assert t5["count"] == 3 and t5["avg_watts"] == round((602 * 249 + 600 * 249 + 601 * 253) / 1803, 1)
+    assert [i["max_hr"] for i in t5["intervals"]] == [161, 165, 169] and t5["max_hr"] == 169
+    assert rows["t5"]["surges"] == [{"secs": 50, "avg_watts": 432, "max_watts": None, "avg_hr": 159, "start_time": 4395}]
+    assert rows["t4"]["surges"][0]["avg_watts"] == 600 and rows["t4"]["main_set"]["avg_watts"] == 245
+    assert rows["t1"]["excluded"] == [] and rows["t1"]["main_set"]["count"] == 3
+    assert rows["t2"]["comparable"] is False and "interval length 6.0 min vs 10.0 min" in rows["t2"]["not_comparable_reason"]
+    assert payload["reference"] == {"activity_id": "t5", "pattern": {"count": 3, "secs": 601, "pct_ftp": 107.0}, "explicit": False}
+    trends = {t["key"]: t for t in payload["trends"]}
+    assert trends["avg_watts"]["first"] == 240 and trends["avg_watts"]["last"] == 250.3 and trends["avg_watts"]["n"] == 3
+    assert trends["rpe_whole_activity"]["first"] == 6 and trends["rpe_whole_activity"]["last"] == 3
+    assert not any("t3" in c[0] for c in calls)
+    text = asyncio.run(compare_workouts(query="Threshold"))
+    assert "Reference pattern: 3 x 10:01 @ 107% FTP from the newest activity t5 (2026-10-09)" in text
+    assert "not averaged (short surges/sprints): 0:50 @ 432 W" in text
+    assert "HR 156/max 169 bpm" in text
+    assert "sport family cycling (default)" in text
+    assert "RPE 3 (whole activity)" in text and "RPE (whole activity, not per interval): 6 -> 3" in text
+    assert "power (time-weighted avg): 240 W -> 250 W (+4.3 %), range 240 W-250 W (n 3)" in text
+    assert "296" not in text
+    assert "Not comparable (left out of the trends): 2026-08-20 'Threshold 4x6' (t2, GravelRide): interval length 6.0 min vs 10.0 min" in text
+    assert "Note: FTP changed over the period (230, 234 W)" in text
+    assert "power meter unknown, gear Road Bike (b1)" in text
 
 
-def test_compare_workouts_ids_json_and_limit(monkeypatch):
-    """Ids and date ranges are accepted; JSON carries rows, missing values as null and the change list; limit is capped at 12."""
+def test_compare_workouts_filters_reference_and_flags(monkeypatch):
+    """Reference activity, explicit sport 'all', duration/intensity/reps/FTP filters and gear flags."""
+    _install_router(monkeypatch, overrides=_threshold_routes())
+    payload = json.loads(asyncio.run(compare_workouts(query="Threshold", reference_activity_id="t2", output_format="json")))
+    assert payload["reference"]["explicit"] is True and payload["reference"]["pattern"]["count"] == 4
+    assert [r["id"] for r in payload["activities"] if r["comparable"]] == ["t2"]
+    every = json.loads(asyncio.run(compare_workouts(query="Threshold", sport_types="all", comparable_only=False, output_format="json")))
+    assert {r["id"] for r in every["activities"]} == {"t1", "t2", "t3", "t4", "t5"}
+    assert next(r for r in every["activities"] if r["id"] == "t3")["main_set"]["pct_ftp"] == 94.0
+    reps = json.loads(asyncio.run(compare_workouts(query="Threshold", sport_types="Ride,GravelRide", min_interval_secs=300,
+                                                   max_interval_secs=700, min_reps=4, output_format="json")))
+    assert [r["id"] for r in reps["activities"] if r["comparable"]] == []
+    assert next(r for r in reps["activities"] if r["id"] == "t5")["not_comparable_reason"] == "3 repetitions outside the requested range"
+    ftp = json.loads(asyncio.run(compare_workouts(query="Threshold", ftp_range="233-240", output_format="json")))
+    assert {r["id"] for r in ftp["activities"]} == {"t4", "t5"}
+    high = json.loads(asyncio.run(compare_workouts(query="Threshold", min_intensity=105, output_format="json")))
+    assert next(r for r in high["activities"] if r["id"] == "t1")["excluded"][0]["reason"] == "outside the requested intensity range"
+    assert asyncio.run(compare_workouts(query="Threshold", ftp_range="x")).startswith("Error: ftp_range")
+    assert asyncio.run(compare_workouts(query="Threshold", min_reps=3, max_reps=2)).startswith("Error: min_reps")
+    # A comparable session on another bike (other power meter) is flagged, not silently mixed.
+    other_bike = _activity("t6", "2026-09-20", "GravelRide", "b2", "Threshold 3x10 gravel", icu_ftp=234, power_meter="Assioma Duo")
+    routes = _threshold_routes()
+    routes["/search-full"] = THRESHOLD_ACTIVITIES + [other_bike]
+    intervals = dict(THRESHOLD_INTERVALS, t6=[_iv("WORK", 600, 238, 157, 164, 90)] * 3)
+    routes["/intervals"] = lambda url, _p: {"icu_intervals": intervals.get(_activity_id_of(url), [])}
+    _install_router(monkeypatch, overrides=routes)
+    mixed = asyncio.run(compare_workouts(query="Threshold"))
+    assert "power meter Assioma Duo, gear Gravel Bike (b2)" in mixed
+    assert "Note: Different gear (b1, b2) / power meters (Assioma Duo): watts come from sensors that are not calibrated against each other" in mixed
+    assert "power on the reference gear only: 240 W -> 250 W" in mixed
+    same_bike = json.loads(asyncio.run(compare_workouts(query="Threshold", gear_id="b1", output_format="json")))
+    assert {r["id"] for r in same_bike["activities"]} == {"t1", "t4", "t5"}
+    assert not any(note.startswith("Different gear") for note in same_bike["notes"])
+
+
+def test_compare_workouts_ids_limit_and_trend_reliability(monkeypatch):
+    """Ids keep their own sport family; the limit is capped at 12; two activities give a not-reliable trend."""
     _install_router(monkeypatch)
-    payload = json.loads(asyncio.run(compare_workouts(activity_ids="a4,a2,a3", output_format="json")))
-    assert [row["id"] for row in payload["activities"]] == ["a2", "a3", "a4"]
-    run_row = payload["activities"][0]
-    assert run_row["avg_watts"] is None and run_row["pw_hr"] is None and run_row["avg_hr"] == 160
-    gravel = payload["activities"][1]
-    assert gravel["work_intervals"] == 3 and gravel["work_time"] == 3120 and gravel["rpe"] is None
-    assert gravel["avg_watts"] == 246.67 and gravel["pw_hr"] == 1.62
-    change = {c["key"]: c for c in payload["change_first_to_last"]}
-    assert "avg_watts" not in change and change["avg_hr"]["diff"] == -5 and change["avg_hr"]["pct"] == -3.1
-    assert payload["api_calls"] == 6
+    payload = json.loads(asyncio.run(compare_workouts(activity_ids="a4,a1", output_format="json")))
+    assert [row["id"] for row in payload["activities"]] == ["a1", "a4"]
+    assert payload["activities"][0]["main_set"]["avg_watts"] == 220 and payload["activities"][1]["main_set"]["avg_hr"] == 155
+    trend = {t["key"]: t for t in payload["trends"]}["avg_watts"]
+    assert trend["n"] == 2 and trend["reliable"] is False
+    text = asyncio.run(compare_workouts(activity_ids="a4,a1"))
+    assert "only 2 activities, not reliable" in text
+    assert "Different gear" not in text  # both on b1
     many = [_activity(f"w{i}", f"2026-08-{i + 1:02d}", "Ride", "b1", f"Workout {i}") for i in range(20)]
     _install_router(monkeypatch, overrides={"/activities": many})
     result = asyncio.run(compare_workouts(start_date="2026-08-01", end_date="2026-08-31", limit=50))
-    assert "12 of 20 activities, oldest first; limit 12, capped from 50" in result
-    assert "'Workout 19' (w19, Ride)" in result and "'Workout 7' (w7, Ride)" not in result
-    assert result.endswith("API calls: 13")
+    assert "12 of 20 activities analysed, oldest first; limit 12, capped from 50" in result
+    assert "'Workout 19' (w19, Ride)" in result and "'Workout 7' (w7" not in result
+    assert result.endswith("API calls: 13 (plus 1 for the gear catalog unless cached)")
 
 
 def test_compare_workouts_errors(monkeypatch):
@@ -452,11 +572,13 @@ def test_compare_workouts_errors(monkeypatch):
     _install_router(monkeypatch)
     assert asyncio.run(compare_workouts(query="Sweet Spot", sport_types="Swim")) == "No activities found (name search 'Sweet Spot'; sports Swim)."
     assert asyncio.run(compare_workouts(start_date="2026-10-02", end_date="2026-10-01")).startswith("Error: start_date must not be after end_date")
+    assert asyncio.run(compare_workouts(query="Sweet Spot", reference_activity_id="zz")).startswith("Reference activity zz not found")
 
 
 # -------------------------------------------------------- get_power_hr_efficiency
 def test_get_power_hr_efficiency_text(monkeypatch):
-    """Steady WORK intervals are bucketed by average power; per band a W/bpm trend oldest vs newest third."""
+    """Steady WORK intervals are bucketed by average power (time-weighted); with two bikes the trends are
+    per gear and too few independent activities give no trend (regression: no +X % from one activity)."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_power_hr_efficiency(
@@ -468,17 +590,53 @@ def test_get_power_hr_efficiency_text(monkeypatch):
     lines = result.split("\n")
     assert lines[0] == (
         "Power:HR efficiency for athlete i1, 2026-09-01 to 2026-10-09, sports Ride,GravelRide: 3 activities (oldest first; limit 30), "
-        "WORK intervals of at least 5:00 with power and HR, bands 150-200 W, 200-250 W, 250-300 W."
+        "WORK intervals of at least 5:00 with power and HR, bands 150-200 W, 200-250 W, 250-300 W (low <= W < high; time-weighted means)."
     )
     assert lines[1] == "2026-09-01 Ride 'Sweet Spot 3x15' (a1), gear Road Bike (b1), FTP 225 W: 200-250 W: 3 x 220 W / 150 bpm = 1.47 W/bpm"
     assert lines[2] == "2026-09-20 GravelRide 'Gravel endurance' (a3), gear Gravel Bike (b2), FTP 230 W: 150-200 W: 1 x 180 W / 135 bpm = 1.33 W/bpm; 250-300 W: 1 x 260 W / 158 bpm = 1.65 W/bpm"
     assert lines[3] == "2026-10-01 Ride 'Sweet Spot 3x20' (a4), gear Road Bike (b1), FTP 235 W: 200-250 W: 3 x 240 W / 155 bpm = 1.55 W/bpm"
-    assert lines[4] == "Trend per band (mean W/bpm of the oldest third vs the newest third of the activities with data):"
-    assert lines[5] == "  150-200 W: not enough activities with data in this band (1)"
-    assert lines[6] == "  200-250 W: 1.47 -> 1.55 W/bpm (+5.5 %; 1 of 2 activities per group)"
-    assert lines[7] == "  250-300 W: not enough activities with data in this band (1)"
-    assert "not a fitness verdict" in result
+    assert lines[4].startswith("Trend per band and gear (power meters are not mixed)")
+    assert "  200-250 W on gear Road Bike (b1): not enough independent activities (2; a trend needs at least 6) - no trend, not reliable" in lines
+    assert "+5.5 %" not in result
+    assert "a single activity with a higher W/bpm does not show an improvement" in result
     assert result.endswith("API calls: 4 (plus 1 for the gear catalog unless cached)")
+
+
+def test_get_power_hr_efficiency_reliable_trend_and_filters(monkeypatch):
+    """Enough independent activities give a trend that is compared with the day-to-day variation;
+    gear, indoor/outdoor and interval position filters apply."""
+    days = [f"2026-08-{d:02d}" for d in range(1, 13)]
+    rides = [_activity(f"r{i}", day, "Ride" if i % 4 else "VirtualRide", "b1", f"Ride {i}", trainer=i % 4 == 0)
+             for i, day in enumerate(days)]
+    hrs = {f"r{i}": 160 - i * 1.5 + (2 if i % 2 else -2) for i in range(12)}
+
+    def intervals(url, _params):
+        aid = _activity_id_of(url)
+        return {"icu_intervals": [
+            {"type": "WORK", "elapsed_time": 600, "start_time": 300, "average_watts": 230, "average_heartrate": hrs.get(aid, 150)},
+            {"type": "WORK", "elapsed_time": 600, "start_time": 3000, "average_watts": 230, "average_heartrate": 175},
+        ]}
+
+    _install_router(monkeypatch, overrides={"/activities": rides, "/intervals": intervals})
+    payload = json.loads(asyncio.run(get_power_hr_efficiency(
+        start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", max_start_minutes=30, output_format="json",
+    )))
+    trend = payload["trends"][0]
+    assert trend["reliable"] is True and trend["activities"] == 12 and trend["group_size"] == 4
+    assert trend["change_pct"] > 5 and trend["beyond_variation"] is True
+    assert payload["activities"][0]["bands"]["200-250 W"]["n"] == 1  # the late interval (50 min in) is excluded
+    outdoor = json.loads(asyncio.run(get_power_hr_efficiency(
+        start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", environment="outdoor", output_format="json",
+    )))
+    assert len(outdoor["activities"]) == 9 and not any(a["indoor"] for a in outdoor["activities"])
+    flat = {f"r{i}": 150 + (3 if i % 2 else -3) for i in range(12)}
+    hrs.clear()
+    hrs.update(flat)
+    text = asyncio.run(get_power_hr_efficiency(start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", max_start_minutes=30))
+    assert "within the day-to-day variation, no meaningful change" in text
+    assert asyncio.run(get_power_hr_efficiency(environment="garage")).startswith("Error: environment")
+    assert asyncio.run(get_power_hr_efficiency(power_bands="150-210,200-250")).startswith("Error: power bands 150-210 and 200-... overlap")
+    assert asyncio.run(get_power_hr_efficiency(min_activities_per_group=0)).startswith("Error: min_activities_per_group")
 
 
 def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
@@ -490,10 +648,11 @@ def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
     assert payload["bands"] == ["100-300 W"] and payload["sport_types"] == "Ride,GravelRide,VirtualRide"
     gravel = payload["activities"][1]["bands"]["100-300 W"]
     # bands are half-open: the 300 W interval of a3 is not in 100-300
-    assert gravel == {"n": 2, "watts": 220.0, "hr": 146.5, "w_per_bpm": 1.502}
+    # time-weighted: 1800 s at 180 W / 135 bpm and 1200 s at 260 W / 158 bpm (simple means gave 220 W / 146.5 bpm)
+    assert gravel == {"n": 2, "secs": 3000.0, "watts": 212.0, "hr": 144.2, "w_per_bpm": 1.47}
+    assert payload["band_rule"] == "low <= W < high"
     trend = payload["trends"][0]
-    assert trend["activities"] == 3 and trend["group_size"] == 1
-    assert trend["oldest_mean"] == 1.467 and trend["newest_mean"] == 1.548 and trend["change_pct"] == 5.5
+    assert trend["activities"] == 2 and trend["reliable"] is False  # per gear, two activities on b1
     assert asyncio.run(get_power_hr_efficiency(power_bands="150-200,abc")).startswith("Error: power_bands must look like")
     assert asyncio.run(get_power_hr_efficiency(power_bands="200-150")).startswith("Error: power band '200-150'")
     assert asyncio.run(get_power_hr_efficiency(power_bands="")).startswith("Error: at least one power band")
@@ -512,15 +671,15 @@ def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
 
 # --------------------------------------------------------- get_fatigue_resistance
 def test_get_fatigue_resistance_activity(monkeypatch):
-    """An activity's fresh curve is compared with its kJ0/kJ1 curves using the configured thresholds."""
+    """With configured thresholds an activity's fresh curve is compared with its kJ0/kJ1 curves."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_fatigue_resistance(activity_id="a1", durations="60,300,1200,3600"))
     assert [(c[0], c[1]) for c in calls] == [
+        ("/athlete/i1/sport-settings", {}),
         ("/activity/a1/power-curve.json", {}),
         ("/activity/a1/power-curve.json", {"fatigue": "kj0"}),
         ("/activity/a1/power-curve.json", {"fatigue": "kj1"}),
-        ("/athlete/i1/sport-settings", {}),
     ]
     lines = result.split("\n")
     assert lines[0] == "Fatigue resistance for athlete i1: power fresh vs after kJ thresholds (Ride)."
@@ -531,27 +690,59 @@ def test_get_fatigue_resistance_activity(monkeypatch):
     assert lines[5] == "  5 min | 320 W | 300 W (-6.2 %) | 280 W (-12.5 %)"
     assert lines[6] == "  20 min | 270 W | 255 W (-5.6 %) | 240 W (-11.1 %)"
     assert lines[7] == "  60 min | 240 W | n/a | n/a"
+    assert "Suggestion" not in result
     assert result.endswith("API calls: 4")
 
 
-def test_get_fatigue_resistance_athlete_curves_not_configured(monkeypatch):
-    """Athlete curves are requested as id, id-kj0, id-kj1; unset thresholds produce the 'not configured' note."""
+def test_get_fatigue_resistance_not_configured_shows_no_pseudo_values(monkeypatch):
+    """Regression: without after_kj0/after_kj1 no kJ curves are requested and no '+0.0 %' values are shown;
+    the configuration is explained and thresholds are suggested (read-only)."""
     calls = []
-    _install_router(monkeypatch, calls=calls, overrides={"/sport-settings": SPORT_SETTINGS_UNSET})
+    athlete = {"id": "i1", "icu_weight": 80.0}
+    rides = [_activity(f"k{i}", f"2026-09-{i + 1:02d}", "Ride", "b1", "Ride", icu_joules=kj * 1000, moving_time=7200)
+             for i, kj in enumerate([900, 1100, 1300, 1500, 1700])]
+    _install_router(monkeypatch, calls=calls, overrides={"/sport-settings": SPORT_SETTINGS_UNSET, "/athlete/i1/activities": rides,
+                                                         "/athlete/i1$": athlete})
     result = asyncio.run(get_fatigue_resistance(curves="42d", durations="60,330"))
-    assert calls[0] == ("/athlete/i1/power-curves.json", {"type": "Ride", "curves": "42d,42d-kj0,42d-kj1"})
-    assert calls[1][0] == "/athlete/i1/sport-settings"
-    assert (
-        "Fatigued power curves are not configured for Ride in Intervals.icu (Settings -> Power -> 'after kJ' is empty), "
-        "so the kJ0 and kJ1 curves equal the fresh curve." in result
-    )
-    assert "Curve 42 days (42d, Ride):" in result
-    assert "  Duration | fresh | kJ0 (not configured) | kJ1 (not configured)" in result
-    assert "  1 min | 410 W | 380 W (-7.3 %) | 350 W (-14.6 %)" in result
-    assert "  330 s (curve point 300 s) | 320 W | 300 W (-6.2 %) | 280 W (-12.5 %)" in result
-    assert result.endswith("API calls: 2")
+    assert calls[0][0] == "/athlete/i1/sport-settings"
+    assert calls[1] == ("/athlete/i1/power-curves.json", {"type": "Ride", "curves": "42d"})
+    assert "after_kj0 / after_kj1 are empty" in result and "so no fatigue values are shown" in result
+    assert "set the thresholds in Intervals.icu" in result and "This tool never changes settings." in result
+    assert "Curve 42 days (42d, Ride) - fresh curve for reference: 1 min 410 W, 330 s n/a" not in result
+    assert "Curve 42 days (42d, Ride) - fresh curve for reference: 1 min 410 W" in result
+    assert "%" not in result.split("fresh curve for reference")[1].split("\n")[0]
+    assert "Suggestion only (not saved): kJ0 ≈ 1250 kJ, kJ1 ≈ 2500 kJ (15 and 30 kJ/kg at 80 kg); your rides of 1 h+ in the last 90 days: median 1300 kJ, 75th percentile 1500 kJ (n 5)" in result
+    assert "so kJ0 ≈ 1000 kJ / kJ1 ≈ 1500 kJ fit your current rides better" in result
+    assert all(c[2] if len(c) > 2 else True for c in calls)
+    assert not any(c[0].endswith("sport-settings/1") for c in calls)  # nothing written
+    payload = json.loads(asyncio.run(get_fatigue_resistance(curves="42d", output_format="json")))
+    assert payload["configured"] == {"kj0": False, "kj1": False}
+    assert payload["suggestion"]["median_ride_kj"] == 1300
+    assert "kj0" not in payload["curves"][0]["rows"][0]
+    quiet = asyncio.run(get_fatigue_resistance(curves="42d", suggest_thresholds=False))
+    assert "Suggestion" not in quiet
     missing = asyncio.run(get_fatigue_resistance(activity_type="Swim"))
     assert "No sport setting covers 'Swim'; kJ thresholds unknown." in missing
+
+
+def test_get_fatigue_resistance_missing_and_identical_curves(monkeypatch):
+    """A fatigued curve without data is 'missing', one equal to the fresh curve 'identical'; no change is computed."""
+    curves = {"list": [
+        {"id": "42d", "label": "42 days", "secs": CURVE_SECS, "values": CURVE_FRESH},
+        {"id": "42d-kj0", "label": "42 days kj0", "secs": CURVE_SECS, "values": CURVE_FRESH},
+    ]}
+    only_kj0 = [{"id": 1, "types": ["Ride"], "ftp": 230, "after_kj0": 800, "after_kj1": None}]
+    _install_router(monkeypatch, overrides={"/power-curves.json": curves, "/sport-settings": only_kj0, "/athlete/i1$": {"icu_weight": None},
+                                            "/athlete/i1/activities": []})
+    result = asyncio.run(get_fatigue_resistance(durations="60,300"))
+    assert "Sport setting for Ride: after kJ0 = 800 kJ, after kJ1 not configured." in result
+    assert "  Duration | fresh | after 800 kJ (identical to fresh)" in result
+    assert "  1 min | 410 W | n/a" in result
+    assert "kj0: identical to the fresh curve at every duration" in result
+    assert "Suggestion only (not saved): kJ0 ≈ 750 kJ, kJ1 ≈ 1250 kJ (1.5 h and 3 h at about 55 % of FTP 230 W)" in result
+    curves["list"] = curves["list"][:1]
+    gone = json.loads(asyncio.run(get_fatigue_resistance(durations="60", output_format="json", suggest_thresholds=False)))
+    assert gone["curves"][0]["status"] == {"kj0": "missing"} and gone["curves"][0]["rows"][0]["kj0"] is None
 
 
 def test_get_fatigue_resistance_json_validation_and_errors(monkeypatch):
@@ -565,7 +756,7 @@ def test_get_fatigue_resistance_json_validation_and_errors(monkeypatch):
         "duration": 300, "secs_used": 300, "fresh": 320.0, "kj0": 300.0, "kj0_change_pct": -6.2, "kj1": 280.0, "kj1_change_pct": -12.5,
     }
     assert payload["curves"][1]["rows"][0]["fresh"] is None
-    assert payload["api_calls"] == 2
+    assert payload["api_calls"] == 2 and payload["suggestion"] is None
     activity = json.loads(asyncio.run(get_fatigue_resistance(activity_id="a1", durations="3600", output_format="json")))
     assert activity["curves"][0]["rows"][0]["kj0"] is None and activity["curves"][0]["rows"][0]["kj0_change_pct"] is None
     assert asyncio.run(get_fatigue_resistance(durations="abc")).startswith("Error: durations must be")

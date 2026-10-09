@@ -22,6 +22,7 @@ from intervals_mcp_server.utils.wellness_stats import (
     format_nutrition_summary,
     format_weight_trend,
     metric_series,
+    metric_units,
     nutrition_summary,
     sort_entries,
     weight_trend,
@@ -345,13 +346,13 @@ def test_formatters_contain_key_numbers() -> None:
     keep the per-day table short.
     """
     trend_text = format_metric_trend(compute_metric_trend(ENTRIES, "hrv"), units="ms")
-    assert "hrv trend: 2026-08-08 to 2026-10-06, 60 days, 53 with values, 7 missing" in trend_text
+    assert "hrv (ms): period 2026-08-08 to 2026-10-06, 60 days, 53 with values, 7 missing" in trend_text
     assert "Latest: 2026-10-06 = 79.5 ms" in trend_text
-    assert "Rolling 7d: mean 78 ms (n=7)" in trend_text
-    assert "Baseline (last 42d, n=38)" in trend_text
-    assert f"Outliers (|z| >= 2.5): {_day(OUTLIER_DAY)} = 120 ms (z +" in trend_text
+    assert "Rolling means at 2026-10-06 (lookback included): 7d 78 ms (n=7)" in trend_text
+    assert "Personal baseline (42 days 2026-08-26 to 2026-10-06, n=38)" in trend_text
+    assert f"Outliers in the period (|z| >= 2.5): {_day(OUTLIER_DAY)} = 120 ms (z +" in trend_text
     assert "Last 14 days (date, value ms, 7d mean):" in trend_text
-    assert "46 earlier days not shown" in trend_text
+    assert "46 earlier days of the period not shown" in trend_text
     assert trend_text.count("\n  2026-") == 14
     assert "n/a" not in trend_text.split("Last 14 days", maxsplit=1)[0]
 
@@ -393,7 +394,7 @@ def test_formatters_show_na_for_missing_statistics() -> None:
     assert "burn mean n/a kcal (0 days)" in nutrition_text
     trend_text = format_metric_trend(compute_metric_trend(short, "hrv"))
     assert "Latest: n/a" in trend_text
-    assert "Range stats: n/a" in trend_text
+    assert "Period stats: n/a" in trend_text
     assert "Latest vs baseline: n/a" in trend_text
     assert "Last 7d vs previous 7d: n/a" in trend_text
 
@@ -443,3 +444,52 @@ def test_degenerate_inputs() -> None:
     assert nutrition["windows"][7]["kcal_consumed_total"] is None
     assert "Notes:" in format_nutrition_summary(nutrition)
     assert not sort_entries([])
+
+
+def test_requested_period_lookback_and_baseline_are_separate() -> None:
+    """
+    Regression: a 42-day request with 42 days of lookback reports 42 days (not 84), takes the
+    statistics from the requested period only and the rolling means / baseline with lookback.
+    """
+    entries = [{"id": (date(2026, 7, 1) + timedelta(days=i)).isoformat(), "hrv": 40.0 if i < 42 else 60.0} for i in range(84)]
+    period_start, period_end = entries[42]["id"], entries[-1]["id"]
+    result = compute_metric_trend(entries, "hrv", windows=(7, 42), period_start=period_start, period_end=period_end)
+    assert (result["start"], result["end"], result["days_total"]) == (period_start, period_end, 42)
+    assert result["fetched"] == {"start": "2026-07-01", "end": period_end, "days": 84}
+    assert result["stats"]["mean"] == 60 and result["stats"]["min"] == 60  # lookback values not in the period stats
+    assert len(result["series"]) == 42 and result["series"][0]["date"] == period_start
+    assert result["series"][0]["rolling"][7] == pytest.approx((6 * 40 + 60) / 7)  # rolling window reaches into the lookback
+    assert result["baseline"]["n"] == 42 and result["baseline"]["start"] == period_start
+    text = format_metric_trend(result, units="ms")
+    assert text.startswith(f"hrv (ms): period {period_start} to {period_end}, 42 days, 42 with values, 0 missing")
+    assert "84" not in text.split("\n", maxsplit=1)[0]
+
+
+def test_zeros_are_missing_for_physiology_and_small_samples_are_flagged() -> None:
+    """
+    A stored 0 HRV / resting HR is 'no value' (never interpolated, never averaged); small baselines
+    and correlations are flagged.
+    """
+    entries = [{"id": (date(2026, 9, 1) + timedelta(days=i)).isoformat(), "hrv": 0 if i % 3 == 0 else 45.0, "steps": 0}
+               for i in range(12)]
+    result = compute_metric_trend(entries, "hrv")
+    assert result["zeros_treated_as_missing"] == 4 and result["days_with_value"] == 8
+    assert result["stats"]["min"] == 45
+    assert result["baseline"]["small_sample"] is True
+    assert "small sample (fewer than 14 values), not reliable" in format_metric_trend(result, units="ms")
+    assert "4 stored 0 treated as missing" in format_metric_trend(result, units="ms")
+    assert compute_metric_trend(entries, "steps")["days_with_value"] == 12  # 0 steps is a real value
+    corr = compute_correlation(ENTRIES, "lin_a", "lin_b", min_pairs=10)
+    assert corr["small_sample"] is False
+    few = compute_correlation(ENTRIES[:20], "lin_a", "lin_b", min_pairs=10)
+    assert few["small_sample"] is True and "small sample" in format_correlation(few)
+
+
+def test_metric_units() -> None:
+    """Native units, custom definition units and eFTP units."""
+    assert metric_units("hrv") == "ms" and metric_units("restingHR") == "bpm" and metric_units("respiration") == "breaths/min"
+    assert metric_units("spO2") == "%" and metric_units("readiness") == "/100" and metric_units("weight") == "kg"
+    assert metric_units("GarminSkinTempDeviationC", "°C") == "°C" and metric_units("eftp_Ride") == "W"
+    assert metric_units("unknownThing") is None
+    text = format_metric_trend(compute_metric_trend(ENTRIES, "hrv"), units="/100")
+    assert "= 79.5/100" in text

@@ -795,6 +795,7 @@ async def get_training_plan(  # pylint: disable=too-many-locals
 
     plan = await make_intervals_request(url=f"/athlete/{athlete_id_to_use}/training-plan", api_key=api_key)
     plan_info = plan if isinstance(plan, dict) and "error" not in plan else {}
+    plan_error = plan.get("message", "unknown error") if isinstance(plan, dict) and "error" in plan else None
     events = await make_intervals_request(
         url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key,
         params={"oldest": start, "newest": end, "category": ",".join(PLAN_CATEGORIES)},
@@ -815,7 +816,7 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     races = [e for e in plan_events if str(e.get("category", "")).startswith("RACE")]
     if output_format.strip().lower() == "json":
         return json.dumps(
-            {"start": start, "end": end, "training_plan": plan_info, "phases": [_event_json(e) for e in phases],
+            {"start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error, "phases": [_event_json(e) for e in phases],
              "targets": [_event_json(e) for e in targets], "races": [_event_json(e) for e in races],
              "fitness_model_events": model_list},
             ensure_ascii=False,
@@ -826,8 +827,12 @@ async def get_training_plan(  # pylint: disable=too-many-locals
             f"Assigned plan: {plan_info.get('training_plan_alias') or plan_info.get('training_plan') or plan_info.get('training_plan_id')}, "
             f"start {plan_info.get('training_plan_start_date')}, last applied {plan_info.get('training_plan_last_applied')}"
         )
+    elif plan_error:
+        lines.append(f"Assigned plan: unknown (the training plan could not be read: {plan_error})")
     else:
         lines.append("Assigned plan: none (no Intervals.icu training plan is applied to this athlete)")
+    if not (phases or targets or races or model_list):
+        lines.append("No plan phases, weekly targets, races or fitness-model events in this range.")
     lines.append(f"Phases / season markers ({len(phases)}):")
     lines.extend([_format_plan_event(e) for e in phases] or ["- none"])
     lines.append(f"Weekly targets ({len(targets)}):")

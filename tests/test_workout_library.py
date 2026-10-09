@@ -343,3 +343,82 @@ def test_delete_library_workout_errors(monkeypatch):
     _patch(monkeypatch, responder)
     result = asyncio.run(delete_library_workout(workout_id="7", athlete_id="i1"))
     assert result == "Error deleting library workout: denied"
+
+
+# ------------------------------------------------------------- get_library_workout
+def _library_workout(steps: Any, **extra: Any) -> dict[str, Any]:
+    return {"id": 77, "name": "SST 3x10", "type": "Ride", "folder_id": 10, "moving_time": 4500, "icu_training_load": 70,
+            "icu_intensity": 82.5, "target": "POWER", "indoor": False, "tags": ["sst"], "updated": "2026-10-01T10:00:00Z",
+            "description": "- 10m 50-70%\n3x\n- 10m 240-250w 85-95rpm\n- 5m 55%", "workout_doc": {"steps": steps}, **extra}
+
+
+REPEATS_WITH_TARGETS = [
+    {"duration": 600, "warmup": True, "ramp": True, "power": {"start": 50, "end": 70, "units": "%ftp"}},
+    {"reps": 3, "steps": [
+        {"duration": 600, "power": {"start": 240, "end": 250, "units": "w"}, "cadence": {"start": 85, "end": 95, "units": "rpm"}},
+        {"duration": 300, "power": {"value": 55, "units": "%ftp"}},
+    ]},
+    {"duration": 600, "cooldown": True, "power": {"value": 50, "units": "%ftp"}},
+]
+
+
+def test_get_library_workout_renders_repeats_and_targets(monkeypatch):
+    """An existing workout: header, description, repeats expanded as 3x with watt / %FTP / cadence targets;
+    only GET requests are made; JSON returns the complete workout."""
+    from intervals_mcp_server.server import get_library_workout  # pylint: disable=import-outside-toplevel
+
+    calls = _patch(monkeypatch, lambda url, method: _library_workout(REPEATS_WITH_TARGETS))
+    text = asyncio.run(get_library_workout("77"))
+    assert text.startswith("Library workout 77: SST 3x10 (Ride, folder 10)")
+    assert "Planned time 1:15:00, load 70, intensity 82.5, target POWER, indoor False, tags sst" in text
+    assert "Description / workout text:\n- 10m 50-70%" in text
+    assert "- 10m ramp 50%-70% ftp" in text and "3x" in text
+    assert "- 10m 240W-250W 85rpm-95rpm Cadence" in text and "- 5m 55% ftp" in text and "- 10m 50% ftp" in text
+    assert calls == [{"url": "/athlete/i1/workouts/77", "method": "GET", "data": None}]
+    import json  # pylint: disable=import-outside-toplevel
+
+    payload = json.loads(asyncio.run(get_library_workout("77", output_format="json")))
+    assert payload["workout_doc"]["steps"][1]["reps"] == 3
+
+
+def test_get_library_workout_pace_hr_and_unsupported_nesting(monkeypatch):
+    """Pace (distance) and %LTHR targets render; a repeat inside a repeat is shown raw instead of failing."""
+    from intervals_mcp_server.server import get_library_workout  # pylint: disable=import-outside-toplevel
+
+    run_steps = [{"distance": 1000, "pace": {"start": 95, "end": 100, "units": "%pace"}},
+                 {"reps": 4, "steps": [{"duration": 60, "hr": {"value": 90, "units": "%lthr"}}, {"duration": 60, "text": "easy"}]}]
+    _patch(monkeypatch, lambda url, method: _library_workout(run_steps, type="Run", target="PACE"))
+    text = asyncio.run(get_library_workout("77"))
+    assert "- 1km 95%-100% Pace" in text and "4x" in text and "- 1m 90% LTHR" in text and "- 1m easy" in text
+    nested = [{"reps": 2, "steps": [{"reps": 2, "steps": [{"duration": 60, "power": {"value": 100, "units": "%ftp"}}]}]}]
+    _patch(monkeypatch, lambda url, method: _library_workout(nested))
+    raw = asyncio.run(get_library_workout("77"))
+    assert "Steps could not be rendered (Nested steps not supported); raw steps: [{\"reps\": 2" in raw
+
+
+def test_get_library_workout_missing_errors_and_invalid_data(monkeypatch):
+    """Missing id, API errors, empty or non-dict payloads and malformed steps give clear answers, never exceptions."""
+    from intervals_mcp_server.server import get_library_workout  # pylint: disable=import-outside-toplevel
+
+    _patch(monkeypatch, lambda url, method: {})
+    assert asyncio.run(get_library_workout("404")) == "No library workout found with id 404."
+    _patch(monkeypatch, lambda url, method: [])
+    assert asyncio.run(get_library_workout("404")) == "No library workout found with id 404."
+    _patch(monkeypatch, lambda url, method: {"error": True, "message": "404 Not Found"})
+    assert asyncio.run(get_library_workout("404")) == "Error fetching library workout: 404 Not Found"
+    # Regression: a non-numeric target value raised AttributeError instead of falling back to the raw steps.
+    _patch(monkeypatch, lambda url, method: _library_workout([{"duration": 60, "power": {"value": "bad", "units": "w"}}]))
+    text = asyncio.run(get_library_workout("77"))
+    assert "Steps could not be rendered" in text and '"value": "bad"' in text
+    _patch(monkeypatch, lambda url, method: _library_workout([{"duration": "abc", "power": "x"}]))
+    assert "Steps could not be rendered" in asyncio.run(get_library_workout("77"))
+    _patch(monkeypatch, lambda url, method: {"id": 77, "name": "Text only", "workout_doc": "not a dict"})
+    text_only = asyncio.run(get_library_workout("77"))
+    assert text_only.startswith("Library workout 77: Text only (?, folder n/a)") and "Steps" not in text_only
+    assert "Planned time n/a, load n/a" in text_only
+
+
+def test_get_workout_library_empty_library(monkeypatch):
+    """An empty library and a library without workouts are reported as such."""
+    _patch(monkeypatch, lambda url, method: [])
+    assert asyncio.run(get_workout_library()) == "No workout library found for athlete i1."
