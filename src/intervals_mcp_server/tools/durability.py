@@ -46,9 +46,20 @@ DEFAULT_DAYS = 42
 MAX_DAYS = 366
 
 
-def sample_note(entry: dict[str, Any]) -> str:
-    """'6 of 19 sessions qualify; small sample, not reliable; mixed: 2 different bikes/shoes' (per sport family)."""
-    parts = [f"{entry['n']} of {entry.get('considered', entry['n'])} sessions qualify"]
+def sample_note(entry: dict[str, Any], short: bool = False) -> str:
+    """'6 of 19 sessions qualify; small sample (< 8), not reliable; mixed sample: 2 different bikes/shoes'.
+
+    ``short`` gives 'n 6 of 19, small sample, not reliable, mixed: 2 different bikes/shoes' for compact views.
+    """
+    considered = entry.get("considered", entry["n"])
+    if short:
+        parts = [f"n {entry['n']} of {considered}"]
+        if entry["small_sample"]:
+            parts.append("small sample, not reliable")
+        if entry.get("heterogeneity"):
+            parts.append("mixed: " + ", ".join(entry["heterogeneity"]))
+        return ", ".join(parts)
+    parts = [f"{entry['n']} of {considered} sessions qualify"]
     if entry["small_sample"]:
         parts.append(f"small sample (< {SMALL_SAMPLE}), not reliable")
     if entry.get("heterogeneity"):

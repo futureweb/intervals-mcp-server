@@ -135,9 +135,9 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_power_hr_efficiency` | Watts per heartbeat per power band and bike over time, with minimum sample sizes and filters for gear, indoor/outdoor and interval position |
 | `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
 | `get_training_load` | Acute and chronic load, acute:chronic ratio, Foster monotony and strain (rest days as 0), deload-like weeks, per sport with the primary sport, ISO week table, CTL/ATL/form/ramp; device loads kept separate; reference ranges with sources, no verdict |
-| `get_intensity_distribution` | Three-zone distribution from power, HR or pace zones (mapping by zone count), polarization index after Treff et al. 2019, class, hard sessions and days, drift between the halves, per sport and week, zone coverage |
-| `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend |
-| `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison |
+| `get_intensity_distribution` | Three-zone distribution from power, HR or pace zones (mapping by zone count), polarization index after Treff et al. 2019, class, hard sessions and days, drift between the halves, per sport and week, zone coverage, a caveat when totals mix power and HR zones |
+| `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out |
+| `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
 | `get_training_summary` | Totals per week, month, sport or gear with separate load sources and time in zones; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
@@ -147,7 +147,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call |
-| `get_coach_context` | Weekly coaching overview in about 2k characters: load, fitness, intensity distribution, HRV / resting HR / sleep against 42-day baselines, durability, top sessions and the plan of the next 7 days |
+| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep against 42-day baselines, durability, top sessions, the plan of the next 7 days and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule) |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |

@@ -354,6 +354,33 @@ def test_get_coach_context_text_and_json(monkeypatch):
     assert asyncio.run(get_coach_context(end_date="2026-10-10")).startswith("Error: end_date lies in the future")
 
 
+def test_coach_context_and_intensity_state_their_method(monkeypatch):
+    """Phase 5 (H): windows, ACWR method, zone basis, threshold_as and hard-session rule in compact outputs; a caveat
+    with the per-sport split when the totals mix power and HR zones."""
+    _setup(monkeypatch)
+    for level in ("compact", "standard"):
+        text = asyncio.run(get_coach_context(detail_level=level))
+        assert (
+            "Method: 7 d acute / 28 d chronic, ratio of daily means, coupled; monotony = mean/SD of 7 daily loads; zones power "
+            "(cycling) or HR/pace, power Z4 = moderate (threshold_as); hard = >= 10 min in Z3 or IF >= 0.85 on >= 20 min."
+        ) in text
+        assert "Caveat: totals mix zone bases (hr " in text and "28 d Z1/Z2/Z3 by sport: cycling (power) " in text
+        assert "walking (hr) " in text
+    assert (
+        "cycling decoupling median 3.0 % (n 7 of 8, small sample, not reliable, mixed: indoor and outdoor mixed "
+        "(1 indoor, 6 outdoor), 2 different bikes/shoes; 3 > 5 %)"
+    ) in asyncio.run(get_coach_context())
+    high = json.loads(asyncio.run(get_coach_context(threshold_as="high", output_format="json")))
+    assert high["method"]["threshold_as"] == "high" and high["method"]["acute_days"] == 7
+    assert "power Z4 = high (threshold_as)" in asyncio.run(get_coach_context(threshold_as="high"))
+    assert asyncio.run(get_coach_context(threshold_as="x")).startswith("Error: threshold_as")
+    compact = asyncio.run(get_intensity_distribution(detail_level="compact"))
+    assert "Caveat: the total combines zone bases (" in compact and "compare the per-sport split below." in compact
+    assert "Rule: hard session = >= 10 min in Z3 or IF >= 0.85 on >= 20 min." in compact
+    rides = asyncio.run(get_intensity_distribution(detail_level="compact", sport_types="Ride"))
+    assert "Caveat" not in rides  # a single basis needs no caveat
+
+
 def test_new_tools_are_read_only_and_prompt():
     """All new tools are in the read class; the review prompt points to them and keeps the no-diagnosis rule."""
     permissions = tool_permissions()
