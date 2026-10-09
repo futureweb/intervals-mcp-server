@@ -9,6 +9,15 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Security (review findings)
+- OAuth: refreshing a token with a narrower scope (for example only `mcp`) keeps the grant's
+  permission scopes; a token without any `intervals:*` scope is read-only and never falls back
+  to the server-wide `MCP_PERMISSIONS`.
+- `/register` (dynamic client registration, reachable without credentials) limits `client_name`
+  to 100 printable characters, `redirect_uris` to 10 and the whole metadata to 8 KB; client-supplied
+  values are escaped and clipped in log lines, and the server logs through a plain stream handler
+  instead of the SDK's rich handler (whose rendering time grows quadratically with long tokens).
+
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list
   (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count

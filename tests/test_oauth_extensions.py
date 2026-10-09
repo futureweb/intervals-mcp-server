@@ -493,7 +493,7 @@ def test_intervals_configuration_validation(tmp_path):
 
 
 def test_granted_classes():
-    assert granted_classes(["mcp"]) is None
+    assert granted_classes(["mcp"]) == {"read"}  # a bare token never widens to MCP_PERMISSIONS
     assert granted_classes(None) is None
     assert granted_classes(["mcp", "intervals:read", "intervals:write"]) == {"read", "write"}
 
@@ -532,8 +532,9 @@ def test_tool_scopes_filter_list_and_call(monkeypatch):
 
     names, write = asyncio.run(as_token(None))
     assert names == ["read_tool", "write_tool"] and write == "ok"
-    names, write = asyncio.run(as_token(["mcp"]))
-    assert names == ["read_tool", "write_tool"] and write == "ok"
+    names, write = asyncio.run(as_token(["mcp"]))  # a bare token is read-only, never MCP_PERMISSIONS
+    assert names == ["read_tool"]
+    assert "needs the 'write' permission" in write
     names, write = asyncio.run(as_token(["mcp", "intervals:read"]))
     assert names == ["read_tool"]
     assert "needs the 'write' permission" in write
