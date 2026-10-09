@@ -179,7 +179,8 @@ def _install_router(monkeypatch, overrides=None, calls=None):
         if calls is not None:
             calls.append((url, params))
         for fragment, payload in ordered:
-            if fragment in (url or ""):
+            exact = fragment.endswith("$")  # "...$" matches the whole URL only
+            if (url == fragment[:-1]) if exact else fragment in (url or ""):
                 return payload(url, params) if callable(payload) else payload
         return {}
 
@@ -668,15 +669,15 @@ def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
 
 # --------------------------------------------------------- get_fatigue_resistance
 def test_get_fatigue_resistance_activity(monkeypatch):
-    """An activity's fresh curve is compared with its kJ0/kJ1 curves using the configured thresholds."""
+    """With configured thresholds an activity's fresh curve is compared with its kJ0/kJ1 curves."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_fatigue_resistance(activity_id="a1", durations="60,300,1200,3600"))
     assert [(c[0], c[1]) for c in calls] == [
+        ("/athlete/i1/sport-settings", {}),
         ("/activity/a1/power-curve.json", {}),
         ("/activity/a1/power-curve.json", {"fatigue": "kj0"}),
         ("/activity/a1/power-curve.json", {"fatigue": "kj1"}),
-        ("/athlete/i1/sport-settings", {}),
     ]
     lines = result.split("\n")
     assert lines[0] == "Fatigue resistance for athlete i1: power fresh vs after kJ thresholds (Ride)."
@@ -687,27 +688,59 @@ def test_get_fatigue_resistance_activity(monkeypatch):
     assert lines[5] == "  5 min | 320 W | 300 W (-6.2 %) | 280 W (-12.5 %)"
     assert lines[6] == "  20 min | 270 W | 255 W (-5.6 %) | 240 W (-11.1 %)"
     assert lines[7] == "  60 min | 240 W | n/a | n/a"
+    assert "Suggestion" not in result
     assert result.endswith("API calls: 4")
 
 
-def test_get_fatigue_resistance_athlete_curves_not_configured(monkeypatch):
-    """Athlete curves are requested as id, id-kj0, id-kj1; unset thresholds produce the 'not configured' note."""
+def test_get_fatigue_resistance_not_configured_shows_no_pseudo_values(monkeypatch):
+    """Regression: without after_kj0/after_kj1 no kJ curves are requested and no '+0.0 %' values are shown;
+    the configuration is explained and thresholds are suggested (read-only)."""
     calls = []
-    _install_router(monkeypatch, calls=calls, overrides={"/sport-settings": SPORT_SETTINGS_UNSET})
+    athlete = {"id": "i1", "icu_weight": 80.0}
+    rides = [_activity(f"k{i}", f"2026-09-{i + 1:02d}", "Ride", "b1", "Ride", icu_joules=kj * 1000, moving_time=7200)
+             for i, kj in enumerate([900, 1100, 1300, 1500, 1700])]
+    _install_router(monkeypatch, calls=calls, overrides={"/sport-settings": SPORT_SETTINGS_UNSET, "/athlete/i1/activities": rides,
+                                                         "/athlete/i1$": athlete})
     result = asyncio.run(get_fatigue_resistance(curves="42d", durations="60,330"))
-    assert calls[0] == ("/athlete/i1/power-curves.json", {"type": "Ride", "curves": "42d,42d-kj0,42d-kj1"})
-    assert calls[1][0] == "/athlete/i1/sport-settings"
-    assert (
-        "Fatigued power curves are not configured for Ride in Intervals.icu (Settings -> Power -> 'after kJ' is empty), "
-        "so the kJ0 and kJ1 curves equal the fresh curve." in result
-    )
-    assert "Curve 42 days (42d, Ride):" in result
-    assert "  Duration | fresh | kJ0 (not configured) | kJ1 (not configured)" in result
-    assert "  1 min | 410 W | 380 W (-7.3 %) | 350 W (-14.6 %)" in result
-    assert "  330 s (curve point 300 s) | 320 W | 300 W (-6.2 %) | 280 W (-12.5 %)" in result
-    assert result.endswith("API calls: 2")
+    assert calls[0][0] == "/athlete/i1/sport-settings"
+    assert calls[1] == ("/athlete/i1/power-curves.json", {"type": "Ride", "curves": "42d"})
+    assert "after_kj0 / after_kj1 are empty" in result and "so no fatigue values are shown" in result
+    assert "set the thresholds in Intervals.icu" in result and "This tool never changes settings." in result
+    assert "Curve 42 days (42d, Ride) - fresh curve for reference: 1 min 410 W, 330 s n/a" not in result
+    assert "Curve 42 days (42d, Ride) - fresh curve for reference: 1 min 410 W" in result
+    assert "%" not in result.split("fresh curve for reference")[1].split("\n")[0]
+    assert "Suggestion only (not saved): kJ0 ≈ 1250 kJ, kJ1 ≈ 2500 kJ (15 and 30 kJ/kg at 80 kg); your rides of 1 h+ in the last 90 days: median 1300 kJ, 75th percentile 1500 kJ (n 5)" in result
+    assert "so kJ0 ≈ 1000 kJ / kJ1 ≈ 1500 kJ fit your current rides better" in result
+    assert all(c[2] if len(c) > 2 else True for c in calls)
+    assert not any(c[0].endswith("sport-settings/1") for c in calls)  # nothing written
+    payload = json.loads(asyncio.run(get_fatigue_resistance(curves="42d", output_format="json")))
+    assert payload["configured"] == {"kj0": False, "kj1": False}
+    assert payload["suggestion"]["median_ride_kj"] == 1300
+    assert "kj0" not in payload["curves"][0]["rows"][0]
+    quiet = asyncio.run(get_fatigue_resistance(curves="42d", suggest_thresholds=False))
+    assert "Suggestion" not in quiet
     missing = asyncio.run(get_fatigue_resistance(activity_type="Swim"))
     assert "No sport setting covers 'Swim'; kJ thresholds unknown." in missing
+
+
+def test_get_fatigue_resistance_missing_and_identical_curves(monkeypatch):
+    """A fatigued curve without data is 'missing', one equal to the fresh curve 'identical'; no change is computed."""
+    curves = {"list": [
+        {"id": "42d", "label": "42 days", "secs": CURVE_SECS, "values": CURVE_FRESH},
+        {"id": "42d-kj0", "label": "42 days kj0", "secs": CURVE_SECS, "values": CURVE_FRESH},
+    ]}
+    only_kj0 = [{"id": 1, "types": ["Ride"], "ftp": 230, "after_kj0": 800, "after_kj1": None}]
+    _install_router(monkeypatch, overrides={"/power-curves.json": curves, "/sport-settings": only_kj0, "/athlete/i1$": {"icu_weight": None},
+                                            "/athlete/i1/activities": []})
+    result = asyncio.run(get_fatigue_resistance(durations="60,300"))
+    assert "Sport setting for Ride: after kJ0 = 800 kJ, after kJ1 not configured." in result
+    assert "  Duration | fresh | after 800 kJ (identical to fresh)" in result
+    assert "  1 min | 410 W | n/a" in result
+    assert "kj0: identical to the fresh curve at every duration" in result
+    assert "Suggestion only (not saved): kJ0 ≈ 750 kJ, kJ1 ≈ 1250 kJ (1.5 h and 3 h at about 55 % of FTP 230 W)" in result
+    curves["list"] = curves["list"][:1]
+    gone = json.loads(asyncio.run(get_fatigue_resistance(durations="60", output_format="json", suggest_thresholds=False)))
+    assert gone["curves"][0]["status"] == {"kj0": "missing"} and gone["curves"][0]["rows"][0]["kj0"] is None
 
 
 def test_get_fatigue_resistance_json_validation_and_errors(monkeypatch):
@@ -721,7 +754,7 @@ def test_get_fatigue_resistance_json_validation_and_errors(monkeypatch):
         "duration": 300, "secs_used": 300, "fresh": 320.0, "kj0": 300.0, "kj0_change_pct": -6.2, "kj1": 280.0, "kj1_change_pct": -12.5,
     }
     assert payload["curves"][1]["rows"][0]["fresh"] is None
-    assert payload["api_calls"] == 2
+    assert payload["api_calls"] == 2 and payload["suggestion"] is None
     activity = json.loads(asyncio.run(get_fatigue_resistance(activity_id="a1", durations="3600", output_format="json")))
     assert activity["curves"][0]["rows"][0]["kj0"] is None and activity["curves"][0]["rows"][0]["kj0_change_pct"] is None
     assert asyncio.run(get_fatigue_resistance(durations="abc")).startswith("Error: durations must be")

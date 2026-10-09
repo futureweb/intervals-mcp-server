@@ -1637,6 +1637,11 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
 
 
 # ---------------------------------------------------------- fatigue resistance
+KJ_PER_KG_SUGGESTION = (15, 30)  # kJ per kg body mass suggested for kJ0 / kJ1 (literature uses ~10-40 kJ/kg)
+SUGGESTION_ROUND_KJ = 250
+SUGGESTION_LOOKBACK_DAYS = 90
+
+
 def _curve_lookup(curve: dict[str, Any], duration: int) -> tuple[float | None, int | None]:
     """Watts at the requested duration (exact or nearest within 10%) and the duration used."""
     secs_raw, values_raw = curve.get("secs"), curve.get("values") or curve.get("watts")
@@ -1655,17 +1660,31 @@ def _curve_lookup(curve: dict[str, Any], duration: int) -> tuple[float | None, i
     return best_watts, best_secs
 
 
-def _fatigue_rows(block: dict[str, Any], durations: list[int]) -> list[dict[str, Any]]:
+def _curve_status(block: dict[str, Any], key: str, durations: list[int]) -> str:
+    """'ok', 'missing' (no data at the durations) or 'identical' (equals the fresh curve everywhere)."""
+    pairs = [(_curve_lookup(block["fresh"], d)[0], _curve_lookup(block.get(key) or {}, d)[0]) for d in durations]
+    values = [(fresh, fatigued) for fresh, fatigued in pairs if fatigued is not None]
+    if not values:
+        return "missing"
+    if all(fresh is not None and fresh == fatigued for fresh, fatigued in values):
+        return "identical"
+    return "ok"
+
+
+def _fatigue_rows(block: dict[str, Any], durations: list[int], keys: tuple[str, ...] = ("kj0", "kj1")) -> list[dict[str, Any]]:
     rows = []
+    status = {key: _curve_status(block, key, durations) for key in keys}
     for duration in durations:
         fresh, secs_used = _curve_lookup(block["fresh"], duration)
         row: dict[str, Any] = {"duration": duration, "secs_used": secs_used, "fresh": fresh}
-        for key in ("kj0", "kj1"):
-            value, _ = _curve_lookup(block[key], duration)
-            row[key] = value
-            drop = _pct_change(fresh, value)
+        for key in keys:
+            value, _ = _curve_lookup(block.get(key) or {}, duration)
+            usable = status[key] == "ok"
+            row[key] = value if usable else None
+            drop = _pct_change(fresh, value) if usable else None
             row[f"{key}_change_pct"] = round(drop, 1) if drop is not None else None
         rows.append(row)
+    block["status"] = status
     return rows
 
 
@@ -1681,41 +1700,90 @@ async def _kj_thresholds(api: _Api, athlete_id: str, activity_type: str) -> tupl
         if wanted in types:
             thresholds = {k: setting.get(k) for k in ("after_kj0", "after_kj1", "ftp")}
             kj0, kj1 = thresholds["after_kj0"], thresholds["after_kj1"]
-            if kj0 is None and kj1 is None:
+            if not kj0 and not kj1:
                 return thresholds, (
-                    f"Fatigued power curves are not configured for {activity_type} in Intervals.icu "
-                    "(Settings -> Power -> 'after kJ' is empty), so the kJ0 and kJ1 curves equal the fresh curve."
+                    f"Fatigued power curves are not configured for {activity_type} in Intervals.icu (after_kj0 / after_kj1 "
+                    "are empty): Intervals.icu then returns the fresh curve as kJ0/kJ1, so no fatigue values are shown."
                 )
             parts = [
-                f"after kJ0 = {kj0} kJ" if kj0 is not None else "after kJ0 not configured (equals the fresh curve)",
-                f"after kJ1 = {kj1} kJ" if kj1 is not None else "after kJ1 not configured (equals the fresh curve)",
+                f"after kJ0 = {kj0} kJ" if kj0 else "after kJ0 not configured",
+                f"after kJ1 = {kj1} kJ" if kj1 else "after kJ1 not configured",
             ]
             return thresholds, f"Sport setting for {activity_type}: " + ", ".join(parts) + "."
     return None, f"No sport setting covers '{activity_type}'; kJ thresholds unknown."
 
 
-def _fatigue_table(block: dict[str, Any], rows: list[dict[str, Any]], thresholds: dict[str, Any] | None) -> list[str]:
-    kj0 = (thresholds or {}).get("after_kj0")
-    kj1 = (thresholds or {}).get("after_kj1")
-    lines = [
-        f"{block['label']}:",
-        "  Duration | fresh | " + (f"after {kj0} kJ" if kj0 is not None else "kJ0 (not configured)")
-        + " | " + (f"after {kj1} kJ" if kj1 is not None else "kJ1 (not configured)"),
-    ]
+def _round_kj(value: float, down: bool = False) -> int:
+    steps = math.floor(value / SUGGESTION_ROUND_KJ) if down else round(value / SUGGESTION_ROUND_KJ)
+    return int(max(SUGGESTION_ROUND_KJ, steps * SUGGESTION_ROUND_KJ))
+
+
+async def _suggest_thresholds(api: _Api, athlete_id: str, activity_type: str, ftp: float | None) -> dict[str, Any]:
+    """Plausible kJ0 / kJ1 from body mass (or FTP) and from the work of recent rides (suggestion only, never saved)."""
+    athlete = await api.get(f"/athlete/{athlete_id}")
+    weight = _num(athlete.get("icu_weight")) if isinstance(athlete, dict) else None
+    end = get_default_end_date()
+    start = (date.fromisoformat(end) - timedelta(days=SUGGESTION_LOOKBACK_DAYS - 1)).isoformat()
+    result = await api.get(f"/athlete/{athlete_id}/activities", {"oldest": start, "newest": end, "fields": "id,type,icu_joules,moving_time"})
+    family = set(family_types(activity_type))
+    work = sorted(
+        joules / 1000 for a in _list_of_dicts(result)
+        if a.get("type") in family and (joules := _num(a.get("icu_joules"))) and (_num(a.get("moving_time")) or 0) >= 3600
+    )
+    suggestion: dict[str, Any] = {"weight_kg": weight, "ftp": ftp, "rides_60min_plus": len(work), "lookback_days": SUGGESTION_LOOKBACK_DAYS}
+    if weight:
+        kj0, kj1 = (weight * factor for factor in KJ_PER_KG_SUGGESTION)
+        basis = f"{KJ_PER_KG_SUGGESTION[0]} and {KJ_PER_KG_SUGGESTION[1]} kJ/kg at {weight:g} kg"
+    elif ftp:
+        kj_per_hour = ftp * 0.55 * 3.6  # endurance riding at about 55 % of FTP
+        kj0, kj1 = 1.5 * kj_per_hour, 3 * kj_per_hour
+        basis = f"1.5 h and 3 h at about 55 % of FTP {ftp:g} W"
+    else:
+        return {**suggestion, "kj0": None, "kj1": None, "basis": "no weight or FTP available"}
+    suggestion.update(kj0=_round_kj(kj0), kj1=_round_kj(kj1), basis=basis)
+    if work:
+        median, p75 = statistics.median(work), work[int(0.75 * (len(work) - 1))]
+        suggestion.update(median_ride_kj=round(median), p75_ride_kj=round(p75))
+        if p75 < suggestion["kj1"] or median < suggestion["kj0"]:
+            ride_kj0 = _round_kj(min(kj0, median), down=True)
+            ride_kj1 = max(_round_kj(min(kj1, p75), down=True), ride_kj0 + SUGGESTION_ROUND_KJ)
+            suggestion["by_recent_rides"] = {"kj0": ride_kj0, "kj1": ride_kj1}
+    return suggestion
+
+
+def _fatigue_table(block: dict[str, Any], rows: list[dict[str, Any]], thresholds: dict[str, Any] | None, keys: tuple[str, ...]) -> list[str]:
+    lines = [f"{block['label']}:"]
+    header = "  Duration | fresh"
+    for key in keys:
+        threshold = (thresholds or {}).get(f"after_{key}")
+        status = (block.get("status") or {}).get(key)
+        label = f"after {threshold} kJ" if threshold else key
+        if status == "missing":
+            label += " (no data)"
+        elif status == "identical":
+            label += " (identical to fresh)"
+        header += f" | {label}"
+    lines.append(header)
     for row in rows:
         cells = [_fmt(row["fresh"], 0, "W")]
-        for key in ("kj0", "kj1"):
+        for key in keys:
             cell = _fmt(row[key], 0, "W")
             if row[f"{key}_change_pct"] is not None:
                 cell += f" ({row[f'{key}_change_pct']:+.1f} %)"
             cells.append(cell)
         used = f" (curve point {row['secs_used']} s)" if row["secs_used"] not in (None, row["duration"]) else ""
         lines.append(f"  {_duration_label(row['duration'])}{used} | " + " | ".join(cells))
+    for key, state in (block.get("status") or {}).items():
+        if state == "identical":
+            lines.append(f"  {key}: identical to the fresh curve at every duration - either the best efforts all came after the "
+                         "threshold or the threshold is too low; no fatigue change is computed.")
+        elif state == "missing":
+            lines.append(f"  {key}: no efforts after the threshold in this period (curve missing) - no values computed.")
     return lines
 
 
 @tool("read")
-async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
+async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
     activity_id: str | None = None,
     activity_type: str = "Ride",
     durations: str = "60,300,1200",
@@ -1723,18 +1791,23 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    suggest_thresholds: bool = True,
 ) -> str:
     """Fatigue resistance: best power fresh vs after the athlete's kJ thresholds (kJ0, kJ1)
 
     Intervals.icu keeps, besides the normal power curve, two "fatigued" curves built only from
-    efforts that started after a configurable amount of work (Settings -> Power -> "after kJ",
-    stored as after_kj0 / after_kj1 in the sport settings). With an activity_id the tool
-    compares that activity's fresh curve with its kJ0 and kJ1 curves; without it the athlete
-    curves for each id in `curves` (e.g. 42d, 90d, s0 for this season, 1y) are compared. The
-    table shows watts per duration for fresh / after kJ0 / after kJ1 and the change in %. When
-    the thresholds are not configured the fatigued curves equal the fresh curve and the tool
-    says so. Three API calls per activity (plus one for the sport settings) or one for the
-    athlete curves plus one for the sport settings.
+    efforts that started after a configurable amount of work (sport settings after_kj0 /
+    after_kj1). The sport settings are read first: when no threshold is configured the
+    fatigued curves equal the fresh curve, so no pseudo values are shown - the tool explains
+    the configuration and (suggest_thresholds) proposes plausible thresholds from body mass
+    (15 / 30 kJ per kg) limited by the work of your recent rides of at least an hour, as a
+    suggestion only: settings are never changed. When configured, the fresh curve is compared
+    with the kJ0 / kJ1 curves (with an activity_id that activity's curves, otherwise the
+    athlete curves for each id in `curves`, e.g. 42d, 90d, s0, 1y): watts per duration and
+    the change in %. A fatigued curve without data is reported as missing and one equal to the
+    fresh curve at every duration as identical; no change is computed for either. API calls:
+    the sport settings, then one per activity curve or one for the athlete curves, plus two for
+    a threshold suggestion.
 
     Args:
         activity_id: The Intervals.icu activity ID (optional; without it the athlete curves are used)
@@ -1744,6 +1817,8 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        suggest_thresholds: Suggest kJ thresholds when they are not configured (optional, default
+            True; read-only, nothing is saved)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -1758,10 +1833,15 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
         return "Error: at least one curve id is required when no activity_id is given."
 
     api = _Api(api_key)
+    thresholds, note = await _kj_thresholds(api, athlete_id_to_use, activity_type)
+    if thresholds is None:
+        keys: tuple[str, ...] = ("kj0", "kj1")  # thresholds unknown: show what Intervals.icu returns, with the caveat
+    else:
+        keys = tuple(key for key in ("kj0", "kj1") if thresholds.get(f"after_{key}"))
     blocks: list[dict[str, Any]] = []
     if activity_id:
         block: dict[str, Any] = {"id": activity_id, "label": f"Activity {activity_id} ({activity_type})"}
-        for key, fatigue in (("fresh", None), ("kj0", "kj0"), ("kj1", "kj1")):
+        for key, fatigue in (("fresh", None), *((k, k) for k in keys)):
             result = await api.get(
                 f"/activity/{activity_id}/power-curve.json", {"fatigue": fatigue} if fatigue else None
             )
@@ -1771,7 +1851,7 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
             block[key] = result if isinstance(result, dict) else {}
         blocks.append(block)
     else:
-        wanted = [cid for curve_id in curve_ids for cid in (curve_id, f"{curve_id}-kj0", f"{curve_id}-kj1")]
+        wanted = [cid for curve_id in curve_ids for cid in (curve_id, *(f"{curve_id}-{k}" for k in keys))]
         result = await api.get(
             f"/athlete/{athlete_id_to_use}/power-curves.json",
             {"type": activity_type, "curves": ",".join(wanted)},
@@ -1784,22 +1864,53 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
             fresh = by_id.get(curve_id, {})
             blocks.append({
                 "id": curve_id, "label": f"Curve {fresh.get('label') or curve_id} ({curve_id}, {activity_type})",
-                "fresh": fresh, "kj0": by_id.get(f"{curve_id}-kj0", {}), "kj1": by_id.get(f"{curve_id}-kj1", {}),
+                "fresh": fresh, **{k: by_id.get(f"{curve_id}-{k}", {}) for k in keys},
             })
-    thresholds, note = await _kj_thresholds(api, athlete_id_to_use, activity_type)
-    tables = [(block, _fatigue_rows(block, duration_list)) for block in blocks]
+    tables = [(block, _fatigue_rows(block, duration_list, keys)) for block in blocks]
+    configured = thresholds is None or bool(keys)
+    suggestion = None
+    if thresholds is not None and len(keys) < 2 and suggest_thresholds:
+        suggestion = await _suggest_thresholds(api, athlete_id_to_use, activity_type, _num(thresholds.get("ftp")))
 
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "activity_id": activity_id, "activity_type": activity_type,
-            "thresholds": thresholds, "note": note, "durations": duration_list,
-            "curves": [{"id": block["id"], "label": block["label"], "rows": rows} for block, rows in tables],
-            "api_calls": api.calls,
+            "thresholds": thresholds, "configured": {k: bool((thresholds or {}).get(f"after_{k}")) for k in ("kj0", "kj1")},
+            "note": note, "durations": duration_list,
+            "curves": [{"id": block["id"], "label": block["label"], "status": block.get("status"), "rows": rows} for block, rows in tables],
+            "suggestion": suggestion, "api_calls": api.calls,
         }
         return json.dumps(payload, ensure_ascii=False)
     lines = [f"Fatigue resistance for athlete {athlete_id_to_use}: power fresh vs after kJ thresholds ({activity_type}).", note]
+    if not configured:
+        lines.append(
+            f"To evaluate fatigue resistance set the thresholds in Intervals.icu: Settings -> {activity_type} sport settings -> "
+            "power -> fatigued curves 'after kJ' (kJ0, kJ1). This tool never changes settings."
+        )
     for block, rows in tables:
-        lines.extend(_fatigue_table(block, rows, thresholds))
-    lines.append("Change in % is relative to the fresh curve; 'n/a' means the curve has no point near that duration.")
+        if configured:
+            lines.extend(_fatigue_table(block, rows, thresholds, keys))
+        else:
+            fresh_text = ", ".join(f"{_duration_label(r['duration'])} {_fmt(r['fresh'], 0, 'W')}" for r in rows)
+            lines.append(f"{block['label']} - fresh curve for reference: {fresh_text}")
+    if suggestion:
+        if suggestion.get("kj0"):
+            text = f"Suggestion only (not saved): kJ0 ≈ {suggestion['kj0']} kJ, kJ1 ≈ {suggestion['kj1']} kJ ({suggestion['basis']})"
+            if suggestion.get("median_ride_kj") is not None:
+                text += (
+                    f"; your rides of 1 h+ in the last {SUGGESTION_LOOKBACK_DAYS} days: median {suggestion['median_ride_kj']} kJ, "
+                    f"75th percentile {suggestion['p75_ride_kj']} kJ (n {suggestion['rides_60min_plus']})"
+                )
+            rides = suggestion.get("by_recent_rides")
+            if rides:
+                text += (
+                    f"; thresholds above most of your rides leave the fatigued curves almost empty, so kJ0 ≈ {rides['kj0']} kJ / "
+                    f"kJ1 ≈ {rides['kj1']} kJ fit your current rides better"
+                )
+            lines.append(text + ".")
+        else:
+            lines.append(f"No threshold suggestion: {suggestion['basis']}.")
+    if configured:
+        lines.append("Change in % is relative to the fresh curve; 'n/a' means no usable value near that duration.")
     lines.append(f"API calls: {api.calls}")
     return "\n".join(lines)
