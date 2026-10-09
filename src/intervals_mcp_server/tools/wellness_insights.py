@@ -11,7 +11,7 @@ import json
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import (
@@ -106,7 +106,7 @@ async def _fetch_wellness(
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{athlete_id}/wellness", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params)
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching wellness data: {result.get('message', 'Unknown error')}"
     if isinstance(result, dict):
@@ -116,13 +116,17 @@ async def _fetch_wellness(
     return sort_entries(entries), None
 
 
-async def _fetch_activities(
-    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None
+async def _fetch_activities(  # pylint: disable=too-many-arguments
+    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None,
+    errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Activities of the range; an API error is appended to *errors* (it is not "no activities")."""
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{athlete_id}/activities", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key, params=params)
+    if isinstance(result, dict) and "error" in result and errors is not None:
+        errors.append(f"activities could not be loaded: {result.get('message', 'Unknown error')}")
     if not isinstance(result, list):
         return []
     return [a for a in result if isinstance(a, dict)]
@@ -272,7 +276,7 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
 
 @tool("read")
-async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches,too-many-return-statements
+async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches,too-many-return-statements,too-many-statements
     date_str: str | None = None,
     days_back: int = 3,
     baseline_metrics: str = DEFAULT_BASELINE_METRICS,
@@ -331,11 +335,14 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     )
     input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
     field_defs = await _defs(athlete_id_to_use, api_key, ACTIVITY_FIELD)
-    activities = await _fetch_activities(athlete_id_to_use, api_key, start, target)
+    load_errors: list[str] = []
+    activities = await _fetch_activities(athlete_id_to_use, api_key, start, target, errors=load_errors)
     events_result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key, params={"oldest": target, "newest": target}
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params={"oldest": target, "newest": target}
     )
     events = [e for e in events_result if isinstance(e, dict)] if isinstance(events_result, list) else []
+    if isinstance(events_result, dict) and "error" in events_result:
+        load_errors.append(f"planned events could not be loaded: {events_result.get('message', 'Unknown error')}")
 
     if output_format.strip().lower() == "json":
         baselines = [
@@ -344,7 +351,8 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         for trend in baselines:
             trend.pop("series", None)
         return json.dumps(
-            _snapshot_json(target, entries, input_defs, baselines, activities, events), ensure_ascii=False
+            {**_snapshot_json(target, entries, input_defs, baselines, activities, events), "load_errors": load_errors},
+            ensure_ascii=False,
         )
 
     lines = [
@@ -379,10 +387,12 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     lines.extend(_baseline_lines(baseline_entries, metrics))
     lines.append("")
     lines.append(f"Activities {start} to {target} ({len(activities)}):")
-    lines.extend([_activity_line(a, field_defs) for a in activities] or ["  none"])
+    activity_error = next((e for e in load_errors if e.startswith("activities")), None)
+    lines.extend([_activity_line(a, field_defs) for a in activities] or [f"  {activity_error}" if activity_error else "  none"])
     lines.append("")
     lines.append(f"Planned on {target} ({len(events)}):")
-    lines.extend([_event_line(e) for e in events] or ["  none"])
+    event_error = next((e for e in load_errors if e.startswith("planned events")), None)
+    lines.extend([_event_line(e) for e in events] or [f"  {event_error}" if event_error else "  none"])
     return "\n".join(lines)
 
 
@@ -556,9 +566,10 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     )
     weight = weight_trend(entries, windows=window_tuple)
     loads: dict[str, float] = {}
+    load_errors: list[str] = []
     if include_training_load:
         for activity in await _fetch_activities(
-            athlete_id_to_use, api_key, start, end, fields="id,start_date_local,icu_training_load"
+            athlete_id_to_use, api_key, start, end, fields="id,start_date_local,icu_training_load", errors=load_errors
         ):
             day = str(activity.get("start_date_local", ""))[:10]
             load = activity.get("icu_training_load")
@@ -566,7 +577,8 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
                 loads[day] = loads.get(day, 0) + load
     if output_format.strip().lower() == "json":
         return json.dumps(
-            {"start": start, "end": end, "nutrition": summary, "weight": weight, "training_load_per_day": loads},
+            {"start": start, "end": end, "nutrition": summary, "weight": weight, "training_load_per_day": loads,
+             "load_errors": load_errors},
             ensure_ascii=False,
         )
     text = f"Nutrition summary for athlete {athlete_id_to_use}, {start} to {end}:\n\n"
@@ -576,7 +588,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
         total = sum(loads.values())
         text += (
             "\n\nTraining load per day (Intervals.icu, last 7 days with activities): "
-            + (", ".join(f"{d} {v:.0f}" for d, v in last) if last else "none")
+            + (", ".join(f"{d} {v:.0f}" for d, v in last) if last else (load_errors[0] if load_errors else "none"))
             + f"; total in range {total:.0f}"
         )
     return text

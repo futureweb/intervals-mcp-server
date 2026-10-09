@@ -18,7 +18,7 @@ import statistics
 from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date
@@ -44,6 +44,8 @@ config = get_config()
 DEFAULT_RANGE_DAYS = 90
 REFERENCE_LOOKBACK_DAYS = 365  # default search window before a reference activity
 MAX_COMPARE_ACTIVITIES = 25
+# compare_best_efforts makes one request per activity and duration (25 x 10 = 250 at most).
+MAX_COMPARE_DURATIONS = 10
 MAX_WORKOUTS = 12
 MAX_EFFICIENCY_ACTIVITIES = 60
 MAX_SEARCH_RESULTS = 100
@@ -210,7 +212,7 @@ def _list_of_dicts(result: Any) -> list[dict[str, Any]]:
 async def _activities_by_ids(api: _Api, ids: list[str]) -> tuple[list[dict[str, Any]], str | None]:
     activities: list[dict[str, Any]] = []
     for activity_id in ids:
-        result = await api.get(f"/activity/{activity_id}")
+        result = await api.get(f"/activity/{seg(activity_id)}")
         error = _error(result, f"activity {activity_id}")
         if error:
             return [], error
@@ -220,7 +222,30 @@ async def _activities_by_ids(api: _Api, ids: list[str]) -> tuple[list[dict[str, 
     return activities, None
 
 
-async def _collect_activities(
+def _name_matches(activity: dict[str, Any], query: str) -> bool:
+    """Same rule as the search endpoint: case-insensitive name search, exact tag for "#tag"."""
+    text = query.strip()
+    if text.startswith("#"):
+        return text[1:].lower() in {str(tag).lower() for tag in activity.get("tags") or []}
+    return text.lower() in str(activity.get("name") or "").lower()
+
+
+def truncation_note(found: list[dict[str, Any]], fetch_limit: int, start_date: str | None, what: str) -> str | None:
+    """Note when an endpoint that answers newest first stopped at its limit, so older matches
+    (e.g. before start_date) are missing; None when the result is complete."""
+    if fetch_limit <= 0 or len(found) < fetch_limit:
+        return None
+    oldest = min((_day(a) for a in found if _day(a)), default="")
+    if start_date and oldest and oldest <= start_date:
+        return None
+    return (
+        f"the {what} returned its maximum of {fetch_limit} results, newest first (oldest {oldest or 'unknown'}); "
+        "older matches are not included. Narrow the search (sport, dates via a date range, a more specific "
+        "query or a reference activity) to reach them."
+    )
+
+
+async def _collect_activities(  # pylint: disable=too-many-arguments
     api: _Api,
     athlete_id: str,
     *,
@@ -230,14 +255,18 @@ async def _collect_activities(
     end_date: str | None = None,
     fetch_limit: int = MAX_SEARCH_RESULTS,
 ) -> tuple[list[dict[str, Any]], str | None, str]:
-    """Activities by id, by name search or by date range; returns (activities, error, source text)."""
+    """Activities by id, by name search or by date range; returns (activities, error, source text).
+
+    A name search WITH a date range lists the range and matches the names locally: the search
+    endpoint answers newest first with a limit, so older matches would be cut off.
+    """
     if activity_ids:
         ids = _split(activity_ids)
         activities, error = await _activities_by_ids(api, ids)
         return activities, error, f"{len(ids)} activity id(s)"
-    if query:
+    if query and not (start_date or end_date):
         result = await api.get(
-            f"/athlete/{athlete_id}/activities/search-full", {"q": query, "limit": fetch_limit}
+            f"/athlete/{seg(athlete_id)}/activities/search-full", {"q": query, "limit": fetch_limit}
         )
         error = _error(result, "activity search")
         return _list_of_dicts(result), error, f"name search '{query}'"
@@ -245,10 +274,14 @@ async def _collect_activities(
     if isinstance(span, str):
         return [], span, ""
     result = await api.get(
-        f"/athlete/{athlete_id}/activities",
-        {"oldest": span[0], "newest": span[1], "fields": ACTIVITY_FIELDS},
+        f"/athlete/{seg(athlete_id)}/activities",
+        {"oldest": span[0], "newest": span[1], "fields": ACTIVITY_FIELDS + (",tags" if query else "")},
     )
-    return _list_of_dicts(result), _error(result, "activities"), f"{span[0]} to {span[1]}"
+    activities = _list_of_dicts(result)
+    if query:
+        activities = [a for a in activities if _name_matches(a, query)]
+        return activities, _error(result, "activities"), f"name '{query}' in {span[0]} to {span[1]}"
+    return activities, _error(result, "activities"), f"{span[0]} to {span[1]}"
 
 
 def _select_activities(
@@ -308,7 +341,7 @@ def _reference_window(reference: dict[str, Any] | None, start_date: str | None) 
 
 async def _intervals_of(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any]], str | None]:
     """All intervals of an activity (WORK and RECOVERY)."""
-    result = await api.get(f"/activity/{activity_id}/intervals")
+    result = await api.get(f"/activity/{seg(activity_id)}/intervals")
     error = _error(result, f"intervals of activity {activity_id}")
     if error:
         return [], error
@@ -317,7 +350,7 @@ async def _intervals_of(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any
 
 
 async def _work_intervals(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any]], str | None]:
-    result = await api.get(f"/activity/{activity_id}/intervals")
+    result = await api.get(f"/activity/{seg(activity_id)}/intervals")
     error = _error(result, f"intervals of activity {activity_id}")
     if error:
         return [], error
@@ -468,7 +501,7 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
         return f"Error: count must be between 1 and {MAX_EFFORT_COUNT}."
 
     api = _Api(api_key)
-    time_data = _time_stream(await api.get(f"/activity/{activity_id}/streams", {"types": "time"}))
+    time_data = _time_stream(await api.get(f"/activity/{seg(activity_id)}/streams", {"types": "time"}))
     base: dict[str, Any] = {"stream": stream, "count": count}
     if exclude_intervals:
         base["excludeIntervals"] = "true"
@@ -480,7 +513,7 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     for key, value in requests:
-        result = await api.get(f"/activity/{activity_id}/best-efforts", {**base, key: value})
+        result = await api.get(f"/activity/{seg(activity_id)}/best-efforts", {**base, key: value})
         error = _error(result, "best efforts")
         if error:
             errors.append(error)
@@ -580,6 +613,11 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         return duration_list
     if not duration_list:
         return "Error: at least one duration is required."
+    if len(duration_list) > MAX_COMPARE_DURATIONS:
+        return (
+            f"Error: {len(duration_list)} durations; at most {MAX_COMPARE_DURATIONS} per call "
+            "(each activity needs one API request per duration)."
+        )
     date_error = _validate_optional_dates(start_date, end_date)
     if date_error:
         return date_error
@@ -605,13 +643,13 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         efforts: list[dict[str, Any]] = []
         for duration in duration_list:
             result = await api.get(
-                f"/activity/{activity.get('id')}/best-efforts",
+                f"/activity/{seg(activity.get('id'))}/best-efforts",
                 {"stream": stream, "duration": duration, "count": 1},
             )
-            error = _error(result, "best efforts")
+            error = _error(result, f"best efforts of activity {activity.get('id')} ({_duration_label(duration)})")
             if error:
                 errors.append(error)
-            efforts.append({"duration": duration, "average": _best_average(result)})
+            efforts.append({"duration": duration, "average": _best_average(result), "error": error})
         rows.append({**_activity_json(activity, gear_map), "efforts": efforts})
     if errors and len(errors) == len(selected) * len(duration_list):
         return errors[0]
@@ -620,16 +658,18 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
     best: list[dict[str, Any]] = []
     for position, duration in enumerate(duration_list):
         candidates = [(row["efforts"][position]["average"], row) for row in rows if row["efforts"][position]["average"] is not None]
+        # A failed request is not "no such effort": the best of the rest may not be the real best.
+        incomplete = any(row["efforts"][position]["error"] for row in rows)
         if candidates:
             value, row = max(candidates, key=lambda item: item[0])
-            best.append({"duration": duration, "average": value, "activity_id": row["id"], "name": row["name"], "date": row["date"]})
+            best.append({"duration": duration, "average": value, "activity_id": row["id"], "name": row["name"], "date": row["date"], "incomplete": incomplete})
         else:
-            best.append({"duration": duration, "average": None, "activity_id": None, "name": None, "date": None})
+            best.append({"duration": duration, "average": None, "activity_id": None, "name": None, "date": None, "incomplete": incomplete})
 
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "stream": stream, "units": units, "durations": duration_list,
-            "source": source, "limit": capped, "activities": rows, "best": best, "api_calls": api.calls,
+            "source": source, "limit": capped, "activities": rows, "best": best, "errors": errors, "api_calls": api.calls,
             "note": POWER_METER_NOTE,
         }
         return json.dumps(payload, ensure_ascii=False)
@@ -641,7 +681,7 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         "Date | Sport | Gear | FTP | " + " | ".join(labels) + " | Activity",
     ]
     for row in rows:
-        cells = [_fmt(effort["average"], 0, units) for effort in row["efforts"]]
+        cells = ["error" if effort["error"] else _fmt(effort["average"], 0, units) for effort in row["efforts"]]
         gear = f"{row['gear_name']} ({row['gear_id']})" if row["gear_name"] else (row["gear_id"] or "no gear")
         lines.append(
             f"{row['date']} | {row['type']} | {gear} | {_fmt(_num(row['ftp']), 0, 'W')} | "
@@ -652,9 +692,15 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         + "; ".join(
             f"{label} {_fmt(item['average'], 0, units)}"
             + (f" ({item['date']} '{item['name']}', {item['activity_id']})" if item["activity_id"] else "")
+            + (" (INCOMPLETE: not every activity could be loaded)" if item["incomplete"] else "")
             for label, item in zip(labels, best, strict=True)
         )
     )
+    if errors:
+        lines.append(
+            f"Errors ({len(errors)} of {len(selected) * len(duration_list)} requests failed; 'error' cells are not "
+            "missing efforts): " + "; ".join(errors[:5]) + (" ..." if len(errors) > 5 else "")
+        )
     lines.append(POWER_METER_NOTE)
     lines.append(f"API calls: {api.calls} {GEAR_CALL_NOTE}")
     return "\n".join(lines)
@@ -950,13 +996,14 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     )
     if isinstance(params, str):
         return params
-    result = await api.get(f"/athlete/{athlete_id_to_use}/activities/interval-search", params)
+    result = await api.get(f"/athlete/{seg(athlete_id_to_use)}/activities/interval-search", params)
     error = _error(result, "interval search")
     if error:
         return error
     found = _list_of_dicts(result)
     sport_filter, sport_text, other_families = _family_filter(found, sport_types, reference)
     window_start, window_note = _reference_window(reference, start_date)
+    truncated = truncation_note(found, int(params["limit"]), window_start, "interval search")
     selected = _select_activities(found, sport_types=sport_filter, gear_id=gear_id, start_date=window_start, end_date=end_date)
     older = (
         len(_select_activities(found, sport_types=sport_filter, gear_id=gear_id, end_date=end_date)) - len(selected)
@@ -986,7 +1033,8 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "criteria": criteria, "api_params": params,
-            "returned_by_api": len(found), "filters": filters or None, "other_sport_families": other_families,
+            "returned_by_api": len(found), "api_result_truncated": truncated,
+            "filters": filters or None, "other_sport_families": other_families,
             "reference": {"activity_id": reference_activity_id, "pattern": pattern} if reference else None,
             "window": window,
             "sort_by": order,
@@ -1018,6 +1066,8 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
         f"API returned {len(found)} activities; filters ({filters}) keep {len(selected)}; "
         + ("ranked by comparability." if order == "comparability" else "newest first.")
     )
+    if truncated:
+        lines.append(f"Note: {truncated}")
     if other_families:
         lines.append(
             "Also found in other sports (not shown, % of FTP is sport-specific; sport_types='all' to include): "
@@ -1085,7 +1135,7 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
             return "Error: bucket_size must be positive."
     width = bucket_size or default_bucket
     api = _Api(api_key)
-    result = await api.get(f"/activity/{activity_id}/{endpoint}", {"bucketSize": width} if width else None)
+    result = await api.get(f"/activity/{seg(activity_id)}/{endpoint}", {"bucketSize": width} if width else None)
     error = _error(result, f"{key} histogram")
     if error:
         return error
@@ -1335,9 +1385,11 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     capped = min(max(limit, 1), MAX_WORKOUTS)
 
     api = _Api(api_key)
+    fetch_limit = min(capped * 4, MAX_SEARCH_RESULTS)
+    name_search = bool(query) and not activity_ids and not (start_date or end_date)
     activities, error, source = await _collect_activities(
         api, athlete_id_to_use, activity_ids=activity_ids, query=query, start_date=start_date,
-        end_date=end_date, fetch_limit=min(capped * 4, MAX_SEARCH_RESULTS),
+        end_date=end_date, fetch_limit=fetch_limit,
     )
     if error:
         return error
@@ -1375,8 +1427,11 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         filters_text = ", ".join(p for p in (filters_text, f"sport family {sport_family(anchor.get('type'))} (default)") if p)
     if window_note:
         filters_text = ", ".join(p for p in (filters_text, window_note) if p)
+    truncated = truncation_note(activities, fetch_limit, start_date, "name search") if name_search else None
     if not selected:
-        return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})."
+        return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})." + (
+            f" Note: {truncated} A name search with start_date/end_date lists that range instead." if truncated else ""
+        )
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
     split_filters = {"min_secs": min_interval_secs, "max_secs": max_interval_secs, "min_pct": min_intensity, "max_pct": max_intensity}
     rows: list[dict[str, Any]] = []
@@ -1415,7 +1470,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
             "athlete_id": athlete_id_to_use, "source": source, "filters": filters_text or None, "limit": capped,
             "window": {"start": start_date, "end": end_date, "default_lookback_days": REFERENCE_LOOKBACK_DAYS if window_note else None},
             "reference": {"activity_id": ref_row["id"], "pattern": pattern, "explicit": reference is not None},
-            "activities": rows, "trends": trends, "notes": notes, "api_calls": api.calls,
+            "activities": rows, "trends": trends, "notes": notes, "api_result_truncated": truncated, "api_calls": api.calls,
         }
         return json.dumps(payload, ensure_ascii=False)
     pattern_text = (
@@ -1458,6 +1513,8 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     else:
         lines.append("Trends: fewer than two comparable activities.")
     lines.extend(f"Note: {note}" for note in notes)
+    if truncated:
+        lines.append(f"Note: {truncated} A name search with start_date/end_date lists that range instead.")
     lines.append(f"API calls: {api.calls} {GEAR_CALL_NOTE}")
     return "\n".join(lines)
 
@@ -1773,7 +1830,7 @@ def _fatigue_rows(block: dict[str, Any], durations: list[int], keys: tuple[str, 
 
 async def _kj_thresholds(api: _Api, athlete_id: str, activity_type: str) -> tuple[dict[str, Any] | None, str]:
     """after_kj0 / after_kj1 / ftp of the sport setting covering activity_type and a note."""
-    result = await api.get(f"/athlete/{athlete_id}/sport-settings")
+    result = await api.get(f"/athlete/{seg(athlete_id)}/sport-settings")
     error = _error(result, "sport settings")
     if error:
         return None, f"{error}; kJ thresholds unknown."
@@ -1805,11 +1862,11 @@ async def _suggest_thresholds(  # pylint: disable=too-many-locals
     api: _Api, athlete_id: str, activity_type: str, ftp: float | None
 ) -> dict[str, Any]:
     """Plausible kJ0 / kJ1 from body mass (or FTP) and from the work of recent rides (suggestion only, never saved)."""
-    athlete = await api.get(f"/athlete/{athlete_id}")
+    athlete = await api.get(f"/athlete/{seg(athlete_id)}")
     weight = _num(athlete.get("icu_weight")) if isinstance(athlete, dict) else None
     end = get_default_end_date()
     start = (date.fromisoformat(end) - timedelta(days=SUGGESTION_LOOKBACK_DAYS - 1)).isoformat()
-    result = await api.get(f"/athlete/{athlete_id}/activities", {"oldest": start, "newest": end, "fields": "id,type,icu_joules,moving_time"})
+    result = await api.get(f"/athlete/{seg(athlete_id)}/activities", {"oldest": start, "newest": end, "fields": "id,type,icu_joules,moving_time"})
     family = set(family_types(activity_type))
     work = sorted(
         joules / 1000 for a in _list_of_dicts(result)
@@ -1928,7 +1985,7 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
         block: dict[str, Any] = {"id": activity_id, "label": f"Activity {activity_id} ({activity_type})"}
         for key, fatigue in (("fresh", None), *((k, k) for k in keys)):
             result = await api.get(
-                f"/activity/{activity_id}/power-curve.json", {"fatigue": fatigue} if fatigue else None
+                f"/activity/{seg(activity_id)}/power-curve.json", {"fatigue": fatigue} if fatigue else None
             )
             error = _error(result, f"power curve ({key})")
             if error:
@@ -1938,7 +1995,7 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
     else:
         wanted = [cid for curve_id in curve_ids for cid in (curve_id, *(f"{curve_id}-{k}" for k in keys))]
         result = await api.get(
-            f"/athlete/{athlete_id_to_use}/power-curves.json",
+            f"/athlete/{seg(athlete_id_to_use)}/power-curves.json",
             {"type": activity_type, "curves": ",".join(wanted)},
         )
         error = _error(result, "athlete power curves")

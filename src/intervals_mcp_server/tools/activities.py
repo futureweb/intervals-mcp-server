@@ -9,7 +9,7 @@ This module contains tools for retrieving and managing athlete activities.
 import json
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -51,6 +51,7 @@ from intervals_mcp_server.utils.streams import (
     stream_length,
 )
 from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_date_params
+from intervals_mcp_server.tool_guard import output_budget
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -58,6 +59,9 @@ from intervals_mcp_server.mcp_instance import tool
 config = get_config()
 
 STREAM_OUTPUT_FORMATS = ("summary", "full", "json")
+# Samples per full/json response: default and hard maximum (a 24 h ride has ~86,400 samples).
+DEFAULT_STREAM_POINTS = 2000
+MAX_STREAM_POINTS = 20000
 # Fields requested from the API for compact / JSON activity listings (keeps payloads small).
 ACTIVITY_LIST_FIELDS = (
     "id,start_date_local,start_date,timezone,type,sub_type,name,description,moving_time,elapsed_time,"
@@ -259,7 +263,7 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
     params: dict[str, Any] = {"oldest": dates[0], "newest": dates[1]}
     if detail_level == "compact" or output_format == "json":
         params["fields"] = ACTIVITY_LIST_FIELDS
-    result = await make_intervals_request(url=f"/athlete/{athlete_id}/activities", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key, params=params)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activities: {result.get('message', 'Unknown error')}"
     activities = _in_window(_parse_activities_from_result(result), dates[0], dates[1])
@@ -417,7 +421,7 @@ async def _fetch_streams(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch streams for an activity. Returns (streams, error_message)."""
     result = await make_intervals_request(
-        url=f"/activity/{activity_id}/streams",
+        url=f"/activity/{seg(activity_id)}/streams",
         api_key=api_key,
         params=params,
     )
@@ -489,7 +493,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
     # Call the Intervals.icu API
     params = {"oldest": start_date, "newest": end_date, "limit": api_limit}
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/activities", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key, params=params
     )
 
     # Check for error
@@ -515,7 +519,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         named = _filter_named_activities(activities)
         if len(named) < limit and len(raw) >= api_limit:
             whole = await make_intervals_request(
-                url=f"/athlete/{athlete_id_to_use}/activities", api_key=api_key,
+                url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key,
                 params={"oldest": start_date, "newest": end_date},
             )
             if isinstance(whole, list):
@@ -576,7 +580,7 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
     if detail_level not in DETAIL_LEVELS_3:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
     # Call the Intervals.icu API
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -714,11 +718,15 @@ def _fmt_short(value: Any) -> str:
     return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
 
 
-async def _activity_payload(activity_id: str, api_key: str | None) -> dict[str, Any] | None:
-    """The activity (for its sport and thresholds); None when it cannot be loaded."""
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+async def _activity_payload(activity_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """The activity (for its sport, thresholds and owner) and why it could not be loaded."""
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    if isinstance(result, dict) and "error" in result:
+        return None, str(result.get("message", "Unknown error"))
     activity = result[0] if isinstance(result, list) and result else result
-    return activity if isinstance(activity, dict) and activity and "error" not in activity else None
+    if isinstance(activity, dict) and activity:
+        return activity, None
+    return None, "empty response"
 
 
 async def _planned_step_types(
@@ -816,7 +824,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
     if detail_level == "full" and not stream_types:
         stream_types = "custom"
     # Call the Intervals.icu API
-    result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -839,9 +847,15 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             "get_activity_streams for the raw samples."
         )
 
+    # The intervals carry no sport and no athlete: the activity tells how to show cadence (steps
+    # per minute on foot) and whose custom definitions label the fields (the owner, e.g. for a coach).
+    activity, activity_error = await _activity_payload(activity_id, api_key)
+    activity_type = activity.get("type") if activity else None
+    owner = activity.get("icu_athlete_id") if activity else None
+
     interval_field_defs: CustomFieldDefs = {}
     if include_custom_fields:
-        interval_field_defs = await _custom_defs(INTERVAL_FIELD, api_key)
+        interval_field_defs = await _custom_defs(INTERVAL_FIELD, api_key, owner)
 
     streams: list[dict[str, Any]] | None = None
     stream_defs: CustomFieldDefs = {}
@@ -862,11 +876,13 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             elif selector != "all":
                 requested = set(_split_stream_types(stream_types)) | {"time"}
                 streams = [s for s in streams if s.get("type") in requested]
-            stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
+            stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key, owner)
+    if activity_error:
+        note += (
+            f"\nNote: the activity itself could not be loaded ({activity_error}); cadence is shown as stored "
+            "(per leg for runs) and custom labels come from the configured athlete.\n"
+        )
 
-    # The intervals carry no sport: the activity tells how to show cadence (steps per minute on foot).
-    activity = await _activity_payload(activity_id, api_key)
-    activity_type = activity.get("type") if activity else None
     plan_map: dict[int, dict[str, Any]] = {}
     plan_source = ""
     if include_planned_types or planned_workout_doc:
@@ -936,7 +952,11 @@ def _render_stream_rows(  # pylint: disable=too-many-arguments,too-many-position
     downsample: int,
     max_points: int,
 ) -> str:
-    """Render the selected sample range of the streams as CSV table or JSON."""
+    """Render the selected sample range of the streams as CSV table or one JSON object.
+
+    The output is cut at max_points samples and at the size budget of a tool result; the
+    answer says where to continue (start_index), never silently.
+    """
     start_index, end_index, start_time, end_time = window
     length = stream_length(streams)
     time_stream = find_stream(streams, "time")
@@ -950,39 +970,67 @@ def _render_stream_rows(  # pylint: disable=too-many-arguments,too-many-position
     )
 
     total = len(range(start, end, downsample))
-    cut_end = end
+    cut_end = min(end, start + max_points * downsample)
+
+    def render(stop: int) -> str:
+        if output_format == "json":
+            return json.dumps(render_streams_json(streams, stream_defs, start, stop, downsample), ensure_ascii=False)
+        return render_streams_table(streams, start, stop, downsample)
+
+    body = render(cut_end) if cut_end > start else ""
+    budget = output_budget()
+    size_cut = False
+    for _ in range(4):  # shrink until the body fits the size budget of one tool result
+        rows = len(range(start, cut_end, downsample))
+        if len(body) <= budget or rows <= 1:
+            break
+        keep = max(1, int(rows * budget / len(body) * 0.9))
+        cut_end = start + keep * downsample
+        body = render(cut_end)
+        size_cut = True
+
+    shown = len(range(start, cut_end, downsample)) if cut_end > start else 0
+    next_start = cut_end if cut_end < end else None
     note = ""
-    if total > max_points:
-        cut_end = start + max_points * downsample
+    if next_start is not None:
+        reason = "the size limit of one tool result" if size_cut else f"max_points={max_points}"
         note = (
-            f"\nNote: output cut to {max_points} of {total} samples (indices {start}-{cut_end - 1}). "
-            f"Continue with start_index={cut_end}, or raise downsample or max_points.\n"
+            f"Note: output cut to {shown} of {total} samples (indices {start}-{cut_end - 1}) by {reason}. "
+            f"Continue with start_index={cut_end}, or select fewer stream_types or raise downsample."
+        )
+    resolution = "full sample resolution" if downsample == 1 else f"every {downsample}. sample"
+    labels = [stream_label(describe_stream(s, stream_defs)) for s in order_streams(streams)]
+
+    if output_format == "json":
+        payload = json.loads(body) if body else {"index_start": start, "index_end": start, "downsample": downsample, "streams": {}}
+        return json.dumps(
+            {
+                "activity_id": activity_id,
+                "activity_samples": length,
+                "selected_samples": total,
+                "returned_samples": shown,
+                "resolution": resolution,
+                "next_start_index": next_start,
+                "note": note or ("No samples in the selected range." if not shown else None),
+                "time_note": "time = seconds since activity start; null = no value",
+                "stream_labels": labels,
+                **payload,
+            },
+            ensure_ascii=False,
         )
 
-    resolution = "full sample resolution" if downsample == 1 else f"every {downsample}. sample"
     header = (
         f"Activity Streams for {activity_id}: samples {start}-{max(start, cut_end - 1)} of {length} "
         f"({resolution}). time = seconds since activity start; empty/null = no value.\n"
     )
-    header += "Streams: " + ", ".join(
-        stream_label(describe_stream(s, stream_defs)) for s in order_streams(streams)
-    ) + "\n"
+    header += "Streams: " + ", ".join(labels) + "\n"
     if cut_end <= start:
         return header + "No samples in the selected range.\n"
-
-    if output_format == "json":
-        body = json.dumps(
-            render_streams_json(streams, stream_defs, start, cut_end, downsample),
-            ensure_ascii=False,
-        )
-        body += "\n"
-    else:
-        body = render_streams_table(streams, start, cut_end, downsample)
-    return header + body + note
+    return header + body + (f"\n{note}\n" if note else "")
 
 
 @tool("read")
-async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     activity_id: str,
     api_key: str | None = None,
     stream_types: str | None = None,
@@ -992,7 +1040,7 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
     start_time: int | None = None,
     end_time: int | None = None,
     downsample: int = 1,
-    max_points: int = 10000,
+    max_points: int = DEFAULT_STREAM_POINTS,
 ) -> str:
     """Get time-series (stream) data for a specific activity from Intervals.icu
 
@@ -1013,7 +1061,8 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
             the activity (optional, defaults to time,watts,heartrate,cadence,altitude,distance,velocity_smooth)
         output_format: "summary" (default) = per-stream metadata, statistics and a short preview;
             "full" = CSV table with one row per sample (index, time, one column per stream,
-            empty cell = no value); "json" = the same selection as JSON arrays (null = no value).
+            empty cell = no value); "json" = ONE JSON object with the same selection as arrays
+            (null = no value), the sample range, next_start_index and a note.
             The time stream is always included in full/json output.
         start_index: First sample index of the full/json output (optional, default 0; matches
             start_index of get_activity_intervals)
@@ -1023,22 +1072,29 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
         end_time: Only samples with time < end_time seconds (optional, full/json)
         downsample: Keep every n-th recorded sample in full/json output (optional, default 1 =
             full sample resolution; samples are skipped, never averaged)
-        max_points: Maximum number of samples in full/json output (optional, default 10000).
-            Longer selections are cut and the response says how to continue (page with
-            start_index, or raise downsample or max_points).
+        max_points: Maximum number of samples in full/json output (optional, default 2000,
+            at most 20000). Longer selections, and selections too large for one tool result
+            (many streams), are cut and the response says how to continue (page with
+            start_index, or raise downsample / select fewer streams).
     """
     output_format = (output_format or "summary").strip().lower()
     if output_format not in STREAM_OUTPUT_FORMATS:
         return f"Error: output_format must be one of {', '.join(STREAM_OUTPUT_FORMATS)}."
     if downsample < 1 or max_points < 1:
         return "Error: downsample and max_points must be positive integers."
+    max_points = min(max_points, MAX_STREAM_POINTS)
 
     params = _stream_request_params(stream_types, ensure_time=output_format != "summary")
     streams, error = await _fetch_streams(activity_id, api_key, params)
     if error:
         return error
 
-    stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
+    owner = None
+    if any(s.get("custom") for s in streams):
+        # Custom streams are labelled with the definitions of the activity's owner.
+        activity, _ = await _activity_payload(activity_id, api_key)
+        owner = activity.get("icu_athlete_id") if activity else None
+    stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key, owner)
 
     if output_format == "summary":
         return format_streams_summary(activity_id, streams, stream_defs)
@@ -1118,7 +1174,7 @@ async def list_activity_streams(
         include_stats: Also download the streams and report sample count, non-null count and
             start/end/min/max/mean per stream (optional, default False)
     """
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -1154,7 +1210,7 @@ async def get_activity_messages(activity_id: str, api_key: str | None = None) ->
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     result = await make_intervals_request(
-        url=f"/activity/{activity_id}/messages",
+        url=f"/activity/{seg(activity_id)}/messages",
         api_key=api_key,
     )
 
@@ -1190,8 +1246,10 @@ async def add_activity_message(
         content: The message text to add
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
+    if not (content or "").strip():
+        return "Error: content must not be blank; nothing was posted."
     result = await make_intervals_request(
-        url=f"/activity/{activity_id}/messages",
+        url=f"/activity/{seg(activity_id)}/messages",
         api_key=api_key,
         method="POST",
         data={"content": content},
@@ -1210,8 +1268,8 @@ async def add_activity_message(
     return f"Message appears to have been added to activity {activity_id}, but no ID was returned. Please verify manually."
 
 
-@tool("write")
-async def update_activity(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+@tool("write", overwrites=True)
+async def update_activity(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
     activity_id: str,
     rpe: int | None = None,
     feel: int | None = None,
@@ -1222,7 +1280,8 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     """WRITE TOOL: modifies an existing activity in Intervals.icu (PUT /activity/{id}).
 
     Only the fields that are passed are sent; all other activity values stay untouched.
-    At least one of rpe, feel, name or description must be provided.
+    name and description REPLACE the current text (read it first with get_activity_details to
+    extend it). At least one of rpe, feel, name or description must be provided.
     Activities imported from Strava cannot be updated via the API; the API returns an error.
 
     Args:
@@ -1238,6 +1297,9 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     if feel is not None and (isinstance(feel, bool) or not 1 <= feel <= 5):
         return "Error: feel must be an integer between 1 and 5 (1 = Strong ... 5 = Weak)."
 
+    if name is not None and not name.strip():
+        return "Error: name must not be blank."
+
     payload: dict[str, Any] = {}
     if rpe is not None:
         payload["icu_rpe"] = rpe
@@ -1252,7 +1314,7 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
         return "Error: at least one of rpe, feel, name or description must be provided."
 
     result = await make_intervals_request(
-        url=f"/activity/{activity_id}",
+        url=f"/activity/{seg(activity_id)}",
         api_key=api_key,
         method="PUT",
         data=payload,

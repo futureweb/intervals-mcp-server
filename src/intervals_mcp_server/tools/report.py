@@ -11,7 +11,7 @@ quality), "standard" (the full analysis without raw stream dumps; default) or "f
 import json
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.activities import _compact_details, _compact_intervals  # pylint: disable=protected-access
 from intervals_mcp_server.tools.analysis import PACE_SPORTS, _get_event, _threshold_context, tolerances_from_args  # pylint: disable=protected-access
@@ -199,6 +199,20 @@ def _key_findings(  # pylint: disable=too-many-arguments,too-many-positional-arg
     return findings[:MAX_FINDINGS]
 
 
+def _load_error_note(note: str, intervals_result: Any, streams_result: Any) -> str:
+    """Replace a "no data" note by the API error that caused it."""
+    for marker, result, what in (
+        ("no intervals detected", intervals_result, "intervals"),
+        ("no streams returned", streams_result, "streams"),
+    ):
+        if note.startswith(marker) and isinstance(result, dict) and "error" in result:
+            return (
+                f"{what} could not be loaded from Intervals.icu ({result.get('message', 'Unknown error')}); "
+                f"the report is without {what} - retry later"
+            )
+    return note
+
+
 def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     activity: dict[str, Any], available: list[str], streams: list[dict[str, Any]], intervals: list[dict[str, Any]],
     power: dict[str, Any] | None, stream_defs: dict[str, Any], execution: dict[str, Any] | None,
@@ -279,7 +293,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
         return tolerances
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -291,14 +305,14 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     field_defs, stream_defs, interval_defs = (index.get(t, {}) for t in (ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD))
     assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
 
-    intervals_result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
     intervals_payload = intervals_result if isinstance(intervals_result, dict) and "error" not in intervals_result else {}
     intervals = [i for i in intervals_payload.get("icu_intervals") or [] if isinstance(i, dict)]
 
     available = [str(t) for t in (activity.get("stream_types") or [])]
     wanted = [t for t in CORE_STREAMS if t in available or t == "time"] + [t for t in available if t in stream_defs]
     streams_result = await make_intervals_request(
-        url=f"/activity/{activity_id}/streams", api_key=api_key, params={"types": ",".join(wanted)}
+        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params={"types": ",".join(wanted)}
     )
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
 
@@ -320,6 +334,8 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     want_climbs = include_climbs if include_climbs is not None else (not intervals or (activity.get("total_elevation_gain") or 0) > 500)
     climbs = _climb_summary(streams, activity.get("type"), None if detail_level == "full" else MAX_CLIMBS) if want_climbs and streams else None
     notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution)
+    # An API error is not "no intervals" / "file not retained": say what failed (API-7).
+    notes = [_load_error_note(note, intervals_result, streams_result) for note in notes]
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)
 
     if output_format.strip().lower() == "json":

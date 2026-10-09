@@ -7,7 +7,7 @@ the calendar day for existing events to avoid duplicates.
 import json
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.formatting import event_type_label
 from intervals_mcp_server.utils.sports import hms
@@ -94,7 +94,7 @@ async def validate_workout(  # pylint: disable=too-many-arguments,too-many-posit
                     calendar_note = error_msg
                 else:
                     events = await make_intervals_request(
-                        url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key,
+                        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key,
                         params={"oldest": start_date, "newest": start_date},
                     )
                     if isinstance(events, dict) and "error" in events:

@@ -8,7 +8,7 @@ track progress, e.g. the same pace at a lower heart rate.
 
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.power_curves import _validate_dates
 from intervals_mcp_server.utils.formatting import format_hr_curves, format_pace_curves
@@ -140,7 +140,7 @@ async def _fetch_curves(
         return None, error_msg
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/{endpoint}",
+        url=f"/athlete/{seg(athlete_id_to_use)}/{endpoint}",
         params=params,
         api_key=api_key,
     )

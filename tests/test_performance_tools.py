@@ -288,8 +288,13 @@ def test_compare_best_efforts_ids_json(monkeypatch):
     assert payload["source"] == "2 activity id(s)"
     assert [row["id"] for row in payload["activities"]] == ["a4", "a1"]
     assert payload["activities"][0]["gear_name"] == "Road Bike"
-    assert payload["activities"][0]["efforts"] == [{"duration": 60, "average": 410.0}, {"duration": 1200, "average": 265.0}]
-    assert payload["best"][0] == {"duration": 60, "average": 410.0, "activity_id": "a4", "name": "Sweet Spot 3x20", "date": "2026-10-01"}
+    assert payload["activities"][0]["efforts"] == [
+        {"duration": 60, "average": 410.0, "error": None}, {"duration": 1200, "average": 265.0, "error": None}
+    ]
+    assert payload["best"][0] == {
+        "duration": 60, "average": 410.0, "activity_id": "a4", "name": "Sweet Spot 3x20", "date": "2026-10-01", "incomplete": False
+    }
+    assert payload["errors"] == []
     assert payload["api_calls"] == 6
     assert [c[0] for c in calls[:2]] == ["/activity/a1", "/activity/a4"]
 
@@ -304,7 +309,7 @@ def test_compare_best_efforts_limit_cap_and_errors(monkeypatch):
     _install_router(monkeypatch, overrides={"/activities": ERROR})
     assert asyncio.run(compare_best_efforts()) == "Error fetching activities: boom"
     _install_router(monkeypatch, overrides={"/best-efforts": ERROR})
-    assert asyncio.run(compare_best_efforts(activity_ids="a1", durations="60")) == "Error fetching best efforts: boom"
+    assert asyncio.run(compare_best_efforts(activity_ids="a1", durations="60")) == "Error fetching best efforts of activity a1 (1 min): boom"
     assert asyncio.run(compare_best_efforts(durations="x")).startswith("Error: durations must be")
     assert asyncio.run(compare_best_efforts(start_date="2026-13-01")).startswith("Error: Invalid date format")
     _install_router(monkeypatch, overrides={"/activities": []})
@@ -818,6 +823,7 @@ def test_compare_workouts_query_with_reference_default_window(monkeypatch):
     old = _activity("t0", "2024-05-01", "Ride", "b1", "Threshold 3x10 old", icu_ftp=220)
     routes = _threshold_routes()
     routes["/search-full"] = THRESHOLD_ACTIVITIES + [old]
+    routes["/activities"] = THRESHOLD_ACTIVITIES + [old]  # a name search with dates lists the range (API-9)
     intervals = dict(THRESHOLD_INTERVALS, t0=[_iv("WORK", 600, 230, 155, 162, 90)] * 3)
     routes["/intervals"] = lambda url, _p: {"icu_intervals": intervals.get(_activity_id_of(url), [])}
     _install_router(monkeypatch, overrides=routes)
