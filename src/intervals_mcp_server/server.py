@@ -28,6 +28,7 @@ Usage:
         - list_activity_streams
         - get_activity_messages
         - add_activity_message
+        - update_activity
         - get_events
         - get_event_by_id
         - add_or_update_event
@@ -81,6 +82,7 @@ from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-imp
     get_activity_messages,
     get_activity_streams,
     list_activity_streams,
+    update_activity,
 )
 from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-position  # noqa: E402
     add_or_update_event,
@@ -123,6 +125,7 @@ __all__ = [
     "get_activity_messages",
     "get_activity_streams",
     "list_activity_streams",
+    "update_activity",
     "get_events",
     "get_event_by_id",
     "delete_event",

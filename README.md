@@ -254,6 +254,10 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - `get_activity_intervals`: Get detailed interval data for a specific activity, including custom interval fields and, with `stream_types`, per-interval statistics of any stream (e.g. stamina drop, second power meter)
 - `get_activity_streams`: Get raw data streams for a specific activity: any standard or custom stream, as summary or at full sample resolution (CSV or JSON) with slicing and downsampling
 - `list_activity_streams`: List the standard and custom streams an activity has, with names and units
+- `get_activity_details`: Get detailed information for a specific activity
+- `get_activity_intervals`: Get detailed interval data for a specific activity
+- `get_activity_streams`: Get raw data streams (power, heart rate, etc.) for a specific activity
+- `update_activity`: **Writes data.** Update an activity's RPE (1-10), feel (1-5, 1 = Strong ... 5 = Weak), name and/or description; only the passed fields are changed
 - `get_athlete_power_curves`: Get best power output curves for selected durations and time periods
 - `get_hr_curves`: Get best average heart rate curves for selected durations and time periods
 - `get_pace_curves`: Get best time/pace curves (min/km, min/100m for swims; optional GAP) for selected distances and time periods
