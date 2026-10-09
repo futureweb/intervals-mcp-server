@@ -368,3 +368,104 @@ def test_segments_to_json_is_serialisable():
     assert segments_to_json({"x": float("nan"), "y": [1.0, float("inf"), (2, 3)]}) == {
         "x": None, "y": [1.0, None, [2, 3]],
     }
+
+
+# ------------------------------------------------------------------ phase 3: hikes and quality
+def _hike_streams() -> list[dict[str, Any]]:
+    """A slow alpine hike: walk, scramble with GPS speed 0 while climbing, a real rest, a very steep pitch."""
+    time, altitude, distance, velocity, cadence, moving = [], [], [], [], [], []
+    clock, height, dist, moved = 0, 1500.0, 0.0, 0
+
+    def add(seconds, climb, metres, speed, steps, counting):
+        nonlocal clock, height, dist, moved
+        for _ in range(seconds):
+            time.append(clock)
+            altitude.append(round(height, 2))
+            distance.append(round(dist, 2))
+            velocity.append(speed)
+            cadence.append(steps)
+            moving.append(moved)
+            clock += 1
+            height += climb / seconds
+            dist += metres / seconds
+            moved += 1 if counting else 0
+
+    add(600, 60.0, 600.0, 1.0, 55, True)      # trail: +60 m over 600 m (10 %)
+    add(900, 90.0, 60.0, 0.0, 30, False)      # scramble: +90 m over 60 m, GPS speed 0, device "not moving"
+    add(300, 0.0, 2.0, 0.0, 0, False)         # real rest
+    add(300, 40.0, 15.0, 0.0, 30, False)      # very steep pitch: +40 m over 15 m horizontal
+    add(600, -60.0, 600.0, 1.0, 55, True)     # descent on the trail
+    return [
+        {"type": "time", "data": time}, {"type": "altitude", "data": altitude}, {"type": "distance", "data": distance},
+        {"type": "velocity_smooth", "data": velocity}, {"type": "cadence", "data": cadence},
+        {"type": "Movingtime", "name": "Moving time", "custom": True, "data": moving},
+        {"type": "Elapsedtime", "name": "Elapsed time", "custom": True, "data": list(time)},
+        {"type": "GearRatio", "name": "Gear Ratio", "custom": True, "data": [2.5] * len(time)},
+    ]
+
+
+def test_hike_slow_movement_is_not_a_pause_and_tiny_distances_get_no_grade():
+    """Regression (alpine hike): scrambling with GPS speed 0 is slow movement, a real rest is a pause,
+    no extreme grade from a tiny horizontal distance, counters / bike streams are left out, device
+    moving time is reported but not used."""
+    result = detect_segments(_hike_streams(), sport="Hike", min_climb_gain_m=30)
+    assert result["settings"]["sport_profile"].startswith("foot")
+    # The rest (25:00-30:00) is a pause (classified in 2-minute chunks); scrambling and the pitch are slow movement.
+    assert [(p["kind"], p["start_index"], p["duration_s"]) for p in result["pauses"]] == [("stationary", 1560, 239)]
+    assert [round(p["duration_s"]) for p in result["slow_movement"]] == [959, 299]
+    assert result["slow_movement"][0]["vertical_m_per_h"] > 300 and result["slow_movement"][0]["device_moving_s"] == 0
+    summary = result["summary"]
+    assert summary["pause_time_s"] == 239 and summary["slow_movement_s"] == 1258
+    assert summary["device_moving_s"] == 1199 and summary["moving_estimate_s"] == summary["elapsed_s"] - 239
+    assert set(result["hidden_streams"]) == {"Movingtime", "Elapsedtime", "GearRatio"}
+    climbs = _segments_of(result, "climb")
+    assert climbs and all(set(c["streams"]) == set() for c in climbs)
+    flags = [f for c in climbs for f in c["quality_flags"]]
+    assert any("is approximate" in f for f in flags) and any("contains pauses of 239 s" in f for f in flags)
+    assert summary["steepest_climb"]["avg_grade_pct"] <= 60
+    assert all(c["moving_s"] <= c["duration_s"] - 239 for c in climbs)
+    text = format_segments(result)
+    assert "Very slow movement kept as moving time (2, 1258 s total):" in text
+    assert "device moving-time counter" in text and "not used" in text
+    assert "segment sums are not the activity's total elevation gain" in text
+    assert "Custom streams left out per segment: Elapsedtime (clock/counter stream), GearRatio (bike drivetrain metric on a Hike activity)" in text
+    # A steep pitch over a tiny horizontal distance gets no grade, a moderate one is flagged as approximate.
+    pitch = detect_segments(_hike_streams()[:], sport="Hike", min_climb_gain_m=30, min_grade_distance_m=800)
+    assert all(c["avg_grade_pct"] is None for c in _segments_of(pitch, "climb"))
+    assert any("grade not computed" in f for c in _segments_of(pitch, "climb") for f in c["quality_flags"])
+
+
+def test_sport_defaults_raw_grade_and_vam_on_moving_time():
+    """Bike defaults keep the old behaviour; raw grade is optional; VAM excludes a rest inside a climb."""
+    ride = _Ride()
+    ride.add(300, speed=8.0)
+    ride.add(300, climb_m=100.0, speed=5.0)
+    ride.add(200, speed=0.0, watts=0, cadence=0)  # stop on the climb
+    ride.add(300, climb_m=100.0, speed=5.0)
+    ride.add(300, speed=8.0)
+    result = detect_segments(ride.streams(), sport="Ride", show_raw_grade=True)
+    climb = _segments_of(result, "climb")[0]
+    assert climb["moving_s"] <= climb["duration_s"] - 190
+    assert 1100 <= climb["vam_m_per_h"] <= 1300  # 200 m in ~600 s of moving time
+    assert climb["raw_avg_grade_pct"] is not None and climb["raw_max_grade_pct"] is not None
+    assert any("contains pauses" in flag for flag in climb["quality_flags"])
+    plain = detect_segments(ride.streams())
+    assert _segments_of(plain, "climb")[0]["raw_avg_grade_pct"] is None
+    assert detect_segments(ride.streams(), sport="Hike")["settings"]["grade_window_m"] == 50.0
+    assert detect_segments(ride.streams(), sport="Ride", grade_window_m=200)["settings"]["grade_window_m"] == 200
+
+
+def test_implausible_grade_is_flagged_and_not_the_steepest_climb():
+    """A climb of +50 m over 60 m horizontal (83 %) on foot is flagged and not reported as the steepest climb."""
+    ride = _Ride()
+    ride.add(300, speed=1.2)
+    ride.add(600, climb_m=60.0, speed=1.0)   # trail climb, 10 %
+    ride.add(600, climb_m=-40.0, speed=1.2)  # down again
+    ride.add(300, climb_m=50.0, speed=0.2)   # +50 m over 60 m
+    ride.add(300, speed=1.2)
+    result = detect_segments(ride.streams(), sport="Hike")
+    climbs = _segments_of(result, "climb")
+    steep = next(c for c in climbs if (c["avg_grade_pct"] or 0) > 60)
+    assert any("exceeds 60%" in flag and "treat the grade as approximate" in flag for flag in steep["quality_flags"])
+    assert result["summary"]["steepest_climb"]["avg_grade_pct"] < 20
+    assert result["summary"]["flagged_segments"] >= 1
