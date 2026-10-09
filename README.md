@@ -351,7 +351,8 @@ integrates community pull requests by
 [#142](https://github.com/mvilanova/intervals-mcp-server/pull/142) to
 [#147](https://github.com/mvilanova/intervals-mcp-server/pull/147)),
 [biochaos](https://github.com/biochaos) ([#131](https://github.com/mvilanova/intervals-mcp-server/pull/131)) and
-[kokostitiahah](https://github.com/kokostitiahah) ([#149](https://github.com/mvilanova/intervals-mcp-server/pull/149));
+[kokostitiahah](https://github.com/kokostitiahah) ([#149](https://github.com/mvilanova/intervals-mcp-server/pull/149)), and fixes reported by
+[morritter](https://github.com/morritter) ([#150](https://github.com/mvilanova/intervals-mcp-server/pull/150));
 thank you. Maintained by [Futureweb](https://www.futureweb.at), together with the
 [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge).
 

@@ -93,7 +93,19 @@ class ValueUnits(Enum):
     MINS_KM = "MINS_KM"
     MINS_MILE = "MINS_MILE"
     SECS_100M = "SECS_100M"
+    SECS_100Y = "SECS_100Y"
     SECS_500M = "SECS_500M"
+
+
+# Absolute paces are written in the Intervals.icu workout syntax "m:ss<suffix> Pace", e.g.
+# "5:35/km Pace" (idea and format from mvilanova/intervals-mcp-server#150 by morritter).
+ABSOLUTE_PACE_SUFFIXES = {
+    ValueUnits.MINS_KM: "/km",
+    ValueUnits.MINS_MILE: "/mi",
+    ValueUnits.SECS_100M: "/100m",
+    ValueUnits.SECS_100Y: "/100y",
+    ValueUnits.SECS_500M: "/500m",
+}
 
 
 class TransportAliases(StrEnum):
@@ -180,7 +192,16 @@ class Value:
             return f"{float_to_str(value)}W"
         if self.units in [ValueUnits.CADENCE, ValueUnits.RPM]:
             return f"{float_to_str(value)}rpm"
+        if self.units in ABSOLUTE_PACE_SUFFIXES:
+            return self._format_pace(value)
         return float_to_str(value)
+
+    def _format_pace(self, value: float) -> str:
+        """Absolute pace as m:ss. Per-km/mile paces accept seconds (>= 60) or decimal minutes
+        (< 60); swim and row paces are seconds."""
+        seconds = value * 60 if self.units in (ValueUnits.MINS_KM, ValueUnits.MINS_MILE) and value < 60 else value
+        minutes, secs = divmod(int(round(seconds)), 60)
+        return f"{minutes}:{secs:02d}"
 
     def _format_units(self) -> str:
         """Format units into a human-readable string using dictionary mapping."""
@@ -195,6 +216,7 @@ class Value:
             ValueUnits.POWER_ZONE: "W",
             ValueUnits.CADENCE: "Cadence",
             ValueUnits.RPM: "Cadence",
+            **dict.fromkeys(ABSOLUTE_PACE_SUFFIXES, "Pace"),
         }
         if self.units is None:
             return ""
@@ -202,10 +224,12 @@ class Value:
 
     def __str__(self) -> str:
         val = ""
+        # Absolute paces carry their suffix once, after the value or the range: "5:30-5:40/km".
+        suffix = ABSOLUTE_PACE_SUFFIXES.get(self.units, "") if self.units is not None else ""
         if self.start is not None and self.end is not None:
-            val += f"{self._format_value(self.start)}-{self._format_value(self.end)} "
+            val += f"{self._format_value(self.start)}-{self._format_value(self.end)}{suffix} "
         if self.value is not None:
-            val += f"{self._format_value(self.value)} "
+            val += f"{self._format_value(self.value)}{suffix} "
         if self.units is not None:
             val += f"{self._format_units()} "
         if self.target is not None:

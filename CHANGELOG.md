@@ -117,6 +117,12 @@ First public beta of the Futureweb fork. Based on upstream
   user, security policy, issue and PR templates, documentation (`docs/`).
 
 ### Fixed
+- `add_or_update_event` / `add_or_update_note` updates are partial: only passed fields are sent, so an
+  update no longer clears the description, moves the event to today or turns a NOTE into a WORKOUT;
+  new optional `category` (e.g. `RACE_A`); a name is only required when creating (reported in
+  mvilanova/intervals-mcp-server#150 by morritter).
+- Absolute pace targets (`MINS_KM`, `MINS_MILE`, `SECS_100M`, `SECS_100Y`, `SECS_500M`) are written as
+  `5:35/km Pace` instead of bare numbers Intervals.icu cannot parse (format from #150 by morritter).
 - `get_event_by_id` used the wrong endpoint (`/event/` instead of `/events/`) and returned 404.
 - Events reported `Type: Other`; category and sport are now shown, planned time/load and the
   paired activity included, the workout document rendered.
