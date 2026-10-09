@@ -7,9 +7,10 @@ workout on the calendar.
 """
 
 import json
+import re
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
@@ -18,6 +19,7 @@ from intervals_mcp_server.utils.validation import (
     resolve_athlete_id,
     validate_date,
 )
+from intervals_mcp_server.utils.workout_validation import workout_text_for_write, write_refusal
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -37,6 +39,9 @@ _WORKOUT_FIELDS_FOR_EVENT = (
     "target",
     "sub_type",
     "carbs_per_hour",
+    # Planned load and work, e.g. the manual load of a strength session.
+    "icu_training_load",
+    "joules",
 )
 
 # Above this many workouts, an unfiltered listing only shows per-folder counts.
@@ -92,7 +97,7 @@ async def _fetch_folders(
     athlete_id: str, api_key: str | None
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch all folders/plans. Returns (folders, error_message)."""
-    result = await make_intervals_request(url=f"/athlete/{athlete_id}/folders", api_key=api_key)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/folders", api_key=api_key)
     if isinstance(result, dict) and "error" in result:
         return [], str(result.get("message", "Unknown error"))
     folders = [f for f in result if isinstance(f, dict)] if isinstance(result, list) else []
@@ -187,7 +192,7 @@ async def _resolve_folder_id(
 
 
 @tool("write")
-async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     name: str,
     sport_type: str,
     folder: str | None = None,
@@ -206,9 +211,10 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
         folder: Folder or plan to put the workout in, by name (case-insensitive) or id. Optional if
             the library has exactly one folder; the call fails if there is no folder.
         description: Workout text in Intervals.icu workout syntax (e.g. "- 10m 55%\\n3x\\n- 10m 90%\\n- 5m 55%")
-            or free text. Ignored if workout_doc is given.
-        workout_doc: Structured steps (same format as in add_or_update_event). Rendered into the
-            description text.
+            or free text. Ignored if workout_doc has steps.
+        workout_doc: Structured steps (same format and checks as in add_or_update_event). Rendered
+            into the description text; an empty workout_doc ({} or no steps) is ignored, so the
+            description is used. With validation errors nothing is created.
         moving_time: Expected total moving time in seconds (optional)
         distance: Expected total distance in meters (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
@@ -217,6 +223,16 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
+    if not (name or "").strip():
+        return "Error: name must not be blank."
+    for key, value in (("moving_time", moving_time), ("distance", distance)):
+        if value is not None and value < 0:
+            return f"Error: {key} must not be negative."
+    workout_type = resolve_activity_type(name, sport_type)
+    # A doc with steps wins; a blank doc ({} / {"steps": []}) falls back to the description.
+    text, problem = workout_text_for_write(workout_doc, workout_type, allow_text_only=description is None)
+    if problem:
+        return write_refusal(problem)
 
     folder_id, error = await _resolve_folder_id(athlete_id_to_use, api_key, folder)
     if error:
@@ -224,11 +240,11 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
 
     workout_data: dict[str, Any] = {
         "name": name,
-        "type": resolve_activity_type(name, sport_type),
+        "type": workout_type,
         "folder_id": folder_id,
     }
-    if workout_doc:
-        workout_data["description"] = str(workout_doc)
+    if text is not None:
+        workout_data["description"] = text
     elif description is not None:
         workout_data["description"] = description
     if moving_time is not None:
@@ -237,7 +253,7 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
         workout_data["distance"] = distance
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/workouts",
+        url=f"/athlete/{seg(athlete_id_to_use)}/workouts",
         api_key=api_key,
         data=workout_data,
         method="POST",
@@ -249,8 +265,13 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     return f"No library workout created for athlete {athlete_id_to_use}."
 
 
+def _has_step_lines(text: str) -> bool:
+    """True when workout text contains at least one step line ("- 10m 55%") or repeat ("3x")."""
+    return re.search(r"^\s*(?:-|\d+\s*x\b)", text, re.MULTILINE | re.IGNORECASE) is not None
+
+
 @tool("write")
-async def add_event_from_library(
+async def add_event_from_library(  # pylint: disable=too-many-return-statements
     workout_id: str,
     date: str,
     athlete_id: str | None = None,
@@ -259,7 +280,9 @@ async def add_event_from_library(
     """WRITES to Intervals.icu: schedule a workout from the workout library on the calendar.
 
     Creates a new calendar event (category WORKOUT) on the given date by copying the library
-    workout's name, description (steps), type, duration, distance and tags.
+    workout's name, description (steps), type, duration, distance, tags and planned load.
+    A workout imported from a file (.zwo, .mrc, .erg, .fit) whose description holds no workout
+    steps is created without steps; the answer says so.
 
     Args:
         workout_id: The id of the library workout (see get_workout_library). Library ids are
@@ -279,7 +302,7 @@ async def add_event_from_library(
         return f"Error: {e}"
 
     workout = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/workouts/{workout_id}", api_key=api_key
+        url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}", api_key=api_key
     )
     if isinstance(workout, dict) and "error" in workout:
         return f"Error fetching library workout: {workout.get('message', 'Unknown error')}"
@@ -293,7 +316,7 @@ async def add_event_from_library(
     event_data["start_date_local"] = validated_date + "T00:00:00"
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/events",
+        url=f"/athlete/{seg(athlete_id_to_use)}/events",
         api_key=api_key,
         data=event_data,
         method="POST",
@@ -303,9 +326,16 @@ async def add_event_from_library(
             f"Error creating event from library workout: {result.get('message', 'Unknown error')}"
         )
     if isinstance(result, dict) and result.get("id") is not None:
+        note = ""
+        steps = (workout.get("workout_doc") or {}).get("steps") if isinstance(workout.get("workout_doc"), dict) else None
+        if steps and not _has_step_lines(str(workout.get("description") or "")):
+            note = (
+                " Note: the library workout's structure is not in its description text (e.g. imported from a "
+                "file), so the event was created WITHOUT steps; check it with get_event_by_id."
+            )
         return (
             f"Successfully created event id: {result.get('id')} on {validated_date} "
-            f"from library workout {workout_id}"
+            f"from library workout {workout_id}.{note}"
         )
     return f"No event created for athlete {athlete_id_to_use}."
 
@@ -334,7 +364,7 @@ async def delete_library_workout(
     if not (workout_id.isascii() and workout_id.isdigit()):
         return "Error: workout_id must be a numeric library workout ID."
 
-    url = f"/athlete/{athlete_id_to_use}/workouts/{workout_id}"
+    url = f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}"
     workout = await make_intervals_request(url=url, api_key=api_key)
     if isinstance(workout, dict) and "error" in workout:
         return f"Error fetching library workout: {workout.get('message', 'Unknown error')}"
@@ -368,7 +398,7 @@ async def get_library_workout(
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    result = await make_intervals_request(url=f"/athlete/{athlete_id_to_use}/workouts/{workout_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}", api_key=api_key)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching library workout: {result.get('message', 'Unknown error')}"
     if not isinstance(result, dict) or not result:
