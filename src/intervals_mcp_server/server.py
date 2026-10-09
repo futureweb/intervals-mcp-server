@@ -32,6 +32,7 @@ Usage:
         - get_events
         - get_event_by_id
         - add_or_update_event
+        - add_events_bulk
         - delete_event
         - delete_events_by_date_range
         - get_wellness_data
@@ -85,6 +86,7 @@ from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-imp
     update_activity,
 )
 from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-position  # noqa: E402
+    add_events_bulk,
     add_or_update_event,
     delete_event,
     delete_events_by_date_range,
@@ -132,6 +134,7 @@ __all__ = [
     "delete_events_by_date_range",
     "add_or_update_event",
     "get_gear_list",
+    "add_events_bulk",
     "get_wellness_data",
     "get_athlete_power_curves",
     "get_hr_curves",
