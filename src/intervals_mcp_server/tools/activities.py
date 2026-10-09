@@ -7,7 +7,6 @@ This module contains tools for retrieving and managing athlete activities.
 # pylint: disable=too-many-lines
 
 import json
-from datetime import datetime, timedelta
 from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
@@ -263,7 +262,7 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
     result = await make_intervals_request(url=f"/athlete/{athlete_id}/activities", api_key=api_key, params=params)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activities: {result.get('message', 'Unknown error')}"
-    activities = _parse_activities_from_result(result)
+    activities = _in_window(_parse_activities_from_result(result), dates[0], dates[1])
     if not include_unnamed:
         activities = _filter_named_activities(activities)
     wanted = {t.strip().lower() for t in (sport_types or "").split(",") if t.strip()}
@@ -329,42 +328,27 @@ def _filter_named_activities(activities: list[dict[str, Any]]) -> list[dict[str,
     ]
 
 
-async def _fetch_more_activities(
-    athlete_id: str,
-    start_date: str,
-    api_key: str | None,
-    api_limit: int,
-) -> list[dict[str, Any]]:
-    """Fetch additional activities from an earlier date range."""
-    oldest_date = datetime.fromisoformat(start_date)
-    older_start_date = (oldest_date - timedelta(days=60)).strftime("%Y-%m-%d")
-    older_end_date = (oldest_date - timedelta(days=1)).strftime("%Y-%m-%d")
+def _in_window(activities: list[dict[str, Any]], start_date: str, end_date: str) -> list[dict[str, Any]]:
+    """Activities whose local start date lies in [start_date, end_date] (upstream #134: nothing outside the range).
 
-    if older_start_date >= older_end_date:
-        return []
-
-    more_params = {
-        "oldest": older_start_date,
-        "newest": older_end_date,
-        "limit": api_limit,
-    }
-    more_result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
-        api_key=api_key,
-        params=more_params,
-    )
-
-    if isinstance(more_result, list):
-        return _filter_named_activities(more_result)
-    return []
+    An activity without a local start date cannot be placed and is kept as returned by the API.
+    """
+    kept = []
+    for activity in activities:
+        day = str(activity.get("start_date_local") or "")[:10]
+        if day and not start_date <= day <= end_date:
+            continue
+        kept.append(activity)
+    return kept
 
 
 def _format_activities_response(
     activities: list[dict[str, Any]],
     athlete_id: str,
     include_unnamed: bool,
+    note: str = "",
 ) -> str:
-    """Format the activities response based on the results."""
+    """Format the activities response based on the results (``note`` is appended)."""
     if not activities:
         if include_unnamed:
             return (
@@ -380,7 +364,7 @@ def _format_activities_response(
         else:
             activities_summary += f"Invalid activity format: {activity}\n\n"
 
-    return activities_summary
+    return activities_summary + note
 
 
 async def _custom_defs(
@@ -517,21 +501,33 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         return f"No activities found for athlete {athlete_id_to_use} in the specified date range."
 
     # Parse activities from result
-    activities = _parse_activities_from_result(result)
+    raw = _parse_activities_from_result(result)
+    activities = _in_window(raw, start_date, end_date)
 
     if not activities:
         return f"No valid activities found for athlete {athlete_id_to_use} in the specified date range."
 
-    # Filter and fetch more if needed
+    # Unnamed activities are dropped. When the API stopped at the request limit, the window may hold
+    # more named ones: fetch the whole window once more. Activities before start_date are never
+    # added (upstream #134); fewer than `limit` are returned when the range holds fewer.
+    note = ""
     if not include_unnamed:
-        activities = _filter_named_activities(activities)
-
-        # If we don't have enough named activities, try to fetch more
-        if len(activities) < limit:
-            more_activities = await _fetch_more_activities(
-                athlete_id_to_use, start_date, api_key, api_limit
+        named = _filter_named_activities(activities)
+        if len(named) < limit and len(raw) >= api_limit:
+            whole = await make_intervals_request(
+                url=f"/athlete/{athlete_id_to_use}/activities", api_key=api_key,
+                params={"oldest": start_date, "newest": end_date},
             )
-            activities.extend(more_activities)
+            if isinstance(whole, list):
+                named = _filter_named_activities(_in_window(_parse_activities_from_result(whole), start_date, end_date))
+        hidden = len(activities) - len(named)
+        activities = named
+        if len(activities) < limit:
+            note = (
+                f"Note: {len(activities)} named activities between {start_date} and {end_date} (fewer than the limit "
+                f"{limit}; nothing outside the range is added"
+                + (f"; {hidden} unnamed hidden, include_unnamed=True shows them" if hidden > 0 else "") + ").\n"
+            )
 
     # Limit to requested count
     activities = activities[:limit]
@@ -541,7 +537,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         activities, athlete_id=athlete_id_to_use, api_key=api_key
     )
 
-    return _format_activities_response(activities, athlete_id_to_use, include_unnamed)
+    return _format_activities_response(activities, athlete_id_to_use, include_unnamed, note)
 
 
 @tool("read")

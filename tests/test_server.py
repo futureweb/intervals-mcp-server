@@ -1457,3 +1457,45 @@ def test_add_events_bulk_api_error(monkeypatch):
     )
     assert "Error creating events in bulk: boom" in result
     assert "may have been partially or fully created" in result
+
+
+def test_get_activities_never_returns_activities_outside_the_range(monkeypatch):
+    """Upstream mvilanova/intervals-mcp-server#134: with fewer named activities than the limit no
+    activities from before start_date are added; every result lies in the requested local dates."""
+    calls = []
+    window = [
+        {"id": "i3", "name": "Ride in range", "type": "Ride", "start_date_local": "2026-10-05T08:00:00"},
+        {"id": "i4", "name": "Unnamed", "type": "Walk", "start_date_local": "2026-10-06T08:00:00"},
+        {"id": "i5", "name": "Stray before", "type": "Ride", "start_date_local": "2026-09-20T08:00:00"},
+    ]
+
+    async def fake_request(url=None, **kwargs):
+        calls.append(kwargs.get("params") or {})
+        if url and "/gear" in url:
+            return []
+        params = kwargs.get("params") or {}
+        if params.get("newest", "") < "2026-10-01":  # a request for an earlier range
+            return [{"id": "i1", "name": "Old ride", "type": "Ride", "start_date_local": "2026-09-01T08:00:00"}]
+        return window
+
+    for target in ("intervals_mcp_server.api.client.make_intervals_request",
+                   "intervals_mcp_server.tools.activities.make_intervals_request",
+                   "intervals_mcp_server.tools.gear.make_intervals_request"):
+        monkeypatch.setattr(target, fake_request)
+    result = asyncio.run(get_activities(athlete_id="1", start_date="2026-10-01", end_date="2026-10-09", limit=5))
+    assert "Ride in range" in result
+    assert "Old ride" not in result and "Stray before" not in result
+    assert all(c.get("oldest", "2026-10-01") >= "2026-10-01" for c in calls if "oldest" in c)
+    assert "Note: 1 named activities between 2026-10-01 and 2026-10-09 (fewer than the limit 5" in result
+    assert "1 unnamed hidden" in result
+    filtered = asyncio.run(get_activities(athlete_id="1", start_date="2026-10-01", end_date="2026-10-09", detail_level="compact",
+                                          include_unnamed=True))
+    assert "Stray before" not in filtered and "Ride in range" in filtered and "Unnamed" in filtered
+    # When the API stops at the request limit the whole range is fetched again, never an earlier range.
+    window[:] = [{"id": f"u{i}", "name": "Unnamed", "type": "Walk", "start_date_local": "2026-10-02T08:00:00"} for i in range(15)]
+    window.append({"id": "i9", "name": "Late named", "type": "Ride", "start_date_local": "2026-10-03T08:00:00"})
+    calls.clear()
+    paged = asyncio.run(get_activities(athlete_id="1", start_date="2026-10-01", end_date="2026-10-09", limit=5))
+    assert "Late named" in paged
+    activity_calls = [c for c in calls if "oldest" in c]
+    assert [c.get("limit") for c in activity_calls] == [15, None] and all(c["oldest"] == "2026-10-01" for c in activity_calls)
