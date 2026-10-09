@@ -22,7 +22,10 @@ First public beta of the Futureweb fork. Based on upstream
   above FTP and efforts above FTP (30 s power >= FTP for >= 60 s), so easy and hard kJ can be told apart;
   climbs (from `analyze_climbs`' detection) after `climb_after_hours` are marked with stamina at start
   and end. Across rides: median, range and n of the changes per phase, rides split by their share of
-  work above FTP (from 4 rides), small samples flagged. Context: the forum threads
+  work above FTP (from 4 rides); a row is flagged as a small sample with fewer than 3 rides or when more
+  than half of its rides have small phase samples, and cadence changes of more than 15 rpm between
+  phases (terrain, gearing) are flagged. `activity_ids` are de-duplicated and cut to `limit` before any
+  request; dropped ids are named. Context: the forum threads
   [Fatigue resistance](https://forum.intervals.icu/t/fatigue-resistance/4396),
   [Power curve after kj/kg](https://forum.intervals.icu/t/power-curve-after-kj-kg/93688) and
   [Three ways field data fooled me about durability](https://forum.intervals.icu/t/three-ways-field-data-fooled-me-about-durability-1-350-climbs-33-amateurs/132461)
@@ -35,16 +38,19 @@ First public beta of the Futureweb fork. Based on upstream
   longer work interval, not continued after the test window and not preceded by hard riding; a
   detection inside a regular workout is listed with its reason and never used as a benchmark. HRRc 0
   without a recovery window counts as not measured; `require_recovery` makes recovery mandatory. Valid
-  tests are trended (HR at the end, efficiency factor, HRRc, HR rise, HR drop in an easy minute after
+  tests are trended per sport family and test type - power (W, W/bpm) and pace (m/s, m/s per bpm) tests
+  are never pooled - (HR at the end, efficiency factor, HRRc, HR rise, HR drop in an easy minute after
   the test) with n, change, slope per week, SD and an ISO week table; differing targets, bikes and
   indoor/outdoor are pointed out.
 - `compare_power_streams` several-rides mode: without `activity_id` (date range, default 180 days, or
-  `activity_ids`) every ride carrying the second power stream is compared on its own and summarised per
-  bike and power meter identity (from the file's device data or the bike's PowerMeter gear components):
+  `activity_ids`, de-duplicated and cut to `limit` before any request) every ride carrying the second
+  power stream is compared on its own and summarised per bike, indoor/outdoor, primary power meter (from
+  the file's device data or the bike's PowerMeter gear components) and second power source (its field
+  name in the file; the device is not in the activity data, which the output says per ride):
   n, mean, median, between-ride SD and range of the offset overall, per power band and in stable
   windows, the within-ride spread, drift between the first and last quarter, lag counts, outlier share
-  and rides far from the group median; rides with fewer than 10 min of usable pairs are excluded with
-  the reason. No correction factor is derived or applied. New optional parameters `activity_ids`,
+  and rides far from the group median; power bands and groups with fewer than 3 rides are flagged as
+  small samples; rides with fewer than 10 min of usable pairs are excluded with the reason. No correction factor is derived or applied. New optional parameters `activity_ids`,
   `start_date`, `end_date`, `limit`, `detail_level`, `athlete_id`.
 
 ### Changed (phase 5: coach test feedback)

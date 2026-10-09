@@ -336,7 +336,8 @@ def test_summarize_rides_between_ride_spread_groups_and_exclusions() -> None:
     assert ultimate["overall_diff_pct"]["sd"] > 5  # the 0.80 ride widens the between-ride spread
     assert [r["id"] for r in ultimate["far_from_median"]] == ["r4"]
     assert ultimate["lag_s"] == {"counts": {"0": 4}, "median": 0}
-    assert {b["rides"] for b in ultimate["bins"]} == {4}
+    assert {b["rides"] for b in ultimate["bins"]} == {4} and not any(b["small_sample"] for b in ultimate["bins"])
+    assert all(b["small_sample"] for b in grail["bins"])
     assert grail["small_sample"] and grail["overall_diff_pct"]["sd"] is None and not grail["far_from_median"]
     assert any("No correction or calibration factor" in note for note in summary["notes"])
     assert any("not pooled" in note for note in summary["notes"])

@@ -69,6 +69,7 @@ EFFORT_MIN_S = 60
 SMALL_SAMPLE_SEGMENTS = 3
 SMALL_SAMPLE_MINUTES = 10.0
 MIN_ACTIVITIES = 3
+CADENCE_SHIFT_RPM = 15.0  # a larger cadence change between phases is flagged (climbing vs flat, gearing)
 DEFAULT_BAND_PCT = (75, 85)  # default band in % of FTP, rounded outward to 5 W
 
 METHOD = (
@@ -78,7 +79,7 @@ METHOD = (
     "cadence and temperature exclude each segment's first 60 s (HR lag). Work = power x time on the time stream "
     "(pauses not counted); kJ above FTP = sum of power above FTP (as Intervals.icu icu_joules_above_ftp); an effort "
     "above FTP = 30 s rolling power >= FTP for >= 60 s. Changes are phase minus the phase before the first "
-    "threshold; small samples (< 3 segments or < 10 min) are flagged."
+    "threshold; small samples (< 3 segments or < 10 min) and cadence changes > 15 rpm are flagged."
 )
 
 
@@ -386,6 +387,7 @@ def phase_changes(phases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     reference = phases[0]
     changes = []
     for index, phase in enumerate(phases[1:], start=1):
+        cadence = _delta(phase["cadence"], reference["cadence"])
         wpb = None
         if phase["w_per_bpm"] is not None and reference["w_per_bpm"]:
             wpb = round((phase["w_per_bpm"] / reference["w_per_bpm"] - 1) * 100, 1)
@@ -394,7 +396,8 @@ def phase_changes(phases: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "comparable": phase["segments"] > 0 and reference["segments"] > 0,
             "small_sample": phase["small_sample"] or reference["small_sample"],
             "hr_bpm": _delta(phase["hr"], reference["hr"]), "watts_w": _delta(phase["watts"], reference["watts"]),
-            "w_per_bpm_pct": wpb, "cadence_rpm": _delta(phase["cadence"], reference["cadence"]),
+            "w_per_bpm_pct": wpb, "cadence_rpm": cadence,
+            "cadence_shift": cadence is not None and abs(cadence) > CADENCE_SHIFT_RPM,
             "temp_c": _delta(phase["temp_c"], reference["temp_c"]),
         })
     return changes
@@ -537,7 +540,9 @@ def across_rides(rides: list[dict[str, Any]], labels: list[str]) -> list[dict[st
     """Per band and later phase: the per-ride changes against the reference phase (median, range, n).
 
     Each ride counts once; a phase needs data in both the reference and the later phase.
-    Fewer than 3 rides are a small sample. With at least 4 rides the rides are also split at
+    Fewer than 3 rides, or more than half of the rides with a small phase sample, make the row a
+    small sample; rides whose cadence differs by more than 15 rpm between the phases (terrain,
+    gearing) are counted. With at least 4 rides the rides are also split at
     the median share of work above FTP done before the threshold (context, not a predictor).
     """
     out = []
@@ -554,12 +559,15 @@ def across_rides(rides: list[dict[str, Any]], labels: list[str]) -> list[dict[st
                 entries.append({
                     "id": ride["id"], "hr_bpm": change["hr_bpm"], "w_per_bpm_pct": change["w_per_bpm_pct"],
                     "cadence_rpm": change["cadence_rpm"], "watts_w": change["watts_w"], "small_sample": change["small_sample"],
+                    "cadence_shift": change["cadence_shift"],
                     "above_ftp_share_pct": ((crossing.get("prior_work") or {}).get("above_ftp_share_pct")),
                 })
+            small_phases = sum(1 for e in entries if e["small_sample"])
             out.append({
                 "band": band_name, "phase": phase_index, "label": labels[phase_index], "rides": len(entries),
-                "small_sample": len(entries) < MIN_ACTIVITIES,
-                "rides_with_small_phase_samples": sum(1 for e in entries if e["small_sample"]),
+                "small_sample": len(entries) < MIN_ACTIVITIES or small_phases > len(entries) / 2,
+                "rides_with_small_phase_samples": small_phases,
+                "rides_with_cadence_shift": sum(1 for e in entries if e["cadence_shift"]),
                 "hr_bpm": _describe([e["hr_bpm"] for e in entries if e["hr_bpm"] is not None]),
                 "w_per_bpm_pct": _describe([e["w_per_bpm_pct"] for e in entries if e["w_per_bpm_pct"] is not None]),
                 "cadence_rpm": _describe([e["cadence_rpm"] for e in entries if e["cadence_rpm"] is not None]),

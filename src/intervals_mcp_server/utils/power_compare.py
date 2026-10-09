@@ -689,7 +689,7 @@ def _group_summary(label: str, rides: list[dict[str, Any]], bins: tuple[tuple[in
         if members:
             bin_rows.append({
                 "range_w": [low, high], "rides": len(members), "samples": sum(m["n"] for m in members),
-                "diff_pct": _spread([m["mean_diff_pct"] for m in members]),
+                "small_sample": len(members) < MIN_RIDES, "diff_pct": _spread([m["mean_diff_pct"] for m in members]),
             })
     return {
         "group": label,
@@ -780,6 +780,7 @@ def format_rides_summary(summary: dict[str, Any]) -> list[str]:
             low, high = entry["range_w"]
             lines.append(
                 f"  {low}-{high} W: {_rides(entry['rides'])}, {entry['samples']} pairs, diff {_spread_text(entry['diff_pct'])}"
+                + (" - small sample" if entry["small_sample"] else "")
             )
     for item in summary["excluded"]:
         lines.append(f"Excluded {item['id']}: {item['reason']}")

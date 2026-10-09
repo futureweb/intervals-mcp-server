@@ -10,15 +10,23 @@ judged. Methods: ``utils.fatigue_profile`` and ``utils.submax``.
 # pylint: disable=too-many-lines
 
 import json
-from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
+from intervals_mcp_server.tools.performance import (  # pylint: disable=protected-access
+    _Api,
+    _activities_by_ids,
+    _bands,
+    _error,
+    _num,
+    _resolve_range,
+    _split,
+    cap_ids,
+    ids_note,
+)
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_STREAM
-from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.fatigue_profile import (
     METHOD,
     across_rides,
@@ -29,7 +37,7 @@ from intervals_mcp_server.utils.fatigue_profile import (
 )
 from intervals_mcp_server.utils.sports import hms, is_indoor
 from intervals_mcp_server.utils.submax import REASONS, context_checks, normalise_test, trends, validity
-from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
+from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -64,69 +72,11 @@ SUBMAX_NOTE = (
 )
 
 
-class _Api:  # pylint: disable=too-few-public-methods
-    """Issues GET requests for one tool call and counts them."""
-
-    def __init__(self, api_key: str | None) -> None:
-        self.api_key = api_key
-        self.calls = 0
-
-    async def get(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        """GET an endpoint (path relative to the API base) and count the call."""
-        self.calls += 1
-        return await make_intervals_request(url=url, api_key=self.api_key, params=params)
-
-
-def _error(result: Any, what: str) -> str | None:
-    if isinstance(result, dict) and "error" in result:
-        return f"Error fetching {what}: {result.get('message', 'Unknown error')}"
-    return None
-
-
-def _split(csv: str | None) -> list[str]:
-    return [part.strip() for part in (csv or "").split(",") if part.strip()]
-
-
-def _num(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value)
-
-
 def _fmt(value: Any, digits: int = 0, unit: str = "", signed: bool = False) -> str:
     number = _num(value)
     if number is None:
         return "n/a"
     return f"{number:{'+' if signed else ''}.{digits}f}{unit}"
-
-
-def _resolve_range(start_date: str | None, end_date: str | None, default_days: int) -> tuple[str, str] | str:
-    end = end_date or get_default_end_date()
-    try:
-        validate_date(end)
-        if start_date:
-            validate_date(start_date)
-    except ValueError as exc:
-        return f"Error: {exc}"
-    start = start_date or (date.fromisoformat(end) - timedelta(days=default_days - 1)).isoformat()
-    if start > end:
-        return "Error: start_date must not be after end_date."
-    return start, end
-
-
-def _parse_bands(text: str) -> list[tuple[float, float]] | str:
-    bands: list[tuple[float, float]] = []
-    for part in _split(text):
-        try:
-            low, high = (float(bit) for bit in part.split("-"))
-        except ValueError:
-            return f"Error: power_bands must look like '180-200,200-220', got '{part}'."
-        if low < 0 or high <= low:
-            return f"Error: power band '{part}' must have 0 <= low < high."
-        bands.append((low, high))
-    if not bands:
-        return "Error: at least one power band is required."
-    return sorted(bands)
 
 
 def _parse_thresholds(text: str) -> list[float] | str:
@@ -147,20 +97,11 @@ def _gear_id(activity: dict[str, Any]) -> str | None:
 
 
 async def _ride_list(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    api: _Api, athlete_id: str, activity_ids: str | None, span: tuple[str, str], fields: str, sport_types: str | None,
+    api: _Api, athlete_id: str, activity_ids: list[str], span: tuple[str, str], fields: str, sport_types: str | None,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Activities by id or of the date range (filtered by sport, newest first)."""
-    activities: list[dict[str, Any]] = []
+    """Activities by id (already de-duplicated and capped) or of the date range (filtered by sport, newest first)."""
     if activity_ids:
-        for activity_id in _split(activity_ids):
-            result = await api.get(f"/activity/{activity_id}")
-            error = _error(result, f"activity {activity_id}")
-            if error:
-                return [], error
-            activity = result[0] if isinstance(result, list) and result else result
-            if isinstance(activity, dict) and activity:
-                activities.append(activity)
-        return activities, None
+        return await _activities_by_ids(api, activity_ids)
     result = await api.get(f"/athlete/{athlete_id}/activities", {"oldest": span[0], "newest": span[1], "fields": fields})
     error = _error(result, "activities")
     if error:
@@ -217,6 +158,8 @@ def _change_text(change: dict[str, Any]) -> str:
     if not change["comparable"]:
         return f"{change['label']}: not comparable (no segments in one of the phases)"
     small = " [small sample]" if change["small_sample"] else ""
+    if change.get("cadence_shift"):
+        small += " [cadence differs by more than 15 rpm]"
     temp = f", temp {_fmt(change['temp_c'], 1, ' °C', True)}" if change.get("temp_c") is not None else ""
     return (
         f"{change['label']}: HR {_fmt(change['hr_bpm'], 1, ' bpm', True)}, W/bpm {_fmt(change['w_per_bpm_pct'], 1, ' %', True)}, "
@@ -301,6 +244,7 @@ def _across_lines(rows: list[dict[str, Any]], reference: str) -> list[str]:
             f"W/bpm {_describe_text(row['w_per_bpm_pct'], ' %')}, cadence {_describe_text(row['cadence_rpm'], ' rpm')}, "
             f"power {_describe_text(row['watts_w'], ' W')}{small}"
             + (f" ({row['rides_with_small_phase_samples']} with small phase samples)" if row["rides_with_small_phase_samples"] else "")
+            + (f" ({row['rides_with_cadence_shift']} with cadence differing by > 15 rpm)" if row["rides_with_cadence_shift"] else "")
         )
         split = row.get("by_prior_intensity")
         if split:
@@ -393,7 +337,7 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     thresholds = _parse_thresholds(work_thresholds)
     if isinstance(thresholds, str):
         return thresholds
-    bands = _parse_bands(power_bands) if power_bands else None
+    bands = _bands(power_bands) if power_bands else None
     if isinstance(bands, str):
         return bands
     if min_segment_secs < 90:
@@ -404,9 +348,10 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     if isinstance(span, str):
         return span
     capped = min(max(limit, 1), MAX_PROFILE_RIDES)
+    ids, dropped_ids, duplicate_ids = cap_ids(activity_ids, capped)
 
     api = _Api(api_key)
-    activities, error = await _ride_list(api, athlete, activity_ids, span, PROFILE_FIELDS, None if activity_ids else sport_types)
+    activities, error = await _ride_list(api, athlete, ids, span, PROFILE_FIELDS, None if ids else sport_types)
     if error:
         return error
     profile_weight: float | None = None
@@ -427,14 +372,14 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         joules = _num(activity.get("icu_joules"))
         if unit == "kj_per_kg" and not weight:
             skipped.append({"id": activity.get("id"), "reason": "no body mass for kJ/kg thresholds"})
-        elif not activity_ids and (joules is None or joules / 1000 < needed):
+        elif not ids and (joules is None or joules / 1000 < needed):
             continue  # not a long ride for these thresholds
         else:
             selected.append(activity)
     beyond_limit = max(0, len(selected) - capped)
     selected = selected[:capped]
     if not selected:
-        what = f"activities {activity_ids}" if activity_ids else (
+        what = f"activities {', '.join(ids)}" if ids else (
             f"{sport_types} rides between {span[0]} and {span[1]} reaching {thresholds[-1]:g} {'kJ/kg' if unit == 'kj_per_kg' else 'kJ'}")
         return f"No {what} found." + (f" Skipped: {skipped}" if skipped else "")
     if bands is None:
@@ -480,7 +425,8 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     across = across_rides(rides, labels) if len(rides) > 1 else []
     notes = _heterogeneity(rides)
     band_labels = [f"{low:g}-{high:g} W" for low, high in bands]
-    source = f"{len(_split(activity_ids))} activity id(s)" if activity_ids else f"{span[0]} to {span[1]}, {sport_types}"
+    source = f"{len(ids)} activity id(s)" if ids else f"{span[0]} to {span[1]}, {sport_types}"
+    source += ids_note(dropped_ids, duplicate_ids, capped)
 
     if output_format.strip().lower() == "json":
         for ride in rides:
@@ -492,7 +438,8 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
             "athlete_id": athlete, "source": source, "bands": band_labels, "band_source": band_source,
             "thresholds": {"values": thresholds, "unit": unit_label, "phases": labels},
             "settings": {"min_segment_secs": min_segment_secs, "climb_after_hours": climb_after_hours,
-                         "min_climb_gain_m": min_climb_gain_m, "limit": capped, "rides_beyond_limit": beyond_limit},
+                         "min_climb_gain_m": min_climb_gain_m, "limit": capped, "rides_beyond_limit": beyond_limit,
+                         "ids_beyond_limit": dropped_ids, "duplicate_ids_ignored": duplicate_ids},
             "method": METHOD, "rides": rides, "across_rides": across, "skipped": skipped,
             "notes": [*notes, PROFILE_NOTE, PROFILE_BACKGROUND], "api_calls": api.calls,
         }
@@ -596,11 +543,38 @@ def _trend_text(trend: dict[str, Any], label: str, unit: str, digits: int) -> st
 
 TREND_LABELS = (
     ("final_bpm", "HR at the end of the test (Intervals.icu)", " bpm", 0),
-    ("efficiency_factor", "Efficiency factor (average / final HR)", "", 3),
+    ("efficiency_factor", "Efficiency factor (average / final HR)", None, 3),
     ("hrrc_bpm", "HR recovery HRRc (Intervals.icu)", " bpm", 0),
     ("hr_rise", "HR rise during the test (stream)", " bpm", 0),
     ("hr_drop_60s", "HR drop 60 s after the test (stream, easy minute only)", " bpm", 0),
 )
+
+
+def _group_lines(group: dict[str, Any], detail_level: str) -> list[str]:
+    """Trend block of one sport family and test type (its own units, never pooled with others)."""
+    units = group["units"]
+    pace = group["test_type"] == "PACE"
+    lines = [
+        f"Trend for {group['sport_family']} {group['test_type']} tests ({', '.join(group['sports'])}; average in "
+        f"{units['average']}, efficiency factor in {units['efficiency_factor']}) over {group['tests']} valid test(s):"
+    ]
+    for key, label, unit, digits in TREND_LABELS:
+        if detail_level == "compact" and key in ("hr_rise", "hr_drop_60s"):
+            continue
+        if unit is None:
+            unit, digits = f" {units['efficiency_factor']}", 4 if pace else digits
+        lines.append(_trend_text(group["metrics"][key], label, unit, digits))
+    if group["weeks"] and detail_level != "compact":
+        lines.append("  Per ISO week (means of valid tests):")
+        for week in group["weeks"]:
+            lines.append(
+                f"    {week['week']}: {week['tests']} test(s), HR end {_fmt(week['final_bpm'])} bpm, "
+                f"EF {_fmt(week['efficiency_factor'], 4 if pace else 3)} {units['efficiency_factor']}, HRRc {_fmt(week['hrrc_bpm'])} bpm, "
+                f"average {_fmt(week['average'], 2 if pace else 0, ' ' + units['average'])} vs target "
+                f"{_fmt(week['target'], 2 if pace else 0, ' ' + units['average'])}"
+            )
+    lines.extend(f"  Note: {note}" for note in group["notes"])
+    return lines
 
 
 @tool("read")
@@ -620,14 +594,14 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     """Submaximal fatigue tests detected by Intervals.icu (#SFT): validity and trend over the weeks
 
     Lists the tests of the period (default 180 days) with target, average, CV, HR at the end,
-    efficiency factor (W/bpm) and HR recovery (HRRc; missing is never 0), and trends the valid
-    ones per metric and ISO week (n, change, slope, SD). Valid: average within the tolerance
-    (default the test's own), CV within its limit, not ignored and, with check_context, not part
-    of a longer work interval, not continued after the test window and not preceded by hard
-    riding. Detections inside a regular workout are flagged and excluded with the reason.
-    HRRc trends use tests with a recovery part only (require_recovery excludes the others).
-    Statistics only, no verdict. API calls: sport settings, activity list, plus intervals and
-    streams per test with check_context.
+    efficiency factor and HR recovery (HRRc; missing is never 0) and trends the valid ones per
+    sport family and test type (power and pace never pooled) and ISO week: n, change, slope,
+    SD. Valid: average within the tolerance (default the test's own), CV within its limit, not
+    ignored and, with check_context, not part of a longer work interval, not continued after
+    the test and not after hard riding. Detections inside a regular workout are excluded with
+    the reason. HRRc trends use tests with a recovery part (require_recovery excludes the
+    others). Statistics only, no verdict. API calls: sport settings, activity list, plus
+    intervals and streams per test with check_context.
 
     Args:
         start_date: Start date YYYY-MM-DD (optional, default 180 days before end_date)
@@ -657,7 +631,7 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     api = _Api(api_key)
     settings_result = await api.get(f"/athlete/{athlete}/sport-settings")
     settings = _sft_settings(settings_result) if not _error(settings_result, "sport settings") else {}
-    activities, error = await _ride_list(api, athlete, None, span, SUBMAX_FIELDS, sport_types)
+    activities, error = await _ride_list(api, athlete, [], span, SUBMAX_FIELDS, sport_types)
     if error:
         return error
     tests = [test for activity in activities if (test := normalise_test(activity)) is not None]
@@ -720,19 +694,10 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
             lines.append("Excluded by reason: " + ", ".join(f"{REASONS[code]} {count}" for code, count in by_reason.items()))
     else:
         lines.extend(_test_line(test, detail_level) for test in tests)
-    lines.append(f"Trend over the {len(valid)} valid tests:")
-    for key, label, unit, digits in TREND_LABELS:
-        if detail_level == "compact" and key in ("hr_rise", "hr_drop_60s"):
-            continue
-        lines.append(_trend_text(trend["metrics"][key], label, unit, digits))
-    if trend["weeks"] and detail_level != "compact":
-        lines.append("Per ISO week (means of valid tests):")
-        for week in trend["weeks"]:
-            lines.append(
-                f"  {week['week']}: {week['tests']} test(s), HR end {_fmt(week['final_bpm'])} bpm, EF {_fmt(week['efficiency_factor'], 3)}, "
-                f"HRRc {_fmt(week['hrrc_bpm'])} bpm, average {_fmt(week['average'])} vs target {_fmt(week['target'])}"
-            )
-    lines.extend(f"Note: {note}" for note in trend["notes"])
+    if not trend["groups"]:
+        lines.append("Trend: no valid tests.")
+    for group in trend["groups"]:
+        lines.extend(_group_lines(group, detail_level))
     lines.append(SUBMAX_NOTE)
     lines.append(f"API calls: {api.calls}")
     return "\n".join(lines)

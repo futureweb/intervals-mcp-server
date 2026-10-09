@@ -23,6 +23,7 @@ from datetime import date
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import is_missing
+from intervals_mcp_server.utils.sports import sport_family
 
 DEFAULT_TOLERANCE_PCT = 5.0
 CONTAINING_INTERVAL_EXTRA_S = 60  # a WORK interval this much longer than the test contains it
@@ -78,7 +79,7 @@ def normalise_test(activity: dict[str, Any]) -> dict[str, Any] | None:
         "cv_pct": _rnd(_num(test.get("cv")), 1), "max_cv_pct": _num(test.get("max_cv_percent")),
         "final_bpm": final_bpm if final_bpm else None,
         "hrrc_bpm": hrrc if recovery else None, "recovery_measured": recovery,
-        "efficiency_factor": _rnd(_num(test.get("efficiency_factor")), 3) or None,
+        "efficiency_factor": _rnd(_num(test.get("efficiency_factor")), 4) or None,
         "rpe": test.get("rpe"), "tte_mins": test.get("tte_mins"), "ignore": bool(test.get("ignore")),
         "gear_id": (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("gear_id"),
         "indoor": bool(activity.get("trainer")) or str(activity.get("type") or "").startswith("Virtual"),
@@ -202,22 +203,28 @@ def _metric_trend(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
     if not points:
         return out
     values = [v for _, v in points]
-    out.update(first=values[0], last=values[-1], change=round(values[-1] - values[0], 3),
-               mean=round(statistics.fmean(values), 3), sd=round(statistics.stdev(values), 3) if len(values) > 1 else None,
+    out.update(first=values[0], last=values[-1], change=round(values[-1] - values[0], 4),
+               mean=round(statistics.fmean(values), 4), sd=round(statistics.stdev(values), 4) if len(values) > 1 else None,
                slope_per_week=None, weeks=round((points[-1][0] - points[0][0]).days / 7, 1))
     if len(points) >= 3:
         xs = [(d - points[0][0]).days / 7 for d, _ in points]
         if len(set(xs)) > 1:
             slope = statistics.linear_regression(xs, values).slope
-            out["slope_per_week"] = round(slope, 3)
+            out["slope_per_week"] = round(slope, 4)
     return out
 
 
 TREND_METRICS = ("final_bpm", "efficiency_factor", "hrrc_bpm", "hr_rise", "hr_drop_60s")
 
 
-def trends(valid: list[dict[str, Any]]) -> dict[str, Any]:
-    """Trend of every metric over the valid tests, a weekly table and comparability notes."""
+UNITS: dict[str, dict[str, str]] = {
+    "POWER": {"average": "W", "efficiency_factor": "W/bpm"},
+    "PACE": {"average": "m/s", "efficiency_factor": "m/s per bpm"},
+}
+
+
+def _group_trend(family: str, kind: str, valid: list[dict[str, Any]]) -> dict[str, Any]:  # pylint: disable=too-many-locals
+    """Trend of every metric over the valid tests of one sport family and test type."""
     rows = sorted(valid, key=lambda r: r["date"])
     flat = [{**r, "hr_rise": (r.get("context") or {}).get("hr_rise"), "hr_drop_60s": (r.get("context") or {}).get("hr_drop_60s")}
             for r in rows]
@@ -231,17 +238,33 @@ def trends(valid: list[dict[str, Any]]) -> dict[str, Any]:
         entry: dict[str, Any] = {"week": week, "tests": len(items)}
         for key in ("final_bpm", "efficiency_factor", "hrrc_bpm", "average", "target"):
             values = [float(i[key]) for i in items if i.get(key) is not None]
-            entry[key] = round(statistics.fmean(values), 3) if values else None
+            entry[key] = round(statistics.fmean(values), 4) if values else None
         table.append(entry)
+    units = UNITS.get(kind, {"average": "", "efficiency_factor": ""})
     notes = []
     targets = sorted({r["target"] for r in rows if r.get("target")})
     if targets and targets[-1] > targets[0] * 1.01:
-        notes.append(f"targets differ ({targets[0]:g}-{targets[-1]:g}): HR at the end of the test is not like for like; "
-                     "the efficiency factor (W per bpm) partly accounts for it")
+        notes.append(f"targets differ ({targets[0]:g}-{targets[-1]:g} {units['average']}): HR at the end of the test is not "
+                     f"like for like; the efficiency factor ({units['efficiency_factor']}) partly accounts for it")
     gears = {r.get("gear_id") for r in rows if r.get("gear_id")}
     if len(gears) > 1:
-        notes.append(f"{len(gears)} different bikes/power meters")
+        notes.append(f"{len(gears)} different bikes/shoes" + (" (power meters)" if kind == "POWER" else ""))
     indoor = sum(1 for r in rows if r.get("indoor"))
     if 0 < indoor < len(rows):
         notes.append(f"indoor and outdoor mixed ({indoor} indoor)")
-    return {"metrics": {key: _metric_trend(flat, key) for key in TREND_METRICS}, "weeks": table, "notes": notes}
+    return {
+        "sport_family": family, "test_type": kind, "sports": sorted({str(r.get("type")) for r in rows}),
+        "units": units, "tests": len(rows),
+        "metrics": {key: _metric_trend(flat, key) for key in TREND_METRICS}, "weeks": table, "notes": notes,
+    }
+
+
+def trends(valid: list[dict[str, Any]]) -> dict[str, Any]:
+    """Trends of the valid tests per sport family and test type (POWER / PACE): units are never pooled."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in valid:
+        groups.setdefault((sport_family(row.get("type")), str(row.get("test_type"))), []).append(row)
+    return {
+        "groups": [_group_trend(family, kind, rows) for (family, kind), rows in sorted(groups.items())],
+        "rule": "one trend per sport family and test type; power (W) and pace (m/s) tests are never pooled",
+    }

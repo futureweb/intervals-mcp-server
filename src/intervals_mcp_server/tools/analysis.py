@@ -16,7 +16,7 @@ from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_raw
-from intervals_mcp_server.tools.performance import _resolve_range, _split  # pylint: disable=protected-access
+from intervals_mcp_server.tools.performance import _resolve_range, cap_ids, ids_note  # pylint: disable=protected-access
 from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_FIELD,
     ACTIVITY_STREAM,
@@ -33,7 +33,7 @@ from intervals_mcp_server.utils.power_compare import (
     ride_summary,
     summarize_rides,
 )
-from intervals_mcp_server.utils.sports import format_start_times, hms, start_times
+from intervals_mcp_server.utils.sports import format_start_times, hms, is_indoor, start_times
 from intervals_mcp_server.utils.streams import find_stream
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
@@ -118,6 +118,18 @@ def _has_stream(activity: dict[str, Any], stream_type: str) -> bool:
     return stream_type == "secondary_power" and isinstance(fields, list) and len(fields) > 1
 
 
+def _secondary_identity(activity: dict[str, Any], secondary: str) -> str:
+    """Label of the second power source: its field name in the file when known; the device is never in the activity data."""
+    if secondary != "secondary_power":
+        return f"stream '{secondary}' (device not identified)"
+    fields = [str(f) for f in activity.get("power_field_names") or [] if f]
+    primary_field = str(activity.get("power_field") or (fields[0] if fields else ""))
+    others = [f for f in fields if f != primary_field]
+    if others:
+        return f"file field '{others[0]}' (device not identified)"
+    return "'secondary_power' (field and device not identified)"
+
+
 def _meter_identity(activity: dict[str, Any], gear_items: list[dict[str, Any]]) -> tuple[str, str]:
     """(gear label, primary power meter label) from the file's device data or the bike's gear components."""
     gear = activity.get("gear")
@@ -138,13 +150,14 @@ def _meter_identity(activity: dict[str, Any], gear_items: list[dict[str, Any]]) 
 
 
 async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    athlete_id: str, api_key: str | None, activity_ids: str | None, start_date: str | None,
+    athlete_id: str, api_key: str | None, activity_ids: list[str], start_date: str | None,
     end_date: str | None, secondary: str,
 ) -> tuple[list[dict[str, Any]], str | None, str]:
-    """Activities for the multi-ride comparison (by id or by date range with the second stream); newest first."""
+    """Activities for the multi-ride comparison (by id - already de-duplicated and capped - or by date range
+    with the second stream, newest first)."""
     if activity_ids:
         rides = []
-        for activity_id in _split(activity_ids):
+        for activity_id in activity_ids:
             activity, error = await _get_activity(activity_id, api_key)
             if error or activity is None:
                 return [], error, ""
@@ -169,7 +182,8 @@ def _ride_line(ride: dict[str, Any]) -> str:
     s = ride["summary"]
     lag = s["best_lag_s"]
     return (
-        f"{ride['date']} '{ride['name']}' ({ride['id']}), {ride['gear']}, primary {ride['meter']}: {s['used']} pairs, "
+        f"{ride['date']} '{ride['name']}' ({ride['id']}), {ride['gear']}, {ride['environment']}, primary {ride['meter']}, "
+        f"secondary {ride['secondary_source']}: {s['used']} pairs, "
         f"mean primary {_fmt_num(s['mean_primary_w'])} W, diff {_fmt_num(s['mean_diff_pct'], 2)}% (median "
         f"{_fmt_num(s['median_diff_pct'], 2)}%, sd {_fmt_num(s['stdev_diff_pct'], 2)}%), stable windows "
         f"{_fmt_num(s['stable_diff_pct'], 2, '%')} (n {s['stable_windows'] or 0}), drift last-first quarter "
@@ -189,12 +203,14 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
     start_date: str | None, end_date: str | None, limit: int, output_format: str, detail_level: str,
 ) -> str:
     """Multi-ride mode of compare_power_streams."""
-    rides, error, source = await _power_rides(athlete_id, api_key, activity_ids, start_date, end_date, secondary)
+    capped = min(max(limit, 1), MAX_POWER_RIDES)
+    ids, dropped, duplicates = cap_ids(activity_ids, capped)
+    rides, error, source = await _power_rides(athlete_id, api_key, ids, start_date, end_date, secondary)
     if error:
         return error
-    capped = min(max(limit, 1), MAX_POWER_RIDES)
     skipped = len(rides) - capped if len(rides) > capped else 0
     rides = rides[:capped]
+    source += ids_note(dropped, duplicates, capped)
     if not rides:
         return f"No activities with a '{secondary}' stream found ({source})."
     gear_items = await get_gear_raw(athlete_id=athlete_id, api_key=api_key)
@@ -209,19 +225,29 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
             continue
         result = compute_power_comparison(first.get("data") or [], second.get("data") or [], (time_stream or {}).get("data") or [])
         gear, meter = _meter_identity(activity, gear_items)
+        source_label = _secondary_identity(activity, secondary)
+        setting = "indoor" if is_indoor(activity) else "outdoor"
         rows.append({
             "id": activity_id, "name": activity.get("name"), "date": str(activity.get("start_date_local") or "")[:10],
-            "type": activity.get("type"), "gear": gear, "meter": meter, "device": _device_text(activity),
-            "group": f"{gear} | primary {meter} | secondary '{secondary}'",
+            "type": activity.get("type"), "gear": gear, "environment": setting, "meter": meter, "secondary_source": source_label,
+            "device": _device_text(activity), "group": f"{gear} | {setting} | primary {meter} | secondary {source_label}",
             "summary": ride_summary(result), "comparison": result,
         })
     summary = summarize_rides(rows)
     summary["excluded"].extend(missing)
+    if any(row["meter"] == "not identified" for row in rows):
+        summary["notes"].append(
+            "Primary power meter not identified (no power meter in the file data and no PowerMeter component on the bike): "
+            "the rides of such a group may come from different meters.")
+    if any("device not identified" in row["secondary_source"] for row in rows):
+        summary["notes"].append(
+            "The second power source is known only by its field name in the file; the activity data does not say which "
+            "device recorded it (pedals, trainer, another crank), so groups assume the same device per bike, setting and field.")
     if output_format.strip().lower() == "json":
-        keep = ("id", "name", "date", "type", "gear", "meter", "device", "group", "summary")
+        keep = ("id", "name", "date", "type", "gear", "environment", "meter", "secondary_source", "device", "group", "summary")
         payload = {
             "mode": "rides", "source": source, "primary": primary, "secondary": secondary, "limit": capped,
-            "not_analysed_beyond_limit": skipped,
+            "not_analysed_beyond_limit": skipped, "ids_beyond_limit": dropped, "duplicate_ids_ignored": duplicates,
             "rides": [
                 {**{k: row[k] for k in keep}, **({"comparison": comparison_to_json(row["comparison"])} if detail_level == "full" else {})}
                 for row in rows

@@ -337,49 +337,79 @@ def test_compare_power_streams_tool(monkeypatch):
     assert missing.startswith("Activity i1 has no 'secondary_power' stream.")
 
 
-def test_compare_power_streams_several_rides(monkeypatch):
-    """Without activity_id the rides carrying a second power stream are compared one by one and summarised."""
+def _dual_power_rides():
+    """Streams with a second power stream reading 95 % of the first, and activities: indoor, two outdoor, a Rally ride, one without."""
     primary = EXECUTION_STREAMS[1]["data"]
     streams = [EXECUTION_STREAMS[0], EXECUTION_STREAMS[1],
                {"type": "secondary_power", "name": "Power2", "custom": False, "data": [round(w * 0.95) for w in primary]}]
     base = {"type": "Ride", "gear": {"id": "b1"}}
-    activities = [
-        {**base, "id": "p3", "name": "Ride 3", "start_date_local": "2026-10-03T08:00:00", "stream_types": ["time", "watts", "secondary_power"]},
-        {**base, "id": "p2", "name": "Ride 2", "start_date_local": "2026-10-02T08:00:00", "power_field_names": ["power", "Power2"]},
+    fields = {"power_field_names": ["power", "Power2"], "power_field": "power"}
+    return streams, [
+        {**base, **fields, "id": "p4", "name": "Trainer", "start_date_local": "2026-10-04T08:00:00", "trainer": True,
+         "stream_types": ["time", "watts", "secondary_power"]},
+        {**base, **fields, "id": "p3", "name": "Ride 3", "start_date_local": "2026-10-03T08:00:00",
+         "stream_types": ["time", "watts", "secondary_power"]},
+        {**base, **fields, "id": "p2", "name": "Ride 2", "start_date_local": "2026-10-02T08:00:00"},
         {**base, "id": "p1", "name": "Ride 1", "start_date_local": "2026-10-01T08:00:00", "stream_types": ["secondary_power"],
          "power_meter": "Rally RS200", "power_meter_serial": "77"},
         {**base, "id": "x", "name": "Single meter", "start_date_local": "2026-09-30T08:00:00", "stream_types": ["time", "watts"]},
     ]
+
+
+def test_compare_power_streams_several_rides(monkeypatch):
+    """Without activity_id the rides carrying a second power stream are compared one by one and summarised."""
+    streams, activities = _dual_power_rides()
     calls = []
     _install_router(monkeypatch, {"/activities": activities, "/streams": streams}, calls)
     result = asyncio.run(compare_power_streams(start_date="2026-09-01", end_date="2026-10-09"))
     assert result.startswith(
-        "Power meter comparison over 3 rides (2026-09-01 to 2026-10-09, 3 of 4 activities with 'secondary_power'; limit 10)")
-    assert "2026-10-03 'Ride 3' (p3), Canyon Ultimate (b1), primary Shimano FC-R9200P (gear component): " in result
-    assert "primary Rally RS200 #77 (file)" in result
-    assert "Group Canyon Ultimate (b1) | primary Shimano FC-R9200P (gear component) | secondary 'secondary_power': 2 rides" in result
+        "Power meter comparison over 4 rides (2026-09-01 to 2026-10-09, 4 of 5 activities with 'secondary_power'; limit 10)")
+    assert ("2026-10-03 'Ride 3' (p3), Canyon Ultimate (b1), outdoor, primary Shimano FC-R9200P (gear component), "
+            "secondary file field 'Power2' (device not identified): ") in result
+    assert "primary Rally RS200 #77 (file), secondary 'secondary_power' (field and device not identified)" in result
+    outdoor = "Group Canyon Ultimate (b1) | outdoor | primary Shimano FC-R9200P (gear component) | secondary file field 'Power2' (device not identified)"
+    assert f"{outdoor}: 2 rides" in result
+    assert "Group Canyon Ultimate (b1) | indoor | primary Shimano FC-R9200P (gear component) | secondary file field 'Power2' (device not identified): 1 ride," in result
     assert "small sample, not reliable" in result
     assert "Overall difference per ride: median -4.99% (mean -4.99%, sd 0.00%, range -4.99..-4.99%, n 2)" in result
+    assert "pairs, diff median -4.98% (mean -4.98%, sd 0.00%, range -4.98..-4.98%, n 2) - small sample" in result
     assert "No correction or calibration factor is derived or applied" in result
-    assert {c[0] for c in calls if c[0].endswith("/streams")} == {"/activity/p3/streams", "/activity/p2/streams", "/activity/p1/streams"}
+    assert "The second power source is known only by its field name in the file" in result
+    assert "Primary power meter not identified" not in result
+    assert {c[0] for c in calls if c[0].endswith("/streams")} == {f"/activity/p{i}/streams" for i in range(1, 5)}
     payload = json.loads(asyncio.run(compare_power_streams(start_date="2026-09-01", end_date="2026-10-09", output_format="json",
                                                            detail_level="full", limit=2)))
-    assert payload["mode"] == "rides" and payload["not_analysed_beyond_limit"] == 1
-    assert [r["id"] for r in payload["rides"]] == ["p3", "p2"] and "comparison" in payload["rides"][0]
-    assert payload["between_rides"]["groups"][0]["rides"] == 2
-    compact = json.loads(asyncio.run(compare_power_streams(activity_ids="p1,p2", output_format="json", detail_level="compact")))
-    assert compact["source"] == "2 activity id(s)" and set(compact["rides"][0]) == {"id", "date", "group"}
-    text = asyncio.run(compare_power_streams(activity_ids="p1", detail_level="compact"))
-    assert "Per ride:" not in text and "Group " in text
+    assert payload["mode"] == "rides" and payload["not_analysed_beyond_limit"] == 2
+    assert [r["id"] for r in payload["rides"]] == ["p4", "p3"] and "comparison" in payload["rides"][0]
+    assert [g["rides"] for g in payload["between_rides"]["groups"]] == [1, 1]
+    assert payload["rides"][0]["environment"] == "indoor" and payload["rides"][1]["secondary_source"].startswith("file field")
     full = asyncio.run(compare_power_streams(start_date="2026-09-01", end_date="2026-10-09", detail_level="full"))
     assert "    bins: " in full and "device: " in full
+
+
+def test_compare_power_streams_several_rides_ids_and_errors(monkeypatch):
+    """Ids are de-duplicated and capped before any request; validation and API errors."""
+    streams, activities = _dual_power_rides()
+    calls = []
+    _install_router(monkeypatch, {"/activities": activities, "/streams": streams}, calls)
+    compact = json.loads(asyncio.run(compare_power_streams(activity_ids="p1,p2", output_format="json", detail_level="compact")))
+    assert compact["source"] == "2 activity id(s)" and set(compact["rides"][0]) == {"id", "date", "group"}
+    calls.clear()
+    capped = json.loads(asyncio.run(compare_power_streams(activity_ids="p1,p2,p2,p3", limit=2, output_format="json")))
+    assert [c[0] for c in calls if c[0].startswith("/activity/") and not c[0].endswith("/streams")] == ["/activity/p1", "/activity/p2"]
+    assert capped["source"] == "2 activity id(s); 1 id beyond the limit of 2 not fetched (p3); 1 duplicate id ignored"
+    assert capped["ids_beyond_limit"] == ["p3"] and capped["duplicate_ids_ignored"] == 1
+    unknown = asyncio.run(compare_power_streams(activity_ids="p1"))
+    assert "Primary power meter not identified" in unknown  # ACTIVITY_WITH_CUSTOM_FIELDS has no gear or power meter
+    text = asyncio.run(compare_power_streams(activity_ids="p1", detail_level="compact"))
+    assert "Per ride:" not in text and "Group " in text
     assert asyncio.run(compare_power_streams(start_index=5)).startswith("Error: start_index / end_index apply")
     assert asyncio.run(compare_power_streams(detail_level="x")).startswith("Error: detail_level")
-    _install_router(monkeypatch, {"/activities": activities[3:], "/streams": streams})
+    _install_router(monkeypatch, {"/activities": activities[4:], "/streams": streams})
     assert asyncio.run(compare_power_streams()).startswith("No activities with a 'secondary_power' stream found")
     _install_router(monkeypatch, {"/activities": activities[:1], "/streams": EXECUTION_STREAMS})
     missing = asyncio.run(compare_power_streams())
-    assert "Excluded p3: no 'secondary_power' stream returned" in missing
+    assert "Excluded p4: no 'secondary_power' stream returned" in missing
     _install_router(monkeypatch, {"/activities": {"error": True, "message": "down"}})
     assert asyncio.run(compare_power_streams()) == "Error fetching activities: down"
     _install_router(monkeypatch, {"/activity/": {"error": True, "message": "gone"}})

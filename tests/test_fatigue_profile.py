@@ -22,6 +22,7 @@ from intervals_mcp_server.utils.fatigue_profile import (  # pylint: disable=wron
     across_rides,
     build_series,
     default_band,
+    phase_changes,
     phase_labels,
     ride_profile,
     stamina_codes,
@@ -47,9 +48,9 @@ def _profile(streams=None, **kwargs):
 
 
 def _install_router(monkeypatch, overrides=None, calls=None):
-    """The coaching router plus the fatigue tool module."""
+    """The coaching router plus the performance helpers the fatigue tools request through."""
     fake = _coaching_router(monkeypatch, overrides, calls)
-    monkeypatch.setattr("intervals_mcp_server.tools.fatigue.make_intervals_request", fake)
+    monkeypatch.setattr("intervals_mcp_server.tools.performance.make_intervals_request", fake)
     return fake
 
 
@@ -216,14 +217,31 @@ def test_across_rides_median_range_and_split_by_prior_intensity():
     labels = phase_labels(list(LONG_RIDE_THRESHOLDS))
     rows = across_rides([_ride("r1", 4, 1.0), _ride("r2", 6, 2.0), _ride("r3", 8, 5.0), _ride("r4", 10, 6.0)], labels)
     first = next(r for r in rows if r["phase"] == 1)
-    assert first["rides"] == 4 and not first["small_sample"]
+    assert first["rides"] == 4 and first["small_sample"]  # every ride has only small phase samples
     assert first["hr_bpm"] == {"n": 4, "median": 7.0, "min": 4.0, "max": 10.0}
-    assert first["rides_with_small_phase_samples"] == 4
+    assert first["rides_with_small_phase_samples"] == 4 and first["rides_with_cadence_shift"] == 0
     split = first["by_prior_intensity"]
     assert split["lower_share"]["rides"] == 2 and split["lower_share"]["hr_bpm"]["median"] == 5.0
     assert split["higher_share"]["hr_bpm"]["median"] == 9.0
     small = across_rides([_ride("r1", 4), _ride("r2", 6)], labels)
     assert small[0]["small_sample"] and small[0]["by_prior_intensity"] is None
+    rides = [_ride("r1", 4), _ride("r2", 6), _ride("r3", 8)]
+    for ride in rides[:2]:  # two of three rides with large phase samples: the row counts as reliable
+        ride["profile"]["bands"][0]["changes"][0]["small_sample"] = False
+    rides[2]["profile"]["bands"][0]["changes"][0]["cadence_shift"] = True
+    row = across_rides(rides, labels)[0]
+    assert not row["small_sample"] and row["rides_with_small_phase_samples"] == 1 and row["rides_with_cadence_shift"] == 1
+
+
+def test_cadence_shift_between_phases_is_flagged():
+    """A phase pair whose cadence differs by more than 15 rpm (climbing vs flat) is flagged."""
+    base = {"segments": 3, "small_sample": False, "watts": 190.0, "hr": 130.0, "w_per_bpm": 1.46, "temp_c": 20.0}
+    phases = [{**base, "label": "0-750 kJ", "cadence": 90.0}, {**base, "label": "750-1500 kJ", "cadence": 70.0},
+              {**base, "label": ">= 1500 kJ", "cadence": 80.0}]
+    changes = phase_changes(phases)
+    first, second = changes[0], changes[1]
+    assert first["cadence_rpm"] == -20.0 and first["cadence_shift"]
+    assert second["cadence_rpm"] == -10.0 and not second["cadence_shift"]
 
 
 # ------------------------------------------------------------------ tool
@@ -323,3 +341,17 @@ def test_tool_validation_and_errors(monkeypatch):
     assert asyncio.run(get_long_ride_fatigue_profile()).startswith("No Ride,GravelRide rides between")
     _install_router(monkeypatch, {"/activity/": {"error": True, "message": "nope"}})
     assert asyncio.run(get_long_ride_fatigue_profile(activity_ids="x1")) == "Error fetching activity x1: nope"
+
+
+def test_tool_caps_and_deduplicates_ids_before_requests(monkeypatch):
+    """A long id list is de-duplicated and cut to the limit before any request; dropped ids are named."""
+    calls = []
+    _install_router(monkeypatch, {"/activity/": long_ride_activity("r1", "2026-09-20"), "/streams": long_ride_streams()}, calls)
+    ids = ",".join(["r1", "r1"] + [f"x{i}" for i in range(200)])
+    result = asyncio.run(get_long_ride_fatigue_profile(activity_ids=ids, power_bands="180-200", limit=3, detail_level="compact"))
+    fetched = [c[0] for c in calls if c[0].startswith("/activity/") and not c[0].endswith("/streams")]
+    assert fetched == ["/activity/r1", "/activity/x0", "/activity/x1"]
+    assert "3 activity id(s); 198 ids beyond the limit of 3 not fetched (x2, x3, x4, x5, x6, ...); 1 duplicate id ignored" in result
+    payload = json.loads(asyncio.run(get_long_ride_fatigue_profile(activity_ids="r1,r2", power_bands="180-200", limit=1,
+                                                                  output_format="json")))
+    assert payload["settings"]["ids_beyond_limit"] == ["r2"] and payload["settings"]["duplicate_ids_ignored"] == 0

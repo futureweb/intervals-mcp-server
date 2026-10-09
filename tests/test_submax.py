@@ -124,7 +124,9 @@ def test_trends_slope_weeks_and_notes():
         activity = submax_activity(f"a{number}", day, final_bpm=bpm, hrrc=hrrc, end_index_hrrc=1140 if hrrc else 0,
                                    efficiency_factor=round(248 / bpm, 4))
         rows.append(_checked(activity))
-    result = trends(rows)
+    result = trends(rows)["groups"][0]
+    assert (result["sport_family"], result["test_type"], result["sports"], result["tests"]) == ("cycling", "POWER", ["Ride"], 4)
+    assert result["units"] == {"average": "W", "efficiency_factor": "W/bpm"}
     final = result["metrics"]["final_bpm"]
     assert final["n"] == 4 and not final["small_sample"]
     assert final["first"] == 150 and final["last"] == 144 and final["change"] == -6
@@ -139,11 +141,36 @@ def test_trends_slope_weeks_and_notes():
     rows[0]["target"] = 230.0
     rows[1]["gear_id"] = "b2"
     rows[2]["indoor"] = True
-    notes = trends(rows)["notes"]
-    assert notes[0].startswith("targets differ (230-246)")
-    assert "2 different bikes/power meters" in notes and "indoor and outdoor mixed (1 indoor)" in notes
-    empty = trends([])
-    assert empty["metrics"]["final_bpm"] == {"metric": "final_bpm", "n": 0, "small_sample": True} and not empty["weeks"]
+    notes = trends(rows)["groups"][0]["notes"]
+    assert notes[0].startswith("targets differ (230-246 W)")
+    assert "2 different bikes/shoes (power meters)" in notes and "indoor and outdoor mixed (1 indoor)" in notes
+    assert not trends([])["groups"]
+
+
+def _pace_test(aid, day, mps, bpm):
+    """A running pace test (no context checks for pace tests)."""
+    activity = submax_activity(aid, day, type="PACE", average_watts=0, average_mps=mps, target=3.6, final_bpm=bpm,
+                               efficiency_factor=round(mps / bpm, 5))
+    activity["type"] = "Run"
+    test = normalise_test(activity)
+    assert test is not None
+    test["context"] = {"checked": False}
+    return test
+
+
+def test_trends_never_pool_power_and_pace_tests():
+    """Power (W) and pace (m/s) tests and sport families get separate trends with their own units and n."""
+    power = [_checked(submax_activity(f"p{i}", day, final_bpm=bpm)) for i, (day, bpm) in
+             enumerate((("2026-08-03", 150), ("2026-08-17", 148), ("2026-08-31", 146)))]
+    pace = [_pace_test("r1", "2026-08-04", 3.6, 160), _pace_test("r2", "2026-08-18", 3.62, 158)]
+    groups = trends(power + pace)["groups"]
+    assert [(g["sport_family"], g["test_type"], g["tests"]) for g in groups] == [("cycling", "POWER", 3), ("running", "PACE", 2)]
+    cycling, running = groups
+    assert running["units"] == {"average": "m/s", "efficiency_factor": "m/s per bpm"}
+    assert running["metrics"]["efficiency_factor"]["mean"] == pytest.approx(0.0227, abs=0.0002)
+    assert cycling["metrics"]["efficiency_factor"]["mean"] == pytest.approx(1.653, abs=0.001)
+    assert running["weeks"][0]["average"] == 3.6 and cycling["weeks"][0]["average"] == 248.0
+    assert not running["notes"] and not cycling["notes"]
 
 
 # ------------------------------------------------------------------ tool
@@ -189,10 +216,13 @@ def test_tool_text_lists_valid_and_excluded_tests(monkeypatch):
     assert "EXCLUDED: average outside the target tolerance: +9.8 %" in result
     assert "EXCLUDED: coefficient of variation above the limit: CV 12.0 % > 10 %" in result
     assert "EXCLUDED: hard riding right before the test: 240 W in the 5 min before the test" in result
+    assert "Trend for cycling POWER tests (Ride; average in W, efficiency factor in W/bpm) over 4 valid test(s):" in result
     assert "  HR at the end of the test (Intervals.icu): n 4, 150 -> 144 bpm (change -6 bpm), mean 147 bpm" in result
+    assert "  Efficiency factor (average / final HR): n 4, 1.653 -> 1.653 W/bpm" in result
     assert "slope -1.0 bpm/week over 6 weeks" in result
     assert "  HR recovery HRRc (Intervals.icu): n 3, 28 -> 32 bpm" in result and "small sample, not reliable" in result
-    assert "Per ISO week (means of valid tests):" in result and "2026-W36: 1 test(s), HR end 146 bpm" in result
+    assert "  Per ISO week (means of valid tests):" in result
+    assert "    2026-W36: 1 test(s), HR end 146 bpm, EF 1.653 W/bpm, HRRc n/a bpm, average 248 W vs target 246 W" in result
     assert "API calls: 20" in result  # settings, list, 9 x (intervals + streams)
     stream_params = next(c[1] for c in calls if c[0].endswith("/streams"))
     assert stream_params == {"types": "time,watts,heartrate"}
@@ -209,7 +239,8 @@ def test_tool_json_compact_and_options(monkeypatch):
     assert a3 == {"activity_id": "a3", "date": "2026-08-31", "average": 248.0, "target": 246.0, "final_bpm": 146.0,
                   "efficiency_factor": pytest.approx(1.653, abs=0.001), "hrrc_bpm": None, "valid": False, "reasons": ["no_recovery"]}
     assert payload["settings"]["Ride"]["sft_target_percent"] == 105
-    assert payload["trend"]["metrics"]["final_bpm"]["n"] == 3
+    assert payload["trend"]["groups"][0]["metrics"]["final_bpm"]["n"] == 3
+    assert payload["trend"]["rule"].startswith("one trend per sport family and test type")
     calls = []
     _install_router(monkeypatch, _routes(), calls)
     unchecked = json.loads(asyncio.run(get_submax_test_trends(
@@ -228,7 +259,7 @@ def test_tool_without_tests_and_errors(monkeypatch):
                                   "/streams": submax_streams(), "/intervals": {"icu_intervals": []}})
     result = asyncio.run(get_submax_test_trends(sport_types="Ride"))
     assert "1 detected (0 valid, 1 excluded)" in result and "No valid test yet" in result
-    assert "  HR at the end of the test (Intervals.icu): no valid values" in result
+    assert "Trend: no valid tests." in result
     _install_router(monkeypatch, {"/activities": [], "/sport-settings": {"error": True, "message": "x"}})
     empty = asyncio.run(get_submax_test_trends(sport_types="Run"))
     assert "No submax tests detected in this period" in empty and "Test settings: not available." in empty
@@ -237,3 +268,19 @@ def test_tool_without_tests_and_errors(monkeypatch):
     assert asyncio.run(get_submax_test_trends(detail_level="x")).startswith("Error: detail_level")
     assert asyncio.run(get_submax_test_trends(tolerance_pct=0)).startswith("Error: tolerance_pct")
     assert asyncio.run(get_submax_test_trends(start_date="2026-10-02", end_date="2026-10-01")).startswith("Error: start_date")
+
+
+def test_tool_separates_ride_and_run_tests(monkeypatch):
+    """A run pace test next to ride power tests gets its own trend block with m/s units."""
+    run = submax_activity("r1", "2026-09-01", type="PACE", average_watts=0, average_mps=3.6, target=3.6, final_bpm=160,
+                          efficiency_factor=0.0225)
+    run["type"] = "Run"
+    routes = {"/activities": [run, submax_activity("a1", "2026-08-03")], "/sport-settings": SFT_SPORT_SETTINGS,
+              "/streams": submax_streams(), "/intervals": {"icu_intervals": [TEST_INTERVAL]}}
+    _install_router(monkeypatch, routes)
+    result = asyncio.run(get_submax_test_trends(start_date="2026-08-01", end_date="2026-09-30"))
+    assert "Trend for cycling POWER tests (Ride; average in W, efficiency factor in W/bpm) over 1 valid test(s):" in result
+    assert "Trend for running PACE tests (Run; average in m/s, efficiency factor in m/s per bpm) over 1 valid test(s):" in result
+    assert "  Efficiency factor (average / final HR): n 1, 0.0225 -> 0.0225 m/s per bpm" in result
+    assert "average 3.60 m/s vs target 3.60 m/s" in result
+    assert "3.60 m/s vs target 3.60 m/s (+0.0 %)" in result
