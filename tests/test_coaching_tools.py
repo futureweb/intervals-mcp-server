@@ -430,8 +430,12 @@ def test_get_training_summary_groups(monkeypatch):
     result = asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="week"))
     assert "Training summary for athlete i1, 2026-10-01 to 2026-10-09, grouped by week:" in result
     assert "2026-10-05 (ISO 2026-W41): 3 sessions | 3:57:49 moving (4:08:40 elapsed) | 96.4 km | +800 m" in result
-    assert "Load (Intervals.icu): total 250 = power 220 / HR 138 / pace 30" in result
-    assert "Time in power zones: Z2 24:49, Z4 29:13" in result
+    # ANA-15: power/HR/pace loads are alternative calculations, not parts of the total
+    assert ("Load (Intervals.icu): total 250; alternative calculations (not parts of the total): "
+            "power-based 220, HR-based 138, pace-based 30") in result
+    # API-5: HR zone times arrive as a plain list; sweet spot (overlapping Z3/Z4) is listed apart
+    assert "Time in power zones: Z2 24:49, Z4 29:13; sweet spot 20:00 (overlaps Z3/Z4)" in result
+    assert "Time in HR zones: Z2 33:20" in result
     assert "- Ride: 1 sessions, 1:21:01, 40.4 km, load 90" in result
     assert "- gear Canyon Ultimate (b1): 1 sessions" in result
     assert "feel 2: 1, 3: 1, 4: 1 | RPE mean 5.0 | sessions >= 3 h: 0 | longest 1:51:48 ('Grail gravel')" in result
@@ -445,7 +449,27 @@ def test_get_training_summary_groups(monkeypatch):
     assert "Run: 1 sessions" in by_sport and "GravelRide" not in by_sport
     payload = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="gear", output_format="json")))
     assert {g["group"] for g in payload["groups"]} == {"Canyon Ultimate (b1)", "Canyon Grail (b2)", "no gear"}
+    assert payload["overall"]["time_in_hr_zones_s"] == {"Z1": 0.0, "Z2": 2000.0, "Z3": 0.0, "Z4": 0.0, "Z5": 0.0, "Z6": 0.0, "Z7": 0.0}
+    assert payload["overall"]["time_in_sweet_spot_s"] == 1200 and "SS" not in payload["overall"]["time_in_power_zones_s"]
     assert asyncio.run(get_training_summary("2026-10-01", group_by="year")).startswith("Error: group_by")
+
+
+def test_training_summary_group_end_and_missing_atl():
+    """ANA-15/16: fitness is read at the group's calendar end (capped at the end date); a record
+    with CTL but no ATL is shown as n/a instead of failing."""
+    from intervals_mcp_server.tools.summary import _format_group, _group_end  # pylint: disable=import-outside-toplevel
+
+    september = [{"start_date_local": "2026-09-23T10:00:00"}, {"start_date_local": "2026-09-30T10:00:00"}]
+    assert _group_end("week", september[:1], "2026-10-09") == "2026-09-27"
+    assert _group_end("month", september, "2026-10-09") == "2026-09-30"
+    assert _group_end("month", [{"start_date_local": "2026-10-02T10:00:00"}], "2026-10-09") == "2026-10-09"
+    assert _group_end("sport", september, "2026-10-09") == "2026-10-09"
+    summary = {"sessions": 1, "moving_time_s": 60, "elapsed_time_s": 60, "distance_m": 0, "elevation_gain_m": 0,
+               "training_load": 10, "power_load": 10, "hr_load": 0, "pace_load": 0, "intensity_time_weighted_pct": None,
+               "by_sport": {}, "custom_fields": {}}
+    text = _format_group("W", summary, {"date": "2026-09-27", "ctl": 50.0, "atl": None, "form": None, "ramp_rate": None},
+                         False, "compact")
+    assert "End of period (2026-09-27): CTL 50.0, ATL n/a, form n/a, ramp n/a" in text
 
 
 # ------------------------------------------------------- workout validation

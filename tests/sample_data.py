@@ -322,8 +322,8 @@ EXECUTION_ACTIVITY = {
 ACTIVITIES_DATA = [
     {"id": "i10", "name": "Ultimate ride", "type": "Ride", "start_date_local": "2026-10-06T17:36:22", "moving_time": 4861,
      "elapsed_time": 4967, "distance": 40360.0, "total_elevation_gain": 375.0, "icu_training_load": 90, "power_load": 90,
-     "hr_load": 60, "icu_intensity": 80, "gear": {"id": "b1"}, "feel": 3, "icu_rpe": 6, "icu_zone_times": [{"id": "Z2", "secs": 1489}, {"id": "Z4", "secs": 1753}],
-     "icu_hr_zone_times": [{"id": "Z2", "secs": 2000}], "TrainingLoad": 129.5, "AerobicEffect": 3.5,
+     "hr_load": 60, "icu_intensity": 80, "gear": {"id": "b1"}, "feel": 3, "icu_rpe": 6, "icu_zone_times": [{"id": "Z2", "secs": 1489}, {"id": "Z4", "secs": 1753}, {"id": "SS", "secs": 1200}],
+     "icu_hr_zone_times": [0, 2000, 0, 0, 0, 0, 0], "TrainingLoad": 129.5, "AerobicEffect": 3.5,
      "power_meter": "Shimano FC-R9200P"},
     {"id": "i11", "name": "Grail gravel", "type": "GravelRide", "start_date_local": "2026-10-07T12:26:55", "moving_time": 6708,
      "elapsed_time": 7153, "distance": 48000.0, "total_elevation_gain": 375.0, "icu_training_load": 130, "power_load": 130,
