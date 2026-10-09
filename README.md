@@ -1,111 +1,205 @@
 # Futureweb Intervals MCP
 
-**Advanced Intervals.icu MCP server with Garmin-enriched metrics, full custom streams, recovery
-insights and endurance performance analysis.**
+**Advanced Intervals.icu MCP server for ChatGPT, Claude and every MCP client: Garmin-enriched
+metrics, every custom field and stream, recovery insights and endurance performance analysis.**
 
 [![CI](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
+![Status: public beta](https://img.shields.io/badge/status-1.0.0b1%20public%20beta-orange)
+[![Garmin Intervals Bridge](https://img.shields.io/badge/companion-Garmin%20Intervals%20Bridge-6f42c1)](https://github.com/futureweb/garmin-intervals-bridge)
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that lets ChatGPT, Claude
-and other MCP clients read and analyse your [Intervals.icu](https://intervals.icu) data the way
-a coach would: activities with every custom field and stream, intervals, wellness with personal
-baselines, thresholds and zones, planned-vs-executed workouts, climbs, dual power meters,
-nutrition and weight trends, weekly and monthly summaries, and the calendar.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that lets AI assistants read
+and analyse your [Intervals.icu](https://intervals.icu) training data the way a coach would:
+activities with every custom field and stream, intervals, wellness against personal baselines,
+thresholds and zones, planned-versus-executed workouts, climbs, dual power meters, best efforts,
+efficiency and fatigue resistance, nutrition and weight, training summaries and the calendar.
+It runs where you run it, talks only to the Intervals.icu API and exposes nothing that writes
+unless you enable it.
 
-> Community-maintained fork of [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server).
-> Not affiliated with Intervals.icu or Garmin. Works with any standard Intervals.icu account;
-> the optional [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge)
-> adds the Garmin metrics that are otherwise filtered out. All training data and credentials
-> stay under your control: the server runs where you run it and talks only to the
-> Intervals.icu API.
+> **Continuation of [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server).**
+> The original project is no longer actively developed (last commit on 2 August 2026, 29
+> pull requests left open). This community-maintained fork carries it on: the useful
+> open pull requests were reviewed and merged with their authors credited, the bugs fixed, and the
+> server rebuilt around coaching analysis, Garmin data and safe remote access. Not affiliated with
+> Intervals.icu or Garmin.
 
-## What sets it apart
+**Companion project:** the [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge)
+puts back the metrics Garmin strips from the files it sends to Intervals.icu (stamina, training
+effect, recovery time, VO₂max, running dynamics, sleep and HRV details …). This MCP is built to
+read all of it, but works just as well without the bridge.
 
-- **Every custom item, resolved dynamically.** Custom activity fields, interval fields, streams
-  and wellness fields are read from your account's definitions and shown with name, code,
-  value and units: training effect, EPOC, recovery time, VO₂max, performance condition,
-  stamina, sweat loss, running dynamics, gear selection, Body Battery, sleep stages … whatever
-  is there. Nothing device-specific is hard-coded; null, NaN, zero and absent are distinguished.
+## Contents
+
+- [Highlights](#highlights)
+- [Works with the Garmin Intervals Bridge](#works-with-the-garmin-intervals-bridge)
+- [Tools](#tools)
+- [Quick start](#quick-start)
+- [Connect an AI client](#connect-an-ai-client)
+- [Configuration](#configuration)
+- [Permissions and security](#permissions-and-security)
+- [Project status and roadmap](#project-status-and-roadmap)
+- [Documentation](#documentation)
+- [Development](#development)
+- [Credits and license](#credits-and-license)
+
+## Highlights
+
+- **Every custom item, resolved dynamically.** Custom activity fields, interval fields, streams and
+  wellness fields are read from your own definitions and reported with name, code, value and
+  units. Nothing device-specific is hard-coded; null, NaN, zero and absent stay distinct, fields
+  that do not belong to the sport are kept apart, and device loads are never mixed with the
+  Intervals.icu load.
 - **Streams at full resolution.** Any stream as summary, CSV or JSON, sliced by index or time,
-  downsampled and paged; per-interval statistics of custom streams (e.g. stamina drop per interval).
-- **Coaching analysis, no black boxes.** Recovery snapshot with 42-day baselines, wellness
-  trends and correlations, planned-vs-executed workout analysis, climb/descent segmentation,
-  dual power meter comparison, nutrition/calorie/weight trends, training summaries with the
-  Intervals.icu load kept apart from device loads. Statistics only; the interpretation is yours.
-- **Safe by default.** Tools are grouped into permission classes (`read`, `write`,
-  `destructive`, `admin`); only `read` is exposed unless you enable more. Secrets are never
-  logged. See [SECURITY.md](SECURITY.md).
-- **Built on the community's work.** Includes the best upstream pull requests (weekly summary
-  and plan compliance, HR/pace curves, workout library, bulk calendar events, update tools)
-  with their authors credited in the history; see [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md)
-  and [docs/FEATURE_COMPARISON.md](docs/FEATURE_COMPARISON.md).
+  downsampled and paged, plus per-interval statistics of any stream (for example the stamina drop
+  of each interval).
+- **Coaching analysis instead of raw dumps.** One-call activity report, planned versus executed
+  per step (also for deleted events and rides extended beyond the plan), climbs and descents,
+  second power meter check, best efforts, similar intervals, repeated workouts over time,
+  power-to-heart-rate efficiency, fatigue resistance, recovery snapshot with 42-day baselines,
+  wellness trends and correlations, nutrition and weight trends, weekly and monthly summaries.
+  Statistics with their sample sizes; the interpretation stays with the coach.
+- **Token-efficient.** `detail_level` (`compact`, `standard`, `full`) and `output_format="json"`
+  on the heavy tools, eight ready-made coaching prompts and two MCP resources.
+- **Safe remote access.** Built-in OAuth 2.1 server with **"Continue with Intervals.icu"**
+  sign-in, a consent page with per-connection permissions, client metadata documents with
+  `private_key_jwt` (ChatGPT), PKCE and RFC 9207. Streamable HTTP (`/mcp`) and SSE from one
+  process.
+- **Read-only by default.** Tools are grouped into permission classes (`read`, `write`,
+  `destructive`, `admin`) enforced on the server; only `read` is active unless you enable more.
+- **Tested.** More than 300 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
+  build and Docker smoke tests on every pull request.
+
+## Works with the Garmin Intervals Bridge
+
+```
+Garmin device ──► Garmin Connect ──► official sync ──► Intervals.icu activity (filtered FIT)
+                        │                                     ▲
+                        └── Garmin Intervals Bridge ──────────┘  restores custom fields, streams, wellness
+                                                              │
+                                              Futureweb Intervals MCP (this project)
+                                                              │
+                                                 ChatGPT / Claude / any MCP client
+```
+
+The [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge) writes the
+metrics Garmin filters out into the custom activity fields, custom streams and wellness fields
+you defined in Intervals.icu. The MCP reads those definitions at run time, so every restored value
+shows up in the tools automatically:
+
+| Restored by the bridge | Where the MCP shows it |
+| --- | --- |
+| Training effect, EPOC, Garmin training load, recovery time, VO₂max, performance condition, stamina start/end, sweat loss, temperatures | `get_activity_details`, `get_activity_report`, `get_training_summary` |
+| Stamina and potential stamina, second power meter, grade-adjusted speed, gear selection, running dynamics streams | `get_activity_streams`, `get_activity_intervals`, `analyze_workout_execution`, `analyze_climbs`, `compare_power_streams` |
+| Night SpO₂, respiration, sleeping HR, HRV details, Body Battery, sleep stages and stress, readiness, nutrition | `get_wellness_data`, `get_recovery_snapshot`, `get_wellness_trends`, `get_nutrition_summary` |
+
+The MCP never contacts Garmin; the bridge is optional and other devices or sync tools that fill
+custom items get the same treatment. Worked examples and notes on reading the device metrics
+correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
+
+## Tools
+
+57 tools; 42 of them only read. Write tools are marked ✎ (`write`), ✖ (`destructive`) or
+⚙ (`admin`) and are hidden unless their class is enabled. Most tools accept `output_format="json"`.
+
+**Activity analysis**
+
+| Tool | What it does |
+| --- | --- |
+| `get_activity_report` | Complete compact analysis in one call: overview, plan vs execution or intervals, second power meter check, climbs, data-quality notes |
+| `analyze_workout_execution` | Planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina); takes a `planned_workout_doc` for deleted events, reports training beyond the plan separately, suggests matching events read-only |
+| `analyze_climbs` | Climbs, descents and pauses from the streams with power, NP, HR, VAM, grade and custom streams per segment |
+| `compare_power_streams` | Sample-aligned comparison of two power meters: offset, power bands, stable windows, drift, lag |
+| `get_best_efforts` | Best efforts of one activity for durations or distances, with their time windows |
+| `get_activity_histogram` | Time distribution of power, heart rate, pace or GAP |
+
+**Activities and streams**
+
+| Tool | What it does |
+| --- | --- |
+| `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output |
+| `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units |
+| `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream |
+| `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging |
+| `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description |
+
+**Performance over time**
+
+| Tool | What it does |
+| --- | --- |
+| `compare_best_efforts` | Best efforts across activities (ids, date range, sport, gear) side by side |
+| `find_similar_intervals` | Activities with intervals of a given length and intensity |
+| `compare_workouts` | The same workout type over weeks: work intervals, NP, HR, Pw:HR, load |
+| `get_power_hr_efficiency` | Watts per heartbeat per power band over time |
+| `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds |
+| `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
+| `get_training_summary` | Totals per week, month, sport or gear with separate load sources, time in zones and custom field aggregates |
+| `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
+
+**Wellness and recovery**
+
+| Tool | What it does |
+| --- | --- |
+| `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call |
+| `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport |
+| `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
+| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |
+
+**Athlete, gear, calendar and workouts**
+
+| Tool | What it does |
+| --- | --- |
+| `get_athlete_profile`, `get_sport_settings`, `get_training_zones` | Profile, per-sport thresholds, zones with absolute ranges |
+| `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace |
+| `get_gear_list`, `get_gear_details` | Bikes, shoes and components with mileage and maintenance reminders |
+| `get_events`, `get_event_by_id`, `get_training_plan` | Calendar with the full workout document; plan phases, weekly targets, races |
+| `validate_workout`, `preview_workout` | Check and render a workout document before writing it |
+| `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes |
+| `get_workout_library`, `get_library_workout`, `create_library_workout` ✎, `add_event_from_library` ✎, `delete_library_workout` ✖ | Workout library |
+
+**Custom items and server**
+
+| Tool | What it does |
+| --- | --- |
+| `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions |
+| `get_server_status` | Version, enabled permissions, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
+
+**Prompts:** `recovery_check`, `workout_deep_dive`, `weekly_training_review`,
+`performance_progression`, `long_ride_climbing_analysis`, `nutrition_weight_trend`,
+`power_meter_comparison`, `workout_planning_validation`.
+**Resources:** `intervals://guide` (how to use the tools), `intervals://custom-items` (your
+custom item definitions).
 
 ## Quick start
 
 Requirements: Python 3.12+, [uv](https://github.com/astral-sh/uv), an Intervals.icu API key
-(Intervals.icu → Settings → Developer Settings) and your athlete ID (`i123456`).
+(Settings → Developer Settings) and your athlete ID (`i123456`).
 
 ```bash
 git clone https://github.com/futureweb/intervals-mcp-server.git
 cd intervals-mcp-server
 uv sync --locked
-cp .env.example .env                       # fill API_KEY and ATHLETE_ID
+cp .env.example .env                       # set API_KEY and ATHLETE_ID
 uv run futureweb-intervals-mcp --doctor    # checks configuration and API access
 uv run futureweb-intervals-mcp             # starts the server on stdio
 ```
 
-Run without cloning (from git until the package is on PyPI):
+Without cloning:
 
 ```bash
 uvx --from git+https://github.com/futureweb/intervals-mcp-server futureweb-intervals-mcp --version
 ```
 
-Docker (image published by the release workflow to `ghcr.io/futureweb/intervals-mcp-server`):
+Docker: tagged releases publish `ghcr.io/futureweb/intervals-mcp-server` (`latest` only for
+final versions, beta tags such as `1.0.0b1` explicitly):
 
 ```bash
-docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:latest
+docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:1.0.0b1
 ```
 
-## Configuration
+## Connect an AI client
 
-All settings are environment variables (a `.env` file in the working directory is loaded
-automatically; see [.env.example](.env.example)).
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `API_KEY` | – | Intervals.icu API key (required) |
-| `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
-| `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
-| `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
-| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (both remote transports in one process: `/mcp` and `/sse`) |
-| `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address for `sse`/`http` |
-| `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | Endpoint paths; a secret path segment turns the URL into a credential |
-| `MCP_AUTH` | `none` | `oauth` enables the built-in OAuth 2.1 server for remote clients (see [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md)) |
-| `MCP_PUBLIC_URL` | – | Public base URL, required with `MCP_AUTH=oauth` |
-| `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | – | Intervals.icu OAuth app for "Continue with Intervals.icu" |
-| `OAUTH_LOGIN`, `OAUTH_ALLOWED_ATHLETES` | `intervals` if an app is set, else `password`; `ATHLETE_ID` | Sign-in method(s) and who may sign in |
-| `OAUTH_PASSWORD` / `OAUTH_PASSWORD_HASH` | – | Password sign-in (alternative or fallback) |
-| `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
-
-### Permission classes
-
-| Class | Tools | Enable with |
-| --- | --- | --- |
-| `read` | everything that only reads (activities, streams, wellness, analysis, curves, calendar, library, status) | default |
-| `write` | `add_or_update_event`, `add_or_update_note`, `add_activity_message`, `update_activity`, `update_wellness`, `create_library_workout`, `add_event_from_library` | `MCP_PERMISSIONS=read,write` |
-| `destructive` | `delete_event`, `delete_events_by_date_range`, `delete_custom_item`, `delete_library_workout` | `MCP_PERMISSIONS=read,write,destructive` |
-| `admin` | `create_custom_item`, `update_custom_item`, `add_events_bulk`, `update_sport_settings` | `MCP_PERMISSIONS=all` |
-
-Tools of a disabled class are not registered at all; `get_server_status` lists what is enabled
-and hidden.
-
-## Connecting a client
-
-### Claude Desktop / Claude Code (stdio)
-
-`claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows:
-`%APPDATA%\Claude\`):
+### Claude Desktop and Claude Code (local, stdio)
 
 ```json
 {
@@ -113,125 +207,160 @@ and hidden.
     "intervals-icu": {
       "command": "uv",
       "args": ["--directory", "/path/to/intervals-mcp-server", "run", "futureweb-intervals-mcp"],
-      "env": { "API_KEY": "your_key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read,write" }
+      "env": { "API_KEY": "your-api-key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read" }
     }
   }
 }
 ```
 
-On Windows use double backslashes in paths and the full path to `uv.exe` (`where.exe uv`).
 Claude Code: `claude mcp add intervals-icu -- uv --directory /path/to/intervals-mcp-server run futureweb-intervals-mcp`.
 
-### ChatGPT and other remote clients (SSE / HTTP)
+### ChatGPT, Claude.ai and other remote clients (OAuth)
+
+Remote clients need an HTTPS endpoint. Run the server behind a TLS reverse proxy with OAuth:
 
 ```bash
-MCP_TRANSPORT=http+sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8001 uv run futureweb-intervals-mcp
+MCP_TRANSPORT=http+sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8001 \
+MCP_AUTH=oauth MCP_PUBLIC_URL=https://mcp.example.com \
+INTERVALS_OAUTH_CLIENT_ID=... INTERVALS_OAUTH_CLIENT_SECRET=... \
+MCP_PERMISSIONS=read,write \
+uv run futureweb-intervals-mcp
 ```
 
-ChatGPT connectors support only "no authentication" or OAuth, so two protections are built in
-and documented in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md):
+1. Create an Intervals.icu OAuth app at <https://intervals.icu/oauth/apply> with the redirect URL
+   `https://mcp.example.com/oauth/intervals/callback` (until it is approved, use the password
+   sign-in).
+2. In ChatGPT (developer mode) add a connection with the URL `https://mcp.example.com/mcp` and
+   authentication **OAuth**; leave client id and secret empty. Claude.ai: *Add custom connector*
+   with the same URL.
+3. On the consent page choose the permissions for this connection and press **Continue with
+   Intervals.icu**. Only the athletes in `OAUTH_ALLOWED_ATHLETES` (default `ATHLETE_ID`) can sign in.
+4. After server updates use **Refresh** on the ChatGPT connection to reload the tools.
 
-1. **Built-in OAuth 2.1 server** (`MCP_AUTH=oauth`, recommended): you sign in with your
-   Intervals.icu account ("Continue with Intervals.icu", only allowlisted athletes) or a server
-   password, choose on a consent page which permission classes the connection gets, and the
-   client receives its own short-lived tokens. Supports client metadata documents with
-   `private_key_jwt` (ChatGPT), dynamic client registration, PKCE and RFC 9207. Connect ChatGPT
-   with `https://<your-host>/mcp` and authentication OAuth.
-2. **Secret path** (for clients without OAuth): set `FASTMCP_SSE_PATH=/mcp-<random>/sse` and
-   `FASTMCP_MESSAGE_PATH=/mcp-<random>/messages/` and let the reverse proxy forward only that
-   prefix. The URL then acts as a credential.
+Everything about the OAuth server, the reverse proxy (Apache and nginx examples) and the
+security model: [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md). Clients without OAuth can use a
+secret endpoint path instead (`FASTMCP_SSE_PATH=/mcp-<random>/sse`).
 
-Keep the server bound to localhost behind a TLS-terminating reverse proxy that forwards
-`X-Forwarded-Proto`, and never expose the SSE/HTTP transport directly on a public interface.
-One Intervals.icu API key serves everyone who can log in: this is a single-user deployment.
-See [SECURITY.md](SECURITY.md).
+## Configuration
 
-## Tools
+Environment variables; a `.env` file in the working directory is loaded automatically
+([.env.example](.env.example)).
 
-All tools accept `athlete_id` / `api_key` overrides and most accept `output_format="json"`.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `API_KEY` | – | Intervals.icu API key (required) |
+| `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
+| `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
+| `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (`/mcp` and `/sse` in one process) |
+| `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address of the HTTP transports |
+| `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | SSE endpoint paths |
+| `MCP_AUTH` | `none` | `oauth` enables the built-in OAuth 2.1 server |
+| `MCP_PUBLIC_URL` | – | Public base URL, required with `MCP_AUTH=oauth` |
+| `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | – | Intervals.icu OAuth app for "Continue with Intervals.icu" |
+| `OAUTH_LOGIN` | `intervals` if an app is set, else `password` | Sign-in method(s): `intervals`, `password` or both |
+| `OAUTH_ALLOWED_ATHLETES` | `ATHLETE_ID` | Athletes allowed to sign in |
+| `OAUTH_PASSWORD_HASH` / `OAUTH_USERNAME` | – / `athlete` | Password sign-in (hash: `python -m intervals_mcp_server.auth hash-password`) |
+| `OAUTH_STATE_FILE` | `./oauth_state.json` | Registered clients and refresh token digests |
+| `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
 
-**Activities & streams**
-- `get_activities` – list with sport/gear filters, sorting, pagination, compact or JSON output
-- `get_activity_details` – summary, thresholds used (FTP, eFTP, LTHR, zones, power meter), running dynamics, every custom field with units
-- `get_activity_intervals` – intervals and groups, custom interval fields, per-interval statistics of any stream (`stream_types="custom"`)
-- `list_activity_streams` / `get_activity_streams` – discover and fetch any stream (summary, CSV, JSON; slicing, downsampling, paging)
-- `get_activity_messages`, `add_activity_message`\*, `update_activity`\* (RPE, feel, name, description)
+Further OAuth options (client and redirect host allowlists, token lifetimes, rate limit) are
+listed in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md).
 
-**Analysis**
-- `get_activity_report` – one-call compact analysis: overview, plan vs execution (or intervals), second power meter check, climbs, data notes (3–4 API calls)
-- `analyze_workout_execution` – planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina); accepts `planned_workout_doc` for deleted events, reports additional training after the plan separately and suggests matching events for unpaired activities (read-only)
-- `analyze_climbs` – climbs, descents and pauses from the streams with power, NP, HR, VAM, grade and custom streams per segment
-- `compare_power_streams` – sample-aligned comparison of two power meters (offset, bands, stable windows, drift, lag, best efforts)
-- `get_training_summary` – totals per week/month/sport/gear with separate load sources, time in zones, feel/RPE, custom field aggregates
-- `get_weekly_summary`, `get_plan_compliance` – quick weekly review and planned-vs-done overview
-- `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves`
+## Permissions and security
 
-**Performance analytics**
-- `get_best_efforts` – best efforts of one activity per duration/distance with time windows
-- `compare_best_efforts` – best efforts across activities (ids, date range, sport, gear)
-- `find_similar_intervals` – activities with intervals of a given duration and intensity (optionally reps, target type, sport, gear, dates)
-- `get_activity_histogram` – power / HR / pace / GAP time distribution
-- `compare_workouts` – the same workout type over weeks (work intervals, NP, HR, Pw:HR, load)
-- `get_power_hr_efficiency` – W/bpm per power band over time
-- `get_fatigue_resistance` – fresh vs fatigued (after kJ) power curves
+| Class | Tools | Enable with |
+| --- | --- | --- |
+| `read` | everything that only reads | default |
+| `write` | `add_or_update_event`, `add_or_update_note`, `add_activity_message`, `update_activity`, `update_wellness`, `create_library_workout`, `add_event_from_library` | `MCP_PERMISSIONS=read,write` |
+| `destructive` | `delete_event`, `delete_events_by_date_range`, `delete_custom_item`, `delete_library_workout` | `MCP_PERMISSIONS=read,write,destructive` |
+| `admin` | `create_custom_item`, `update_custom_item`, `add_events_bulk`, `update_sport_settings` | `MCP_PERMISSIONS=all` |
 
-**Wellness & recovery**
-- `get_wellness_data` – daily records; `include_all_fields=True` adds every custom wellness field with its name and units
-- `get_recovery_snapshot` – today and the previous days, baselines, recent activities and planned sessions in one call
-- `get_wellness_trends` – rolling means, baselines, outliers, week-over-week, correlations, eFTP per sport
-- `get_nutrition_summary` – intake, device burn, balance (logged days only), weight trend, training load per day
-- `update_wellness`\* – subjective scores and comments
+Tools of a disabled class are not registered at all. With OAuth, each connection additionally
+gets only the classes granted on the consent page (`intervals:read`, `intervals:write`, …);
+other tools are hidden from it and refused if called.
 
-**Athlete, thresholds, gear**
-- `get_athlete_profile`, `get_sport_settings`, `get_training_zones`, `update_sport_settings`\*\*\*
-- `get_gear_list`, `get_gear_details` (components, mileage, maintenance reminders)
+- Credentials never appear in logs or tool output; the Intervals.icu sign-in token is used for
+  the identity check only and never stored.
+- Never expose the HTTP transports without OAuth or a secret path, and always behind TLS.
+- One deployment serves one athlete's API key; the sign-in allowlist decides who may connect.
 
-**Calendar & workouts**
-- `get_events`, `get_event_by_id` (with the full workout document), `get_training_plan` (phases, weekly targets, races), `add_or_update_event`\*, `add_or_update_note`\*, `add_events_bulk`\*\*\*, `delete_event`\*\*, `delete_events_by_date_range`\*\*
-- `validate_workout`, `preview_workout` – check a workout document before writing it
-- `get_workout_library`, `get_library_workout`, `create_library_workout`\*, `add_event_from_library`\*, `delete_library_workout`\*\*
+Details and how to report a vulnerability: [SECURITY.md](SECURITY.md).
 
-**Custom items & server**
-- `get_custom_items`, `get_custom_item_by_id`, `create_custom_item`\*\*\*, `update_custom_item`\*\*\*, `delete_custom_item`\*\*
-- `get_server_status` – version, permissions, hidden tools, API check, custom item counts (also `--doctor` on the command line)
+## Project status and roadmap
 
-\* write · \*\* destructive · \*\*\* admin
+`1.0.0b1` is the first public beta of this fork. Development happens in reviewed pull requests;
+`main` is protected and every change runs the full CI.
 
-Most tools accept `output_format="json"`; `get_activity_details`, `get_activity_intervals` and
-`get_recovery_snapshot` also take `detail_level="compact" | "standard" | "full"` for token-efficient answers.
+**Done**
+- Custom fields, custom streams and interval statistics for any device data
+  (also offered upstream as [mvilanova/intervals-mcp-server#153](https://github.com/mvilanova/intervals-mcp-server/pull/153))
+- Coaching tools, permission classes, upstream fixes and merged community pull requests
+- Performance analytics, execution analysis for deleted and extended workouts, detail levels,
+  one-call activity report, prompts and resources
+- OAuth with "Continue with Intervals.icu", per-connection permissions, client metadata
+  documents, streamable HTTP and SSE in one process
 
-**Prompts** (reusable workflows for MCP clients that support them): `recovery_check`,
-`workout_deep_dive`, `weekly_training_review`, `performance_progression`,
-`long_ride_climbing_analysis`, `nutrition_weight_trend`, `power_meter_comparison`,
-`workout_planning_validation`. **Resources:** `intervals://guide` (how to use the tools),
-`intervals://custom-items` (the athlete's custom item definitions).
+**In progress: analytics quality**
+- Extended rides: planned steps capped in time, longer intervals split for the analysis, all
+  extra riding after the plan reported separately
+- `compare_workouts` and `find_similar_intervals` restricted to truly comparable intervals
+  (sport, duration, intensity, reference activity), surges kept apart, time-weighted means
+- Custom field aggregation by meaning and units (no sums of percentages, ground contact time or
+  oscillation)
+- Clearer periods and units in wellness trends, minimum sample sizes for efficiency trends,
+  reliable detection of missing fatigue-resistance configuration
+- Smoothed grades, pause vs scrambling detection and sport-specific thresholds in `analyze_climbs`
+- Compact `detail_level` for the report and summaries
 
-## Garmin Intervals Bridge
+**Next**
+- PyPI package and the first tagged release with a GHCR image
+- Optional multi-athlete mode that uses each athlete's own Intervals.icu OAuth token
+- Migration to MCP SDK v2 once it is stable for the transports used here
 
-Since Garmin started filtering the FIT files it sends to partners, Intervals.icu no longer
-receives Garmin's own metrics. The [Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge)
-restores them into the custom fields and streams you define; this MCP then shows them
-everywhere. The bridge is optional and the MCP never contacts Garmin itself. Details and
-worked examples: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
+## Documentation
+
+| Document | Content |
+| --- | --- |
+| [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md) | OAuth server, Intervals.icu sign-in, ChatGPT and Claude setup, reverse proxy, operations |
+| [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md) | Working with the Garmin Intervals Bridge, worked examples, reading device metrics |
+| [docs/FEATURE_COMPARISON.md](docs/FEATURE_COMPARISON.md) | Comparison with other Intervals.icu MCP servers |
+| [docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md) | Every open upstream pull request and what happened to it |
+| [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Release process and gates |
+| [CHANGELOG.md](CHANGELOG.md) | Changes per version |
+| [SECURITY.md](SECURITY.md) | Security policy and vulnerability reporting |
 
 ## Development
 
 ```bash
 uv sync --all-extras --locked
-uv run --locked pytest -q          # tests use synthetic fixtures, no credentials needed
+uv run --locked pytest                 # synthetic fixtures, no credentials needed
 uv run --locked ruff check .
 uv run --locked mypy src tests
 uv run --locked --with pylint pylint --disable=C0301 $(git ls-files '*.py')   # advisory
 ```
 
-CI runs ruff, mypy and pytest on Python 3.12 and 3.13; releases are built from tags
-([docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)). Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).
-Please never put real athlete data, API keys or hostnames into issues, fixtures or logs.
+CI runs ruff, mypy and pytest on Python 3.12 and 3.13, builds and imports the wheel and sdist,
+builds and smoke-tests the Docker image, and CodeQL scans the code. All GitHub Actions are pinned
+to commit SHAs; Dependabot keeps them and the dependencies current. Releases are built from tags
+([docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)); beta tags become GitHub pre-releases.
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Never put real athlete data,
+API keys or hostnames into issues, fixtures or logs.
 
 ## Credits and license
 
-Original project by [Marc Vilanova](https://github.com/mvilanova) and contributors. This fork
-integrates community pull requests by arnold-maderthaner (#140, #142–#147), biochaos (#131)
-and kokostitiahah (#149); thank you. Licensed under the GNU General Public License v3.0, see
-[LICENSE](LICENSE). Intervals.icu and Garmin are trademarks of their respective owners and are
-used only to describe compatibility.
+Original project by [Marc Vilanova](https://github.com/mvilanova) and contributors:
+[mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server). This fork
+integrates community pull requests by
+[arnold-maderthaner](https://github.com/arnold-maderthaner)
+([#140](https://github.com/mvilanova/intervals-mcp-server/pull/140),
+[#142](https://github.com/mvilanova/intervals-mcp-server/pull/142) to
+[#147](https://github.com/mvilanova/intervals-mcp-server/pull/147)),
+[biochaos](https://github.com/biochaos) ([#131](https://github.com/mvilanova/intervals-mcp-server/pull/131)) and
+[kokostitiahah](https://github.com/kokostitiahah) ([#149](https://github.com/mvilanova/intervals-mcp-server/pull/149));
+thank you. Maintained by [Futureweb](https://www.futureweb.at), together with the
+[Garmin Intervals Bridge](https://github.com/futureweb/garmin-intervals-bridge).
+
+Licensed under the GNU General Public License v3.0, see [LICENSE](LICENSE). Intervals.icu and
+Garmin are trademarks of their respective owners and are used only to describe compatibility.
