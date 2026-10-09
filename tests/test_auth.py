@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
 import pytest
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AuthorizationParams
@@ -98,7 +97,7 @@ def build_app(env: Mapping[str, str]) -> tuple[FastMCP[Any], TestClient]:
         return JSONResponse({"client_id": None, "scopes": []})
 
     assert ping() == "pong"
-    return mcp, TestClient(mcp.sse_app(), follow_redirects=False)
+    return mcp, TestClient(mcp.sse_app(), base_url="http://127.0.0.1:8000", follow_redirects=False)
 
 
 @pytest.fixture
@@ -147,7 +146,7 @@ def start_authorization(
 
 def login(
     client: TestClient, request_id: str, password: str, username: str = "athlete"
-) -> httpx.Response:
+) -> Any:
     """Submit the login form."""
     return client.post(
         "/oauth/login",
@@ -157,7 +156,7 @@ def login(
 
 def exchange_code(
     client: TestClient, client_id: str, code: str, verifier: str
-) -> httpx.Response:
+) -> Any:
     """Exchange an authorization code for tokens."""
     return client.post(
         "/token",
@@ -428,7 +427,7 @@ def test_streamable_http_initialize_with_bearer(oauth_env):
     kwargs = oauth_from_env(oauth_env)
     mcp = FastMCP("test", json_response=True, stateless_http=True, **kwargs)
     install_login_routes(mcp, kwargs["auth_server_provider"])
-    with TestClient(mcp.streamable_http_app(), follow_redirects=False) as http:
+    with TestClient(mcp.streamable_http_app(), base_url="http://127.0.0.1:8000", follow_redirects=False) as http:
         _, tokens = obtain_tokens(http)
         initialize = {
             "jsonrpc": "2.0",

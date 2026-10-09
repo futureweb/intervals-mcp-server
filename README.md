@@ -256,6 +256,7 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (`/mcp` and `/sse` in one process) |
 | `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address of the HTTP transports |
 | `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | SSE endpoint paths |
+| `FASTMCP_ALLOWED_HOSTS` / `FASTMCP_ALLOWED_ORIGINS` | host of `MCP_PUBLIC_URL` | Public Host headers accepted behind a reverse proxy (DNS rebinding protection); required for a public endpoint without OAuth |
 | `MCP_AUTH` | `none` | `oauth` enables the built-in OAuth 2.1 server |
 | `MCP_PUBLIC_URL` | – | Public base URL, required with `MCP_AUTH=oauth` |
 | `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | – | Intervals.icu OAuth app for "Continue with Intervals.icu" |

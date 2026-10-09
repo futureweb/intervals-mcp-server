@@ -9,6 +9,12 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Security
+- Dependencies updated: MCP SDK 1.30 (minimum 1.28.1), Starlette 1.7, python-multipart 0.0.32,
+  cryptography 50, anyio 4.15, PyJWT 2.15 and others (Dependabot advisories).
+- `FASTMCP_ALLOWED_HOSTS` / `FASTMCP_ALLOWED_ORIGINS`: the SDK's DNS rebinding protection now
+  accepts the public host of `MCP_PUBLIC_URL` and configured hosts behind a reverse proxy.
+
 ### Changed (phase 3: analytics quality)
 - `analyze_workout_execution` / `get_activity_report`: planned steps are capped at their planned
   (moving) duration; a longer interval is split logically (analysis only) so the planned part is

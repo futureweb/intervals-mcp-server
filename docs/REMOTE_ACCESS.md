@@ -122,6 +122,12 @@ nginx: `proxy_pass http://127.0.0.1:8001;`, `proxy_set_header X-Forwarded-Proto 
 uvicorn trusts `X-Forwarded-For`/`-Proto` from 127.0.0.1, which is what the sign-in rate
 limit keys on. `MCP_PUBLIC_URL` must be exactly the origin clients use, without a path.
 
+The MCP SDK protects servers bound to localhost against DNS rebinding and then accepts only
+localhost `Host` headers. A proxy that keeps the public `Host` header (Apache `ProxyPreserveHost On`)
+therefore needs the public host on the allowlist: it is added automatically from `MCP_PUBLIC_URL`;
+other hosts (e.g. a secret-path endpoint without OAuth) go into `FASTMCP_ALLOWED_HOSTS`
+(comma-separated; `FASTMCP_ALLOWED_ORIGINS` for browser origins). Requests for other hosts get `421`.
+
 ## 4. Connect ChatGPT
 
 1. ChatGPT → Settings → Apps / Plugins (developer mode) → create a connection with the URL
