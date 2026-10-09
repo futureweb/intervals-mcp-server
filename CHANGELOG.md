@@ -70,4 +70,4 @@ First public beta of the Futureweb fork. Based on upstream
 
 ### Changed
 - Package renamed to `futureweb-intervals-mcp`; project metadata points to the fork.
-- Pylint runs non-blocking in CI; ruff, mypy and pytest are required.
+- Pylint runs as an advisory CI job (only error-class messages fail it); ruff, mypy and pytest are required.

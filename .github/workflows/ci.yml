@@ -119,9 +119,10 @@ jobs:
           test "$(docker run --rm "${IMAGE_NAME}:ci" id -u)" != "0"
 
   pylint:
-    # Informational only: pylint has a few pre-existing messages that are not
-    # gates. The job is reported but never fails the workflow.
-    name: Pylint (non-blocking)
+    # Informational only: pylint reports complexity and style notes (mostly in
+    # inherited code and tests) that are not gates. Error-class messages (E/F)
+    # still fail the job; everything else is printed with the score.
+    name: Pylint (advisory)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -139,4 +140,6 @@ jobs:
         run: uv sync --all-extras --locked
 
       - name: Analyse the code with pylint
-        run: uv run --locked --with pylint pylint --disable=C0301 $(git ls-files '*.py')
+        # --fail-on=E,F keeps real errors (e.g. undefined names) failing while
+        # --fail-under=0 stops style/complexity notes from turning the check red.
+        run: uv run --locked --with pylint pylint --disable=C0301 --fail-under=0 --fail-on=E,F $(git ls-files '*.py')

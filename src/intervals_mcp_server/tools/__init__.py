@@ -16,13 +16,14 @@ from intervals_mcp_server.tools.activities import (  # noqa: F401
     list_activity_streams,
     update_activity,
 )
-from intervals_mcp_server.tools.events import (  # noqa: F401, get_training_plan
+from intervals_mcp_server.tools.events import (  # noqa: F401
     add_events_bulk,
     add_or_update_event,
     delete_event,
     delete_events_by_date_range,
     get_event_by_id,
     get_events,
+    get_training_plan,
 )
 from intervals_mcp_server.tools.custom_items import (  # noqa: F401
     create_custom_item,
@@ -39,10 +40,11 @@ from intervals_mcp_server.tools.hr_pace_curves import (  # noqa: F401
     get_pace_curves,
 )
 from intervals_mcp_server.tools.gear import get_gear_details, get_gear_list  # noqa: F401
-from intervals_mcp_server.tools.athlete import (  # noqa: F401, update_sport_settings
+from intervals_mcp_server.tools.athlete import (  # noqa: F401
     get_athlete_profile,
     get_sport_settings,
     get_training_zones,
+    update_sport_settings,
 )
 from intervals_mcp_server.tools.analysis import (  # noqa: F401
     analyze_workout_execution,
@@ -71,10 +73,11 @@ from intervals_mcp_server.tools.training_review import (  # noqa: F401
     get_plan_compliance,
     get_weekly_summary,
 )
-from intervals_mcp_server.tools.workout_library import (  # noqa: F401, get_library_workout
+from intervals_mcp_server.tools.workout_library import (  # noqa: F401
     add_event_from_library,
-    delete_library_workout,
     create_library_workout,
+    delete_library_workout,
+    get_library_workout,
     get_workout_library,
 )
 from intervals_mcp_server.tools.wellness import get_wellness_data, update_wellness  # noqa: F401
