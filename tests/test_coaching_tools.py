@@ -147,7 +147,7 @@ def test_get_sport_settings_with_zones_and_eftp(monkeypatch):
     assert "Sport setting 1 for Ride:" in result
     assert "Power: FTP 234 W, indoor FTP 230 W, W' 18000 J, Pmax 1036 W" in result
     assert "eFTP (Ride, Intervals.icu estimate as of 2026-10-09): 229 W" in result
-    assert "Z2 Endurance: 55-75% = 130-176 W" in result
+    assert "Z2 Endurance: 55-75% = 129-175 W" in result  # floored like Intervals.icu (ANA-8)
     assert "Z7 Neuromuscular: >150% = >352 W" in result
     assert "Z1 Recovery: ≤133 bpm" in result
     assert "Sweet spot: 84-97% = 197-227 W" in result
@@ -157,7 +157,7 @@ def test_get_sport_settings_with_zones_and_eftp(monkeypatch):
     assert "Threshold pace: 5:10/km" in run
     assert "Z4 Zone 4: 94.3-100%" in run
     payload = json.loads(asyncio.run(get_sport_settings(output_format="json")))
-    assert payload["sport_settings"][0]["zones"]["power"][1]["max_watts"] == 176
+    assert payload["sport_settings"][0]["zones"]["power"][1]["max_watts"] == 175
     assert payload["sport_settings"][0]["default_gear_name"] == "Canyon Ultimate"
 
 
@@ -258,7 +258,7 @@ def test_get_activity_details_json_and_thresholds(monkeypatch):
     assert "Date: 2026-10-06T17:36:22 local (UTC+02:00) / 2026-10-06T15:36:22Z UTC" in text
     assert "Thresholds used for this activity" in text
     assert "FTP 234 W (icu_ftp, setting at the time)" in text
-    assert "Power zones (% FTP, upper bounds): Z1 ≤55% (0-129 W)" in text
+    assert "Power zones (% FTP, upper bounds): Z1 ≤55% (0-128 W)" in text
     assert "power meter Shimano FC-R9200P, serial 123" in text
     payload = json.loads(asyncio.run(get_activity_details("i1", output_format="json")))
     assert payload["times"]["start_time_utc"] == "2026-10-06T15:36:22Z"

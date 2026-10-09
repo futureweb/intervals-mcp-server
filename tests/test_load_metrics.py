@@ -178,7 +178,9 @@ def test_top_sessions_keeps_the_hardest_short_session():
     assert [s["load"] for s in top[:4]] == [200, 190, 180, 170]
     assert top[-1]["intensity_factor"] == 1.05 and top[-1]["minutes"] == 25
     assert lm.top_sessions([]) == []
-    assert lm.intensity_factor({"icu_intensity": 0.9}) == 0.9 and lm.intensity_factor({"icu_intensity": None}) is None
+    assert lm.intensity_factor({"icu_intensity": 90}) == 0.9 and lm.intensity_factor({"icu_intensity": None}) is None
+    # ANA-9: icu_intensity is always percent; a tiny value is no IF > 1 and no "hard" session
+    assert lm.intensity_factor({"icu_intensity": 2.6}) == pytest.approx(0.026)
 
 
 # ------------------------------------------------------------------ intensity
