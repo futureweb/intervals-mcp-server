@@ -184,10 +184,15 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         plan = payload["plan"]
         if plan:
             race = plan["next_race"]
-            lines.append(
-                f"Planned {plan['from']} to {plan['to']}: {plan['sessions']} workouts, load {fmt(plan['load'])}"
+            planned = (
+                f"{plan['sessions']} workouts, load {fmt(plan['load'])}"
                 + (f" ({plan['without_load']} without planned load)" if plan["without_load"] else "")
-                + f", {fmt(plan['hours'], 1)} h" + (f" | next race {race['date']} {race['category']} '{race['name']}'" if race else "")
+                + f", {fmt(plan['hours'], 1)} h"
+                if plan["sessions"] else "NO PLANNED WORKOUTS in the calendar (a load projection shows only the decay)"
+            )
+            lines.append(
+                f"Planned {plan['from']} to {plan['to']}: {planned}"
+                + (f" | next race {race['date']} {race['category']} '{race['name']}'" if race else "")
             )
         cov = payload["coverage"]
         lines.append(

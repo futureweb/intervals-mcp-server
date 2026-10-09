@@ -505,13 +505,29 @@ def _projection_weeks(
     return out
 
 
+def projection_basis(planned: dict[str, Any]) -> dict[str, Any]:
+    """Whether a projection contains planned training: 'planned_load', 'no_planned_load' or 'no_planned_workouts'."""
+    if not planned["sessions"]:
+        return {"kind": "no_planned_workouts", "label": "PROJECTION WITHOUT PLANNED TRAINING (no planned workouts in the calendar)"}
+    if not planned["with_load"]:
+        return {
+            "kind": "no_planned_load",
+            "label": f"PROJECTION WITHOUT PLANNED LOAD ({planned['sessions']} planned workouts, none with a planned load)",
+        }
+    return {"kind": "planned_load", "label": "PROJECTION"}
+
+
 def _projection_text(payload: dict[str, Any], detail_level: str) -> str:
     start, today_info, plan = payload["start"], payload["today"], payload["planned"]
     end_row = payload["days"][-1] if payload["days"] else None
+    basis = payload["projection_basis"]
+    assumption = (
+        "assumes every planned workout is done with its planned Intervals.icu load and nothing else"
+        if basis["kind"] == "planned_load" else "only the decay of CTL and ATL without any training after today's completed load"
+    )
     lines = [
-        f"Load projection for athlete {payload['athlete_id']}, {payload['from']} to {payload['to']} (PROJECTION: assumes every "
-        f"planned workout is done with its planned Intervals.icu load and nothing else; model CTL {payload['ctl_days']} d / "
-        f"ATL {payload['atl_days']} d).",
+        f"{basis['label']}: load projection for athlete {payload['athlete_id']}, {payload['from']} to {payload['to']} "
+        f"({assumption}; model CTL {payload['ctl_days']} d / ATL {payload['atl_days']} d).",
         f"Start (end of {start['date']}, Intervals.icu): CTL {fmt(start['ctl'], 1)} | ATL {fmt(start['atl'], 1)} | "
         f"form {fmt(start['form'], 1, signed=True)}",
         f"Today {today_info['date']}: completed load {fmt(today_info['completed_load'])} + planned, not yet done "
@@ -582,7 +598,9 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     assumed. Reports the values at the end date, the lowest form and highest 7-day ramp,
     per ISO week (load, sessions, CTL/ATL/form at the end of the week, lowest form, ramp),
     projected values on race days (RACE_A/B/C) and, for comparison, Intervals.icu's own
-    projection from the wellness records. A model check replays the last 14 days of
+    projection from the wellness records. Without planned workouts (or without any planned
+    load) the header says so at every detail level ("PROJECTION WITHOUT PLANNED TRAINING";
+    JSON projection_basis). A model check replays the last 14 days of
     Intervals.icu loads to show that the time constants match. Clearly a projection, not a
     forecast; no verdict.
 
@@ -664,6 +682,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         "model_check": model_check(wellness, today - timedelta(days=1), 14, ctl_days, atl_days),
         "days": projected,
     }
+    payload["projection_basis"] = projection_basis(payload["planned"])
     if output_format.strip().lower() == "json":
         return json.dumps(payload, ensure_ascii=False)
     return _projection_text(payload, detail_level)

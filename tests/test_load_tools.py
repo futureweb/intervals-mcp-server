@@ -204,7 +204,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     """Planned loads drive the projection; missing planned loads are reported; races and Intervals.icu's projection."""
     _setup(monkeypatch)
     result = asyncio.run(get_load_projection())
-    assert "2026-10-09 to 2026-11-06 (PROJECTION" in result
+    assert result.startswith("PROJECTION: load projection for athlete i1, 2026-10-09 to 2026-11-06 (assumes every planned workout")
     assert "Start (end of 2026-10-08, Intervals.icu)" in result
     assert "Today 2026-10-09: completed load 0 + planned, not yet done 100" in result
     assert "Planned workouts: 4 (3 with a planned load, sum 300); 1 without a planned load are not included" in result
@@ -236,6 +236,25 @@ def test_get_load_projection_validation_and_missing_data(monkeypatch):
     assert asyncio.run(get_load_projection()) == "Error fetching events: boom"
     _setup(monkeypatch, {"/events": []})
     assert "Planned workouts: none in the calendar" in asyncio.run(get_load_projection())
+
+
+def test_projection_and_coach_context_say_when_nothing_is_planned(monkeypatch):
+    """Phase 5 (F): without planned workouts the header says so at every detail level, also in the coach context."""
+    _setup(monkeypatch, {"/events": []})
+    for level in ("compact", "standard", "full"):
+        text = asyncio.run(get_load_projection(detail_level=level))
+        assert text.startswith("PROJECTION WITHOUT PLANNED TRAINING (no planned workouts in the calendar): load projection")
+        assert "only the decay of CTL and ATL without any training" in text.splitlines()[0]
+    payload = json.loads(asyncio.run(get_load_projection(output_format="json")))
+    assert payload["projection_basis"]["kind"] == "no_planned_workouts"
+    context = asyncio.run(get_coach_context())
+    assert "Planned 2026-10-10 to 2026-10-16: NO PLANNED WORKOUTS in the calendar" in context
+    unloaded = [dict(e, icu_training_load=None) for e in EVENTS if e["category"] == "WORKOUT" and not e.get("paired_activity_id")]
+    _setup(monkeypatch, {"/events": unloaded})
+    text = asyncio.run(get_load_projection(detail_level="compact"))
+    assert text.startswith("PROJECTION WITHOUT PLANNED LOAD (4 planned workouts, none with a planned load)")
+    _setup(monkeypatch)
+    assert asyncio.run(get_load_projection(detail_level="compact")).startswith("PROJECTION: ")
 
 
 # ------------------------------------------------------------------ get_intensity_distribution
