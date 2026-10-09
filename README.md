@@ -258,6 +258,8 @@ Once the server is running and Claude Desktop is configured, you can use the fol
 - `get_hr_curves`: Get best average heart rate curves for selected durations and time periods
 - `get_pace_curves`: Get best time/pace curves (min/km, min/100m for swims; optional GAP) for selected distances and time periods
 - `get_wellness_data`: Fetch wellness data
+- `get_weekly_summary`: Weekly training summary per ISO week and sport (sessions, time, distance, load, HR zones) with end-of-week CTL/ATL/form
+- `get_plan_compliance`: Compare planned workouts with executed activities (completed, missed, upcoming, unplanned, deviations)
 - `get_events`: Retrieve upcoming events (workouts, races, etc.)
 - `get_event_by_id`: Get detailed information for a specific event
 - `add_or_update_event`: Create or update an event (workout, race, note, etc.)
