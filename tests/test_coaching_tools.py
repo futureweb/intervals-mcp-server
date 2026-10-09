@@ -67,6 +67,11 @@ PATCH_TARGETS = (
     "intervals_mcp_server.tools.wellness_insights.make_intervals_request",
     "intervals_mcp_server.tools.summary.make_intervals_request",
     "intervals_mcp_server.tools.workout_check.make_intervals_request",
+    "intervals_mcp_server.tools.workout_library.make_intervals_request",
+    "intervals_mcp_server.tools.training_review.make_intervals_request",
+    "intervals_mcp_server.tools.hr_pace_curves.make_intervals_request",
+    "intervals_mcp_server.tools.power_curves.make_intervals_request",
+    "intervals_mcp_server.tools.report.make_intervals_request",
 )
 
 
@@ -278,10 +283,11 @@ def test_analyze_workout_execution_with_plan(monkeypatch):
     _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/streams": EXECUTION_STREAMS})
     result = asyncio.run(analyze_workout_execution("i1"))
     assert "Workout execution for Threshold Ride (i1, Ride" in result
-    assert "Planned workout: 2x5 min Threshold (event 5, 2026-10-06)" in result
+    assert "Plan source: event 5 ('2x5 min Threshold', 2026-10-06)" in result
     assert "Intervals.icu compliance 101%, RPE 7/10, feel 3/5, load 41 (Intervals.icu)" in result
     assert "Device/custom fields: Aerobic Effect [AerobicEffect]: 3.1; EPOC [EPOC]: 80.5 ml/kg" in result
-    assert "Plan: 6 steps, 29:00 planned | Actual: 6 intervals, 29:00 | matched 6" in result
+    assert "Plan: 6 steps, 29:00 planned | Actual: 6 intervals, 29:00 in total | matched 6" in result
+    assert "extended beyond the plan" not in result
     assert "work steps in target: 2/2" in result
     assert "[plan 2] work (rep 1/2) 5:00 @ 240-250 W" in result
     assert "in range (99% of target)" in result
@@ -299,7 +305,10 @@ def test_analyze_workout_execution_without_plan(monkeypatch):
     activity = {k: v for k, v in EXECUTION_ACTIVITY.items() if k != "paired_event_id"}
     _install_router(monkeypatch, {"/activity/": activity, "/streams": EXECUTION_STREAMS})
     result = asyncio.run(analyze_workout_execution("i1"))
-    assert "No planned workout paired with this activity; analysing intervals only." in result
+    assert "No planned workout paired with this activity (paired_event_id is empty); analysing intervals only." in result
+    assert "Possible planned workouts (read-only suggestion, nothing was paired):" in result
+    assert "- event 5 '2x5 min Threshold' 2026-10-06 Ride 29:00, score" in result
+    assert "same sport" in result and "already paired with i1" in result
     assert "No planned workout: 6 intervals, 29:00 in total" in result
     assert "[no planned step] -> Warmup (WORK) 10:00 from 0:00" in result
     assert ", fade " in result
@@ -473,3 +482,181 @@ def test_get_server_status(monkeypatch):
     assert payload["api"]["ok"] is True
     assert "get_recovery_snapshot" in payload["tools_by_class"]["read"]
     assert payload["tools_hidden"]["delete_event"] == "destructive"
+
+
+def test_analyze_workout_execution_extended_ride_with_provided_doc(monkeypatch):
+    """A caller-provided workout document is used when the event was deleted; extra riding after
+    the plan is reported as additional training and not counted against the plan."""
+    from tests.sample_data import EXTENDED_ACTIVITY, EXTENDED_INTERVALS, EXTENDED_STREAMS  # pylint: disable=import-outside-toplevel
+
+    _install_router(monkeypatch, {"/activity/": EXTENDED_ACTIVITY, "/streams": EXTENDED_STREAMS,
+                                  "/intervals": EXTENDED_INTERVALS, "/events": []})
+    result = asyncio.run(analyze_workout_execution("i2", planned_workout_doc=EVENT_DATA["workout_doc"]))
+    assert "Plan source: workout document provided by the caller" in result
+    assert "Plan: 6 steps, 29:00 planned | Actual: 9 intervals, 1:27:00 in total | matched 6" in result
+    assert "The activity was extended beyond the plan: plan part 29:00, additional training 58:00" in result
+    assert "work steps in target: 2/2" in result
+    assert "Additional training after the plan: 58:00 from 29:00 to 1:27:00 (3 interval(s))" in result
+    assert "hardest part: 0:50 at avg 430 W (max 480 W), HR 165 bpm" in result
+    assert "[no planned step]" not in result
+    payload = json.loads(asyncio.run(analyze_workout_execution("i2", planned_workout_doc=EVENT_DATA["workout_doc"], output_format="json")))
+    assert payload["summary"]["extended_beyond_plan"] is True
+    assert payload["summary"]["extension_s"] == 3480
+    assert payload["summary"]["plan_part_actual_s"] == 1740
+    assert payload["extension"]["intervals"] == 3
+    assert payload["plan_source"] == "workout document provided by the caller"
+    # Without a plan and without candidate events the suggestion block says so.
+    plain = asyncio.run(analyze_workout_execution("i2"))
+    assert "No planned workouts found on the activity's day or the days around it." in plain
+    assert "No planned workout: 9 intervals, 1:27:00 in total" in plain
+
+
+# ----------------------------------------------------- phase 2: new tools and levels
+def test_get_training_plan(monkeypatch):
+    """The ATP view groups plan phases, weekly targets and races and reports the assigned plan."""
+    from intervals_mcp_server.server import get_training_plan  # pylint: disable=import-outside-toplevel
+    from tests.sample_data import PLAN_EVENTS  # pylint: disable=import-outside-toplevel
+
+    calls = []
+    _install_router(monkeypatch, {"/training-plan": {"training_plan_id": None}, "/events": PLAN_EVENTS,
+                                  "/fitness-model-events": [{"start_date_local": "2026-09-01T00:00:00", "category": "SET_EFTP", "eftp": 230}]}, calls=calls)
+    result = asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01"))
+    assert "Assigned plan: none" in result
+    assert "Phases / season markers (1):" in result and "- 2026-10-13 to 2026-11-09 Plan (Ride): Base 2 (event 901) | aerobic base" in result
+    assert "Weekly targets (1):" in result and "load 450, time 10:00:00, weekly target" in result
+    assert "Races (1):" in result and "Race A (Ride): Ötztaler (event 903)" in result
+    assert "ignored" not in result
+    assert "SET_EFTP" in result
+    assert next(c for c in calls if "/events" in c[0])[1]["category"] == "PLAN,TARGET,RACE_A,RACE_B,RACE_C,SEASON_START"
+    payload = json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01", output_format="json")))
+    assert [r["id"] for r in payload["races"]] == [903]
+    # Fallback when the API rejects the category filter: all events are fetched and filtered.
+    state = {"n": 0}
+    async def flaky(url=None, **kwargs):
+        if "/events" in url:
+            state["n"] += 1
+            return {"error": True, "message": "bad category"} if kwargs.get("params", {}).get("category") else PLAN_EVENTS
+        if "/fitness-model-events" in url:
+            return []
+        return {}
+    for target in PATCH_TARGETS:
+        monkeypatch.setattr(target, flaky)
+    result = asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01"))
+    assert "Races (1):" in result and state["n"] == 2
+
+
+def test_get_library_workout(monkeypatch):
+    """A library workout is rendered with its steps; errors are reported."""
+    from intervals_mcp_server.server import get_library_workout  # pylint: disable=import-outside-toplevel
+    from tests.sample_data import LIBRARY_WORKOUT  # pylint: disable=import-outside-toplevel
+
+    _install_router(monkeypatch, {"/workouts/": LIBRARY_WORKOUT})
+    result = asyncio.run(get_library_workout("77"))
+    assert "Library workout 77: SST 3x12 (Ride, folder 301129)" in result
+    assert "Steps (rendered):" in result and "240W-250W" in result
+    assert json.loads(asyncio.run(get_library_workout("77", output_format="json")))["id"] == 77
+    _install_router(monkeypatch, {"/workouts/": {"error": True, "message": "404"}})
+    assert asyncio.run(get_library_workout("77")).startswith("Error fetching library workout")
+
+
+def test_update_sport_settings_validation_and_put(monkeypatch):
+    """Only passed values are sent after range checks; LTHR must stay below max HR."""
+    from intervals_mcp_server.server import update_sport_settings  # pylint: disable=import-outside-toplevel
+
+    calls = []
+    _install_router(monkeypatch, {"/sport-settings/1": {"id": 1, "ftp": 240, "lthr": 165}}, calls=calls)
+    assert asyncio.run(update_sport_settings("Ride")).startswith("Error: pass at least one value")
+    assert asyncio.run(update_sport_settings("Ride", ftp=5)).startswith("Error: ftp must be between 50 and 600 W")
+    assert asyncio.run(update_sport_settings("Ride", lthr=190)).startswith("Error: LTHR (190) must be below max HR (188)")
+    assert asyncio.run(update_sport_settings("Swim", ftp=200)).startswith("Error: expected exactly one sport setting for 'Swim'")
+    result = asyncio.run(update_sport_settings("Ride", ftp=240))
+    put = next(c for c in calls if c[2] == "PUT")
+    assert put[0] == "/athlete/i1/sport-settings/1"
+    assert "Updated sport setting 1 (Ride): ftp 234 -> 240" in result
+    assert "Zones were not recalculated" in result
+
+
+def test_get_gear_details_reminders(monkeypatch):
+    """Maintenance reminders show usage against their target."""
+    from tests.sample_data import GEAR_WITH_REMINDER  # pylint: disable=import-outside-toplevel
+
+    _install_router(monkeypatch, {"/gear": GEAR_WITH_REMINDER})
+    result = asyncio.run(get_gear_details("b1"))
+    assert "- Maintenance reminders (1):" in result
+    assert "  - Chain wax: 250/400 km (62% used), last reset 2026-08-01" in result
+
+
+def test_get_activities_power_meter_filter(monkeypatch):
+    """The power meter filter keeps activities whose power meter name contains the text."""
+    _install_router(monkeypatch)
+    result = asyncio.run(get_activities(start_date="2026-10-01", end_date="2026-10-09", power_meter="shimano", detail_level="compact"))
+    assert "Activities 1-1 of 1" in result and "i10" in result and "PM Shimano FC-R9200P" in result
+    assert "power meter contains 'shimano'" in result
+
+
+def test_detail_levels_details_intervals_snapshot(monkeypatch):
+    """compact / standard / full change the amount of output; sport-assigned fields are separated."""
+    _install_router(monkeypatch, {"/activity/": EXECUTION_ACTIVITY, "/streams": EXECUTION_STREAMS})
+    compact = asyncio.run(get_activity_details("i1", detail_level="compact"))
+    assert compact.startswith("Threshold Ride (i1, Ride) 2026-10-06 17:36 local")
+    assert "Load 41 (Intervals.icu; power n/a / HR n/a / pace n/a) | IF n/a% | NP n/a W" in compact
+    assert "device Edge 1040, power meter Shimano FC-R9200P, power fields power, Power2" in compact
+    assert "Custom fields (assigned to this sport): EPOC [EPOC]: 80.5 ml/kg" in compact
+    assert "Aerobic Effect" not in compact
+    assert "Data: 6 streams (1 custom)" in compact
+    assert len(compact.splitlines()) <= 8
+    standard = asyncio.run(get_activity_details("i1"))
+    assert "- EPOC [EPOC]: 80.5 ml/kg" in standard
+    assert "Not assigned to this sport in the Intervals.icu settings (values as stored, treat with care): Aerobic Effect [AerobicEffect]: 3.1" in standard
+    full = asyncio.run(get_activity_details("i1", detail_level="full"))
+    assert "Other Fields:" in full
+    assert asyncio.run(get_activity_details("i1", detail_level="huge")).startswith("Error: detail_level")
+    payload = json.loads(asyncio.run(get_activity_details("i1", output_format="json")))
+    assert next(f for f in payload["custom_fields"] if f["code"] == "EPOC")["assigned_to_sport"] is True
+
+    compact_iv = asyncio.run(get_activity_intervals("i1", detail_level="compact", stream_types="Stamina"))
+    assert compact_iv.startswith("Intervals of i1 (analysed True):")
+    assert "[2] WORK | 5:00 (10:00-15:00, idx 600-900) | avg 242 W NP n/a max 260 | HR 155/160 | cad 88 | streams Stamina 88→82.0 (min 82.0)" in compact_iv
+    full_iv = asyncio.run(get_activity_intervals("i1", detail_level="full"))
+    assert "Stream Metrics (samples 600-899):" in full_iv and "Garmin Stamina [Stamina]" in full_iv
+
+    _install_router(monkeypatch)
+    compact_snap = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1, detail_level="compact"))
+    assert "custom:" not in compact_snap and "Baselines" in compact_snap
+    standard_snap = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1))
+    assert "custom: Garmin Deep Sleep 85 min" in standard_snap
+    assert asyncio.run(get_recovery_snapshot(detail_level="x")).startswith("Error: detail_level")
+
+
+def test_get_activity_report_single_call(monkeypatch):
+    """The report combines overview, plan vs execution, power check, climbs and data notes."""
+    from intervals_mcp_server.server import get_activity_report  # pylint: disable=import-outside-toplevel
+    from tests.sample_data import EXTENDED_ACTIVITY, EXTENDED_INTERVALS, EXTENDED_STREAMS  # pylint: disable=import-outside-toplevel
+
+    primary = EXECUTION_STREAMS[1]["data"]
+    streams = EXECUTION_STREAMS + [{"type": "secondary_power", "name": "Power2", "custom": False, "data": [round(w * 1.03) for w in primary]}]
+    calls = []
+    with_power2 = dict(EXECUTION_ACTIVITY, stream_types=EXECUTION_ACTIVITY["stream_types"] + ["secondary_power"])
+    _install_router(monkeypatch, {"/activity/": with_power2, "/streams": streams}, calls=calls)
+    result = asyncio.run(get_activity_report("i1"))
+    assert result.startswith("== Overview\nThreshold Ride (i1, Ride) 2026-10-06 17:36 local")
+    assert "== Plan vs execution (event 5 ('2x5 min Threshold'))" in result
+    assert "work steps in target: 2/2" in result
+    assert "== Second power meter check (watts vs secondary_power, no calibration)" in result
+    assert "mean diff +" in result and "ratio 1.0" in result
+    assert "== Climbs" not in result  # intervals exist and little elevation
+    assert "== Data quality" not in result  # complete device data, intervals present
+    stream_calls = [c for c in calls if "/streams" in c[0]]
+    assert len(stream_calls) == 1 and "secondary_power" in stream_calls[0][1]["types"] and "Stamina" in stream_calls[0][1]["types"]
+    assert sum(1 for c in calls if "/activity/" in c[0] and "/streams" not in c[0] and "/intervals" not in c[0]) == 1
+
+    _install_router(monkeypatch, {"/activity/": EXTENDED_ACTIVITY, "/streams": EXTENDED_STREAMS, "/intervals": EXTENDED_INTERVALS, "/events": []})
+    plain = asyncio.run(get_activity_report("i2", planned_workout_doc=EVENT_DATA["workout_doc"], include_climbs=False))
+    assert "== Plan vs execution (workout document provided by the caller)" in plain
+    assert "additional training 58:00" in plain
+    assert "- only one power stream recorded; no power meter comparison possible" in plain
+    assert "- compliance 0 only means the activity is not paired with a planned workout" in plain
+    payload = json.loads(asyncio.run(get_activity_report("i2", output_format="json")))
+    assert payload["execution"]["summary"]["actual_intervals"] == 9
+    assert payload["power_check"] is None
+    assert payload["api_calls"] == 3

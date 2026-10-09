@@ -80,6 +80,9 @@ automatically; see [.env.example](.env.example)).
 | `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `http` |
 | `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address for `sse`/`http` |
+| `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | Endpoint paths; a secret path segment turns the URL into a credential |
+| `MCP_AUTH` | `none` | `oauth` enables the built-in single-user OAuth 2.1 server for remote clients (see [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md)) |
+| `MCP_PUBLIC_URL`, `OAUTH_PASSWORD` / `OAUTH_PASSWORD_HASH` | – | Required with `MCP_AUTH=oauth` |
 | `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
 
 ### Permission classes
@@ -89,7 +92,7 @@ automatically; see [.env.example](.env.example)).
 | `read` | everything that only reads (activities, streams, wellness, analysis, curves, calendar, library, status) | default |
 | `write` | `add_or_update_event`, `add_or_update_note`, `add_activity_message`, `update_activity`, `update_wellness`, `create_library_workout`, `add_event_from_library` | `MCP_PERMISSIONS=read,write` |
 | `destructive` | `delete_event`, `delete_events_by_date_range`, `delete_custom_item`, `delete_library_workout` | `MCP_PERMISSIONS=read,write,destructive` |
-| `admin` | `create_custom_item`, `update_custom_item`, `add_events_bulk` | `MCP_PERMISSIONS=all` |
+| `admin` | `create_custom_item`, `update_custom_item`, `add_events_bulk`, `update_sport_settings` | `MCP_PERMISSIONS=all` |
 
 Tools of a disabled class are not registered at all; `get_server_status` lists what is enabled
 and hidden.
@@ -122,11 +125,20 @@ Claude Code: `claude mcp add intervals-icu -- uv --directory /path/to/intervals-
 MCP_TRANSPORT=sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8000 uv run futureweb-intervals-mcp
 ```
 
-The server has no authentication of its own. Keep it bound to localhost and put an
-authenticating reverse proxy (basic auth, mTLS or an OAuth-aware proxy with TLS) in front of
-`/sse` and `/messages/` before you give ChatGPT (Settings → Connectors → custom MCP) or any
-other remote client the URL. Never expose the SSE/HTTP transport directly on a public
-interface. See [SECURITY.md](SECURITY.md).
+ChatGPT custom connectors support only "no authentication" or OAuth, so two protections are
+built in and documented in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md):
+
+1. **Secret path** (immediate, works with every client): set `FASTMCP_SSE_PATH=/mcp-<random>/sse`
+   and `FASTMCP_MESSAGE_PATH=/mcp-<random>/messages/`, let the reverse proxy forward only that
+   prefix and deny everything else. The URL then acts as a credential (it never appears in
+   certificate transparency logs, unlike a hostname).
+2. **Built-in OAuth 2.1 server** (`MCP_AUTH=oauth`): dynamic client registration, PKCE, a login
+   page with the configured password; ChatGPT and Claude run the OAuth flow on first use.
+
+Keep the server bound to localhost behind a TLS-terminating reverse proxy that forwards
+`X-Forwarded-Proto`, and never expose the SSE/HTTP transport directly on a public interface.
+One Intervals.icu API key serves everyone who can log in: this is a single-user deployment.
+See [SECURITY.md](SECURITY.md).
 
 ## Tools
 
@@ -140,12 +152,22 @@ All tools accept `athlete_id` / `api_key` overrides and most accept `output_form
 - `get_activity_messages`, `add_activity_message`\*, `update_activity`\* (RPE, feel, name, description)
 
 **Analysis**
-- `analyze_workout_execution` – planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina)
+- `get_activity_report` – one-call compact analysis: overview, plan vs execution (or intervals), second power meter check, climbs, data notes (3–4 API calls)
+- `analyze_workout_execution` – planned vs executed per step (duration, target adherence, time in range, HR response, fade, drift, stamina); accepts `planned_workout_doc` for deleted events, reports additional training after the plan separately and suggests matching events for unpaired activities (read-only)
 - `analyze_climbs` – climbs, descents and pauses from the streams with power, NP, HR, VAM, grade and custom streams per segment
 - `compare_power_streams` – sample-aligned comparison of two power meters (offset, bands, stable windows, drift, lag, best efforts)
 - `get_training_summary` – totals per week/month/sport/gear with separate load sources, time in zones, feel/RPE, custom field aggregates
 - `get_weekly_summary`, `get_plan_compliance` – quick weekly review and planned-vs-done overview
 - `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves`
+
+**Performance analytics**
+- `get_best_efforts` – best efforts of one activity per duration/distance with time windows
+- `compare_best_efforts` – best efforts across activities (ids, date range, sport, gear)
+- `find_similar_intervals` – activities with intervals of a given duration and intensity (optionally reps, target type, sport, gear, dates)
+- `get_activity_histogram` – power / HR / pace / GAP time distribution
+- `compare_workouts` – the same workout type over weeks (work intervals, NP, HR, Pw:HR, load)
+- `get_power_hr_efficiency` – W/bpm per power band over time
+- `get_fatigue_resistance` – fresh vs fatigued (after kJ) power curves
 
 **Wellness & recovery**
 - `get_wellness_data` – daily records; `include_all_fields=True` adds every custom wellness field with its name and units
@@ -155,13 +177,13 @@ All tools accept `athlete_id` / `api_key` overrides and most accept `output_form
 - `update_wellness`\* – subjective scores and comments
 
 **Athlete, thresholds, gear**
-- `get_athlete_profile`, `get_sport_settings`, `get_training_zones`
-- `get_gear_list`, `get_gear_details`
+- `get_athlete_profile`, `get_sport_settings`, `get_training_zones`, `update_sport_settings`\*\*\*
+- `get_gear_list`, `get_gear_details` (components, mileage, maintenance reminders)
 
 **Calendar & workouts**
-- `get_events`, `get_event_by_id` (with the full workout document), `add_or_update_event`\*, `add_or_update_note`\*, `add_events_bulk`\*\*\*, `delete_event`\*\*, `delete_events_by_date_range`\*\*
+- `get_events`, `get_event_by_id` (with the full workout document), `get_training_plan` (phases, weekly targets, races), `add_or_update_event`\*, `add_or_update_note`\*, `add_events_bulk`\*\*\*, `delete_event`\*\*, `delete_events_by_date_range`\*\*
 - `validate_workout`, `preview_workout` – check a workout document before writing it
-- `get_workout_library`, `create_library_workout`\*, `add_event_from_library`\*, `delete_library_workout`\*\*
+- `get_workout_library`, `get_library_workout`, `create_library_workout`\*, `add_event_from_library`\*, `delete_library_workout`\*\*
 
 **Custom items & server**
 - `get_custom_items`, `get_custom_item_by_id`, `create_custom_item`\*\*\*, `update_custom_item`\*\*\*, `delete_custom_item`\*\*
@@ -169,8 +191,14 @@ All tools accept `athlete_id` / `api_key` overrides and most accept `output_form
 
 \* write · \*\* destructive · \*\*\* admin
 
+Most tools accept `output_format="json"`; `get_activity_details`, `get_activity_intervals` and
+`get_recovery_snapshot` also take `detail_level="compact" | "standard" | "full"` for token-efficient answers.
+
 **Prompts** (reusable workflows for MCP clients that support them): `recovery_check`,
-`workout_analysis`, `weekly_planning`.
+`workout_deep_dive`, `weekly_training_review`, `performance_progression`,
+`long_ride_climbing_analysis`, `nutrition_weight_trend`, `power_meter_comparison`,
+`workout_planning_validation`. **Resources:** `intervals://guide` (how to use the tools),
+`intervals://custom-items` (the athlete's custom item definitions).
 
 ## Garmin Intervals Bridge
 

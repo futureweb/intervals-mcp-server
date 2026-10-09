@@ -173,13 +173,21 @@ def _subjective_line(entry: dict[str, Any]) -> str | None:
     return ", ".join(parts) + " (1-4 scales, 1 = best)" if parts else None
 
 
-def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs) -> str | None:
+SNAPSHOT_LEVELS = ("compact", "standard", "full")
+STANDARD_CUSTOM_LIMIT = 20
+
+
+def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs, limit: int | None = None) -> str | None:
     parts = [
         f"{definition['name']} {format_field_value(definition, entry[code])}"
         for code, definition in defs.items()
         if code in entry and not is_missing(entry[code])
     ]
-    return "; ".join(parts) if parts else None
+    if not parts:
+        return None
+    if limit is not None and len(parts) > limit:
+        return "; ".join(parts[:limit]) + f"; +{len(parts) - limit} more (detail_level=full)"
+    return "; ".join(parts)
 
 
 def _missing_line(entry: dict[str, Any]) -> str | None:
@@ -260,13 +268,14 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
 
 @tool("read")
-async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches
+async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches,too-many-return-statements
     date_str: str | None = None,
     days_back: int = 3,
     baseline_metrics: str = DEFAULT_BASELINE_METRICS,
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    detail_level: str = "standard",
 ) -> str:
     """Compact recovery / readiness context for a day in one call (read-only, no verdict)
 
@@ -289,10 +298,16 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        detail_level: "compact" (native values, fitness, baselines, activities, planned; no custom
+            field dump), "standard" (default, plus up to 20 custom wellness fields per day) or
+            "full" (every custom field). Device composite scores (readiness, Body Battery ...) are
+            derived values, not independent measurements.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
+    if detail_level not in SNAPSHOT_LEVELS:
+        return f"Error: detail_level must be one of {', '.join(SNAPSHOT_LEVELS)}."
     if not 0 <= days_back <= MAX_DAYS_BACK:
         return f"Error: days_back must be between 0 and {MAX_DAYS_BACK}."
     target = date_str or get_default_end_date()
@@ -347,7 +362,9 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         for extra in (_fitness_line(entry), _subjective_line(entry)):
             if extra:
                 lines.append("  " + extra)
-        custom = _custom_line(entry, input_defs)
+        custom = None if detail_level == "compact" else _custom_line(
+            entry, input_defs, None if detail_level == "full" else STANDARD_CUSTOM_LIMIT
+        )
         if custom:
             lines.append("  custom: " + custom)
         missing = _missing_line(entry)

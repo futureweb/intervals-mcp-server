@@ -12,6 +12,7 @@ from typing import Any, TypeVar, cast
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 
 from intervals_mcp_server.api.client import setup_api_client
+from intervals_mcp_server.auth import install_login_routes, oauth_from_env
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 
 # FastMCP passes explicit defaults (e.g. host="127.0.0.1", port=8000) to its
@@ -22,6 +23,7 @@ _ENV_STRING_SETTINGS = {
     "FASTMCP_LOG_LEVEL": "log_level",
     "FASTMCP_MOUNT_PATH": "mount_path",
     "FASTMCP_SSE_PATH": "sse_path",
+    "FASTMCP_MESSAGE_PATH": "message_path",
     "FASTMCP_STREAMABLE_HTTP_PATH": "streamable_http_path",
 }
 
@@ -53,9 +55,14 @@ def fastmcp_settings_from_env(environ: Mapping[str, str] | None = None) -> dict[
     return settings
 
 
+# Optional built-in OAuth 2.1 authorization server (MCP_AUTH=oauth), see auth.py.
+_oauth = oauth_from_env()
+
 mcp: FastMCP = FastMCP(  # pylint: disable=invalid-name
-    "intervals-icu", lifespan=setup_api_client, **fastmcp_settings_from_env()
+    "intervals-icu", lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
 )
+if _oauth:
+    install_login_routes(mcp, _oauth["auth_server_provider"])
 
 F = TypeVar("F", bound=Callable[..., Any])
 

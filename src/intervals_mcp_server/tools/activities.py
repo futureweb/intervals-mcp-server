@@ -12,6 +12,7 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import (
     resolve_gear_for_activities,
@@ -22,7 +23,9 @@ from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_STREAM,
     INTERVAL_FIELD,
     CustomFieldDefs,
+    assigned_codes,
     custom_fields_json,
+    format_custom_field_lines,
     is_missing,
 )
 from intervals_mcp_server.utils.sports import hms, start_times
@@ -65,6 +68,62 @@ ACTIVITY_LIST_FIELDS = (
 )
 SORT_KEYS = ("date_desc", "date_asc", "distance", "moving_time", "load")
 DETAIL_LEVELS = ("summary", "compact")
+DETAIL_LEVELS_3 = ("compact", "standard", "full")
+
+
+def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None) -> str:
+    """Token-efficient activity view: key numbers, thresholds, assigned custom fields, data quality."""
+    gear = activity.get("_resolved_gear_name") or (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("_resolved_gear_name")
+    lines = [
+        f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_start_times_short(activity)}",
+        f"Time {hms(activity.get('moving_time'))} moving / {hms(activity.get('elapsed_time'))} elapsed | "
+        f"{(activity.get('distance') or 0) / 1000:.1f} km | +{activity.get('total_elevation_gain') or 0:.0f} m"
+        + (f" | gear {gear}" if gear else ""),
+        f"Load {_n(activity.get('icu_training_load'))} (Intervals.icu; power {_n(activity.get('power_load'))} / HR {_n(activity.get('hr_load'))} / pace {_n(activity.get('pace_load'))}) | "
+        f"IF {_n(activity.get('icu_intensity'))}% | NP {_n(activity.get('icu_weighted_avg_watts'))} W | avg {_n(activity.get('icu_average_watts'))} W | "
+        f"HR avg {_n(activity.get('average_heartrate'))} max {_n(activity.get('max_heartrate'))} | cadence {_n(activity.get('average_cadence'))}",
+        f"Feel {activity.get('feel', 'n/a')}/5 | RPE {activity.get('icu_rpe', 'n/a')}/10 | compliance {activity.get('compliance', 'n/a')} | "
+        f"FTP used {activity.get('icu_ftp', 'n/a')} W, eFTP {activity.get('icu_rolling_ftp', 'n/a')} W, LTHR {activity.get('lthr', 'n/a')} | "
+        f"device {activity.get('device_name') or 'unknown'}, power meter {activity.get('power_meter') or 'unknown'}"
+        + (f", power fields {', '.join(str(p) for p in activity['power_field_names'])}" if activity.get("power_field_names") else ""),
+    ]
+    custom = format_custom_field_lines(activity, defs, prefix="", only=assigned)
+    if custom:
+        lines.append("Custom fields" + (" (assigned to this sport)" if assigned is not None else "") + ": " + "; ".join(custom[:14]) + (" ..." if len(custom) > 14 else ""))
+    quality = []
+    if activity.get("icu_intervals_edited"):
+        quality.append("intervals edited")
+    if activity.get("icu_sync_error"):
+        quality.append(f"sync error {activity['icu_sync_error']}")
+    streams = activity.get("stream_types")
+    if isinstance(streams, list):
+        quality.append(f"{len(streams)} streams ({sum(1 for s in streams if s in defs or s not in STANDARD_STREAM_NAMES)} custom)")
+    if activity.get("analyzed"):
+        quality.append(f"analysed {activity['analyzed']}")
+    if quality:
+        lines.append("Data: " + ", ".join(quality))
+    return "\n".join(lines)
+
+
+STANDARD_STREAM_NAMES = {
+    "time", "watts", "raw_watts", "fixed_watts", "secondary_power", "heartrate", "cadence", "distance", "altitude",
+    "fixed_altitude", "latlng", "velocity_smooth", "grade_smooth", "temp", "torque", "left_right_balance", "hrv",
+    "respiration", "left_pedal_smoothness", "right_pedal_smoothness", "left_torque_effectiveness",
+    "right_torque_effectiveness", "stance_time", "vertical_oscillation", "vertical_ratio", "step_length", "moving",
+}
+
+
+def _n(value: Any, digits: int = 0) -> str:
+    """Number for compact lines: rounded, 'n/a' when missing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value):
+        return "n/a"
+    return f"{value:.{digits}f}"
+
+
+def format_start_times_short(activity: dict[str, Any]) -> str:
+    """'2026-10-06 17:36 local' for compact views."""
+    local = str(activity.get("start_date_local") or "")[:16].replace("T", " ")
+    return f"{local} local" if local else "date unknown"
 
 
 def _json_safe(value: Any) -> Any:
@@ -184,6 +243,7 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
     offset: int,
     detail_level: str,
     output_format: str,
+    power_meter: str | None = None,
 ) -> str:
     """Filtered, sorted and paginated activity listing (compact / summary / json)."""
     if sort_by not in SORT_KEYS:
@@ -208,11 +268,15 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
         activities = [a for a in activities if str(a.get("type", "")).lower() in wanted]
     if gear_id:
         activities = [a for a in activities if _activity_gear_id(a) == str(gear_id)]
+    if power_meter:
+        needle = power_meter.strip().lower()
+        activities = [a for a in activities if needle in str(a.get("power_meter") or "").lower()]
     total = len(activities)
     page = _sort_activities(activities, sort_by)[offset : offset + limit]
     await resolve_gear_for_activities(page, athlete_id=athlete_id, api_key=api_key)
     filters = ", ".join(
-        f for f in (f"types {sport_types}" if sport_types else "", f"gear {gear_id}" if gear_id else "", f"sort {sort_by}") if f
+        f for f in (f"types {sport_types}" if sport_types else "", f"gear {gear_id}" if gear_id else "",
+                    f"power meter contains '{power_meter}'" if power_meter else "", f"sort {sort_by}") if f
     )
     next_offset = offset + limit if offset + limit < total else None
     if output_format == "json":
@@ -395,6 +459,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
     offset: int = 0,
     detail_level: str = "summary",
     output_format: str = "text",
+    power_meter: str | None = None,
 ) -> str:
     """Get a list of activities for an athlete from Intervals.icu
 
@@ -415,6 +480,8 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         offset: Number of matching activities to skip for pagination (optional, default 0)
         detail_level: "summary" (default, full text block per activity) or "compact" (one line each)
         output_format: "text" (default) or "json" (records with explicit units, local and UTC start)
+        power_meter: Only activities whose power meter name (from the device file) contains this
+            text, e.g. "Rally" or "Shimano"; activities without power meter data are excluded (optional)
     """
     # Resolve athlete ID and date parameters
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -423,10 +490,10 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
     start_date, end_date = resolve_date_params(start_date, end_date)
 
-    if any((sport_types, gear_id, sort_by != "date_desc", offset, detail_level != "summary", output_format != "text")):
+    if any((sport_types, gear_id, power_meter, sort_by != "date_desc", offset, detail_level != "summary", output_format != "text")):
         return await _list_activities_filtered(
             athlete_id_to_use, api_key, (start_date, end_date), limit, include_unnamed,
-            sport_types, gear_id, sort_by, offset, detail_level, output_format,
+            sport_types, gear_id, sort_by, offset, detail_level, output_format, power_meter,
         )
 
     # Fetch more activities if we need to filter out unnamed ones
@@ -475,12 +542,13 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
 
 @tool("read")
-async def get_activity_details(
+async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
     activity_id: str,
     api_key: str | None = None,
     include_custom_fields: bool = True,
     include_all_fields: bool = False,
     output_format: str = "text",
+    detail_level: str = "standard",
 ) -> str:
     """Get detailed information for a specific activity from Intervals.icu
 
@@ -502,7 +570,12 @@ async def get_activity_details(
             power meter details, available stream types (optional, default False)
         output_format: "text" (default) or "json" (raw activity, explicit start times, gear name,
             thresholds snapshot and every custom field with value/units/status)
+        detail_level: "compact" (key numbers, thresholds, custom fields assigned to the sport, data
+            quality; ~8 lines), "standard" (default, the full summary) or "full" (standard plus every
+            other payload field, same as include_all_fields=True)
     """
+    if detail_level not in DETAIL_LEVELS_3:
+        return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
     # Call the Intervals.icu API
     result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
 
@@ -525,10 +598,15 @@ async def get_activity_details(
     )
 
     custom_field_defs: CustomFieldDefs | None = None
+    assigned: set[str] | None = None
     if include_custom_fields:
         custom_field_defs = await _custom_defs(
             ACTIVITY_FIELD, api_key, activity_data.get("icu_athlete_id")
         )
+        field_ids = await assigned_field_ids(
+            str(activity_data.get("icu_athlete_id") or config.athlete_id or ""), api_key, activity_data.get("type")
+        )
+        assigned = assigned_codes(custom_field_defs, field_ids)
 
     if output_format.strip().lower() == "json":
         return json.dumps(
@@ -537,7 +615,8 @@ async def get_activity_details(
                     "activity": {k: v for k, v in activity_data.items() if k not in ("skyline_chart_bytes", "_resolved_gear_name")},
                     "times": start_times(activity_data),
                     "gear_name": activity_data.get("_resolved_gear_name"),
-                    "custom_fields": custom_fields_json(activity_data, custom_field_defs or {}),
+                    "custom_fields": custom_fields_json(activity_data, custom_field_defs or {}, assigned),
+                    "detail_level": detail_level,
                     "thresholds": {
                         k: activity_data.get(k)
                         for k in ("icu_ftp", "icu_rolling_ftp", "icu_pm_ftp", "icu_pm_cp", "icu_w_prime", "icu_pm_w_prime",
@@ -550,10 +629,13 @@ async def get_activity_details(
             ensure_ascii=False,
         )
 
+    if detail_level == "compact":
+        return _compact_details(activity_data, custom_field_defs or {}, assigned)
     return format_activity_details(
         activity_data,
         custom_field_defs=custom_field_defs,
-        include_all_fields=include_all_fields,
+        include_all_fields=include_all_fields or detail_level == "full",
+        assigned=assigned,
     )
 
 
@@ -574,13 +656,65 @@ def _interval_stream_metrics(
     return out
 
 
+def _compact_intervals(
+    result: dict[str, Any],
+    interval_defs: CustomFieldDefs,
+    streams: list[dict[str, Any]] | None,
+    stream_defs: CustomFieldDefs,
+) -> str:
+    """One line per interval and group with the key numbers and compact custom data."""
+    lines = [f"Intervals of {result.get('id')} (analysed {result.get('analyzed', 'n/a')}):"]
+    intervals = [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)]
+    for index, interval in enumerate(intervals, 1):
+        parts = [
+            f"[{index}] {interval.get('type', '?')}" + (f" '{interval['label']}'" if interval.get("label") else ""),
+            f"{hms(interval.get('elapsed_time'))} ({hms(interval.get('start_time'))}-{hms(interval.get('end_time'))}, idx {interval.get('start_index')}-{interval.get('end_index')})",
+        ]
+        if interval.get("average_watts") is not None:
+            parts.append(f"avg {interval['average_watts']} W NP {interval.get('weighted_average_watts', 'n/a')} max {interval.get('max_watts', 'n/a')}")
+        if interval.get("average_heartrate") is not None:
+            parts.append(f"HR {interval['average_heartrate']}/{interval.get('max_heartrate', 'n/a')}")
+        if interval.get("average_cadence") is not None:
+            parts.append(f"cad {interval['average_cadence']:.0f}")
+        if interval.get("average_speed"):
+            parts.append(f"{interval['average_speed'] * 3.6:.1f} km/h")
+        if interval.get("intensity") is not None:
+            parts.append(f"IF {interval['intensity']}%")
+        custom = format_custom_field_lines(interval, interval_defs, prefix="")
+        if custom:
+            parts.append("custom " + ", ".join(custom))
+        if streams:
+            metrics = _interval_stream_metrics(interval, streams, stream_defs)
+            compact = [
+                f"{t} {_fmt_short(m.get('first'))}→{_fmt_short(m.get('last'))} (min {_fmt_short(m.get('min'))})"
+                for t, m in metrics.items() if m.get("non_null")
+            ]
+            if compact:
+                parts.append("streams " + ", ".join(compact))
+        lines.append(" | ".join(parts))
+    for group in result.get("icu_groups") or []:
+        if isinstance(group, dict):
+            lines.append(
+                f"group {group.get('id')}: {group.get('count', '?')} intervals, {hms(group.get('elapsed_time'))}, "
+                f"avg {group.get('average_watts', 'n/a')} W, HR {group.get('average_heartrate', 'n/a')}"
+            )
+    return "\n".join(lines)
+
+
+def _fmt_short(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
+
+
 @tool("read")
-async def get_activity_intervals(
+async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches
     activity_id: str,
     api_key: str | None = None,
     stream_types: str | None = None,
     include_custom_fields: bool = True,
     output_format: str = "text",
+    detail_level: str = "standard",
 ) -> str:
     """Get interval data for a specific activity from Intervals.icu
 
@@ -607,7 +741,14 @@ async def get_activity_intervals(
         include_custom_fields: List custom interval fields per interval (optional, default True)
         output_format: "text" (default) or "json" (raw intervals and groups plus custom fields
             and per-interval stream statistics)
+        detail_level: "compact" (one line per interval with the key numbers; custom streams as
+            start→end), "standard" (default, the full block per interval) or "full" (standard plus
+            every custom stream when stream_types is not given)
     """
+    if detail_level not in DETAIL_LEVELS_3:
+        return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
+    if detail_level == "full" and not stream_types:
+        stream_types = "custom"
     # Call the Intervals.icu API
     result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
 
@@ -647,10 +788,14 @@ async def get_activity_intervals(
             note = f"\nNote: stream metrics unavailable. {error}\n"
             streams = None
         else:
-            if stream_types.strip().lower() == "custom":
+            selector = stream_types.strip().lower()
+            if selector == "custom":
                 streams = [
                     s for s in streams if s.get("custom") or s.get("type") == "secondary_power"
                 ]
+            elif selector != "all":
+                requested = set(_split_stream_types(stream_types)) | {"time"}
+                streams = [s for s in streams if s.get("type") in requested]
             stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key)
 
     if output_format.strip().lower() == "json":
@@ -670,6 +815,9 @@ async def get_activity_intervals(
             "note": note.strip() or None,
         }
         return json.dumps(_json_safe(payload), ensure_ascii=False)
+
+    if detail_level == "compact":
+        return _compact_intervals(result, interval_field_defs, streams, stream_defs) + note
 
     # Format the intervals data
     return (

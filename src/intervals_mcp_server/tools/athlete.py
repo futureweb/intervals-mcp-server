@@ -146,6 +146,21 @@ async def get_latest_eftp(athlete_id: str, api_key: str | None = None) -> dict[s
     return {}
 
 
+async def assigned_field_ids(athlete_id: str, api_key: str | None, activity_type: Any) -> list[Any] | None:
+    """Custom activity field ids configured for the sport setting that covers activity_type.
+
+    None when there is no such setting or it lists no fields (= no information).
+    """
+    if not athlete_id or not activity_type:
+        return None
+    settings = await get_sport_settings_raw(athlete_id, api_key)
+    for setting in _setting_for_sport(settings, str(activity_type)):
+        ids = setting.get("activity_field_ids")
+        if isinstance(ids, list) and ids:
+            return ids
+    return None
+
+
 def _setting_for_sport(
     settings: list[dict[str, Any]], sport_type: str | None
 ) -> list[dict[str, Any]]:
@@ -211,7 +226,7 @@ def _format_zone_rows(kind: str, rows: list[dict[str, Any]], setting: dict[str, 
     return lines
 
 
-def _format_setting(
+def _format_setting(  # pylint: disable=too-many-locals,too-many-branches
     setting: dict[str, Any], gear_map: dict[str, str], eftp: dict[str, Any], include_zones: bool
 ) -> str:
     """Readable block for one sport setting."""
@@ -490,3 +505,87 @@ async def get_training_zones(  # pylint: disable=too-many-arguments,too-many-pos
     if output_format.strip().lower() == "json":
         return json.dumps({"training_zones": payload}, ensure_ascii=False)
     return "\n".join(lines)
+
+
+_SETTING_LIMITS: dict[str, tuple[float, float, str]] = {
+    "ftp": (50, 600, "W"),
+    "indoor_ftp": (50, 600, "W"),
+    "lthr": (80, 220, "bpm"),
+    "max_hr": (100, 230, "bpm"),
+    "w_prime": (1000, 60000, "J"),
+    "p_max": (300, 2500, "W"),
+    "threshold_pace": (0.5, 10.0, "m/s"),
+}
+
+
+@tool("admin")
+async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-return-statements
+    sport_type: str,
+    ftp: int | None = None,
+    indoor_ftp: int | None = None,
+    lthr: int | None = None,
+    max_hr: int | None = None,
+    w_prime: int | None = None,
+    p_max: int | None = None,
+    threshold_pace: float | None = None,
+    athlete_id: str | None = None,
+    api_key: str | None = None,
+) -> str:
+    """ADMIN WRITE: change thresholds of the sport setting that covers a sport (FTP, LTHR, max HR ...)
+
+    Only the values passed are sent; zones are NOT recalculated (Intervals.icu keeps the
+    configured zone percentages/bpm, so check get_training_zones afterwards). Values are
+    sanity-checked (FTP 50-600 W, LTHR 80-220 and below max HR 100-230 bpm, W' 1000-60000 J,
+    Pmax 300-2500 W, threshold pace 0.5-10 m/s). Affects future analysis of every activity
+    of the sport group (e.g. Ride) and the training load of new activities. Use only on
+    explicit request of the athlete.
+
+    Args:
+        sport_type: Activity type whose sport setting is changed, e.g. "Ride" or "Run"
+        ftp: New FTP in watts (optional)
+        indoor_ftp: New indoor FTP in watts (optional)
+        lthr: New lactate threshold heart rate in bpm (optional)
+        max_hr: New maximum heart rate in bpm (optional)
+        w_prime: New W' in joules (optional)
+        p_max: New Pmax in watts (optional)
+        threshold_pace: New threshold pace in m/s (optional)
+        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+    """
+    athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+    if error_msg:
+        return error_msg
+    changes: dict[str, float] = {}
+    for name, value in (("ftp", ftp), ("indoor_ftp", indoor_ftp), ("lthr", lthr), ("max_hr", max_hr),
+                        ("w_prime", w_prime), ("p_max", p_max), ("threshold_pace", threshold_pace)):
+        if value is None:
+            continue
+        low, high, units = _SETTING_LIMITS[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+            return f"Error: {name} must be between {low:g} and {high:g} {units}."
+        changes[name] = value
+    if not changes:
+        return "Error: pass at least one value to change (ftp, indoor_ftp, lthr, max_hr, w_prime, p_max, threshold_pace)."
+    settings = await get_sport_settings_raw(athlete_id_to_use, api_key, refresh=True)
+    matching = _setting_for_sport(settings, sport_type)
+    if len(matching) != 1:
+        known = sorted({str(t) for s in settings for t in (s.get("types") or [])})
+        return f"Error: expected exactly one sport setting for '{sport_type}', found {len(matching)}. Known types: {', '.join(known)}."
+    setting = matching[0]
+    new_lthr = changes.get("lthr", setting.get("lthr"))
+    new_max = changes.get("max_hr", setting.get("max_hr"))
+    if new_lthr is not None and new_max is not None and new_lthr >= new_max:
+        return f"Error: LTHR ({new_lthr}) must be below max HR ({new_max})."
+    result = await api_client.make_intervals_request(
+        url=f"/athlete/{athlete_id_to_use}/sport-settings/{setting.get('id')}", api_key=api_key, method="PUT", data=changes
+    )
+    if isinstance(result, dict) and "error" in result:
+        return f"Error updating sport settings: {result.get('message', 'Unknown error')}"
+    _SPORT_SETTINGS_CACHE.pop(athlete_id_to_use, None)
+    echoed = {k: (result.get(k) if isinstance(result, dict) else None) for k in changes}
+    before = {k: setting.get(k) for k in changes}
+    return (
+        f"Updated sport setting {setting.get('id')} ({', '.join(str(t) for t in setting.get('types') or [])}): "
+        + "; ".join(f"{k} {before[k]} -> {echoed[k] if echoed[k] is not None else v}" for k, v in changes.items())
+        + ". Zones were not recalculated; verify them with get_training_zones."
+    )

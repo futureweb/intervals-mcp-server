@@ -37,7 +37,7 @@ decision), `REJECT`.
 | #149 | tags and sub_type in activity summary | ADOPT | – | merged | two lines, tests | yes | low |
 | #150 | large "coach athlete" feature (28 files, removes uv.lock) | DEFER | partially overlapping with our analysis tools | not merged | needs a separate architecture and security review; no description; deletes the lock file | yes | high |
 | #151 | subjective wellness `/4 (1 = best)` | ALREADY COVERED | #143 labels each field explicitly | not merged | #143 is the better fix for the same bug | yes | low |
-| #152 | OAuth resource server for remote use | DEFER | permission classes + reverse-proxy guidance | separate decision | OAuth alone does not separate tenants when one API key is used server-side; evaluate for a multi-user deployment | yes | medium |
+| #152 | OAuth resource server for remote use | PARTIAL | built-in single-user OAuth 2.1 authorization server (`auth.py`, `MCP_AUTH=oauth`) | idea adopted, implemented differently | #152 needs an external JWT issuer; ChatGPT needs dynamic client registration + PKCE, so the fork ships its own small authorization server with a login page; still single-user (one API key) | yes (ours) | low |
 | #153 | our custom fields / streams PR | – | this fork | – | – | yes | – |
 
 ## Summary

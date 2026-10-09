@@ -150,10 +150,13 @@ def test_custom_fields_json_statuses_and_sources():
     defs = index_custom_items(CUSTOM_ITEMS_DATA)[ACTIVITY_FIELD]
     rows = {row["code"]: row for row in custom_fields_json(ACTIVITY_WITH_CUSTOM_FIELDS, defs)}
     assert rows["EPOC"] == {
-        "code": "EPOC", "name": "EPOC", "value": 129.58348, "units": "ml/kg",
+        "code": "EPOC", "assigned_to_sport": None, "name": "EPOC", "value": 129.58348, "units": "ml/kg",
         "units_source": "definition", "label": None, "status": "value", "zero_ambiguous": False,
         "source": "fit:178", "item_type": "ACTIVITY_FIELD", "value_type": "numeric",
     }
+    assigned_rows = custom_fields_json(ACTIVITY_WITH_CUSTOM_FIELDS, defs, assigned={"EPOC"})
+    assert next(r for r in assigned_rows if r["code"] == "EPOC")["assigned_to_sport"] is True
+    assert next(r for r in assigned_rows if r["code"] == "AerobicEffect")["assigned_to_sport"] is False
     assert rows["TrainingEffectSelect"]["label"] == "Base"
     assert rows["TrainingEffectSelect"]["source"] == "manual/input"
     assert rows["FlightTime"]["status"] == "missing"

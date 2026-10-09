@@ -21,6 +21,7 @@ from intervals_mcp_server.utils.streams import find_stream, numeric_values, rang
 
 GAP_COST = 0.8
 TARGET_TOLERANCE_PCT = 5.0
+EXTENSION_MIN_SECS = 120  # additional training shorter than this is not reported separately
 REST_POWER_FRACTION = 0.65  # of FTP: planned steps at or below this are "rest"
 REST_PACE_FRACTION = 0.80  # of threshold speed
 REST_HR_FRACTION = 0.80  # of LTHR
@@ -152,7 +153,7 @@ def _target(kind: str, low: float | None, high: float | None, units: str) -> dic
     return {"kind": kind, "low": low, "high": high, "units": units, "source": "resolved from athlete thresholds"}
 
 
-def classify_step(step: dict[str, Any], target: dict[str, Any] | None, context: dict[str, Any]) -> str:
+def classify_step(step: dict[str, Any], target: dict[str, Any] | None, context: dict[str, Any]) -> str:  # pylint: disable=too-many-return-statements
     """'warmup', 'cooldown', 'rest' or 'work' for a planned step."""
     if step.get("warmup"):
         return "warmup"
@@ -398,6 +399,55 @@ def adherence(target: dict[str, Any] | None, metrics: dict[str, Any]) -> dict[st
 
 
 # ------------------------------------------------------------------------ analysis
+def _extension(
+    rows: list[dict[str, Any]], intervals: list[dict[str, Any]], streams: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Training done after the last planned step was completed (extra riding, extra efforts).
+
+    Trailing intervals without a planned counterpart are summarised as one block with
+    its own metrics so that they are reported separately and not as poor compliance.
+    """
+    matched = [r["interval_index"] for r in rows if r.get("planned") and r.get("metrics")]
+    if not matched:
+        return None
+    last_matched = max(i for i in matched if i is not None)
+    extra = [intervals[i] for i in range(last_matched + 1, len(intervals)) if isinstance(intervals[i], dict)]
+    if not extra:
+        return None
+    duration = sum(_num(i.get("elapsed_time")) or 0 for i in extra)
+    if duration < EXTENSION_MIN_SECS:
+        return None
+    starts: list[int] = [int(i["start_index"]) for i in extra if isinstance(i.get("start_index"), int)]
+    ends: list[int] = [int(i["end_index"]) for i in extra if isinstance(i.get("end_index"), int)]
+    block = {
+        "start_index": min(starts) if starts else None,
+        "end_index": max(ends) if ends else None,
+        "start_time": extra[0].get("start_time"),
+        "end_time": extra[-1].get("end_time"),
+        "elapsed_time": duration,
+        "average_watts": None,
+        "average_heartrate": None,
+    }
+    metrics = interval_metrics(block, streams, None)
+    hardest = max(extra, key=lambda i: _num(i.get("average_watts")) or _num(i.get("average_speed")) or 0)
+    return {
+        "intervals": len(extra),
+        "first_interval_index": last_matched + 1,
+        "duration_s": duration,
+        "start_time": block["start_time"],
+        "end_time": block["end_time"],
+        "metrics": metrics,
+        "hardest_interval": {
+            "label": hardest.get("label"),
+            "elapsed_time": hardest.get("elapsed_time"),
+            "average_watts": hardest.get("average_watts"),
+            "max_watts": hardest.get("max_watts"),
+            "average_heartrate": hardest.get("average_heartrate"),
+            "average_speed": hardest.get("average_speed"),
+        },
+    }
+
+
 def analyze(  # pylint: disable=too-many-locals
     planned: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
@@ -427,6 +477,11 @@ def analyze(  # pylint: disable=too-many-locals
     actual_total = sum(_num(i.get("elapsed_time")) or 0 for i in intervals)
     work_rows = [r for r in rows if r.get("planned") and r["planned"]["kind"] == "work" and r.get("metrics")]
     in_range = [r for r in work_rows if (r.get("adherence") or {}).get("status") == "in range"]
+    extension = _extension(rows, intervals, streams) if planned else None
+    if extension:
+        # Trailing extra intervals are reported as additional training, not as unmatched rows.
+        rows = [r for r in rows if not (r.get("planned") is None and (r.get("interval_index") or -1) >= extension["first_interval_index"])]
+    matched_actual = sum(_num(intervals[r["interval_index"]].get("elapsed_time")) or 0 for r in rows if r.get("planned") and r.get("metrics") and r.get("interval_index") is not None)
     summary = {
         "planned_steps": len(planned),
         "actual_intervals": len(intervals),
@@ -435,9 +490,12 @@ def analyze(  # pylint: disable=too-many-locals
         "unmatched_intervals": sum(1 for r in rows if not r.get("planned") and r.get("metrics")),
         "planned_total_s": planned_total or None,
         "actual_total_s": actual_total or None,
+        "plan_part_actual_s": matched_actual or None,
+        "extension_s": extension["duration_s"] if extension else 0,
+        "extended_beyond_plan": bool(extension),
         "work_steps_in_range": f"{len(in_range)}/{len(work_rows)}" if work_rows else None,
     }
-    return {"rows": rows, "summary": summary}
+    return {"rows": rows, "summary": summary, "extension": extension}
 
 
 # ------------------------------------------------------------------------ rendering
@@ -494,17 +552,22 @@ def _metric_lines(metrics: dict[str, Any], target: dict[str, Any] | None, pace_b
     return lines
 
 
-def format_execution(result: dict[str, Any], header: str, pace_based: bool = False) -> str:
+def format_execution(result: dict[str, Any], header: str, pace_based: bool = False) -> str:  # pylint: disable=too-many-branches
     """Readable report of an execution analysis."""
     summary = result["summary"]
     lines = [header, ""]
     if summary["planned_steps"]:
         lines.append(
             f"Plan: {summary['planned_steps']} steps, {hms(summary['planned_total_s'])} planned | "
-            f"Actual: {summary['actual_intervals']} intervals, {hms(summary['actual_total_s'])} | "
+            f"Actual: {summary['actual_intervals']} intervals, {hms(summary['actual_total_s'])} in total | "
             f"matched {summary['matched']}, planned without match {summary['unmatched_planned']}, "
-            f"extra intervals {summary['unmatched_intervals']} | work steps in target: {summary['work_steps_in_range'] or 'n/a'}"
+            f"extra intervals inside the plan {summary['unmatched_intervals']} | work steps in target: {summary['work_steps_in_range'] or 'n/a'}"
         )
+        if summary.get("extended_beyond_plan"):
+            lines.append(
+                f"The activity was extended beyond the plan: plan part {hms(summary.get('plan_part_actual_s'))}, "
+                f"additional training {hms(summary['extension_s'])} (reported separately below, not counted against the plan)."
+            )
     else:
         lines.append(f"No planned workout: {summary['actual_intervals']} intervals, {hms(summary['actual_total_s'])} in total")
     lines.append("")
@@ -529,4 +592,20 @@ def format_execution(result: dict[str, Any], header: str, pace_based: bool = Fal
             lines.extend(_metric_lines(metrics, step["target"] if step else None, pace_based))
         else:
             lines.append(f"{head} -> not executed / no matching interval")
+    extension = result.get("extension")
+    if extension:
+        lines.append("")
+        lines.append(
+            f"Additional training after the plan: {hms(extension['duration_s'])} from {hms(extension.get('start_time'))} "
+            f"to {hms(extension.get('end_time'))} ({extension['intervals']} interval(s))"
+        )
+        lines.extend(_metric_lines(extension["metrics"], None, pace_based))
+        hardest = extension.get("hardest_interval") or {}
+        if hardest.get("elapsed_time"):
+            lines.append(
+                f"    hardest part: {hms(hardest['elapsed_time'])} at avg {_fmt(hardest.get('average_watts'))} W "
+                f"(max {_fmt(hardest.get('max_watts'))} W), HR {_fmt(hardest.get('average_heartrate'))} bpm"
+                if hardest.get("average_watts") is not None
+                else f"    hardest part: {hms(hardest['elapsed_time'])} at {format_pace(hardest.get('average_speed'))}"
+            )
     return "\n".join(lines)

@@ -1,5 +1,11 @@
 name: Release
 
+# Triggered by version tags. Tag format (PEP 440, prefixed with v):
+#   v1.0.0        final release   -> GitHub release, GHCR tags 1.0.0, 1.0 and latest
+#   v1.0.0b1      beta            -> GitHub PRE-release, GHCR tag 1.0.0b1 only
+#   v1.0.0rc1     release cand.   -> GitHub PRE-release, GHCR tag 1.0.0rc1 only
+# The tag must match the version in pyproject.toml. All CI checks (tests on
+# 3.12/3.13, build, Docker smoke test) must pass before anything is published.
 on:
   push:
     tags: ["v*"]
@@ -12,147 +18,116 @@ env:
 
 jobs:
   checks:
-    name: Checks
+    name: Checks, build and Docker smoke test
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
 
-  build:
-    name: Build sdist and wheel
+  version:
+    name: Validate tag and classify release
     needs: checks
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.classify.outputs.version }}
+      prerelease: ${{ steps.classify.outputs.prerelease }}
+      docker_tags: ${{ steps.classify.outputs.docker_tags }}
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: uv.lock
 
-      - name: Check that the tag matches the project version
+      - name: Classify the tag (PEP 440) and compare with pyproject.toml
+        id: classify
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          project_version="$(uv version --short)"
-          echo "tag: ${tag_version}  pyproject.toml: ${project_version}"
-          if [ "${tag_version}" != "${project_version}" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match version ${project_version} in pyproject.toml"
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::Tag ${tag} is not a supported version (vX.Y.Z, vX.Y.ZaN, vX.Y.ZbN or vX.Y.ZrcN)"
             exit 1
           fi
-
-      - name: Build sdist and wheel
-        run: uv build
-
-      - name: Check the built distributions
-        run: |
-          ls -l dist/
-          uv run --locked --with twine twine check dist/*
-
-      - name: Install the wheel into a clean environment and import the server
-        # Guards against an sdist/wheel that is missing modules (e.g. a wrong
-        # hatch `include` list): the published package must be importable.
-        run: |
-          uv run --no-project --isolated --python 3.12 --with dist/*.whl \
-            python -c "import intervals_mcp_server.server; print('wheel import ok')"
-
-      - name: Upload distributions
-        uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
+          project_version="$(uv version --short)"
+          if [ "${version}" != "${project_version}" ]; then
+            echo "::error::Tag ${tag} does not match version ${project_version} in pyproject.toml"
+            exit 1
+          fi
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            prerelease=false
+            major_minor="${version%.*}"
+            docker_tags="${IMAGE_NAME}:${version},${IMAGE_NAME}:${major_minor},${IMAGE_NAME}:latest"
+          else
+            prerelease=true
+            docker_tags="${IMAGE_NAME}:${version}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "docker_tags=${docker_tags}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}, prerelease ${prerelease}, docker tags ${docker_tags}"
 
   github-release:
     name: GitHub release
-    needs: build
+    needs: version
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v8
+      - name: Download distributions (built by the CI workflow)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          # Tags such as v1.2.0-rc1 are published as pre-releases.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
           files: dist/*
           fail_on_unmatched_files: true
 
   docker:
     name: Docker image (GHCR)
-    needs: build
+    needs: version
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU (arm64 build)
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-          labels: |
-            org.opencontainers.image.title=intervals-mcp-server
-            org.opencontainers.image.description=Model Context Protocol server for Intervals.icu
-            org.opencontainers.image.licenses=GPL-3.0-only
-
-      - name: Build image for smoke test (amd64, not pushed)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          tags: ${{ env.IMAGE_NAME }}:smoke
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Smoke test the image
-        env:
-          # Placeholder values for the import check only; no real credentials.
-          API_KEY: test
-          ATHLETE_ID: i1
-        run: |
-          docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:smoke" \
-            python -c "import intervals_mcp_server.server; print('import ok')"
-          test "$(docker run --rm "${IMAGE_NAME}:smoke" id -u)" != "0"
-
       - name: Build and push (amd64, arm64)
-        uses: docker/build-push-action@v7
+        # Tags are computed explicitly from the PEP 440 version (docker/metadata-action's
+        # semver parser does not understand 1.0.0b1); `latest` only for final releases.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ needs.version.outputs.docker_tags }}
+          labels: |
+            org.opencontainers.image.title=futureweb-intervals-mcp
+            org.opencontainers.image.description=Advanced Intervals.icu MCP server with Garmin-enriched metrics
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/futureweb/intervals-mcp-server
+            org.opencontainers.image.licenses=GPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -164,11 +139,10 @@ jobs:
     #      and environment "pypi" (https://docs.pypi.org/trusted-publishers/).
     #   2. In this repository create the GitHub environment "pypi" (Settings ->
     #      Environments), ideally with required reviewers.
-    #   3. Replace the `if: false` below with `if: ${{ !contains(github.ref_name, '-') }}`
-    #      (or remove the line). No API token or secret is needed: the job
-    #      authenticates with its OIDC token (permissions: id-token: write).
+    #   3. Replace the `if: false` below with `if: ${{ needs.version.outputs.prerelease == 'false' }}`
+    #      (pre-releases can be published too; PyPI marks them as such automatically).
     if: false
-    needs: [build, github-release]
+    needs: [version, github-release]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -177,12 +151,12 @@ jobs:
       id-token: write
     steps:
       - name: Download distributions
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
 
       - name: Publish to PyPI (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/

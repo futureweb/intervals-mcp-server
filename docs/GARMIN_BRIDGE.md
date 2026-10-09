@@ -164,6 +164,20 @@ Trends report rolling means, baselines, outliers and week-over-week changes; cor
 labelled as statistical associations, never as causes. The MCP does not compute a readiness
 verdict: the interpretation stays with the coach.
 
+## Reading the device metrics correctly
+
+- **Stamina vs potential stamina.** Stamina drops quickly during hard efforts and recovers
+  during easier riding; potential stamina is the longer-term reserve. Report both per interval
+  (`get_activity_intervals(stream_types="Stamina,PotentialStamina")`), never treat a dip as a verdict.
+- **Sport assignment.** Intervals.icu assigns custom fields to sports (sport settings). Fields
+  not assigned to the activity's sport (e.g. running metrics on a ride, or a *Run Effectiveness*
+  stream on a ride) are listed separately and excluded from coaching summaries.
+- **Gear streams.** `FrontGear`/`RearGear` and the `*Index` streams come from shift events; whether a
+  value is a tooth count or a gear index depends on the head-unit configuration, so the units of
+  your definitions are shown as stored and nothing is converted.
+- **Loads.** Garmin training load / EPOC and the Intervals.icu load (TSS-like) are different models
+  and are always printed apart.
+
 ## Without the bridge
 
 Everything above still works with the standard Intervals.icu data: the custom sections are

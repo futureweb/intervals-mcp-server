@@ -269,7 +269,26 @@ async def get_gear_details(  # pylint: disable=too-many-locals,too-many-branches
             lines.append("- Auto-assignment filters: " + "; ".join(parts))
     reminders = item.get("reminders")
     if isinstance(reminders, list) and reminders:
-        lines.append(f"- Reminders: {len(reminders)}")
+        lines.append(f"- Maintenance reminders ({len(reminders)}):")
+        for rem in reminders:
+            if not isinstance(rem, dict):
+                continue
+            targets = []
+            if rem.get("distance"):
+                targets.append(f"{(rem.get('distance_used') or 0) / 1000:.0f}/{rem['distance'] / 1000:.0f} km")
+            if rem.get("time"):
+                targets.append(f"{(rem.get('time_used') or 0) / 3600:.0f}/{rem['time'] / 3600:.0f} h")
+            if rem.get("activities"):
+                targets.append(f"{rem.get('activities_used') or 0}/{rem['activities']} activities")
+            if rem.get("days"):
+                targets.append(f"{rem.get('days_used') or 0}/{rem['days']} days")
+            used = rem.get("percent_used")
+            lines.append(
+                f"  - {rem.get('name', 'reminder')}: " + (", ".join(targets) or "no target")
+                + (f" ({used:.0f}% used)" if isinstance(used, (int, float)) else "")
+                + (f", last reset {rem['last_reset']}" if rem.get("last_reset") else "")
+                + (f", snoozed until {rem['snoozed_until']}" if rem.get("snoozed_until") else "")
+            )
     component_ids = item.get("component_ids") or []
     if component_ids:
         lines.append(f"- Components ({len(component_ids)}):")

@@ -9,6 +9,26 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (phase 2: analytics, hardening)
+- `get_activity_report`: one-call compact analysis (overview, plan vs execution, power meter
+  check, climbs, data-quality notes).
+- `analyze_workout_execution`: `planned_workout_doc` for deleted events, detection of training
+  beyond the plan (reported as additional training, not as poor compliance), read-only match
+  suggestions for unpaired activities.
+- Performance analytics: `get_best_efforts`, `compare_best_efforts`, `find_similar_intervals`,
+  `get_activity_histogram`, `compare_workouts`, `get_power_hr_efficiency`, `get_fatigue_resistance`.
+- `get_training_plan` (ATP phases, weekly targets, races, fitness-model events),
+  `get_library_workout`, `update_sport_settings` (admin), gear maintenance reminders,
+  `get_activities(power_meter=...)`.
+- `detail_level` (compact / standard / full) for activity details, intervals and the recovery
+  snapshot; custom fields are separated into "assigned to this sport" (from the sport settings)
+  and others; interval stream statistics limited to the requested streams.
+- Remote hardening: `FASTMCP_MESSAGE_PATH`, secret-path deployment guide, built-in single-user
+  OAuth 2.1 authorization server (`MCP_AUTH=oauth`) for ChatGPT/Claude, `docs/REMOTE_ACCESS.md`.
+- Eight coaching prompts and two MCP resources.
+- CI: actions pinned to commit SHAs, build and Docker smoke jobs on every PR, PEP 440 pre-release
+  detection and explicit GHCR tags in the release workflow.
+
 ### Added
 - Custom activity fields, custom interval fields and every custom stream (e.g. the metrics the
   Garmin Intervals Bridge restores) with names, codes, values and units in

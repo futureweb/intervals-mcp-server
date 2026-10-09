@@ -182,7 +182,9 @@ def field_source(definition: dict[str, Any]) -> str:
     return "manual/input"
 
 
-def custom_fields_json(payload: dict[str, Any], defs: CustomFieldDefs) -> list[dict[str, Any]]:
+def custom_fields_json(
+    payload: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Machine-readable view of every defined custom field for a payload.
 
     Each entry carries code, name, value (null for missing/absent), units, select label,
@@ -196,6 +198,7 @@ def custom_fields_json(payload: dict[str, Any], defs: CustomFieldDefs) -> list[d
         rows.append(
             {
                 "code": code,
+                "assigned_to_sport": None if assigned is None else code in assigned,
                 "name": definition.get("name"),
                 "value": None if status in ("absent", "missing") else value,
                 "units": definition.get("units"),
@@ -228,34 +231,66 @@ def apply_units_overrides(index: CustomItemIndex, overrides: dict[str, str]) -> 
     return index
 
 
+def assigned_codes(defs: CustomFieldDefs, field_ids: Any) -> set[str] | None:
+    """Codes of the definitions whose item id is listed in a sport setting's activity_field_ids.
+
+    Returns None when the setting lists no fields (unknown / no restriction), so callers can
+    tell "not assigned" from "no information".
+    """
+    if not isinstance(field_ids, list) or not field_ids:
+        return None
+    ids = {str(i) for i in field_ids}
+    return {code for code, definition in defs.items() if str(definition.get("id")) in ids}
+
+
 def format_custom_field_lines(
-    payload: dict[str, Any], defs: CustomFieldDefs, prefix: str = "- "
+    payload: dict[str, Any], defs: CustomFieldDefs, prefix: str = "- ", only: set[str] | None = None
 ) -> list[str]:
-    """One line per custom field present on the payload, in definition order."""
+    """One line per custom field present on the payload, in definition order.
+
+    ``only`` restricts the output to the given codes (e.g. the fields assigned to the sport).
+    """
     lines: list[str] = []
     for code, definition in defs.items():
-        if code not in payload:
+        if code not in payload or (only is not None and code not in only):
             continue
         rendered = format_field_value(definition, payload[code])
         lines.append(f"{prefix}{definition['name']} [{code}]: {rendered}")
     return lines
 
 
-def format_custom_activity_fields(activity: dict[str, Any], defs: CustomFieldDefs) -> str:
-    """Render the 'Custom Activity Fields' section of an activity."""
+def format_custom_activity_fields(
+    activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None = None
+) -> str:
+    """Render the 'Custom Activity Fields' section of an activity.
+
+    When ``assigned`` (the codes configured for the activity's sport in Intervals.icu) is
+    known, fields outside that set are listed separately so that e.g. running metrics on a
+    ride are not mistaken for sport-relevant values.
+    """
     lines = ["Custom Activity Fields:"]
     if not defs:
         lines.append("- (no custom activity field definitions found for this athlete)")
         return "\n".join(lines)
 
-    field_lines = format_custom_field_lines(activity, defs)
-    if not field_lines:
+    field_lines = format_custom_field_lines(activity, defs, only=assigned)
+    other_lines = format_custom_field_lines(activity, defs) if assigned is None else [
+        line for line in format_custom_field_lines(activity, defs, prefix="") if line.split(" [")[0] not in {
+            definition["name"] for code, definition in defs.items() if code in assigned
+        }
+    ]
+    if not field_lines and not other_lines:
         lines.append(
             f"- (none of the {len(defs)} defined custom activity fields is present on this activity)"
         )
         return "\n".join(lines)
 
     lines.extend(field_lines)
+    if assigned is not None and other_lines:
+        lines.append(
+            "Not assigned to this sport in the Intervals.icu settings (values as stored, treat with care): "
+            + "; ".join(other_lines)
+        )
     absent = sorted(code for code in defs if code not in activity)
     if absent:
         lines.append(f"Defined but not present on this activity: {', '.join(absent)}")

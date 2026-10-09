@@ -87,6 +87,7 @@ from intervals_mcp_server.tools.activities import (  # pylint: disable=wrong-imp
     update_activity,
 )
 from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_training_plan,
     add_events_bulk,
     add_or_update_event,
     delete_event,
@@ -96,6 +97,7 @@ from intervals_mcp_server.tools.events import (  # pylint: disable=wrong-import-
 )
 from intervals_mcp_server.tools.gear import get_gear_list  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.workout_library import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_library_workout,
     add_event_from_library,
     delete_library_workout,
     create_library_workout,
@@ -116,6 +118,7 @@ from intervals_mcp_server.tools.custom_items import (  # pylint: disable=wrong-i
     update_custom_item,
 )
 from intervals_mcp_server.tools.athlete import (  # pylint: disable=wrong-import-position  # noqa: E402
+    update_sport_settings,
     get_athlete_profile,
     get_sport_settings,
     get_training_zones,
@@ -126,6 +129,16 @@ from intervals_mcp_server.tools.analysis import (  # pylint: disable=wrong-impor
     compare_power_streams,
 )
 from intervals_mcp_server.tools.climbs import analyze_climbs  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.report import get_activity_report  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.performance import (  # pylint: disable=wrong-import-position  # noqa: E402
+    compare_best_efforts,
+    compare_workouts,
+    find_similar_intervals,
+    get_activity_histogram,
+    get_best_efforts,
+    get_fatigue_resistance,
+    get_power_hr_efficiency,
+)
 from intervals_mcp_server.tools.wellness_insights import (  # pylint: disable=wrong-import-position  # noqa: E402
     get_nutrition_summary,
     get_recovery_snapshot,
@@ -181,9 +194,20 @@ __all__ = [
     "get_athlete_profile",
     "get_sport_settings",
     "get_training_zones",
+    "get_library_workout",
+    "get_training_plan",
+    "update_sport_settings",
     "get_gear_details",
     "analyze_workout_execution",
     "analyze_climbs",
+    "get_activity_report",
+    "compare_best_efforts",
+    "compare_workouts",
+    "find_similar_intervals",
+    "get_activity_histogram",
+    "get_best_efforts",
+    "get_fatigue_resistance",
+    "get_power_hr_efficiency",
     "compare_power_streams",
     "get_nutrition_summary",
     "get_recovery_snapshot",

@@ -19,6 +19,7 @@ env:
   # Tests only use these placeholder values; no real credentials are required.
   API_KEY: test
   ATHLETE_ID: i1
+  IMAGE_NAME: ghcr.io/futureweb/intervals-mcp-server
 
 jobs:
   checks:
@@ -30,10 +31,10 @@ jobs:
         python-version: ["3.12", "3.13"]
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -51,6 +52,72 @@ jobs:
       - name: Test (pytest)
         run: uv run --locked pytest -q
 
+  build:
+    name: Build sdist and wheel
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check the built distributions
+        run: |
+          ls -l dist/
+          uv run --locked --with twine twine check dist/*
+
+      - name: Install the wheel into a clean environment and run the CLI
+        # Guards against an sdist/wheel that is missing modules: the published
+        # package must be importable and the console script must work.
+        run: |
+          uv run --no-project --isolated --python 3.12 --with dist/*.whl \
+            python -c "import intervals_mcp_server.server as s; print('wheel import ok, tools:', len(s.__all__))"
+          uv run --no-project --isolated --python 3.12 --with dist/*.whl futureweb-intervals-mcp --version
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  docker:
+    name: Docker image (build and smoke test, not pushed)
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image (amd64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" \
+            python -c "import intervals_mcp_server.server; print('import ok')"
+          docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" python src/intervals_mcp_server/server.py --version
+          test "$(docker run --rm "${IMAGE_NAME}:ci" id -u)" != "0"
+
   pylint:
     # Informational only: pylint has a few pre-existing messages that are not
     # gates. The job is reported but never fails the workflow.
@@ -59,10 +126,10 @@ jobs:
     continue-on-error: true
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true

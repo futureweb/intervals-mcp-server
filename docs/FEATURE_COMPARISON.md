@@ -8,7 +8,7 @@ Date: 2026-10-09
 `mvilanova/intervals-mcp-server`. Positioning: Garmin-enriched metrics, full custom streams, recovery insights
 and endurance performance analysis for practical coaching, not full API coverage.
 
-Inventory of our tools at the time of the audit (36; the release adds `analyze_workout_execution`, `analyze_climbs`, `compare_power_streams`, `get_recovery_snapshot`, `get_wellness_trends`, `get_nutrition_summary`, `get_training_summary`, `validate_workout`, `preview_workout`, `get_server_status` = 46 tools, three prompts and the permission classes described in the README):
+Inventory of our tools at the time of the audit (36; the release adds the analysis, wellness, summary, validation, status, performance, ATP and report tools = 56 tools, eight prompts, two resources and the permission classes described in the README):
 
 | Module | Tools |
 |---|---|

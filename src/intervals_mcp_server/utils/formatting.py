@@ -292,6 +292,7 @@ def format_activity_details(
     activity: dict[str, Any],
     custom_field_defs: CustomFieldDefs | None = None,
     include_all_fields: bool = False,
+    assigned: set[str] | None = None,
 ) -> str:
     """Detailed activity view: summary, zones, custom fields and optionally every other field.
 
@@ -308,7 +309,7 @@ def format_activity_details(
     if dynamics:
         view += "\nRunning Dynamics:\n" + dynamics + "\n"
     if custom_field_defs is not None:
-        view += "\n" + format_custom_activity_fields(data, custom_field_defs) + "\n"
+        view += "\n" + format_custom_activity_fields(data, custom_field_defs, assigned) + "\n"
     if isinstance(data, _KeyTracker):
         other = _format_activity_other_fields(data)
         if other:

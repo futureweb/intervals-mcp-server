@@ -6,7 +6,9 @@ All tools are read-only; they combine the activity, its intervals, its streams a
 paired) the planned workout, and compute statistics from recorded samples only.
 """
 
+import difflib
 import json
+from datetime import date, timedelta
 from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
@@ -24,7 +26,7 @@ from intervals_mcp_server.utils.power_compare import (
     comparison_to_json,
     format_power_comparison,
 )
-from intervals_mcp_server.utils.sports import format_start_times, start_times
+from intervals_mcp_server.utils.sports import format_start_times, hms, start_times
 from intervals_mcp_server.utils.streams import find_stream
 
 # Import mcp instance from shared module for tool registration
@@ -173,6 +175,58 @@ async def _get_event(athlete_id: str, event_id: Any, api_key: str | None) -> dic
     return result if isinstance(result, dict) and "error" not in result else None
 
 
+async def _match_candidates(  # pylint: disable=too-many-locals
+    athlete_id: str, activity: dict[str, Any], api_key: str | None
+) -> list[dict[str, Any]]:
+    """Read-only suggestion of planned workouts that could belong to an unpaired activity.
+
+    Looks at WORKOUT events on the activity's day and the day before/after and scores them
+    by sport, planned vs actual moving time and name similarity. Nothing is paired or changed.
+    """
+    day = str(activity.get("start_date_local", ""))[:10]
+    try:
+        start = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        end = (date.fromisoformat(day) + timedelta(days=1)).isoformat()
+    except ValueError:
+        return []
+    result = await make_intervals_request(
+        url=f"/athlete/{athlete_id}/events", api_key=api_key,
+        params={"oldest": start, "newest": end, "category": "WORKOUT"},
+    )
+    if not isinstance(result, list):
+        return []
+    actual = activity.get("moving_time") or activity.get("elapsed_time") or 0
+    name = str(activity.get("name") or "").lower()
+    candidates: list[dict[str, Any]] = []
+    for event in result:
+        if not isinstance(event, dict):
+            continue
+        score = 0.0
+        reasons = []
+        if str(event.get("type")) == str(activity.get("type")):
+            score += 0.4
+            reasons.append("same sport")
+        planned = event.get("moving_time") or 0
+        if planned and actual:
+            ratio = min(planned, actual) / max(planned, actual)
+            score += 0.4 * ratio
+            reasons.append(f"duration {hms(planned)} planned vs {hms(actual)} actual")
+        similarity = difflib.SequenceMatcher(None, name, str(event.get("name") or "").lower()).ratio()
+        score += 0.2 * similarity
+        if similarity > 0.5:
+            reasons.append(f"name similarity {similarity:.0%}")
+        if str(event.get("start_date_local", ""))[:10] != day:
+            score -= 0.2
+            reasons.append("different day")
+        if event.get("paired_activity_id"):
+            reasons.append(f"already paired with {event['paired_activity_id']}")
+            score -= 0.3
+        candidates.append({"event_id": event.get("id"), "name": event.get("name"), "date": str(event.get("start_date_local", ""))[:10],
+                           "type": event.get("type"), "moving_time": planned, "score": round(score, 2), "reasons": reasons})
+    candidates.sort(key=lambda c: float(c["score"]), reverse=True)
+    return candidates[:3]
+
+
 def _stream_types_for_execution(activity: dict[str, Any], stream_defs: dict[str, Any]) -> list[str]:
     available = [str(t) for t in (activity.get("stream_types") or [])]
     wanted = [t for t in CORE_STREAMS if t in available or t == "time"]
@@ -181,31 +235,40 @@ def _stream_types_for_execution(activity: dict[str, Any], stream_defs: dict[str,
 
 
 @tool("read")
-async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many-branches
+async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
     activity_id: str,
     api_key: str | None = None,
     event_id: str | None = None,
+    planned_workout_doc: dict[str, Any] | None = None,
+    suggest_matches: bool = True,
     output_format: str = "text",
 ) -> str:
     """Compare a planned workout with how it was actually executed (or analyse the intervals alone)
 
-    Uses the planned workout paired with the activity (or the given event_id) and the
-    intervals Intervals.icu detected. Planned steps (repeats expanded) are aligned with the
-    actual intervals in order; for each step it reports planned vs actual duration, the
-    target range (resolved to W, bpm or pace from the thresholds stored with the activity),
-    the actual average, below/in/above target and the time within the target range (±5%),
-    HR start/end and the HR drop in the first minute of the following interval, cadence,
-    power/speed fade (second half vs first half), Pw:HR drift for steady efforts of 10 min
-    or more, and the change of every custom stream (e.g. stamina) during the step. Without
-    a plan the same metrics are reported per detected interval. Intervals.icu's own
-    compliance value, RPE/feel and the device metrics stored as custom fields (training
-    effect, performance condition ...) are included. No interpretation is made.
+    Uses, in this order, the given planned_workout_doc, the given event_id, or the event
+    paired with the activity, together with the intervals Intervals.icu detected. Planned
+    steps (repeats expanded) are aligned with the actual intervals by order, duration and
+    target; for each step it reports planned vs actual duration, the target range (resolved
+    to W, bpm or pace from the thresholds stored with the activity), the actual average,
+    below/in/above target and the time within the target range (±5%), HR start/end and the
+    HR drop in the first minute of the following interval, cadence, power/speed fade,
+    Pw:HR drift for steady efforts of 10 min or more, and the change of every custom stream
+    (e.g. stamina) during the step. Training done after the last planned step (a longer
+    ride home, an extra effort) is reported as additional training with its own metrics
+    and is not counted against the plan. Without a plan the same metrics are reported per
+    detected interval; for an unpaired activity up to three planned workouts of the same
+    days are suggested as possible matches (read-only, nothing is paired or changed). The
+    content of a deleted event is never reconstructed; pass planned_workout_doc instead.
 
     Args:
         activity_id: The Intervals.icu activity ID
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         event_id: Planned workout (event) to compare against (optional; default: the event
             paired with the activity, if any)
+        planned_workout_doc: Workout document with "steps" (same format as add_or_update_event)
+            to compare against, e.g. when the calendar event no longer exists (optional)
+        suggest_matches: For unpaired activities without a plan, list candidate events of the
+            same days as a read-only suggestion (optional, default True)
         output_format: "text" (default) or "json"
     """
     activity, error = await _get_activity(activity_id, api_key)
@@ -222,23 +285,39 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     streams, _ = await _get_streams(activity_id, api_key, _stream_types_for_execution(activity, stream_defs))
 
     event: dict[str, Any] | None = None
+    steps: Any = None
+    plan_source = ""
+    if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
+        steps = planned_workout_doc["steps"]
+        plan_source = "workout document provided by the caller"
     paired = event_id or activity.get("paired_event_id")
-    if paired and athlete_id:
+    if steps is None and paired and athlete_id:
         event = await _get_event(athlete_id, paired, api_key)
-    steps = (event or {}).get("workout_doc", {}).get("steps") if event else None
+        steps = (event or {}).get("workout_doc", {}).get("steps") if event else None
+        if event:
+            plan_source = f"event {event.get('id')} ('{event.get('name')}', {str(event.get('start_date_local', ''))[:10]})"
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
+    candidates: list[dict[str, Any]] = []
+    if not planned and not paired and suggest_matches and athlete_id:
+        candidates = await _match_candidates(athlete_id, activity, api_key)
 
     result = analyze(planned, intervals, streams)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
     device_lines = format_custom_field_lines(activity, field_defs, prefix="")
     header = f"Workout execution for {_activity_header(activity)}"
-    if event:
-        header += f"\nPlanned workout: {event.get('name')} (event {event.get('id')}, {event.get('start_date_local', '')[:10]})"
+    if planned:
+        header += f"\nPlan source: {plan_source}"
     elif paired:
         header += f"\nPlanned workout {paired} could not be loaded; analysing intervals only."
     else:
-        header += "\nNo planned workout paired with this activity; analysing intervals only."
+        header += "\nNo planned workout paired with this activity (paired_event_id is empty); analysing intervals only."
+        if candidates:
+            header += "\nPossible planned workouts (read-only suggestion, nothing was paired):"
+            for cand in candidates:
+                header += f"\n  - event {cand['event_id']} '{cand['name']}' {cand['date']} {cand['type']} {hms(cand['moving_time'])}, score {cand['score']} ({'; '.join(cand['reasons'])})"
+        elif suggest_matches:
+            header += "\nNo planned workouts found on the activity's day or the days around it."
     extras = []
     if activity.get("compliance") is not None:
         extras.append(f"Intervals.icu compliance {activity['compliance']:.0f}%")
@@ -262,10 +341,13 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
                 "training_load": activity.get("icu_training_load"),
             },
             "event": {"id": event.get("id"), "name": event.get("name"), "start_date_local": event.get("start_date_local")} if event else None,
+            "plan_source": plan_source or None,
+            "match_candidates": candidates,
             "thresholds": _threshold_context(activity),
             "custom_fields": [row for row in custom_fields_json(activity, field_defs) if row["status"] in ("value", "zero")],
             "summary": result["summary"],
             "rows": result["rows"],
+            "extension": result.get("extension"),
         }
         return json.dumps(payload, ensure_ascii=False)
     return format_execution(result, header, pace_based)
