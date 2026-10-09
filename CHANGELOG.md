@@ -17,6 +17,79 @@ First public beta of the Futureweb fork. Based on upstream
   to 100 printable characters, `redirect_uris` to 10 and the whole metadata to 8 KB; client-supplied
   values are escaped and clipped in log lines, and the server logs through a plain stream handler
   instead of the SDK's rich handler (whose rendering time grows quadratically with long tokens).
+- OAuth consent page: the form only accepts a submission from the browser that opened it. The page
+  sets an HttpOnly consent cookie (`__Host-` prefixed on https) and the form carries an HMAC bound
+  to it and to the sign-in request; a POST whose `Origin` or `Sec-Fetch-Site` names another site is
+  refused. Previously another web page could submit the consent (and pick all permissions) in the
+  athlete's browser when the Intervals.icu sign-in was enabled. The pages now send
+  `Referrer-Policy: same-origin` (no form-action CSP, which would block the redirects).
+- The consent form body is limited to 16 KB / 50 fields; `/register` accepts at most 10
+  registrations per client address and hour, and a client in the middle of its consent is no
+  longer evicted from the 50-client table.
+- Pending sign-ins and Intervals.icu sign-ins in progress are capped per client address (IPv4
+  address or IPv6 /64, 20 each); a flood of `/authorize` requests can no longer push out the
+  athlete's own pending sign-in.
+- Client metadata documents: bounded cache (256 documents, rejected ones evicted first), one
+  shared fetch per document, a global budget of 30 fetches per minute, a known document is kept
+  for up to a day while its host is unreachable, and client ids with a query string, control
+  characters or more than 512 characters are refused (an invalid URL gave HTTP 500). A document's
+  redirect URIs must stay on its own host, another allowlisted host or loopback.
+- `OAUTH_CLIENT_HOSTS` and `OAUTH_REDIRECT_HOSTS` accept `host/path` entries (an exact document
+  URL or a redirect path prefix) in addition to hosts; redirect URIs of dynamically registered
+  clients may not contain a query string.
+- Refresh tokens: a rotated refresh token presented again after `OAUTH_REFRESH_REUSE_GRACE`
+  seconds (default 120) revokes the whole grant (RFC 9700 reuse detection); within the grace
+  period a client that lost the response can retry. A client whose metadata document declares
+  `private_key_jwt` (ChatGPT) must send its client assertion with every token request
+  (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified from the production journal that
+  ChatGPT signs its code and refresh requests). Verified assertions are logged at INFO.
+- Sign-in: the PBKDF2 password check runs in a worker thread instead of blocking the event loop
+  for 0.3 s per attempt; failed password / API-key sign-ins also count against a global budget
+  (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`, default 50 per 15 minutes); the per-address limit groups IPv6
+  addresses by /64 and its table is bounded; an authenticator code is only used up when the
+  password or API key was right.
+- `get_server_status` no longer tells connected clients the OAuth user name, password source,
+  allowed athletes, state file path, bind address, port or SSE path (a secret path is a
+  credential); `--doctor` on the server still shows them.
+- Logging: uvicorn's access log keeps query parameter names but drops their values (the
+  Intervals.icu callback code, the sign-in request id, SSE session ids); request bodies are no
+  longer logged at DEBUG and Intervals.icu error bodies are shortened; httpx's per-request INFO
+  lines are off unless `FASTMCP_LOG_LEVEL=DEBUG`. The documentation no longer claims that no
+  log contains codes (the reverse proxy's does unless configured, see `docs/REMOTE_ACCESS.md`).
+- Docker base images are pinned by digest (Dependabot updates them).
+
+### Fixed (review findings: operations)
+- OAuth state file: written in a worker thread and only committed to memory once the write
+  succeeded (a full disk no longer loses the refresh token or authorization code of the request,
+  the client can retry); the directory is fsynced after the rename; the server checks at startup
+  that the directory is writable.
+- A state file that cannot be used (not JSON, wrong structure, written by a newer version) stops
+  the server with a one-line error and is never overwritten or moved; entries that the current
+  SDK cannot read are kept in the file unchanged instead of crashing the server. The format stays
+  version 1; existing files load unchanged.
+- New command line front end (`futureweb-intervals-mcp`, also used by
+  `python src/intervals_mcp_server/server.py`): `--version` and `--help` work with a broken
+  configuration, unknown flags are refused, `--doctor` lists every configuration problem
+  (permissions, transport, port range, log level, path settings, OAuth settings, state file)
+  without starting anything, and a configuration error at startup is reported in one line
+  (exit code 2) instead of a traceback. A network transport without `API_KEY` / `ATHLETE_ID`
+  logs a warning.
+- `FASTMCP_PORT` must be 1-65535, `FASTMCP_LOG_LEVEL` a known level and the path settings must
+  start with `/`.
+- `MCP_PUBLIC_URL` with a path: the protected resource metadata is served once, at the path the
+  SDK advertises, with the permission scopes (previously a second document without them was
+  added at the root), and the consent form posts to the prefixed path.
+- An Intervals.icu sign-in whose request was denied or expired while Intervals.icu answered
+  shows the "expired" page instead of HTTP 500.
+- Docker image: runs the `futureweb-intervals-mcp` console script from the installed package
+  (no second copy of the sources), keeps the OAuth state in `/data` (mount a volume), and has a
+  health check for the network transports.
+- Release workflow: the GitHub release is created only after the image was pushed, one run per
+  tag at a time, and the tag must also match `__version__` (a test checks it against
+  `pyproject.toml`).
+- Dependencies: floors raised to the security-updated versions (`mcp>=1.30`, `httpx>=0.28.1`,
+  `starlette>=1.7`, `python-multipart>=0.0.32`), direct imports (`starlette`, `uvicorn`, `anyio`)
+  declared, and the unused `mcp[cli]` extra (typer) dropped.
 
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list

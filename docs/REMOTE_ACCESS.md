@@ -36,7 +36,10 @@ and never given to the MCP client.
   document, e.g. "ChatGPT · verified: chatgpt.com") and which permissions the connection
   gets. The permission classes of the server become OAuth scopes: `intervals:read`,
   `intervals:write`, `intervals:destructive`, `intervals:admin`. Tools of classes a
-  connection was not granted are hidden from it and refused if called.
+  connection was not granted are hidden from it and refused if called. The form only
+  accepts a submission from the browser that opened it (a cookie-bound form token plus an
+  `Origin` / `Sec-Fetch-Site` check), so another web page cannot sign in and pick the
+  permissions in your browser.
 * **Client ID Metadata Documents** (preferred by the MCP spec 2026-07-28 and by ChatGPT)
   from an allowlist of hosts, with `private_key_jwt` client authentication, and dynamic
   client registration (RFC 7591) for older clients, restricted to allowlisted redirect hosts.
@@ -46,6 +49,10 @@ and never given to the MCP client.
   `/mcp` (what ChatGPT expects) and SSE at `/sse` + `/messages/`.
 * Access tokens in memory (default 1 h); clients and refresh tokens (default 30 days)
   persisted as digests in `OAUTH_STATE_FILE` (mode 0600). Restarts do not disconnect clients.
+  Refresh tokens rotate; a rotated token presented again after a short grace period revokes
+  the whole connection (RFC 9700), and clients whose metadata document declares
+  `private_key_jwt` (ChatGPT) must sign every token request, so a leaked refresh token alone
+  is useless.
 
 ## 1. Register an Intervals.icu OAuth app (for "Continue with Intervals.icu")
 
@@ -77,13 +84,16 @@ instead) use the API-key or password sign-in: no app is needed for those.
 | `OAUTH_PASSWORD` or `OAUTH_PASSWORD_HASH`, `OAUTH_USERNAME` | Password sign-in (required for `password`). Username default `athlete`. |
 | `API_KEY` | The Intervals.icu API key of the deployment; also the secret of the `apikey` sign-in. |
 | `OAUTH_TOTP_SECRET` | Optional second factor for `password` and `apikey` (create with `python -m intervals_mcp_server.auth totp-secret`). |
-| `OAUTH_CLIENT_HOSTS` | Hosts whose client metadata documents are accepted. Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. |
-| `OAUTH_REDIRECT_HOSTS` | Redirect hosts allowed for dynamically registered clients. Same default; `*` allows any https host. Loopback http is always allowed. |
-| `OAUTH_DYNAMIC_REGISTRATION` | `true` (default) or `false`. |
+| `OAUTH_CLIENT_HOSTS` | Where client metadata documents are accepted: a host (every path on it) or `host/path` (that document only), comma-separated. Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. Client ids with a query string are never accepted, and a document's redirect URIs must stay on its own host, another listed host or loopback. Stricter: `chatgpt.com/oauth/client.json,claude.ai,claude.com`. |
+| `OAUTH_REDIRECT_HOSTS` | Redirect URIs allowed for dynamically registered clients: a host or a `host/path` prefix. Same default; `*` allows any https host. Redirect URIs with a query string are refused; loopback http is always allowed. Stricter: `claude.ai/api/mcp/auth_callback,claude.com/api/mcp/auth_callback,chatgpt.com/connector_platform_oauth_redirect,chatgpt.com/connector/oauth`. |
+| `OAUTH_DYNAMIC_REGISTRATION` | `true` (default) or `false`. At most 10 registrations per client address and hour; 50 clients are kept (idle ones are evicted first). |
 | `OAUTH_PRIVATE_KEY_JWT` | Advertise and verify `private_key_jwt` for metadata-document clients, default `true`. |
-| `OAUTH_STATE_FILE` | Clients and refresh tokens, default `./oauth_state.json`. Keep it on persistent storage. |
+| `OAUTH_REQUIRE_PRIVATE_KEY_JWT` | Default `true`: a token request without a client assertion is refused (`invalid_client`) when the client's metadata document declares `token_endpoint_auth_method: private_key_jwt` (ChatGPT does, and signs its code and refresh requests). `false` accepts such clients without an assertion again (PKCE still protects the code). |
+| `OAUTH_REFRESH_REUSE_GRACE` | Seconds in which a just-rotated refresh token is still accepted, for a client that lost the response and retries (default 120; `0` disables the grace). Later reuse revokes the connection. The rotation history is kept in memory: after a restart an old token is simply rejected. |
+| `OAUTH_STATE_FILE` | Clients and refresh tokens, default `./oauth_state.json` (`/data/oauth_state.json` in the Docker image). Keep it on persistent storage; one server process per file. |
 | `OAUTH_ACCESS_TOKEN_TTL` / `OAUTH_REFRESH_TOKEN_TTL` | Seconds, defaults 3600 and 2592000. |
-| `OAUTH_LOGIN_RATE_LIMIT` | Failed sign-ins per client IP per 15 minutes before `429`, default 5. |
+| `OAUTH_LOGIN_RATE_LIMIT` | Failed sign-ins per client address (IPv4 address, IPv6 /64) per 15 minutes before `429`, default 5. |
+| `OAUTH_LOGIN_GLOBAL_RATE_LIMIT` | Failed password / API-key sign-ins from all addresses together per 15 minutes before those sign-ins pause, default 50 (limits distributed guessing; the Intervals.icu sign-in is not affected). |
 | `MCP_PERMISSIONS` | Upper limit of what any connection can be granted (default `read`). |
 
 Minimal configuration:
@@ -141,7 +151,28 @@ nginx: `proxy_pass http://127.0.0.1:8001;`, `proxy_set_header X-Forwarded-Proto 
 `proxy_buffering off;` and a long `proxy_read_timeout` for SSE.
 
 uvicorn trusts `X-Forwarded-For`/`-Proto` from 127.0.0.1, which is what the sign-in rate
-limit keys on. `MCP_PUBLIC_URL` must be exactly the origin clients use, without a path.
+limit keys on. A proxy on another address (Docker network, separate host) must be listed in
+`FORWARDED_ALLOW_IPS` (uvicorn's setting, e.g. `FORWARDED_ALLOW_IPS=172.18.0.1`), otherwise
+every visitor shares the proxy's address: five wrong passwords then lock out everybody for
+15 minutes. Never use `FORWARDED_ALLOW_IPS=*` on a port that clients can reach directly.
+`MCP_PUBLIC_URL` should be exactly the origin clients use, without a path.
+
+Recommended proxy settings (not required; the server limits its own form bodies):
+
+* **Access log without OAuth secrets.** The proxy logs full request URLs, which include the
+  short-lived Intervals.icu authorization code (`/oauth/intervals/callback?code=...`) and the
+  sign-in request id (`/oauth/login?request=...`, also the `Referer` of the consent form POST).
+  The server's own access log keeps only the parameter names. For Apache, log the path without
+  the query string and without the referrer for this vhost:
+
+  ```apache
+  LogFormat "%h %l %u %t \"%m %U %H\" %>s %b \"%{User-Agent}i\"" mcp_noquery
+  CustomLog /var/log/httpd/mcp-access.log mcp_noquery
+  ```
+
+  (nginx: a `log_format` with `$uri` instead of `$request` and without `$http_referer`.)
+* **Request body limit,** e.g. Apache `LimitRequestBody 4194304` (nginx `client_max_body_size 4m`,
+  the limit the MCP SDK applies to its own OAuth endpoints); Apache's default allows 1 GiB.
 
 The MCP SDK protects servers bound to localhost against DNS rebinding and then accepts only
 localhost `Host` headers. A proxy that keeps the public `Host` header (Apache `ProxyPreserveHost On`)
@@ -171,33 +202,52 @@ Claude: Settings → Connectors → *Add custom connector* with the same URL; th
    document (allowlisted host, no redirects, 64 KiB limit, cached per `Cache-Control`),
    checks that its `client_id` equals the URL and accepts only its `redirect_uris`.
    Older clients register via `POST /register` instead.
-3. `/authorize` (PKCE S256, `resource` must name this server) leads to the consent page.
+3. `/authorize` (PKCE S256, `resource` must name this server) leads to the consent page. The
+   page sets an HttpOnly consent cookie (`__Host-` prefixed on https) and the form carries a
+   token bound to it; the POST must come from that page (same origin).
 4. "Continue with Intervals.icu" goes to `https://intervals.icu/oauth/authorize`, bound to
    your browser by an HttpOnly cookie. The callback exchanges the code, checks the athlete
    id against the allowlist and redirects to the client with `code`, `state` and `iss`.
 5. The client redeems the code at `/token` (ChatGPT signs a `private_key_jwt` assertion
-   with a key from its JWKS; it is verified, including audience, lifetime and replay).
-6. Access tokens are refreshed with rotating refresh tokens.
+   with a key from its JWKS; it is verified, including audience, lifetime and replay, and
+   required because ChatGPT's document declares it).
+6. Access tokens are refreshed with rotating refresh tokens; a retry with the previous token
+   within `OAUTH_REFRESH_REUSE_GRACE` works, later reuse revokes the connection.
 
-Sign-in links live 10 minutes, codes 5 minutes; both are single use.
+Sign-in links live 10 minutes, codes 5 minutes; both are single use. Each client address
+may have at most 20 pending sign-ins, so a flood of `/authorize` requests cannot push out
+your own.
 
 ## Operations
 
 * **Restart:** access tokens are dropped (clients refresh silently); registered clients and
   refresh tokens survive via the state file. Deleting the file disconnects every client.
+* **State file:** checked at startup (the server stops with a one-line error when its
+  directory is not writable or the file cannot be read; such a file is never overwritten or
+  moved). Entries a newer SDK cannot read are kept in the file unchanged. The file is
+  written in a worker thread; when a write fails (disk full), the sign-in or refresh fails
+  with HTTP 500 and nothing changes, so the client can retry. `futureweb-intervals-mcp --doctor`
+  checks all of this without starting the server.
 * **Switch from password to Intervals.icu sign-in:** set the client id/secret and
   `OAUTH_LOGIN=intervals`, restart. Existing connections keep working; the next sign-in uses
   Intervals.icu.
 * **Revoke a connection:** `POST /revoke`, or delete the state file to cut off all.
-* **Logs** contain client ids, athlete ids and events, never passwords, codes or tokens.
-* `get_server_status` / `--doctor` show the sign-in method, whether an Intervals.icu app is
-  configured and the allowed athletes.
+* **Logs:** the server's log lines contain client ids, athlete ids and events, never
+  passwords, codes or tokens; client-supplied values are escaped and shortened. uvicorn's
+  access log keeps query parameter names but not their values. The reverse proxy's access
+  log contains full URLs unless configured as in section 3.
+* `get_server_status` shows the sign-in method and whether an Intervals.icu app is configured;
+  `--doctor` (on the server) also shows the user name, the allowed athletes, the state file,
+  the bind address and the SSE path, which the MCP tool does not reveal to connected clients.
 
 ## Security model
 
 Data access uses the one Intervals.icu API key of the deployment, so this is a
 single-athlete server: the allowlist decides who may connect, and the consent page decides
-what each connection may do, never more than `MCP_PERMISSIONS`. With the Intervals.icu
+which permission classes each connection gets, never more than `MCP_PERMISSIONS`. A refresh
+can only narrow a connection's classes, and every tool call is checked against them. The
+classes are a server-side guard for the tools; they cannot make an API key with full
+account access safe against a compromised host. With the Intervals.icu
 sign-in there is no extra password to leak; with the password sign-in it must be as strong
 as the API key itself. Multiple athletes need separate deployments. A future multi-athlete
 mode would use each athlete's own Intervals.icu OAuth token for data access instead of a
