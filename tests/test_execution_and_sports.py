@@ -212,3 +212,11 @@ def test_make_intervals_request_retries_on_429(monkeypatch):
     assert result == {"ok": True}
     assert client.calls == 2
     assert slept == [0.0]
+
+
+def test_fastmcp_settings_message_path():
+    """FASTMCP_MESSAGE_PATH (and the other FASTMCP_* variables) are passed to FastMCP."""
+    from intervals_mcp_server.mcp_instance import fastmcp_settings_from_env  # pylint: disable=import-outside-toplevel
+
+    settings = fastmcp_settings_from_env({"FASTMCP_SSE_PATH": "/mcp-abc/sse", "FASTMCP_MESSAGE_PATH": "/mcp-abc/messages/", "FASTMCP_PORT": "8001"})
+    assert settings == {"sse_path": "/mcp-abc/sse", "message_path": "/mcp-abc/messages/", "port": 8001}

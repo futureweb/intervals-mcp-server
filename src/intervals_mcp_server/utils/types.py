@@ -103,6 +103,7 @@ class TransportAliases(StrEnum):
     SSE = "sse"
     HTTP = "http"
     STREAMABLE_HTTP = "streamable-http"
+    HTTP_SSE = "http+sse"
 
 
 def float_to_str(value: float) -> str:

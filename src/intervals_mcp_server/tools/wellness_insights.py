@@ -32,7 +32,9 @@ from intervals_mcp_server.utils.wellness_stats import (
     format_correlation,
     format_metric_trend,
     format_nutrition_summary,
+    MIN_BASELINE_VALUES,
     format_weight_trend,
+    metric_units,
     nutrition_summary,
     sort_entries,
     weight_trend,
@@ -173,13 +175,21 @@ def _subjective_line(entry: dict[str, Any]) -> str | None:
     return ", ".join(parts) + " (1-4 scales, 1 = best)" if parts else None
 
 
-def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs) -> str | None:
+SNAPSHOT_LEVELS = ("compact", "standard", "full")
+STANDARD_CUSTOM_LIMIT = 20
+
+
+def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs, limit: int | None = None) -> str | None:
     parts = [
         f"{definition['name']} {format_field_value(definition, entry[code])}"
         for code, definition in defs.items()
         if code in entry and not is_missing(entry[code])
     ]
-    return "; ".join(parts) if parts else None
+    if not parts:
+        return None
+    if limit is not None and len(parts) > limit:
+        return "; ".join(parts[:limit]) + f"; +{len(parts) - limit} more (detail_level=full)"
+    return "; ".join(parts)
 
 
 def _missing_line(entry: dict[str, Any]) -> str | None:
@@ -197,10 +207,12 @@ def _baseline_lines(entries: list[dict[str, Any]], metrics: list[str]) -> list[s
             continue
         comp = trend.get("latest_vs_baseline") or {}
         seven = (rolling.get(7) or {}).get("latest_mean")
+        small = f" [small sample, fewer than {MIN_BASELINE_VALUES} values]" if base.get("n", 0) < MIN_BASELINE_VALUES else ""
         lines.append(
             f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven) if seven is not None else 'n/a'}"
             f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'))}, median {format_value(base.get('median'))}, sd {format_value(base.get('stdev'))} (n {base.get('n')})"
             + (f" | vs baseline {comp['diff']:+.2f} ({comp['diff_pct']:+.1f}%, z {comp['z']:+.2f})" if comp.get("diff") is not None and comp.get("z") is not None else "")
+            + small
         )
     return lines
 
@@ -260,13 +272,14 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
 
 @tool("read")
-async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches
+async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches,too-many-return-statements
     date_str: str | None = None,
     days_back: int = 3,
     baseline_metrics: str = DEFAULT_BASELINE_METRICS,
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    detail_level: str = "standard",
 ) -> str:
     """Compact recovery / readiness context for a day in one call (read-only, no verdict)
 
@@ -289,10 +302,16 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        detail_level: "compact" (native values, fitness, baselines, activities, planned; no custom
+            field dump), "standard" (default, plus up to 20 custom wellness fields per day) or
+            "full" (every custom field). Device composite scores (readiness, Body Battery ...) are
+            derived values, not independent measurements.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
+    if detail_level not in SNAPSHOT_LEVELS:
+        return f"Error: detail_level must be one of {', '.join(SNAPSHOT_LEVELS)}."
     if not 0 <= days_back <= MAX_DAYS_BACK:
         return f"Error: days_back must be between 0 and {MAX_DAYS_BACK}."
     target = date_str or get_default_end_date()
@@ -347,7 +366,9 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         for extra in (_fitness_line(entry), _subjective_line(entry)):
             if extra:
                 lines.append("  " + extra)
-        custom = _custom_line(entry, input_defs)
+        custom = None if detail_level == "compact" else _custom_line(
+            entry, input_defs, None if detail_level == "full" else STANDARD_CUSTOM_LIMIT
+        )
         if custom:
             lines.append("  custom: " + custom)
         missing = _missing_line(entry)
@@ -382,13 +403,20 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
     For every requested wellness metric (native fields such as hrv, restingHR,
     avgSleepingHR, respiration, sleepScore, readiness, spO2, weight, ctl, atl, steps,
     or any custom wellness field by its code, and eFTP per sport as eftp_Ride /
-    eftp_Run) it reports the daily values of the last two weeks with trailing means,
-    rolling means for the requested windows, mean/median/min/max/SD, a 42-day baseline,
-    the latest value versus the baseline (difference, percent, z-score), the last 7 days
-    versus the 7 days before, and outliers (|z| >= 2.5). Weight additionally gets a
-    7/14/28-day trend with the slope in kg per week. Optional correlations between
-    metric pairs are statistical associations only, not causes. Missing days are never
-    filled in.
+    eftp_Run) it reports, with units (HRV ms, resting/sleeping HR bpm, respiration
+    breaths/min, SpO2 %, readiness and sleep score 0-100, weight kg, custom fields with
+    their definition units such as a temperature deviation in °C): the daily values of
+    the last two weeks of the requested period with trailing means, statistics over the
+    requested period only, a personal baseline (the 42 days ending at end_date), the
+    latest value versus the baseline (difference, percent, z-score), rolling means at the
+    end of the period, the last 7 days versus the 7 days before, and outliers (|z| >= 2.5)
+    within the period. The output states the requested period, the extra history fetched
+    for rolling windows and the baseline, and the baseline window separately. Missing days
+    are never filled in; for physiological metrics a stored 0 counts as missing. Baselines
+    with fewer than 14 values and correlations with fewer than 30 paired days are flagged
+    as small samples. Weight additionally gets a 7/14/28-day trend with the slope in kg
+    per week. Optional correlations between metric pairs are statistical associations
+    only, not causes.
 
     Args:
         start_date: Start date YYYY-MM-DD (optional, default 42 days before end_date)
@@ -426,9 +454,12 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
     in_range = [e for e in entries if start <= str(e.get("id")) <= end]
     input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
 
-    trends = [compute_metric_trend(entries, m, windows=window_tuple, baseline_days=BASELINE_DAYS) for m in metric_list]
+    trends = [
+        compute_metric_trend(entries, m, windows=window_tuple, baseline_days=BASELINE_DAYS, period_start=start, period_end=end)
+        for m in metric_list
+    ]
     for trend in trends:
-        trend["series"] = [row for row in trend.get("series", []) if start <= row["date"] <= end]
+        trend["units"] = metric_units(trend["metric"], (input_defs.get(trend["metric"]) or {}).get("units"))
     weight = weight_trend(in_range) if "weight" in metric_list else None
     pairs = []
     for spec in _split(correlations):
@@ -443,15 +474,26 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
                 return f"Error: lag in '{spec}' must be an integer number of days."
         pairs.append(compute_correlation(in_range, bits[0], bits[1], lag_days=lag))
 
+    requested_days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+    fetched_days = (date.fromisoformat(end) - date.fromisoformat(fetch_start)).days + 1
+    windows_info = {
+        "requested": {"start": start, "end": end, "days": requested_days},
+        "fetched": {"start": fetch_start, "end": end, "days": fetched_days, "lookback_days": BASELINE_DAYS},
+        "baseline": {"days": BASELINE_DAYS, "end": end},
+    }
     if output_format.strip().lower() == "json":
         return json.dumps(
-            {"start": start, "end": end, "metrics": trends, "weight": weight, "correlations": pairs},
+            {"start": start, "end": end, "windows": windows_info, "metrics": trends, "weight": weight, "correlations": pairs},
             ensure_ascii=False,
         )
-    blocks = [f"Wellness trends for athlete {athlete_id_to_use}, {start} to {end} (baseline window {BASELINE_DAYS} days):"]
-    for metric, trend in zip(metric_list, trends, strict=True):
-        units = (input_defs.get(metric) or {}).get("units")
-        blocks.append(format_metric_trend(trend, units=units))
+    blocks = [
+        f"Wellness trends for athlete {athlete_id_to_use}, {start} to {end}: {requested_days} days requested; "
+        f"{fetched_days} days fetched ({fetch_start} to {end}, including a {BASELINE_DAYS}-day lookback for rolling "
+        f"windows and the baseline); personal baseline = the {BASELINE_DAYS} days ending {end}; statistics, outliers "
+        "and day values cover the requested period only."
+    ]
+    for trend in trends:
+        blocks.append(format_metric_trend(trend, units=trend.get("units")))
     if weight:
         blocks.append(format_weight_trend(weight))
     blocks.extend(format_correlation(pair) for pair in pairs)

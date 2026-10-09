@@ -9,6 +9,78 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Changed (phase 3: analytics quality)
+- `analyze_workout_execution` / `get_activity_report`: planned steps are capped at their planned
+  (moving) duration; a longer interval is split logically (analysis only) so the planned part is
+  evaluated from the samples and the remainder of the last step plus everything after the plan
+  is reported as additional training (sample range, kJ share, estimated load, extra efforts);
+  riding before the plan and extra time inside the plan are reported separately. Steps can match
+  up to three consecutive same-intensity intervals (lap splits); matching never uses names.
+  New optional `duration_tolerance_pct`, `start_tolerance_s`, `pause_tolerance_s`, `detail_level`.
+  Per-step deviation notes, exact-range hits and mean time in target instead of a single
+  "in target" count; the Intervals.icu interval type is kept and shown next to the planned type;
+  clock counters, duplicate and other-sport custom streams are left out of step statistics.
+- `get_activity_report`: `detail_level` compact (core numbers, up to five key findings,
+  sport-assigned custom fields, data quality) / standard / full; the second-power-meter check
+  needs a second stream with enough valid samples and reports identical streams; gear streams
+  whose values are positions are not presented as tooth counts.
+- `compare_workouts`: compares only comparable work intervals (main set by duration and
+  intensity, surges under 2 min and warm-ups/recoveries labelled WORK are listed but never
+  averaged), time-weighted means, avg/max HR per interval, reference pattern
+  (`reference_activity_id` or newest activity), sport-family default (`sport_types="all"` for the
+  old behaviour), filters for gear, interval length, intensity, reps and FTP range, separate
+  power / HR / cadence / W/bpm / whole-activity RPE trends, gear and power-meter flags.
+- `get_training_summary`: custom fields are aggregated by units and meaning (additive values
+  summed, device loads summed as a device scale, estimates as latest/change/range, percentages,
+  running dynamics, scores and temperatures as mean/median/range, unknown fields not aggregated),
+  values from sports without the field are ignored, start/end pairs (stamina) report the typical
+  change, `CUSTOM_AGGREGATE_OVERRIDES`, `detail_level`.
+- `get_wellness_trends`: requested period, fetched lookback and baseline window are stated
+  separately and statistics cover the requested period only; native metrics carry units; a stored
+  0 of physiological metrics is missing; small baselines and correlations are flagged.
+- `analyze_climbs`: sport profiles (foot vs bike) for smoothing, grade window, minimum horizontal
+  distance and plausible grade; flagged segments; real pauses vs very slow movement; VAM on
+  moving time; device moving-time counter shown for comparison only; optional raw grade and
+  `grade_window_m`, `min_grade_distance_m`, `stationary_speed_m_s`.
+- `find_similar_intervals`: optional `reference_activity_id` (window derived from its main set),
+  sport-family default (`sport_types="all"` keeps the cross-sport search), comparability score with
+  gear / power meter / FTP context, `ftp_range`, `ftp_tolerance_pct`, `sort_by`.
+- `get_power_hr_efficiency`: trends need `min_activities_per_group` independent activities per
+  group and are compared with the day-to-day variation, time-weighted band means, per-gear trends,
+  non-overlapping bands, filters `gear_id`, `environment`, `min_start_minutes`, `max_start_minutes`.
+- `get_fatigue_resistance`: reads the sport settings first; without kJ thresholds no fatigued
+  values are shown, the configuration is explained and thresholds are suggested (read-only);
+  missing and identical fatigued curves are detected.
+- `get_best_efforts`: positions are elapsed time (the clock includes recording pauses) and
+  windows spanning a pause are flagged; `get_activity_intervals`: optional planned step types;
+  `get_training_plan`: unreadable plan reported as unknown; `get_library_workout`: never fails on
+  malformed steps.
+
+### Added (phase 2: analytics, hardening)
+- `get_activity_report`: one-call compact analysis (overview, plan vs execution, power meter
+  check, climbs, data-quality notes).
+- `analyze_workout_execution`: `planned_workout_doc` for deleted events, detection of training
+  beyond the plan (reported as additional training, not as poor compliance), read-only match
+  suggestions for unpaired activities.
+- Performance analytics: `get_best_efforts`, `compare_best_efforts`, `find_similar_intervals`,
+  `get_activity_histogram`, `compare_workouts`, `get_power_hr_efficiency`, `get_fatigue_resistance`.
+- `get_training_plan` (ATP phases, weekly targets, races, fitness-model events),
+  `get_library_workout`, `update_sport_settings` (admin), gear maintenance reminders,
+  `get_activities(power_meter=...)`.
+- `detail_level` (compact / standard / full) for activity details, intervals and the recovery
+  snapshot; custom fields are separated into "assigned to this sport" (from the sport settings)
+  and others; interval stream statistics limited to the requested streams.
+- Remote hardening: `FASTMCP_MESSAGE_PATH`, secret-path deployment guide, built-in OAuth 2.1
+  authorization server (`MCP_AUTH=oauth`) for ChatGPT/Claude, `docs/REMOTE_ACCESS.md`:
+  "Continue with Intervals.icu" sign-in restricted to allowlisted athletes (password sign-in as
+  alternative), consent page with per-connection permission scopes (`intervals:read`, ...)
+  enforced on `tools/list` and `tools/call`, Client ID Metadata Documents with `private_key_jwt`,
+  RFC 9207 `iss`, audience-bound tokens, redirect host allowlist for dynamic registration, and
+  `MCP_TRANSPORT=http+sse` serving `/mcp` and `/sse` from one process.
+- Eight coaching prompts and two MCP resources.
+- CI: actions pinned to commit SHAs, build and Docker smoke jobs on every PR, PEP 440 pre-release
+  detection and explicit GHCR tags in the release workflow.
+
 ### Added
 - Custom activity fields, custom interval fields and every custom stream (e.g. the metrics the
   Garmin Intervals Bridge restores) with names, codes, values and units in
@@ -50,4 +122,4 @@ First public beta of the Futureweb fork. Based on upstream
 
 ### Changed
 - Package renamed to `futureweb-intervals-mcp`; project metadata points to the fork.
-- Pylint runs non-blocking in CI; ruff, mypy and pytest are required.
+- Pylint runs as an advisory CI job (only error-class messages fail it); ruff, mypy and pytest are required.

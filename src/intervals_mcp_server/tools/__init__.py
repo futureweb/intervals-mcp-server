@@ -23,6 +23,7 @@ from intervals_mcp_server.tools.events import (  # noqa: F401
     delete_events_by_date_range,
     get_event_by_id,
     get_events,
+    get_training_plan,
 )
 from intervals_mcp_server.tools.custom_items import (  # noqa: F401
     create_custom_item,
@@ -43,12 +44,23 @@ from intervals_mcp_server.tools.athlete import (  # noqa: F401
     get_athlete_profile,
     get_sport_settings,
     get_training_zones,
+    update_sport_settings,
 )
 from intervals_mcp_server.tools.analysis import (  # noqa: F401
     analyze_workout_execution,
     compare_power_streams,
 )
 from intervals_mcp_server.tools.climbs import analyze_climbs  # noqa: F401
+from intervals_mcp_server.tools.report import get_activity_report  # noqa: F401
+from intervals_mcp_server.tools.performance import (  # noqa: F401
+    compare_best_efforts,
+    compare_workouts,
+    find_similar_intervals,
+    get_activity_histogram,
+    get_best_efforts,
+    get_fatigue_resistance,
+    get_power_hr_efficiency,
+)
 from intervals_mcp_server.tools.wellness_insights import (  # noqa: F401
     get_nutrition_summary,
     get_recovery_snapshot,
@@ -63,8 +75,9 @@ from intervals_mcp_server.tools.training_review import (  # noqa: F401
 )
 from intervals_mcp_server.tools.workout_library import (  # noqa: F401
     add_event_from_library,
-    delete_library_workout,
     create_library_workout,
+    delete_library_workout,
+    get_library_workout,
     get_workout_library,
 )
 from intervals_mcp_server.tools.wellness import get_wellness_data, update_wellness  # noqa: F401
@@ -113,8 +126,19 @@ __all__ = [
     "get_athlete_profile",
     "get_sport_settings",
     "get_training_zones",
+    "get_library_workout",
+    "get_training_plan",
+    "update_sport_settings",
     "analyze_workout_execution",
     "analyze_climbs",
+    "get_activity_report",
+    "compare_best_efforts",
+    "compare_workouts",
+    "find_similar_intervals",
+    "get_activity_histogram",
+    "get_best_efforts",
+    "get_fatigue_resistance",
+    "get_power_hr_efficiency",
     "compare_power_streams",
     "get_nutrition_summary",
     "get_recovery_snapshot",

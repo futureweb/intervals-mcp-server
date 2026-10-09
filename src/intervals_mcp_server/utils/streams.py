@@ -84,13 +84,18 @@ def describe_stream(stream: dict[str, Any], stream_defs: CustomFieldDefs) -> dic
         label = stream.get("name") or stream_type
         units = STANDARD_STREAM_UNITS.get(stream_type)
         description = None
-    return {
+    info = {
         "type": stream_type,
         "label": str(label),
         "units": units,
         "custom": custom,
         "description": description,
     }
+    note = gear_units_note(stream_type, str(label), units, stream.get("data") or [])
+    if note:
+        info["units"] = "gear position"
+        info["units_note"] = note
+    return info
 
 
 def stream_label(info: dict[str, Any]) -> str:
@@ -318,6 +323,8 @@ def format_streams_summary(
         summary += f"  Value Type: {stream.get('valueType', '')}\n"
         summary += f"  Data Points: {len(data)}\n"
         summary += f"  Units: {info['units'] or 'not specified'}\n"
+        if info.get("units_note"):
+            summary += f"  Units note: {info['units_note']}\n"
         summary += f"  Custom: {'yes' if info['custom'] else 'no'}\n"
         if info["description"]:
             summary += f"  Description: {info['description']}\n"
@@ -330,3 +337,115 @@ def format_streams_summary(
                 summary += f"  Last 5 values: {data[-5:]}\n"
         summary += "\n"
     return summary
+
+
+# --------------------------------------------------------------- derived metrics
+# Rolling window and minimum amount of data for normalized power.
+NP_WINDOW_S = 30
+NP_MIN_DURATION_S = 60
+
+
+def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int | None = None) -> float | None:
+    """Normalized power of ``watts[start:end]``: 4th root of the mean 4th power of the 30 s rolling mean.
+
+    The rolling window is defined on the time stream (``time - 30 < t <= time``) and only
+    full windows count, so recording pauses are not bridged by phantom samples. None with
+    less than 60 s of power data.
+    """
+    samples = [
+        (float(t), float(w))
+        for t, w in zip(time[start:end], watts[start:end], strict=False)
+        if isinstance(t, (int, float)) and not isinstance(t, bool)
+        and isinstance(w, (int, float)) and not isinstance(w, bool) and not is_missing(w)
+    ]
+    if not samples or samples[-1][0] - samples[0][0] < NP_MIN_DURATION_S:
+        return None
+    head, window_sum = 0, 0.0
+    fourth_powers: list[float] = []
+    for position, (moment, power) in enumerate(samples):
+        window_sum += power
+        while samples[head][0] <= moment - NP_WINDOW_S:
+            window_sum -= samples[head][1]
+            head += 1
+        if moment - samples[0][0] >= NP_WINDOW_S - 1:
+            fourth_powers.append((window_sum / (position - head + 1)) ** 4)
+    if not fourth_powers:
+        return None
+    return float((sum(fourth_powers) / len(fourth_powers)) ** 0.25)
+
+
+# ------------------------------------------------------------ stream relevance
+# Words in a custom stream's name/code that tie it to a sport family. Used only to hide
+# streams that a device or script computes for every activity (e.g. a running metric on
+# a ride) from compact and standard outputs; "full" output still shows them.
+_FOOT_WORDS = ("run", "running", "stride", "gct", "ground", "stance", "vertical", "step", "flight")
+_BIKE_WORDS = ("gear", "pedal", "crank", "chainring", "cog")
+FOOT_SPORTS = ("run", "trailrun", "virtualrun", "walk", "hike", "snowshoe")
+BIKE_SPORTS = ("ride", "virtualride", "gravelride", "mountainbikeride", "ebikeride", "emountainbikeride", "velomobile", "handcycle", "trackride")
+
+
+def _words(text: str) -> set[str]:
+    """Lower-case words of a name or camelCase / snake_case code."""
+    spaced = ""
+    for index, char in enumerate(text):
+        if char.isupper() and index and (text[index - 1].islower() or text[index - 1].isdigit()):
+            spaced += " "
+        spaced += char if char.isalnum() else " "
+    return {word.lower() for word in spaced.split() if word}
+
+
+def foreign_stream_reason(stream_type: str, label: str | None, activity_type: Any) -> str | None:
+    """Why a custom stream does not belong to the sport of the activity, or None.
+
+    The decision is a name heuristic (running dynamics words on a non-foot sport, drivetrain
+    words on a non-bike sport); it is only used to keep compact outputs focused.
+    """
+    sport = str(activity_type or "").strip().lower()
+    if not sport:
+        return None
+    words = _words(stream_type) | _words(label or "")
+    if sport not in FOOT_SPORTS and words & set(_FOOT_WORDS):
+        return f"running/walking metric on a {activity_type} activity"
+    if sport not in BIKE_SPORTS and words & set(_BIKE_WORDS):
+        return f"bike drivetrain metric on a {activity_type} activity"
+    return None
+
+
+def is_counter_stream(data: list[Any]) -> bool:
+    """True for a clock-like stream (elapsed / moving time counters): never decreasing and rising.
+
+    Such streams carry no per-segment information beyond the duration and are hidden from
+    segment and step statistics.
+    """
+    nums = numeric_values(data)
+    if len(nums) < 30:
+        return False
+    rising = nums[-1] - nums[0]
+    if rising < 0.3 * (len(nums) - 1):
+        return False
+    return all(later >= earlier for earlier, later in zip(nums, nums[1:], strict=False))
+
+
+TOOTH_UNITS = ("cog", "cogs", "teeth", "tooth", "t")
+MIN_TOOTH_COUNT = 9  # the smallest bicycle sprocket has 9 teeth; chainrings have far more
+
+
+def gear_units_note(stream_type: str, label: str | None, units: Any, data: list[Any]) -> str | None:
+    """A note when a gear stream claims tooth units but its values look like gear positions.
+
+    Shifting systems report either tooth counts or gear positions (1 = innermost / largest
+    sprocket). A tooth count is never below 9, so whole numbers below that are gear indices.
+    """
+    if not isinstance(units, str) or units.strip().lower() not in TOOTH_UNITS:
+        return None
+    if "gear" not in (_words(stream_type) | _words(label or "")):
+        return None
+    nums = [value for value in numeric_values(data) if value > 0]
+    if not nums:
+        return None
+    if min(nums) < MIN_TOOTH_COUNT and all(float(value).is_integer() for value in nums):
+        return (
+            f"values {min(nums):g}-{max(nums):g} look like gear positions (index), not tooth counts; "
+            f"units '{units}' from the definition are not applied"
+        )
+    return None

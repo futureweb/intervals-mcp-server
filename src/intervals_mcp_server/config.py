@@ -30,6 +30,9 @@ class Config:
     # Display units for custom item codes whose definition has none or unspecific ones,
     # e.g. {"Stamina": "%"}; configured via CUSTOM_UNITS_OVERRIDES="Stamina=%,RecoveryTime=h".
     custom_units_overrides: dict[str, str] = field(default_factory=dict)
+    # Aggregation policy per custom field code across activities (sum, device_load_sum, trend,
+    # mean, none); configured via CUSTOM_AGGREGATE_OVERRIDES="TrainingLoad=device_load_sum".
+    custom_aggregate_overrides: dict[str, str] = field(default_factory=dict)
     # Enabled tool permission classes (MCP_PERMISSIONS="read,write"); default read-only.
     permissions: frozenset[str] = frozenset({"read"})
 
@@ -62,6 +65,7 @@ def load_config() -> Config:
         intervals_api_base_url=intervals_api_base_url,
         user_agent=user_agent,
         custom_units_overrides=parse_units_overrides(os.getenv("CUSTOM_UNITS_OVERRIDES", "")),
+        custom_aggregate_overrides=parse_units_overrides(os.getenv("CUSTOM_AGGREGATE_OVERRIDES", "")),
         permissions=parse_permissions(os.getenv("MCP_PERMISSIONS", "read")),
     )
 

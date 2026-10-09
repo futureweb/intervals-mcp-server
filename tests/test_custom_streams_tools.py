@@ -28,6 +28,7 @@ from intervals_mcp_server.server import (  # pylint: disable=wrong-import-positi
     get_wellness_data,
     list_activity_streams,
 )
+from intervals_mcp_server.tools import athlete as athlete_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.tools import custom_items as custom_items_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.tools import gear as gear_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.utils.streams import DEFAULT_STREAM_TYPES  # pylint: disable=wrong-import-position
@@ -71,6 +72,8 @@ def _install_router(monkeypatch, *, activity=None, streams=None, intervals=None,
         monkeypatch.setattr(target, fake_request)
     custom_items_module._CUSTOM_ITEMS_CACHE.clear()  # pylint: disable=protected-access
     gear_module._GEAR_RAW_CACHE.clear()  # pylint: disable=protected-access
+    athlete_module._ATHLETE_CACHE.clear()  # pylint: disable=protected-access
+    athlete_module._SPORT_SETTINGS_CACHE.clear()  # pylint: disable=protected-access
 
 
 def _stream_calls(calls):

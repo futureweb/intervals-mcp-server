@@ -10,12 +10,17 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.utils.dates import get_default_end_date, get_default_future_end_date
+from intervals_mcp_server.utils.dates import (
+    get_default_end_date,
+    get_default_future_end_date,
+    get_default_start_date,
+)
 from intervals_mcp_server.utils.formatting import (
     event_type_label,
     format_event_details,
     format_event_summary,
 )
+from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import (
     resolve_activity_type,
@@ -527,7 +532,7 @@ _BULK_WORKOUT_KEYS = _BULK_COMMON_KEYS | {
 _BULK_NOTE_KEYS = _BULK_COMMON_KEYS | {"description", "color"}
 
 
-def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=too-many-branches
+def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=too-many-branches,too-many-statements
     """Validate one bulk entry and build the API event body using the shared builders.
 
     All problems of the entry are collected and reported together.
@@ -728,3 +733,119 @@ async def add_events_bulk(
         },
         indent=2,
     )
+
+
+PLAN_CATEGORIES = ("PLAN", "TARGET", "RACE_A", "RACE_B", "RACE_C", "SEASON_START")
+
+
+def _format_plan_event(event: dict[str, Any]) -> str:
+    """One line for a plan phase, weekly target or race."""
+    day = str(event.get("start_date_local", ""))[:10]
+    end = str(event.get("end_date_local", ""))[:10]
+    text = f"- {day}" + (f" to {end}" if end and end != day else "") + f" {event_type_label(event)}: {event.get('name', 'unnamed')} (event {event.get('id')})"
+    targets = []
+    if event.get("load_target") is not None:
+        targets.append(f"load {event['load_target']}")
+    if event.get("time_target") is not None:
+        targets.append(f"time {hms(event['time_target'])}")
+    if event.get("distance_target") is not None:
+        targets.append(f"distance {event['distance_target'] / 1000:.1f} km")
+    if event.get("for_week"):
+        targets.append("weekly target")
+    if targets:
+        text += " | " + ", ".join(targets)
+    if event.get("description"):
+        text += f" | {str(event['description'])[:120]}"
+    return text
+
+
+@tool("read")
+async def get_training_plan(  # pylint: disable=too-many-locals
+    start_date: str | None = None,
+    end_date: str | None = None,
+    athlete_id: str | None = None,
+    api_key: str | None = None,
+    output_format: str = "text",
+) -> str:
+    """Annual training plan view: plan phases, weekly targets, races and fitness-model events
+
+    Reads the training plan assigned to the athlete (``/training-plan``), the calendar entries
+    that make up the annual plan (categories PLAN = phases/blocks, TARGET = weekly load, time
+    or distance targets, RACE_A/B/C = races with priority, SEASON_START) and the events that
+    influence the fitness model (set eFTP, set fitness/fatigue, fitness days). Nothing is
+    changed. Default range: 30 days back to 180 days ahead.
+
+    Args:
+        start_date: Start date YYYY-MM-DD (optional, default 30 days ago)
+        end_date: End date YYYY-MM-DD (optional, default 180 days ahead)
+        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        output_format: "text" (default) or "json"
+    """
+    athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+    if error_msg:
+        return error_msg
+    start = start_date or get_default_start_date(30)
+    end = end_date or get_default_future_end_date(180)
+    try:
+        validate_date(start)
+        validate_date(end)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    plan = await make_intervals_request(url=f"/athlete/{athlete_id_to_use}/training-plan", api_key=api_key)
+    plan_info = plan if isinstance(plan, dict) and "error" not in plan else {}
+    plan_error = plan.get("message", "unknown error") if isinstance(plan, dict) and "error" in plan else None
+    events = await make_intervals_request(
+        url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key,
+        params={"oldest": start, "newest": end, "category": ",".join(PLAN_CATEGORIES)},
+    )
+    if isinstance(events, dict) and "error" in events:
+        # Older API versions reject unknown category names: fall back to all events.
+        events = await make_intervals_request(
+            url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key, params={"oldest": start, "newest": end}
+        )
+    plan_events = [
+        e for e in (events if isinstance(events, list) else []) if isinstance(e, dict) and e.get("category") in PLAN_CATEGORIES
+    ]
+    model_events = await make_intervals_request(url=f"/athlete/{athlete_id_to_use}/fitness-model-events", api_key=api_key)
+    model_list = [e for e in (model_events if isinstance(model_events, list) else []) if isinstance(e, dict)]
+
+    phases = [e for e in plan_events if e.get("category") in ("PLAN", "SEASON_START")]
+    targets = [e for e in plan_events if e.get("category") == "TARGET"]
+    races = [e for e in plan_events if str(e.get("category", "")).startswith("RACE")]
+    if output_format.strip().lower() == "json":
+        return json.dumps(
+            {"start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error, "phases": [_event_json(e) for e in phases],
+             "targets": [_event_json(e) for e in targets], "races": [_event_json(e) for e in races],
+             "fitness_model_events": model_list},
+            ensure_ascii=False,
+        )
+    lines = [f"Training plan for athlete {athlete_id_to_use}, {start} to {end}:"]
+    if plan_info.get("training_plan_id") or plan_info.get("training_plan"):
+        lines.append(
+            f"Assigned plan: {plan_info.get('training_plan_alias') or plan_info.get('training_plan') or plan_info.get('training_plan_id')}, "
+            f"start {plan_info.get('training_plan_start_date')}, last applied {plan_info.get('training_plan_last_applied')}"
+        )
+    elif plan_error:
+        lines.append(f"Assigned plan: unknown (the training plan could not be read: {plan_error})")
+    else:
+        lines.append("Assigned plan: none (no Intervals.icu training plan is applied to this athlete)")
+    if not (phases or targets or races or model_list):
+        lines.append("No plan phases, weekly targets, races or fitness-model events in this range.")
+    lines.append(f"Phases / season markers ({len(phases)}):")
+    lines.extend([_format_plan_event(e) for e in phases] or ["- none"])
+    lines.append(f"Weekly targets ({len(targets)}):")
+    lines.extend([_format_plan_event(e) for e in targets] or ["- none"])
+    lines.append(f"Races ({len(races)}):")
+    lines.extend([_format_plan_event(e) for e in races] or ["- none"])
+    lines.append(f"Fitness model events ({len(model_list)}):")
+    lines.extend(
+        [
+            f"- {str(e.get('start_date_local', ''))[:10]} {e.get('category')}: {e.get('name') or ''} "
+            f"{json.dumps({k: v for k, v in e.items() if k in ('ctl', 'atl', 'eftp', 'ctl_days', 'atl_days', 'type') and v is not None})}"
+            for e in model_list
+        ]
+        or ["- none"]
+    )
+    return "\n".join(lines)

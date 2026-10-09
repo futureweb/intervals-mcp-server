@@ -6,6 +6,23 @@ container image `ghcr.io/futureweb/intervals-mcp-server`). It is a fork of
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server); problems in
 the upstream project should be reported there as well.
 
+## Remote deployment hardening (SSE / HTTP transports)
+
+- Bind to `127.0.0.1` and terminate TLS in a reverse proxy that forwards `X-Forwarded-Proto`.
+- Use a secret path (`FASTMCP_SSE_PATH=/mcp-<random>/sse`, `FASTMCP_MESSAGE_PATH=/mcp-<random>/messages/`)
+  and let the proxy forward only that prefix; deny every other path. Treat the URL as a credential.
+- Prefer the built-in OAuth server (`MCP_AUTH=oauth`, `MCP_PUBLIC_URL`) for clients that support
+  OAuth (ChatGPT, Claude): sign-in with Intervals.icu restricted to `OAUTH_ALLOWED_ATHLETES` (no extra
+  password), per-connection permission scopes on a consent page, client metadata documents only from
+  allowlisted hosts, redirect URIs of registered clients only on allowlisted hosts, RFC 9207 `iss`,
+  audience-bound tokens. The Intervals.icu token is used for the identity check only and never stored.
+  See `docs/REMOTE_ACCESS.md`.
+- Optionally restrict a transitional legacy path to the published OpenAI egress ranges
+  (`https://openai.com/chatgpt-connectors.json`) at the proxy.
+- Keep `MCP_PERMISSIONS` minimal; write, destructive and admin classes stay hidden unless enabled.
+- One Intervals.icu API key serves every client of the server: never share a deployment between
+  athletes without a multi-tenant design.
+
 ## Supported versions
 
 Only the **latest minor release line** receives security fixes. Fixes ship as patch releases of

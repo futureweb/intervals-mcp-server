@@ -56,6 +56,29 @@ CUSTOM_UNITS_OVERRIDES=Stamina=%,PotentialStamina=%,RecoveryTime=h
 
 Overridden units are marked `units_source: "override"` in JSON output.
 
+### Aggregating custom fields over weeks
+
+`get_training_summary` does not blindly follow the definition's `aggregate`: Garmin field
+definitions often say `SUM` for values that must never be added across activities. The policy
+is derived from the units, the field name and the definition:
+
+| Kind | Examples | Aggregate |
+| --- | --- | --- |
+| additive | sweat loss (ml), calories (kcal), elapsed time (h) | sum and mean per session |
+| device load | Training Load, EPOC, Impact Load | sum, labelled as a device scale (never mixed with the Intervals.icu load) |
+| estimate / state | VO₂max, performance condition, recovery time, detected LTHR | latest value, change, mean and range (a stored 0 counts as "no value") |
+| per-activity value | stamina %, training effects, GCT ms, vertical oscillation cm, balance %, temperatures, scores | mean, median and range (minimum / maximum for min / max temperature) |
+| unknown | no units and no recognisable meaning | no aggregate |
+
+Values on activities whose sport does not have the field assigned (sport settings) are
+ignored, so running dynamics stored as 0 on rides do not dilute the run averages. Paired
+"… at start" / "… at end" fields report the typical start→end change (e.g. stamina). Override
+the policy per code if needed:
+
+```
+CUSTOM_AGGREGATE_OVERRIDES=ImpactLoad=device_load_sum,MyScore=mean
+```
+
 ## Worked examples
 
 All examples use placeholder IDs; outputs are abbreviated. Nothing here requires an API key
@@ -114,13 +137,15 @@ whole block is one line. For sample-level work use
 get_training_summary(start_date="2026-09-01", end_date="2026-09-30", group_by="week")
 ```
 Each week lists the Intervals.icu load split (power / HR / pace) and, separately, the numeric
-custom fields aggregated as their definition prescribes (`SUM` for a load, `MAX` for a
-training effect, mean otherwise):
+custom fields aggregated by their units and meaning (see "Aggregating custom fields over
+weeks" above):
 
 ```
-Custom fields (e.g. device loads, kept separate from Intervals.icu load):
-  Training Load [TrainingLoad] sum 512.3 (n 5); Aerobic Effect [AerobicEffect] max 4.1 (n 5);
-  Recovery Time [RecoveryTime] max 38.5 h (n 5); Sweat loss [Sweatloss] sum 2890 ml (n 5)
+Custom fields (aggregated by units and meaning: sums only for additive values, device loads kept separate from the Intervals.icu load):
+  Training Load [TrainingLoad] device load sum 512.3 (n 5, device scale); Aerobic Effect [AerobicEffect] mean 3.4 (median 3.5, range 2.1-4.1; n 5);
+  Recovery Time [RecoveryTime] latest 33.9 h (2026-09-29), change +8.6 h since 2026-09-02, mean 30.1, range 12-38.5 h (n 5);
+  Stamina at end [Staminaatend] mean 71.3 % (median 74.5, range 44-88 %; n 5); Sweat loss [Sweatloss] sum 2890 ml (n 5, 578 ml/session)
+stamina start→end: median change -25 %, largest drop -49 % (n 5 activities with both values)
 ```
 
 ### 4. Running dynamics
@@ -163,6 +188,20 @@ get_wellness_trends(metrics="hrv,restingHR,GarminSleepStressAvg,GarminSleepRespi
 Trends report rolling means, baselines, outliers and week-over-week changes; correlations are
 labelled as statistical associations, never as causes. The MCP does not compute a readiness
 verdict: the interpretation stays with the coach.
+
+## Reading the device metrics correctly
+
+- **Stamina vs potential stamina.** Stamina drops quickly during hard efforts and recovers
+  during easier riding; potential stamina is the longer-term reserve. Report both per interval
+  (`get_activity_intervals(stream_types="Stamina,PotentialStamina")`), never treat a dip as a verdict.
+- **Sport assignment.** Intervals.icu assigns custom fields to sports (sport settings). Fields
+  not assigned to the activity's sport (e.g. running metrics on a ride, or a *Run Effectiveness*
+  stream on a ride) are listed separately and excluded from coaching summaries.
+- **Gear streams.** `FrontGear`/`RearGear` and the `*Index` streams come from shift events; whether a
+  value is a tooth count or a gear index depends on the head-unit configuration, so the units of
+  your definitions are shown as stored and nothing is converted.
+- **Loads.** Garmin training load / EPOC and the Intervals.icu load (TSS-like) are different models
+  and are always printed apart.
 
 ## Without the bridge
 

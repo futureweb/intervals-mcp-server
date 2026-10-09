@@ -6,10 +6,12 @@ with their workouts), creating new library workouts (templates) and scheduling a
 workout on the calendar.
 """
 
+import json
 from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import (
     resolve_activity_type,
@@ -343,3 +345,55 @@ async def delete_library_workout(
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting library workout: {result.get('message', 'Unknown error')}"
     return f"Deleted library workout {workout_id} '{workout.get('name') or 'unnamed'}'."
+
+
+@tool("read")
+async def get_library_workout(
+    workout_id: str,
+    athlete_id: str | None = None,
+    api_key: str | None = None,
+    output_format: str = "text",
+) -> str:
+    """Get one workout template from the athlete's library (steps, planned time, load, targets)
+
+    Use get_workout_library to find the id. The workout text is rendered from the structured
+    steps so it can be reused with add_or_update_event or validate_workout.
+
+    Args:
+        workout_id: The library workout id
+        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        output_format: "text" (default) or "json" (the complete workout including workout_doc)
+    """
+    athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+    if error_msg:
+        return error_msg
+    result = await make_intervals_request(url=f"/athlete/{athlete_id_to_use}/workouts/{workout_id}", api_key=api_key)
+    if isinstance(result, dict) and "error" in result:
+        return f"Error fetching library workout: {result.get('message', 'Unknown error')}"
+    if not isinstance(result, dict) or not result:
+        return f"No library workout found with id {workout_id}."
+    if output_format.strip().lower() == "json":
+        return json.dumps(result, ensure_ascii=False)
+    def shown(key: str) -> Any:
+        value = result.get(key)
+        if isinstance(value, list):
+            return ", ".join(str(v) for v in value) or "none"
+        return "n/a" if value is None else value
+
+    lines = [
+        f"Library workout {result.get('id')}: {result.get('name', 'unnamed')} ({result.get('type', '?')}, folder {shown('folder_id')})",
+        f"Planned time {hms(result.get('moving_time'))}, load {shown('icu_training_load')}, intensity {shown('icu_intensity')}, "
+        f"target {shown('target')}, indoor {shown('indoor')}, tags {shown('tags')}, updated {shown('updated')}",
+    ]
+    if result.get("description"):
+        lines.append("Description / workout text:")
+        lines.append(str(result["description"]))
+    doc = result.get("workout_doc")
+    if isinstance(doc, dict) and isinstance(doc.get("steps"), list):
+        try:
+            lines.append("Steps (rendered):")
+            lines.append(str(WorkoutDoc.from_dict({"steps": doc["steps"]})).strip())
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:  # malformed or unsupported (nested repeats)
+            lines.append(f"Steps could not be rendered ({exc}); raw steps: {json.dumps(doc['steps'], ensure_ascii=False)}")
+    return "\n".join(lines)

@@ -11,8 +11,12 @@ from intervals_mcp_server.utils.custom_fields import ACTIVITY_STREAM, index_cust
 from intervals_mcp_server.utils.streams import (
     describe_stream,
     find_stream,
+    foreign_stream_reason,
     format_range_metrics,
     format_stats,
+    gear_units_note,
+    is_counter_stream,
+    normalized_power,
     range_stats,
     render_streams_json,
     render_streams_table,
@@ -167,3 +171,30 @@ def test_render_streams_json_metadata_and_nulls():
     assert data["streams"]["latlng"]["data2"] == [12.2, 12.21, 12.22, 12.23, 12.24, 12.25]
     assert data["streams"]["heartrate"]["data"] == [140, 141, 142, 143, 144, 145]
     assert json.loads(json.dumps(render_streams_json(STREAMS_DATA, {}, 0, 6)))["streams"]["heartrate"]["data"][3] is None
+
+
+def test_gear_streams_with_tooth_units_but_index_values():
+    """Regression: a gear stream defined with units 'cog' whose values are 1-12 is a gear position, not teeth."""
+    defs = {"RearGear": {"code": "RearGear", "name": "RearGear", "units": "cog"},
+            "Chainring": {"code": "Chainring", "name": "Front Gear Teeth", "units": "teeth"}}
+    index_stream = {"type": "RearGear", "custom": True, "data": [3, 5, 7, 12, None, 1]}
+    info = describe_stream(index_stream, defs)
+    assert info["units"] == "gear position" and "not tooth counts" in info["units_note"]
+    teeth = describe_stream({"type": "Chainring", "custom": True, "data": [34, 50, 50]}, defs)
+    assert teeth["units"] == "teeth" and "units_note" not in teeth
+    assert describe_stream({"type": "RearGear", "custom": True, "data": []}, defs)["units"] == "cog"  # no evidence
+    assert gear_units_note("Stamina", "Stamina", "cog", [1, 2]) is None  # not a gear stream
+
+
+def test_stream_relevance_helpers():
+    """Counter streams, sport-foreign streams and normalized power."""
+    assert is_counter_stream(list(range(100))) and not is_counter_stream([5] * 100)
+    assert not is_counter_stream(list(range(10)))
+    assert foreign_stream_reason("GarminRunEffectiveness", "Garmin Run Effectiveness", "Ride") is not None
+    assert foreign_stream_reason("GarminRunEffectiveness", None, "Run") is None
+    assert foreign_stream_reason("GearRatio", "Gear Ratio", "Hike") is not None
+    assert foreign_stream_reason("Stamina", "Garmin Stamina", "Ride") is None
+    assert foreign_stream_reason("Stamina", None, None) is None
+    time = list(range(120))
+    assert normalized_power(time, [200] * 120) == 200
+    assert normalized_power(time[:30], [200] * 30) is None

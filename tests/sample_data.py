@@ -4,6 +4,8 @@ Sample data for testing Intervals.icu MCP server functions.
 This module contains test data structures used across the test suite.
 """
 
+from typing import Any
+
 INTERVALS_DATA = {
     "id": "i1",
     "analyzed": True,
@@ -213,7 +215,7 @@ SPORT_SETTINGS_DATA = [
         "hr_zone_names": ["Recovery", "Aerobic", "Tempo", "SubThreshold", "SuperThreshold", "Aerobic Capacity", "Anaerobic"],
         "sweet_spot_min": 84, "sweet_spot_max": 97, "hr_load_type": "HRSS", "load_order": "POWER_HR_PACE",
         "default_gear_id": "b1", "default_indoor_gear_id": None, "warmup_time": 600, "cooldown_time": 600,
-        "updated": "2026-09-18T15:31:34.039+00:00",
+        "updated": "2026-09-18T15:31:34.039+00:00", "activity_field_ids": [2, 3],
     },
     {
         "id": 2, "types": ["Run", "TrailRun"], "ftp": 415, "lthr": 165, "max_hr": 188,
@@ -239,7 +241,7 @@ GEAR_DATA = [
     {"id": "b2", "type": "Bike", "name": "Canyon Grail", "distance": 11465244.0, "time": 1879473.0, "activities": 215},
 ]
 
-EVENT_DATA = {
+EVENT_DATA: dict[str, Any] = {
     "id": 5, "category": "WORKOUT", "type": "Ride", "name": "2x5 min Threshold", "start_date_local": "2026-10-06T00:00:00",
     "end_date_local": "2026-10-07T00:00:00", "moving_time": 1740, "icu_training_load": 40, "indoor": None,
     "paired_activity_id": "i1", "description": "Threshold session", "updated": "2026-10-05T10:00:00+00:00",
@@ -321,7 +323,8 @@ ACTIVITIES_DATA = [
     {"id": "i10", "name": "Ultimate ride", "type": "Ride", "start_date_local": "2026-10-06T17:36:22", "moving_time": 4861,
      "elapsed_time": 4967, "distance": 40360.0, "total_elevation_gain": 375.0, "icu_training_load": 90, "power_load": 90,
      "hr_load": 60, "icu_intensity": 80, "gear": {"id": "b1"}, "feel": 3, "icu_rpe": 6, "icu_zone_times": [{"id": "Z2", "secs": 1489}, {"id": "Z4", "secs": 1753}],
-     "icu_hr_zone_times": [{"id": "Z2", "secs": 2000}], "TrainingLoad": 129.5, "AerobicEffect": 3.5},
+     "icu_hr_zone_times": [{"id": "Z2", "secs": 2000}], "TrainingLoad": 129.5, "AerobicEffect": 3.5,
+     "power_meter": "Shimano FC-R9200P"},
     {"id": "i11", "name": "Grail gravel", "type": "GravelRide", "start_date_local": "2026-10-07T12:26:55", "moving_time": 6708,
      "elapsed_time": 7153, "distance": 48000.0, "total_elevation_gain": 375.0, "icu_training_load": 130, "power_load": 130,
      "hr_load": 50, "icu_intensity": 70, "gear": {"id": "b2"}, "feel": 2, "icu_rpe": 5, "TrainingLoad": 124.7, "AerobicEffect": 3.3},
@@ -354,3 +357,64 @@ def _wellness_series():
 
 
 WELLNESS_SERIES = _wellness_series()
+
+
+def _extended_ride():
+    """A 65-minute plan ridden in 87 minutes: plan intervals, then easy riding and a 50 s sprint."""
+    base_streams = _execution_streams()  # 1740 samples (plan part)
+    extra = 1740 + 1500 + 50 + 1930  # +25 min easy, 50 s sprint, ~32 min home = 5220 samples
+    time = list(range(extra))
+    watts, heartrate, cadence, speed, stamina = (list(s["data"]) for s in base_streams[1:6])
+    for t in range(1740, extra):
+        if 3240 <= t < 3290:
+            w, h = 430, 165
+        elif t < 3240:
+            w, h = 150, 125
+        else:
+            w, h = 140, 120
+        watts.append(w)
+        heartrate.append(h)
+        cadence.append(85)
+        speed.append(8.0)
+        stamina.append(max(0.0, stamina[-1] - 0.01))
+    streams = [
+        {"type": "time", "custom": False, "data": time},
+        {"type": "watts", "custom": False, "data": watts},
+        {"type": "heartrate", "custom": False, "data": heartrate},
+        {"type": "cadence", "custom": False, "data": cadence},
+        {"type": "velocity_smooth", "custom": False, "data": speed},
+        {"type": "Stamina", "custom": True, "data": stamina},
+    ]
+    intervals = {
+        "id": "i2", "analyzed": True,
+        "icu_intervals": list(EXECUTION_INTERVALS["icu_intervals"]) + [
+            {"type": "RECOVERY", "label": None, "start_index": 1740, "end_index": 3240, "start_time": 1740,
+             "end_time": 3240, "elapsed_time": 1500, "average_watts": 150, "average_heartrate": 125},
+            {"type": "WORK", "label": None, "start_index": 3240, "end_index": 3290, "start_time": 3240,
+             "end_time": 3290, "elapsed_time": 50, "average_watts": 430, "max_watts": 480, "average_heartrate": 165},
+            {"type": "RECOVERY", "label": None, "start_index": 3290, "end_index": 5220, "start_time": 3290,
+             "end_time": 5220, "elapsed_time": 1930, "average_watts": 140, "average_heartrate": 120},
+        ],
+        "icu_groups": [],
+    }
+    return streams, intervals
+
+
+EXTENDED_STREAMS, EXTENDED_INTERVALS = _extended_ride()
+
+EXTENDED_ACTIVITY = {
+    **{k: v for k, v in EXECUTION_ACTIVITY.items() if k != "paired_event_id"},
+    "id": "i2", "name": "Threshold + extra riding", "elapsed_time": 5220, "moving_time": 5200,
+    "paired_event_id": None, "compliance": 0.0,
+}
+
+
+PLAN_EVENTS = [
+    {"id": 901, "category": "PLAN", "type": "Ride", "name": "Base 2", "start_date_local": "2026-10-13T00:00:00", "end_date_local": "2026-11-09T00:00:00", "description": "aerobic base"},
+    {"id": 902, "category": "TARGET", "name": "Week target", "start_date_local": "2026-10-13T00:00:00", "for_week": True, "load_target": 450, "time_target": 36000},
+    {"id": 903, "category": "RACE_A", "type": "Ride", "name": "Ötztaler", "start_date_local": "2027-08-29T00:00:00"},
+    {"id": 904, "category": "WORKOUT", "type": "Ride", "name": "ignored", "start_date_local": "2026-10-14T00:00:00"},
+]
+LIBRARY_WORKOUT = {"id": 77, "name": "SST 3x12", "type": "Ride", "folder_id": 301129, "moving_time": 4080, "icu_training_load": 70,
+                   "description": "- 10m 55%\n3x\n- 12m 90%\n- 4m 50%", "workout_doc": {"steps": EVENT_DATA["workout_doc"]["steps"]}}
+GEAR_WITH_REMINDER = [dict(GEAR_DATA[0], reminders=[{"id": 1, "name": "Chain wax", "distance": 400000, "distance_used": 250000, "percent_used": 62.5, "last_reset": "2026-08-01"}])] + GEAR_DATA[1:]
