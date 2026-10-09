@@ -278,17 +278,23 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
 
     Uses, in this order, the given planned_workout_doc, the given event_id, or the event
     paired with the activity, together with the intervals Intervals.icu detected. Planned
-    steps (repeats expanded) are aligned with the actual intervals by order, duration and
-    target intensity (never by interval names); a step may also match two or three
-    consecutive intervals of the same intensity (an effort split by a lap or a stop).
-    Planned steps are capped at their planned duration: when an interval is longer than
+    steps (repeats expanded) are aligned with the actual intervals by order, duration (or
+    distance) and target intensity (never by interval names); a step may also match any
+    number of consecutive intervals of about the same intensity (an effort split by laps,
+    e.g. 1 km device auto-laps, or a stop). When a lap boundary is not the step boundary
+    (one step longer, the next shorter than planned by the same time), the boundary is set on
+    the plan timeline inside the lap and noted, instead of two opposite deviations.
+    Open-ended targets (top zone, a range with a start only) are lower bounds. Steps in the
+    recovery zone or between two clearly harder steps count as rest, easy aerobic steps as
+    work. Planned steps are capped at their planned duration: when an interval is longer than
     its step (beyond the tolerance), it is split logically (analysis only, nothing on
     Intervals.icu changes); the planned part is evaluated against the plan from the samples
     and the remainder is reported separately. For each step: planned vs actual (moving)
     duration, the target range (resolved to W, bpm or pace), the actual average, below/in/
     above target with the offset from the exact range, time within the target range (±5%),
     HR start/end, the HR drop in the first minute after work steps, cadence, power/speed
-    fade, Pw:HR drift for work steps of 10 min or more, the change of every custom stream
+    fade, Pw:HR drift for work steps of 10 min or more (Intervals.icu decoupling sign:
+    positive = HR rose relative to power), the change of every custom stream
     (e.g. stamina; clock counters and other-sport streams are left out) and notes on clear
     deviations (short, too long, off target, paused, shifted). The Intervals.icu interval
     type is kept and shown next to the planned step type when they differ. Everything after
