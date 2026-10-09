@@ -574,7 +574,8 @@ def test_compare_workouts_errors(monkeypatch):
 
 # -------------------------------------------------------- get_power_hr_efficiency
 def test_get_power_hr_efficiency_text(monkeypatch):
-    """Steady WORK intervals are bucketed by average power; per band a W/bpm trend oldest vs newest third."""
+    """Steady WORK intervals are bucketed by average power (time-weighted); with two bikes the trends are
+    per gear and too few independent activities give no trend (regression: no +X % from one activity)."""
     calls = []
     _install_router(monkeypatch, calls=calls)
     result = asyncio.run(get_power_hr_efficiency(
@@ -586,17 +587,53 @@ def test_get_power_hr_efficiency_text(monkeypatch):
     lines = result.split("\n")
     assert lines[0] == (
         "Power:HR efficiency for athlete i1, 2026-09-01 to 2026-10-09, sports Ride,GravelRide: 3 activities (oldest first; limit 30), "
-        "WORK intervals of at least 5:00 with power and HR, bands 150-200 W, 200-250 W, 250-300 W."
+        "WORK intervals of at least 5:00 with power and HR, bands 150-200 W, 200-250 W, 250-300 W (low <= W < high; time-weighted means)."
     )
     assert lines[1] == "2026-09-01 Ride 'Sweet Spot 3x15' (a1), gear Road Bike (b1), FTP 225 W: 200-250 W: 3 x 220 W / 150 bpm = 1.47 W/bpm"
     assert lines[2] == "2026-09-20 GravelRide 'Gravel endurance' (a3), gear Gravel Bike (b2), FTP 230 W: 150-200 W: 1 x 180 W / 135 bpm = 1.33 W/bpm; 250-300 W: 1 x 260 W / 158 bpm = 1.65 W/bpm"
     assert lines[3] == "2026-10-01 Ride 'Sweet Spot 3x20' (a4), gear Road Bike (b1), FTP 235 W: 200-250 W: 3 x 240 W / 155 bpm = 1.55 W/bpm"
-    assert lines[4] == "Trend per band (mean W/bpm of the oldest third vs the newest third of the activities with data):"
-    assert lines[5] == "  150-200 W: not enough activities with data in this band (1)"
-    assert lines[6] == "  200-250 W: 1.47 -> 1.55 W/bpm (+5.5 %; 1 of 2 activities per group)"
-    assert lines[7] == "  250-300 W: not enough activities with data in this band (1)"
-    assert "not a fitness verdict" in result
+    assert lines[4].startswith("Trend per band and gear (power meters are not mixed)")
+    assert "  200-250 W on gear Road Bike (b1): not enough independent activities (2; a trend needs at least 6) - no trend, not reliable" in lines
+    assert "+5.5 %" not in result
+    assert "a single activity with a higher W/bpm does not show an improvement" in result
     assert result.endswith("API calls: 4 (plus 1 for the gear catalog unless cached)")
+
+
+def test_get_power_hr_efficiency_reliable_trend_and_filters(monkeypatch):
+    """Enough independent activities give a trend that is compared with the day-to-day variation;
+    gear, indoor/outdoor and interval position filters apply."""
+    days = [f"2026-08-{d:02d}" for d in range(1, 13)]
+    rides = [_activity(f"r{i}", day, "Ride" if i % 4 else "VirtualRide", "b1", f"Ride {i}", trainer=i % 4 == 0)
+             for i, day in enumerate(days)]
+    hrs = {f"r{i}": 160 - i * 1.5 + (2 if i % 2 else -2) for i in range(12)}
+
+    def intervals(url, _params):
+        aid = _activity_id_of(url)
+        return {"icu_intervals": [
+            {"type": "WORK", "elapsed_time": 600, "start_time": 300, "average_watts": 230, "average_heartrate": hrs.get(aid, 150)},
+            {"type": "WORK", "elapsed_time": 600, "start_time": 3000, "average_watts": 230, "average_heartrate": 175},
+        ]}
+
+    _install_router(monkeypatch, overrides={"/activities": rides, "/intervals": intervals})
+    payload = json.loads(asyncio.run(get_power_hr_efficiency(
+        start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", max_start_minutes=30, output_format="json",
+    )))
+    trend = payload["trends"][0]
+    assert trend["reliable"] is True and trend["activities"] == 12 and trend["group_size"] == 4
+    assert trend["change_pct"] > 5 and trend["beyond_variation"] is True
+    assert payload["activities"][0]["bands"]["200-250 W"]["n"] == 1  # the late interval (50 min in) is excluded
+    outdoor = json.loads(asyncio.run(get_power_hr_efficiency(
+        start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", environment="outdoor", output_format="json",
+    )))
+    assert len(outdoor["activities"]) == 9 and not any(a["indoor"] for a in outdoor["activities"])
+    flat = {f"r{i}": 150 + (3 if i % 2 else -3) for i in range(12)}
+    hrs.clear()
+    hrs.update(flat)
+    text = asyncio.run(get_power_hr_efficiency(start_date="2026-08-01", end_date="2026-08-31", power_bands="200-250", max_start_minutes=30))
+    assert "within the day-to-day variation, no meaningful change" in text
+    assert asyncio.run(get_power_hr_efficiency(environment="garage")).startswith("Error: environment")
+    assert asyncio.run(get_power_hr_efficiency(power_bands="150-210,200-250")).startswith("Error: power bands 150-210 and 200-... overlap")
+    assert asyncio.run(get_power_hr_efficiency(min_activities_per_group=0)).startswith("Error: min_activities_per_group")
 
 
 def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
@@ -608,10 +645,11 @@ def test_get_power_hr_efficiency_json_validation_and_errors(monkeypatch):
     assert payload["bands"] == ["100-300 W"] and payload["sport_types"] == "Ride,GravelRide,VirtualRide"
     gravel = payload["activities"][1]["bands"]["100-300 W"]
     # bands are half-open: the 300 W interval of a3 is not in 100-300
-    assert gravel == {"n": 2, "watts": 220.0, "hr": 146.5, "w_per_bpm": 1.502}
+    # time-weighted: 1800 s at 180 W / 135 bpm and 1200 s at 260 W / 158 bpm (simple means gave 220 W / 146.5 bpm)
+    assert gravel == {"n": 2, "secs": 3000.0, "watts": 212.0, "hr": 144.2, "w_per_bpm": 1.47}
+    assert payload["band_rule"] == "low <= W < high"
     trend = payload["trends"][0]
-    assert trend["activities"] == 3 and trend["group_size"] == 1
-    assert trend["oldest_mean"] == 1.467 and trend["newest_mean"] == 1.548 and trend["change_pct"] == 5.5
+    assert trend["activities"] == 2 and trend["reliable"] is False  # per gear, two activities on b1
     assert asyncio.run(get_power_hr_efficiency(power_bands="150-200,abc")).startswith("Error: power_bands must look like")
     assert asyncio.run(get_power_hr_efficiency(power_bands="200-150")).startswith("Error: power band '200-150'")
     assert asyncio.run(get_power_hr_efficiency(power_bands="")).startswith("Error: at least one power band")

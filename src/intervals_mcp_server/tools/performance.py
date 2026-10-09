@@ -14,6 +14,7 @@ number of API calls made so the caller can keep an eye on the rate limit.
 import json
 import math
 import re
+import statistics
 from datetime import date, timedelta
 from typing import Any
 
@@ -68,7 +69,8 @@ POWER_METER_NOTE = (
 EFFICIENCY_NOTE = (
     "Note: this is a statistical comparison of W per bpm in steady WORK intervals. Heat, fatigue, "
     "hydration, cadence, indoor vs outdoor, interval position in the ride and power meter "
-    "differences between bikes all move the ratio; it is not a fitness verdict."
+    "differences between bikes all move the ratio; it is not a fitness verdict, and a single "
+    "activity with a higher W/bpm does not show an improvement."
 )
 GEAR_CALL_NOTE = "(plus 1 for the gear catalog unless cached)"
 
@@ -1378,6 +1380,9 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
 
 
 # ------------------------------------------------------- power:HR efficiency
+MIN_ACTIVITIES_PER_GROUP = 3
+
+
 def _bands(csv: str) -> list[tuple[float, float]] | str:
     bands: list[tuple[float, float]] = []
     for part in _split(csv):
@@ -1388,55 +1393,114 @@ def _bands(csv: str) -> list[tuple[float, float]] | str:
         if low < 0 or high <= low:
             return f"Error: power band '{part}' must have 0 <= low < high."
         bands.append((low, high))
-    return bands or "Error: at least one power band is required."
+    if not bands:
+        return "Error: at least one power band is required."
+    ordered = sorted(bands)
+    for (low_a, high_a), (low_b, _) in zip(ordered, ordered[1:], strict=False):
+        if low_b < high_a:
+            return f"Error: power bands {low_a:g}-{high_a:g} and {low_b:g}-... overlap; use non-overlapping bands such as '150-200,200-250'."
+    return bands
 
 
 def _band_label(band: tuple[float, float]) -> str:
     return f"{band[0]:g}-{band[1]:g} W"
 
 
-def _band_stats(
-    intervals: list[dict[str, Any]], bands: list[tuple[float, float]], min_secs: int
+def _band_stats(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    intervals: list[dict[str, Any]], bands: list[tuple[float, float]], min_secs: int,
+    min_start_s: float = 0.0, max_start_s: float | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Per band: n, mean watts, mean HR and W/bpm of the steady WORK intervals falling into it."""
+    """Per band: n, time-weighted mean watts and HR and W/bpm of the steady WORK intervals in it.
+
+    Bands are half-open (low <= W < high); only intervals starting between min_start_s and
+    max_start_s (seconds from the start) count.
+    """
     stats: dict[str, dict[str, Any]] = {}
     for band in bands:
-        hits: list[tuple[float, float]] = []
+        hits: list[tuple[float, float, float]] = []
         for interval in intervals:
-            secs = _num(interval.get("elapsed_time"))
+            secs = _num(interval.get("moving_time")) or _num(interval.get("elapsed_time"))
             watts, hr = _num(interval.get("average_watts")), _num(interval.get("average_heartrate"))
+            start = _num(interval.get("start_time")) or 0.0
             if secs is None or secs < min_secs or watts is None or hr is None or hr <= 0:
                 continue
+            if start < min_start_s or (max_start_s is not None and start > max_start_s):
+                continue
             if band[0] <= watts < band[1]:
-                hits.append((watts, hr))
+                hits.append((watts, hr, secs))
         if hits:
-            mean_w = sum(w for w, _ in hits) / len(hits)
-            mean_hr = sum(h for _, h in hits) / len(hits)
+            total = sum(s for _, _, s in hits)
+            mean_w = sum(w * s for w, _, s in hits) / total
+            mean_hr = sum(h * s for _, h, s in hits) / total
             stats[_band_label(band)] = {
-                "n": len(hits), "watts": round(mean_w, 1), "hr": round(mean_hr, 1),
+                "n": len(hits), "secs": total, "watts": round(mean_w, 1), "hr": round(mean_hr, 1),
                 "w_per_bpm": round(mean_w / mean_hr, 3),
             }
     return stats
 
 
-def _band_trend(rows: list[dict[str, Any]], label: str) -> dict[str, Any]:
-    """Oldest third vs newest third (mean W/bpm) of the activities with data in the band."""
+def _band_trend(rows: list[dict[str, Any]], label: str, min_per_group: int, gear: str | None = None) -> dict[str, Any]:
+    """Oldest vs newest group of independent activities (mean W/bpm per activity) in one band.
+
+    Each activity counts once. A trend needs at least ``min_per_group`` activities in each group;
+    the change is compared with the day-to-day standard deviation of the per-activity values.
+    """
     series = [row["bands"][label]["w_per_bpm"] for row in rows if label in row["bands"]]
-    if len(series) < 2:
-        return {"band": label, "activities": len(series), "note": "not enough activities with data in this band"}
-    third = max(1, len(series) // 3)
-    oldest, newest = _mean(series[:third]), _mean(series[-third:])
+    base: dict[str, Any] = {"band": label, "gear_id": gear, "activities": len(series), "min_per_group": min_per_group}
+    if len(series) < 2 * min_per_group:
+        return {**base, "reliable": False,
+                "note": f"not enough independent activities ({len(series)}; a trend needs at least {2 * min_per_group})"}
+    group = max(min_per_group, len(series) // 3)
+    oldest, newest = _mean(series[:group]), _mean(series[-group:])
     change = _pct_change(oldest, newest)
+    spread = statistics.stdev(series)
+    diff = (newest or 0) - (oldest or 0)
     return {
-        "band": label, "activities": len(series), "group_size": third,
+        **base, "group_size": group, "reliable": True,
         "oldest_mean": round(oldest, 3) if oldest is not None else None,
         "newest_mean": round(newest, 3) if newest is not None else None,
         "change_pct": round(change, 1) if change is not None else None,
+        "sd_per_activity": round(spread, 3),
+        "beyond_variation": abs(diff) > spread,
     }
 
 
+def _efficiency_trends(
+    rows: list[dict[str, Any]], labels: list[str], min_per_group: int
+) -> list[dict[str, Any]]:
+    """Trends per band, separately per gear when several bikes / power meters are involved."""
+    gears = sorted({row.get("gear_id") or "" for row in rows})
+    if len(gears) <= 1:
+        return [_band_trend(rows, label, min_per_group) for label in labels]
+    names = {row.get("gear_id") or "": row.get("gear_name") for row in rows}
+    trends = []
+    for label in labels:
+        for gear in gears:
+            subset = [r for r in rows if (r.get("gear_id") or "") == gear]
+            if not any(label in r["bands"] for r in subset):
+                continue
+            name = f"{names[gear]} ({gear})" if names.get(gear) else (gear or "no gear")
+            trends.append(_band_trend(subset, label, min_per_group, name))
+    return trends
+
+
+def _trend_text(trend: dict[str, Any]) -> str:
+    where = f"{trend['band']}" + (f" on gear {trend['gear_id']}" if trend.get("gear_id") else "")
+    if not trend["reliable"]:
+        return f"  {where}: {trend['note']} - no trend, not reliable"
+    change = f"{trend['change_pct']:+.1f} %" if trend["change_pct"] is not None else "n/a"
+    verdict = (
+        "larger than the day-to-day variation" if trend["beyond_variation"]
+        else "within the day-to-day variation, no meaningful change"
+    )
+    return (
+        f"  {where}: {trend['oldest_mean']:.2f} -> {trend['newest_mean']:.2f} W/bpm ({change}; {trend['group_size']} of "
+        f"{trend['activities']} activities per group; SD per activity {trend['sd_per_activity']:.2f}: {verdict})"
+    )
+
+
 @tool("read")
-async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
     start_date: str | None = None,
     end_date: str | None = None,
     sport_types: str = "Ride,GravelRide,VirtualRide",
@@ -1446,30 +1510,48 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    gear_id: str | None = None,
+    environment: str | None = None,
+    min_start_minutes: float = 0.0,
+    max_start_minutes: float | None = None,
+    min_activities_per_group: int = MIN_ACTIVITIES_PER_GROUP,
 ) -> str:
     """Power-to-heart-rate ratio (W per bpm) per power band across steady intervals over time
 
     Takes the activities of the date range (default the last 90 days) for the given sports,
     fetches their intervals and puts every WORK interval of at least min_interval_secs with
-    both power and heart rate into the power band matching its average power. Per activity
-    and band it reports the number of intervals, mean watts, mean HR and W/bpm; per band it
-    then compares the mean W/bpm of the oldest third of activities with data against the
-    newest third. A higher W/bpm at the same power usually means lower HR for the same output,
-    but heat, fatigue, hydration, cadence, indoor/outdoor and power meter differences between
-    bikes all move the ratio, so this is a statistical comparison, not a fitness verdict. One
-    API call to list the activities plus one per activity (at most 60) and one for the gear
-    catalog.
+    both power and heart rate into the power band matching its average power (bands are
+    half-open, low <= W < high, and must not overlap). Per activity and band it reports the
+    number of intervals and the time-weighted mean watts, mean HR and W/bpm. Per band the
+    mean W/bpm of the oldest group of independent activities (each activity counts once) is
+    compared with the newest group; a trend needs at least min_activities_per_group
+    activities in each group, otherwise the band is reported as not reliable. The change is
+    compared with the day-to-day standard deviation of the per-activity values. When the
+    activities use more than one bike / power meter, trends are computed per gear (watts of
+    different power meters are never mixed). Optional filters: gear, indoor/outdoor, and the
+    position of the interval in the ride (minutes from the start, e.g. to skip warm-ups or
+    fatigued late intervals). A higher W/bpm at the same power usually means lower HR for the
+    same output, but heat, fatigue, hydration, cadence, indoor/outdoor and power meter
+    differences all move the ratio: this is a statistical comparison, not a fitness verdict,
+    and a single activity never shows an improvement. One API call to list the activities
+    plus one per activity (at most 60) and one for the gear catalog.
 
     Args:
         start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date)
         end_date: End date YYYY-MM-DD (optional, default today)
         sport_types: Comma-separated sport types (optional, default "Ride,GravelRide,VirtualRide")
-        power_bands: Comma-separated bands in W as "low-high" (optional, default "150-200,200-250,250-300")
+        power_bands: Comma-separated non-overlapping bands in W as "low-high" (optional, default "150-200,200-250,250-300")
         min_interval_secs: Minimum WORK interval length in seconds (optional, default 300)
         limit: Maximum number of activities, newest first, 1-60 (optional, default 30)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        gear_id: Keep only activities done on this gear id (optional)
+        environment: "indoor" (trainer / virtual) or "outdoor" (optional, default both)
+        min_start_minutes: Only intervals starting at least this many minutes into the activity (optional, default 0)
+        max_start_minutes: Only intervals starting at most this many minutes into the activity (optional)
+        min_activities_per_group: Independent activities needed in the oldest and in the newest
+            group for a trend (optional, default 3)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -1479,6 +1561,11 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
         return bands
     if min_interval_secs <= 0:
         return "Error: min_interval_secs must be positive."
+    if min_activities_per_group < 1:
+        return "Error: min_activities_per_group must be at least 1."
+    env = (environment or "").strip().lower() or None
+    if env not in (None, "indoor", "outdoor"):
+        return "Error: environment must be 'indoor' or 'outdoor'."
     span = _resolve_range(start_date, end_date, DEFAULT_RANGE_DAYS)
     if isinstance(span, str):
         return span
@@ -1488,7 +1575,10 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
     activities, error, _ = await _collect_activities(api, athlete_id_to_use, start_date=span[0], end_date=span[1])
     if error:
         return error
-    selected = _select_activities(activities, sport_types=sport_types, limit=capped)
+    selected = _select_activities(activities, sport_types=sport_types, gear_id=gear_id)
+    if env:
+        selected = [a for a in selected if is_indoor(a) == (env == "indoor")]
+    selected = selected[:capped]
     if not selected:
         return f"No activities found between {span[0]} and {span[1]} for sports {sport_types}."
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
@@ -1497,21 +1587,32 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
         intervals, error = await _work_intervals(api, activity.get("id"))
         if error:
             return error
-        rows.append({**_activity_json(activity, gear_map), "bands": _band_stats(intervals, bands, min_interval_secs)})
+        stats = _band_stats(intervals, bands, min_interval_secs, min_start_minutes * 60,
+                            max_start_minutes * 60 if max_start_minutes is not None else None)
+        rows.append({**_activity_json(activity, gear_map), "power_meter": activity.get("power_meter"),
+                     "indoor": is_indoor(activity), "bands": stats})
     labels = [_band_label(band) for band in bands]
-    trends = [_band_trend(rows, label) for label in labels]
+    trends = _efficiency_trends(rows, labels, min_activities_per_group)
+    position = (
+        f", intervals starting {min_start_minutes:g}-{max_start_minutes:g} min into the activity" if max_start_minutes is not None
+        else (f", intervals starting after {min_start_minutes:g} min" if min_start_minutes else "")
+    )
 
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "start": span[0], "end": span[1], "sport_types": sport_types,
-            "bands": labels, "min_interval_secs": min_interval_secs, "limit": capped,
+            "bands": labels, "band_rule": "low <= W < high", "min_interval_secs": min_interval_secs, "limit": capped,
+            "filters": {"gear_id": gear_id, "environment": env, "min_start_minutes": min_start_minutes,
+                        "max_start_minutes": max_start_minutes, "min_activities_per_group": min_activities_per_group},
             "activities": rows, "trends": trends, "note": EFFICIENCY_NOTE, "api_calls": api.calls,
         }
         return json.dumps(payload, ensure_ascii=False)
     lines = [
         f"Power:HR efficiency for athlete {athlete_id_to_use}, {span[0]} to {span[1]}, sports {sport_types}: "
         f"{len(rows)} activities (oldest first; limit {capped}{', capped from ' + str(limit) if limit > capped else ''}), "
-        f"WORK intervals of at least {hms(min_interval_secs)} with power and HR, bands {', '.join(labels)}.",
+        f"WORK intervals of at least {hms(min_interval_secs)} with power and HR{position}, bands {', '.join(labels)} "
+        "(low <= W < high; time-weighted means)."
+        + (f" Filters: {', '.join(f for f in (f'gear {gear_id}' if gear_id else '', env or '') if f)}." if gear_id or env else ""),
     ]
     for row in rows:
         gear = f"{row['gear_name']} ({row['gear_id']})" if row["gear_name"] else (row["gear_id"] or "no gear")
@@ -1521,19 +1622,15 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
             if (s := row["bands"].get(label))
         ]
         lines.append(
-            f"{row['date']} {row['type']} '{row['name']}' ({row['id']}), gear {gear}, FTP {_fmt(_num(row['ftp']), 0, 'W')}: "
-            + ("; ".join(cells) if cells else "no qualifying intervals")
+            f"{row['date']} {row['type']} '{row['name']}' ({row['id']}), gear {gear}{', indoor' if row['indoor'] else ''}, "
+            f"FTP {_fmt(_num(row['ftp']), 0, 'W')}: " + ("; ".join(cells) if cells else "no qualifying intervals")
         )
-    lines.append("Trend per band (mean W/bpm of the oldest third vs the newest third of the activities with data):")
-    for trend in trends:
-        if "note" in trend:
-            lines.append(f"  {trend['band']}: {trend['note']} ({trend['activities']})")
-            continue
-        change = f"{trend['change_pct']:+.1f} %" if trend["change_pct"] is not None else "n/a"
-        lines.append(
-            f"  {trend['band']}: {trend['oldest_mean']:.2f} -> {trend['newest_mean']:.2f} W/bpm ({change}; "
-            f"{trend['group_size']} of {trend['activities']} activities per group)"
-        )
+    per_gear = any(t.get("gear_id") for t in trends)
+    lines.append(
+        f"Trend per band{' and gear (power meters are not mixed)' if per_gear else ''} (mean W/bpm per activity, oldest vs "
+        f"newest group, at least {min_activities_per_group} independent activities per group):"
+    )
+    lines.extend(_trend_text(trend) for trend in trends)
     lines.append(EFFICIENCY_NOTE)
     lines.append(f"API calls: {api.calls} {GEAR_CALL_NOTE}")
     return "\n".join(lines)
