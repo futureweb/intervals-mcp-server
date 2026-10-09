@@ -21,7 +21,17 @@ and never given to the MCP client.
 
 ## What you get
 
-* **Sign-in with Intervals.icu** (recommended) or with a server password, or both.
+* **Three sign-in options**, combinable with `OAUTH_LOGIN`:
+  | Option | Needs | Default when |
+  | --- | --- | --- |
+  | `intervals`: "Continue with Intervals.icu" | an approved Intervals.icu OAuth app | `INTERVALS_OAUTH_CLIENT_ID` is set |
+  | `password`: server password | `OAUTH_PASSWORD_HASH` (or `OAUTH_PASSWORD`) | a password is set |
+  | `apikey`: your Intervals.icu API key | nothing extra: the `API_KEY` the server already uses | otherwise (zero configuration) |
+
+  The API-key sign-in compares the entered key in constant time with a SHA-256 digest of the
+  configured key; the key is never stored, logged or sent anywhere. With `OAUTH_TOTP_SECRET` the
+  password and API-key sign-ins additionally ask for the 6-digit code of an authenticator app
+  (TOTP, RFC 6238, single use).
 * **Consent page** showing which client asks (verified for clients with a metadata
   document, e.g. "ChatGPT · verified: chatgpt.com") and which permissions the connection
   gets. The permission classes of the server become OAuth scopes: `intervals:read`,
@@ -50,8 +60,8 @@ https://mcp.example.com/oauth/intervals/callback
 No webhooks are needed. If the form answers "Invalid url" with an empty *Activity URL
 Template*, enter any URL of your host there (e.g. `https://mcp.example.com/activity/$external_id$`);
 this server never uploads activities. The app stays *Pending* until Intervals.icu approves
-it; client id and secret are shown under Settings → Apps → *Manage App*. Until then you can
-use the password sign-in.
+it; client id and secret are shown under Settings → Apps → *Manage App*. Until then (or
+instead) use the API-key or password sign-in: no app is needed for those.
 
 ## 2. Configuration
 
@@ -60,11 +70,13 @@ use the password sign-in.
 | `MCP_AUTH` | `none` (default) or `oauth`. |
 | `MCP_PUBLIC_URL` | Public base URL, e.g. `https://mcp.example.com`. Required with `oauth`; OAuth issuer and resource. `http://` only for `localhost`. |
 | `MCP_TRANSPORT` | `http+sse` (both transports), `http` / `streamable-http` or `sse`. |
-| `OAUTH_LOGIN` | `intervals`, `password` or `intervals,password`. Default: `intervals` when `INTERVALS_OAUTH_CLIENT_ID` is set, otherwise `password`. |
+| `OAUTH_LOGIN` | Comma-separated `intervals`, `password`, `apikey`. Default: `intervals` with an Intervals.icu app, else `password` when a password is set, else `apikey`. |
 | `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | The Intervals.icu OAuth app (required for `intervals`). |
 | `INTERVALS_OAUTH_SCOPE` | Scope requested at Intervals.icu for the identity check, default `ACTIVITY:READ`. |
 | `OAUTH_ALLOWED_ATHLETES` | Comma-separated athlete ids allowed to sign in, default `ATHLETE_ID`. `i123` and `123` are the same. |
 | `OAUTH_PASSWORD` or `OAUTH_PASSWORD_HASH`, `OAUTH_USERNAME` | Password sign-in (required for `password`). Username default `athlete`. |
+| `API_KEY` | The Intervals.icu API key of the deployment; also the secret of the `apikey` sign-in. |
+| `OAUTH_TOTP_SECRET` | Optional second factor for `password` and `apikey` (create with `python -m intervals_mcp_server.auth totp-secret`). |
 | `OAUTH_CLIENT_HOSTS` | Hosts whose client metadata documents are accepted. Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. |
 | `OAUTH_REDIRECT_HOSTS` | Redirect hosts allowed for dynamically registered clients. Same default; `*` allows any https host. Loopback http is always allowed. |
 | `OAUTH_DYNAMIC_REGISTRATION` | `true` (default) or `false`. |
@@ -87,6 +99,15 @@ INTERVALS_OAUTH_CLIENT_SECRET=...
 OAUTH_STATE_FILE=/var/lib/intervals-mcp/oauth_state.json
 MCP_PERMISSIONS=read,write
 ```
+
+Without an Intervals.icu app and without a password, the sign-in uses the API key: nothing else
+to configure. Add a second factor for a public server:
+
+```bash
+python -m intervals_mcp_server.auth totp-secret      # prints OAUTH_TOTP_SECRET=... and an otpauth:// URI
+```
+
+Add the URI (or the secret) to an authenticator app and set `OAUTH_TOTP_SECRET` on the server.
 
 For the password sign-in, store a hash instead of the plain password:
 
@@ -134,7 +155,8 @@ other hosts (e.g. a secret-path endpoint without OAuth) go into `FASTMCP_ALLOWED
    `https://mcp.example.com/mcp` and authentication **OAuth**. Leave client id and secret
    empty: ChatGPT identifies itself with its metadata document.
 2. ChatGPT opens the consent page. Check which permissions the connection gets and press
-   **Continue with Intervals.icu** (or sign in with the password).
+   **Continue with Intervals.icu**, or sign in with the API key or the password (plus the
+   authenticator code if TOTP is enabled).
 3. Intervals.icu asks you to approve the app; afterwards you are sent back to ChatGPT.
 4. After a server update use **Refresh** on the connection so ChatGPT reloads the tools.
 

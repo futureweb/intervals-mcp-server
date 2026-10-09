@@ -13,7 +13,9 @@ the upstream project should be reported there as well.
   and let the proxy forward only that prefix; deny every other path. Treat the URL as a credential.
 - Prefer the built-in OAuth server (`MCP_AUTH=oauth`, `MCP_PUBLIC_URL`) for clients that support
   OAuth (ChatGPT, Claude): sign-in with Intervals.icu restricted to `OAUTH_ALLOWED_ATHLETES` (no extra
-  password), per-connection permission scopes on a consent page, client metadata documents only from
+  password) or with the Intervals.icu API key / a server password, optionally with a TOTP second
+  factor (`OAUTH_TOTP_SECRET`, recommended for public servers without the Intervals.icu sign-in);
+  per-connection permission scopes on a consent page, client metadata documents only from
   allowlisted hosts, redirect URIs of registered clients only on allowlisted hosts, RFC 9207 `iss`,
   audience-bound tokens. The Intervals.icu token is used for the identity check only and never stored.
   See `docs/REMOTE_ACCESS.md`.

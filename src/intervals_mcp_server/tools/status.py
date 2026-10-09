@@ -103,7 +103,8 @@ def format_status(status: dict[str, Any]) -> str:
         f"Transport: {status['transport']} on {status['host']}:{status['port']}, SSE path {path_note}; "
         f"auth mode {auth.get('mode', 'none')}"
         + (
-            f" (issuer {auth.get('issuer')}, sign-in {'+'.join(auth.get('login') or [])}, "
+            f" (issuer {auth.get('issuer')}, sign-in {'+'.join(auth.get('login') or [])}"
+            f"{' + TOTP' if auth.get('second_factor') == 'totp' else ''}, "
             f"Intervals.icu app {auth.get('intervals_app')}, allowed athletes {', '.join(auth.get('allowed_athletes') or []) or 'none'})"
             if auth.get("mode") == "oauth"
             else " (remote transports need a secret path or OAuth plus a TLS reverse proxy)"

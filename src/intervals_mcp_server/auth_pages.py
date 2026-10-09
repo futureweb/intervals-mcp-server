@@ -140,15 +140,29 @@ def _consent_body(provider: SingleUserOAuthProvider, request_id: str, username: 
         "<fieldset><legend>Permissions for this connection</legend>" + "".join(perms) + "</fieldset>",
         f'<p class="error">{_esc(error)}</p>' if error else "",
     ]
+    local = [m for m in ("password", "apikey") if m in config.login_methods]
     if "intervals" in config.login_methods:
         parts.append('<button type="submit" name="action" value="intervals">Continue with Intervals.icu</button>')
+        if local:
+            parts.append('<hr><p class="note">Or sign in on this server:</p>')
+    if local and provider.totp_required:
+        parts.append(
+            '<label for="totp">Authenticator code</label><input type="text" id="totp" name="totp" '
+            'inputmode="numeric" pattern="[0-9 ]*" maxlength="8" autocomplete="one-time-code">'
+        )
     if "password" in config.login_methods:
-        if "intervals" in config.login_methods:
-            parts.append("<hr><p class=\"note\">Or sign in with the server password:</p>")
         parts.append(
             f'<label for="username">Username</label><input type="text" id="username" name="username" value="{_esc(username)}" autocomplete="username">'
             '<label for="password">Password</label><input type="password" id="password" name="password" autocomplete="current-password">'
             '<button type="submit" name="action" value="password">Sign in</button>'
+        )
+    if "apikey" in config.login_methods:
+        if "password" in config.login_methods:
+            parts.append('<hr>')
+        parts.append(
+            '<label for="api_key">Intervals.icu API key</label><input type="password" id="api_key" name="api_key" autocomplete="off">'
+            '<p class="note">Intervals.icu &rarr; Settings &rarr; Developer Settings. Only checked against the key this server uses; never stored or logged.</p>'
+            '<button type="submit" name="action" value="apikey">Sign in with API key</button>'
         )
     parts.append('<button type="submit" name="action" value="deny" class="secondary" formnovalidate>Deny</button>')
     parts.append("</form>")
@@ -191,7 +205,7 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
         pending = provider.pending_login(request_id)
         if pending is None:
             return _page(_INVALID_LINK, 400)
-        action = _form_value(form, "action") or "password"
+        action = _form_value(form, "action") or ("apikey" if _form_value(form, "api_key") else "password")
         if action == "deny":
             return _redirect(provider.deny_login(request_id))
         granted = provider.grant_for(pending, [v for v in form.getlist("grant") if isinstance(v, str)])
@@ -214,14 +228,20 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
                 _cookie_name(provider), browser, max_age=600, path="/", secure=secure, httponly=True, samesite="lax"
             )
             return response
-        if action != "password" or "password" not in provider.config.login_methods:
+        if action not in ("password", "apikey") or action not in provider.config.login_methods:
             return _page('<p class="error">This sign-in method is not enabled.</p>', 400)
         username = _form_value(form, "username")
-        password = _form_value(form, "password")
-        if not provider.verify_credentials(username, password):
+        if action == "password":
+            valid = provider.verify_credentials(username, _form_value(form, "password"))
+        else:
+            valid = provider.verify_api_key(_form_value(form, "api_key"))
+        # Evaluate the second factor even after a wrong first factor (no early exit).
+        second = provider.verify_second_factor(_form_value(form, "totp"))
+        if not (valid and second):
             provider.record_login_failure(key)
-            logger.warning("Failed login attempt from %s", key)
-            body = _consent_body(provider, request_id, username or provider.config.username, "Invalid credentials.")
+            logger.warning("Failed %s sign-in from %s", action, key)
+            message = "Invalid credentials or authenticator code." if provider.totp_required else "Invalid credentials."
+            body = _consent_body(provider, request_id, username or provider.config.username, message)
             return _page(body, 401)
         return _redirect(provider.complete_login(request_id, key, granted))
 
