@@ -20,8 +20,9 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date
-from intervals_mcp_server.utils.sports import format_pace, hms
+from intervals_mcp_server.utils.sports import family_types, format_pace, hms, is_indoor, sport_family
 from intervals_mcp_server.utils.streams import find_stream
+from intervals_mcp_server.utils.work_sets import interval_secs, matches_pattern, pattern_of, set_summary, split_work
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -39,8 +40,9 @@ MAX_INTENSITY = 300
 TARGETS = ("POWER", "HR", "PACE")
 ACTIVITY_FIELDS = (
     "id,name,start_date_local,type,gear,icu_ftp,icu_training_load,icu_intensity,moving_time,"
-    "icu_rpe,feel,compliance,interval_summary"
+    "icu_rpe,feel,compliance,interval_summary,power_meter,trainer,device_name,power_field_names"
 )
+MIN_TREND_ACTIVITIES = 3
 STREAM_UNITS = {
     "watts": "W",
     "secondary_power": "W",
@@ -57,21 +59,6 @@ HISTOGRAMS: dict[str, tuple[str, str, int | None]] = {
     "pace": ("pace-histogram", "m/s", None),
     "gap": ("gap-histogram", "m/s", None),
 }
-# JSON key, column label, decimals, units of the compare_workouts columns
-WORKOUT_COLUMNS: tuple[tuple[str, str, int, str], ...] = (
-    ("work_intervals", "intervals", 0, ""),
-    ("work_time", "work time", 0, "s"),
-    ("avg_watts", "avg W", 0, "W"),
-    ("np", "NP", 0, "W"),
-    ("avg_hr", "HR", 0, "bpm"),
-    ("cadence", "cadence", 0, "rpm"),
-    ("pw_hr", "Pw:HR", 2, "W/bpm"),
-    ("training_load", "load", 0, ""),
-    ("intensity", "IF", 0, "%"),
-    ("ftp", "FTP", 0, "W"),
-    ("rpe", "RPE", 0, ""),
-    ("feel", "feel", 0, ""),
-)
 POWER_METER_NOTE = (
     "Note: values are averages of the recorded stream as computed by Intervals.icu. Different bikes "
     "may carry different power meters that are not calibrated against each other, so compare "
@@ -284,6 +271,16 @@ def _filter_text(sport_types: str | None, gear_id: str | None, start_date: str |
     if gear_id:
         parts.append(f"gear {gear_id}")
     return ", ".join(parts)
+
+
+async def _intervals_of(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """All intervals of an activity (WORK and RECOVERY)."""
+    result = await api.get(f"/activity/{activity_id}/intervals")
+    error = _error(result, f"intervals of activity {activity_id}")
+    if error:
+        return [], error
+    items = result.get("icu_intervals") if isinstance(result, dict) else None
+    return [i for i in items or [] if isinstance(i, dict)], None
 
 
 async def _work_intervals(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any]], str | None]:
@@ -861,64 +858,139 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
 
 
 # ------------------------------------------------------- workout comparison
-def _work_summary(intervals: list[dict[str, Any]]) -> dict[str, Any]:
-    """Count, total time and simple means of the interval averages over the WORK intervals."""
+def _power_source(activity: dict[str, Any], gear_map: dict[str, str]) -> str:
+    """Which power meter the watts come from, as far as the activity tells (never assumed)."""
+    meter = activity.get("power_meter")
+    gear = _gear_label(activity, gear_map)
+    parts = [f"power meter {meter}" if meter else "power meter unknown", f"gear {gear}"]
+    if is_indoor(activity):
+        parts.append("indoor/trainer")
+    return ", ".join(parts)
 
-    def values(key: str) -> list[float]:
-        return [v for i in intervals if (v := _num(i.get(key))) is not None]
 
-    elapsed = values("elapsed_time") or values("moving_time")
-    watts, hrs = values("average_watts"), values("average_heartrate")
-    mean_w, mean_hr = _mean(watts), _mean(hrs)
+def _parse_range(text: str | None, name: str) -> tuple[float, float] | str | None:
+    """'220-240' -> (220.0, 240.0); None when not given; an error string when malformed."""
+    if not text:
+        return None
+    try:
+        low, high = (float(part) for part in text.split("-"))
+    except ValueError:
+        return f"Error: {name} must look like '220-240'."
+    if low > high:
+        return f"Error: {name} must have low <= high."
+    return low, high
+
+
+def _workout_row(  # pylint: disable=too-many-arguments
+    activity: dict[str, Any], intervals: list[dict[str, Any]], gear_map: dict[str, str], filters: dict[str, Any]
+) -> dict[str, Any]:
+    """Main work set (time-weighted), surges and excluded intervals of one activity."""
+    ftp = _num(activity.get("icu_ftp"))
+    split = split_work(intervals, ftp, **filters)
+    main = set_summary(split["main"], ftp)
     return {
-        "work_intervals": len(intervals),
-        "work_time": sum(elapsed) if elapsed else None,
-        "avg_watts": mean_w,
-        "np": _mean(values("weighted_average_watts")),
-        "avg_hr": mean_hr,
-        "cadence": _mean(values("average_cadence")),
-        "pw_hr": mean_w / mean_hr if mean_w is not None and mean_hr else None,
+        **_activity_json(activity, gear_map),
+        "power_source": _power_source(activity, gear_map),
+        "power_meter": activity.get("power_meter"),
+        "indoor": is_indoor(activity),
+        "main_set": main,
+        "other_intervals": set_summary(split["other"], ftp) if split["other"] else None,
+        "surges": [{"secs": interval_secs(i), "avg_watts": _num(i.get("average_watts")), "max_watts": _num(i.get("max_watts")),
+                    "avg_hr": _num(i.get("average_heartrate")), "start_time": i.get("start_time")} for i in split["surges"]],
+        "excluded": [{"secs": interval_secs(e["interval"]), "avg_watts": _num(e["interval"].get("average_watts")), "reason": e["reason"]}
+                     for e in split["excluded"]],
+        "rpe_whole_activity": _num(activity.get("icu_rpe")),
+        "feel_whole_activity": _num(activity.get("feel")),
     }
 
 
-def _workout_row(activity: dict[str, Any], intervals: list[dict[str, Any]]) -> dict[str, Any]:
-    row = {
-        "id": activity.get("id"), "name": activity.get("name"), "date": _day(activity), "type": activity.get("type"),
-        **_work_summary(intervals),
-        "training_load": _num(activity.get("icu_training_load")),
-        "intensity": _num(activity.get("icu_intensity")),
-        "ftp": _num(activity.get("icu_ftp")),
-        "rpe": _num(activity.get("icu_rpe")),
-        "feel": _num(activity.get("feel")),
+def _trend(rows: list[dict[str, Any]], key: str) -> dict[str, Any] | None:
+    """First -> last change of a main-set value over comparable rows (oldest first)."""
+    series = [(row["date"], value) for row in rows if (value := row["main_set"].get(key) if key in row["main_set"] else row.get(key)) is not None]
+    if len(series) < 2:
+        return None
+    first, last = series[0][1], series[-1][1]
+    values = [v for _, v in series]
+    return {
+        "key": key, "n": len(series), "first": first, "last": last, "first_date": series[0][0], "last_date": series[-1][0],
+        "diff": round(last - first, 3), "pct": _round_pct(_pct_change(first, last)),
+        "min": min(values), "max": max(values), "reliable": len(series) >= MIN_TREND_ACTIVITIES,
     }
-    return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in row.items()}
 
 
-def _column_text(row: dict[str, Any], key: str, digits: int, units: str) -> str:
-    if key == "work_time":
-        return hms(row.get(key))
-    return _fmt(row.get(key), digits, units)
+def _round_pct(value: float | None) -> float | None:
+    return round(value, 1) if value is not None else None
 
 
-def _changes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    first, last = rows[0], rows[-1]
-    changes = []
-    for key, label, digits, units in WORKOUT_COLUMNS:
-        a, b = first.get(key), last.get(key)
-        if a is None or b is None:
-            continue
-        pct = _pct_change(a, b)
-        changes.append({
-            "key": key, "label": label, "first": a, "last": b, "diff": round(b - a, 2),
-            "pct": round(pct, 1) if pct is not None else None,
-            "text": f"{label} {_column_text(first, key, digits, units)} -> {_column_text(last, key, digits, units)}"
-            + (f" ({pct:+.1f} %)" if pct is not None else ""),
-        })
-    return changes
+TREND_LABELS = (
+    ("avg_watts", "power (time-weighted avg)", "W", 0),
+    ("avg_hr", "HR (time-weighted avg)", "bpm", 0),
+    ("max_hr", "max HR", "bpm", 0),
+    ("cadence", "cadence", "rpm", 0),
+    ("w_per_bpm", "W/bpm", "", 2),
+    ("rpe_whole_activity", "RPE (whole activity, not per interval)", "", 0),
+)
+
+
+def _set_text(main: dict[str, Any]) -> str:
+    if not main.get("count"):
+        return "no comparable work intervals"
+    pct = f" @ {main['pct_ftp']:.0f}% FTP" if main.get("pct_ftp") is not None else ""
+    return f"{main['count']} x {hms(main['secs_median'])}{pct}"
+
+
+def _row_text(row: dict[str, Any], include_rpe: bool) -> list[str]:
+    main = row["main_set"]
+    cells = [
+        f"{row['date']} {row['type']} '{row['name']}' ({row['id']})",
+        _set_text(main),
+        f"{_fmt(main.get('avg_watts'), 0, 'W')} (NP {_fmt(main.get('np_watts'), 0, 'W')})",
+        f"HR {_fmt(main.get('avg_hr'), 0)}/max {_fmt(main.get('max_hr'), 0)} bpm",
+        f"cad {_fmt(main.get('cadence'), 0)}",
+        f"{_fmt(main.get('w_per_bpm'), 2)} W/bpm",
+        f"FTP {_fmt(_num(row['ftp']), 0, 'W')}",
+        row["power_source"],
+    ]
+    if include_rpe:
+        cells.append(f"RPE {_fmt(row['rpe_whole_activity'], 0)} (whole activity)")
+    lines = [" | ".join(cells)]
+    if main.get("intervals"):
+        lines.append("    intervals: " + ", ".join(
+            f"{hms(i['secs'])} {_fmt(i['avg_watts'], 0, 'W')} HR {_fmt(i['avg_hr'], 0)}/{_fmt(i['max_hr'], 0)}" for i in main["intervals"]
+        ))
+    if row["surges"]:
+        lines.append("    not averaged (short surges/sprints): " + ", ".join(
+            f"{hms(s['secs'])} @ {_fmt(s['avg_watts'], 0, 'W')}" for s in row["surges"][:6]
+        ) + (" ..." if len(row["surges"]) > 6 else ""))
+    other = row.get("other_intervals")
+    if other and other.get("count"):
+        lines.append(f"    not averaged (other WORK intervals): {other['count']} x ~{hms(other['secs_median'])} at {_fmt(other.get('avg_watts'), 0, 'W')}")
+    if row["excluded"]:
+        lines.append("    excluded: " + ", ".join(f"{hms(e['secs'])} @ {_fmt(e['avg_watts'], 0, 'W')} ({e['reason']})" for e in row["excluded"][:4]))
+    return lines
+
+
+def _comparability_notes(rows: list[dict[str, Any]]) -> list[str]:
+    notes = []
+    gears = sorted({str(row["gear_id"]) for row in rows if row.get("gear_id")})
+    meters = sorted({str(row["power_meter"]) for row in rows if row.get("power_meter")})
+    if len(gears) > 1 or len(meters) > 1:
+        notes.append(
+            f"Different gear ({', '.join(gears) or 'n/a'}) / power meters ({', '.join(meters) or 'unknown'}): watts come from sensors "
+            "that are not calibrated against each other; compare power within one gear, use HR and RPE across gear."
+        )
+    if any(row.get("indoor") for row in rows) and not all(row.get("indoor") for row in rows):
+        notes.append("Indoor and outdoor sessions are mixed (trainer power and outdoor power meter may differ).")
+    if any(not row.get("power_meter") for row in rows):
+        notes.append("Power meter identity unknown for some activities (no power meter name in the file).")
+    ftps = sorted({row["ftp"] for row in rows if row.get("ftp")})
+    if len(ftps) > 1:
+        notes.append(f"FTP changed over the period ({', '.join(f'{f:.0f}' for f in ftps)} W): % of FTP values use the FTP at the time.")
+    return notes
 
 
 @tool("read")
-async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
     query: str | None = None,
     activity_ids: str | None = None,
     start_date: str | None = None,
@@ -928,29 +1000,61 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     athlete_id: str | None = None,
     api_key: str | None = None,
     output_format: str = "text",
+    reference_activity_id: str | None = None,
+    gear_id: str | None = None,
+    min_interval_secs: int | None = None,
+    max_interval_secs: int | None = None,
+    min_intensity: float | None = None,
+    max_intensity: float | None = None,
+    min_reps: int | None = None,
+    max_reps: int | None = None,
+    ftp_range: str | None = None,
+    include_rpe: bool = True,
+    comparable_only: bool = True,
 ) -> str:
-    """Compare repeated executions of the same workout over time (WORK intervals per session)
+    """Compare repeated executions of the same workout over time on truly comparable work intervals
 
-    Collects activities by name search (e.g. "Sweet Spot" or a tag such as "#threshold"), by
-    id list or by date range (default the last 90 days), optionally narrowed by sport, and
-    summarises the WORK intervals of each: count, total work time, mean average power, mean
-    normalised power, mean heart rate, mean cadence and Pw:HR (mean W / mean HR), plus the
-    activity's load, intensity, FTP at the time, RPE and feel. The table is chronological
-    (oldest first) and a "change first -> last" line is given per column. Means are simple
-    means of the per-interval averages, not time-weighted; use it to see whether the same
-    session is being done at higher power, lower HR or lower RPE. One API call to collect
-    the activities (or one per id) plus one per activity for its intervals (at most 12).
+    Collects activities by name search (e.g. "Threshold" or a tag such as "#threshold"), by id
+    list or by date range (default the last 90 days). Per activity the WORK intervals are split
+    into the main set (the largest group of intervals of similar length, within 25 %, and
+    intensity, within 8 % of FTP), short surges/sprints under 2 min (listed, never averaged
+    in), other WORK intervals and intervals below 70 % FTP (warm-ups / recoveries labelled
+    WORK). The main set is summarised with time-weighted means (power, NP, HR, cadence),
+    average and maximum HR per interval and W/bpm. Only activities whose main set matches the
+    reference pattern are compared: the pattern comes from reference_activity_id, otherwise
+    from the newest activity found (interval length within 25 %, intensity within 8 % of FTP);
+    the others are listed with the reason. Sport defaults to the sport family of the reference
+    (or newest) activity (cycling, running ...); sport_types="all" keeps every sport. Trends
+    (first -> last) are reported separately for power, HR, max HR, cadence, W/bpm and RPE; RPE
+    is always the whole-activity RPE, never per interval; fewer than 3 activities are marked
+    as not reliable. Gear, power meter and indoor/outdoor are shown per row and different
+    sensors are flagged: absolute watts of different power meters are not comparable. One API
+    call to collect the activities (or one per id, plus one for a reference outside the list)
+    plus one per activity for its intervals (at most 12).
 
     Args:
         query: Text to match in activity names, tags with leading # (optional)
         activity_ids: Comma-separated activity IDs (optional)
         start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date; also filters query results)
         end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide" (optional)
+        sport_types: Comma-separated sport types, e.g. "Ride,VirtualRide"; "all" for every sport
+            (optional, default: the sport family of the reference / newest activity)
         limit: Maximum number of activities, newest first, 1-12 (optional, default 8)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
+        reference_activity_id: Activity whose main set defines the pattern to compare (optional)
+        gear_id: Keep only activities done on this gear id (optional)
+        min_interval_secs: Only work intervals at least this long (optional; shorter ones are surges)
+        max_interval_secs: Only work intervals at most this long (optional)
+        min_intensity: Only work intervals at or above this % of FTP (optional)
+        max_intensity: Only work intervals at or below this % of FTP (optional)
+        min_reps: Only activities whose main set has at least this many intervals (optional)
+        max_reps: Only activities whose main set has at most this many intervals (optional)
+        ftp_range: Only activities whose FTP at the time is in this range, e.g. "225-240" (optional)
+        include_rpe: Show the whole-activity RPE column and trend (optional, default True)
+        comparable_only: Compare only activities matching the reference pattern (optional, default
+            True); False puts every activity in the table with its comparability note
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -958,6 +1062,12 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     date_error = _validate_optional_dates(start_date, end_date)
     if date_error:
         return date_error
+    ftp_bounds = _parse_range(ftp_range, "ftp_range")
+    if isinstance(ftp_bounds, str):
+        return ftp_bounds
+    reps = _reps_params(min_reps, max_reps)
+    if isinstance(reps, str):
+        return reps
     capped = min(max(limit, 1), MAX_WORKOUTS)
 
     api = _Api(api_key)
@@ -967,45 +1077,105 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     )
     if error:
         return error
+    reference: dict[str, Any] | None = None
+    if reference_activity_id:
+        reference = next((a for a in activities if str(a.get("id")) == str(reference_activity_id)), None)
+        if reference is None:
+            fetched, error = await _activities_by_ids(api, [reference_activity_id])
+            if error or not fetched:
+                return error or f"Reference activity {reference_activity_id} not found."
+            reference = fetched[0]
+    newest = _select_activities(activities, start_date=start_date, end_date=end_date, limit=1)
+    anchor = reference or (newest[0] if newest else None)
+    if sport_types and sport_types.strip().lower() == "all":
+        sport_filter = None
+    elif sport_types:
+        sport_filter = sport_types
+    else:
+        sport_filter = ",".join(family_types(anchor.get("type"))) if anchor else None
     selected = _select_activities(
-        activities, sport_types=sport_types, start_date=start_date, end_date=end_date, limit=capped
+        activities, sport_types=sport_filter, gear_id=gear_id, start_date=start_date, end_date=end_date
     )
-    filters = _filter_text(sport_types, None, start_date, end_date)
+    if ftp_bounds:
+        selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
+    if reference is not None and not any(str(a.get("id")) == str(reference.get("id")) for a in selected):
+        selected.append(reference)
+        selected.sort(key=lambda a: str(a.get("start_date_local") or ""), reverse=True)
+    selected = selected[:capped]
+    filters_text = _filter_text(sport_types if sport_types else None, gear_id, start_date, end_date)
+    if sport_filter and not sport_types and anchor is not None:
+        filters_text = ", ".join(p for p in (filters_text, f"sport family {sport_family(anchor.get('type'))} (default)") if p)
     if not selected:
-        return f"No activities found ({source}{'; ' + filters if filters else ''})."
+        return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})."
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    split_filters = {"min_secs": min_interval_secs, "max_secs": max_interval_secs, "min_pct": min_intensity, "max_pct": max_intensity}
     rows: list[dict[str, Any]] = []
     for activity in reversed(selected):
-        intervals, error = await _work_intervals(api, activity.get("id"))
+        intervals, error = await _intervals_of(api, activity.get("id"))
         if error:
             return error
-        rows.append(_workout_row(activity, intervals))
-    changes = _changes(rows) if len(rows) > 1 else []
+        rows.append(_workout_row(activity, intervals, gear_map, split_filters))
+    ref_row = next((r for r in rows if reference is not None and str(r["id"]) == str(reference.get("id"))), None) or next(
+        (r for r in reversed(rows) if r["main_set"].get("count")), rows[-1]
+    )
+    pattern = pattern_of(ref_row["main_set"])
+    for row in rows:
+        reason = matches_pattern(row["main_set"], pattern) if pattern else "no reference pattern"
+        count = row["main_set"].get("count") or 0
+        if reason is None and (min_reps is not None and count < min_reps or max_reps is not None and count > max_reps):
+            reason = f"{count} repetitions outside the requested range"
+        row["comparable"] = reason is None
+        row["not_comparable_reason"] = reason
+    compared = [r for r in rows if r["comparable"] or not comparable_only]
+    trend_keys = [t for t in TREND_LABELS if include_rpe or t[0] != "rpe_whole_activity"]
+    comparable_rows = [r for r in rows if r["comparable"]]
+    trends = [t for key, *_ in trend_keys if (t := _trend(comparable_rows, key))]
+    notes = _comparability_notes(comparable_rows)
 
     if output_format.strip().lower() == "json":
         payload = {
-            "athlete_id": athlete_id_to_use, "source": source, "filters": filters or None, "limit": capped,
-            "columns": [key for key, _, _, _ in WORKOUT_COLUMNS], "activities": rows,
-            "change_first_to_last": [{k: v for k, v in c.items() if k != "text"} for c in changes],
-            "api_calls": api.calls,
+            "athlete_id": athlete_id_to_use, "source": source, "filters": filters_text or None, "limit": capped,
+            "reference": {"activity_id": ref_row["id"], "pattern": pattern, "explicit": reference is not None},
+            "activities": rows, "trends": trends, "notes": notes, "api_calls": api.calls,
         }
         return json.dumps(payload, ensure_ascii=False)
+    pattern_text = (
+        f"{pattern['count']} x {hms(pattern['secs'])}" + (f" @ {pattern['pct_ftp']:.0f}% FTP" if pattern.get("pct_ftp") is not None else "")
+        if pattern else "n/a"
+    )
     lines = [
-        f"Workout comparison for athlete {athlete_id_to_use} (source {source}{'; ' + filters if filters else ''}; "
-        f"{len(rows)} of {len(activities)} activities, oldest first; limit {capped}"
+        f"Workout comparison for athlete {athlete_id_to_use} (source {source}{'; ' + filters_text if filters_text else ''}; "
+        f"{len(rows)} of {len(activities)} activities analysed, oldest first; limit {capped}"
         + (f", capped from {limit}" if limit > capped else "") + "):",
-        "WORK intervals per activity: count, total time, simple means of the interval averages "
-        "(power, NP, HR, cadence) and Pw:HR = mean W / mean HR; load/IF/FTP/RPE/feel from the activity.",
-        "Date | Activity | " + " | ".join(label for _, label, _, _ in WORKOUT_COLUMNS),
+        f"Reference pattern: {pattern_text} from {'reference' if reference is not None else 'the newest'} activity {ref_row['id']} "
+        f"({ref_row['date']}); comparable = interval length within 25 % and intensity within 8 % of FTP.",
+        "Main set per activity, time-weighted means over the comparable WORK intervals; surges under 2 min and other "
+        "WORK intervals are listed but never averaged in.",
+        "Activity | set | power (NP) | HR avg/max | cadence | W/bpm | FTP | power source" + (" | RPE" if include_rpe else ""),
     ]
-    for row in rows:
-        cells = [_column_text(row, key, digits, units) for key, _, digits, units in WORKOUT_COLUMNS]
-        lines.append(f"{row['date']} | '{row['name']}' ({row['id']}, {row['type']}) | " + " | ".join(cells))
-    if changes:
-        lines.append(
-            f"Change first -> last ({rows[0]['date']} -> {rows[-1]['date']}): "
-            + "; ".join(change["text"] for change in changes)
-        )
-    lines.append(f"API calls: {api.calls}")
+    for row in compared:
+        lines.extend(_row_text(row, include_rpe))
+        if not row["comparable"]:
+            lines.append(f"    NOT comparable: {row['not_comparable_reason']}")
+    skipped = [r for r in rows if not r["comparable"]] if comparable_only else []
+    if skipped:
+        lines.append("Not comparable (left out of the trends): " + "; ".join(
+            f"{r['date']} '{r['name']}' ({r['id']}, {r['type']}): {r['not_comparable_reason']}" for r in skipped
+        ))
+    if trends:
+        lines.append(f"Trends over the {len(comparable_rows)} comparable activities (first -> last):")
+        for trend in trends:
+            label, units, digits = next((lab, u, d) for k, lab, u, d in trend_keys if k == trend["key"])
+            pct = f" ({trend['pct']:+.1f} %)" if trend.get("pct") is not None else ""
+            reliability = "" if trend["reliable"] else f"; only {trend['n']} activities, not reliable"
+            lines.append(
+                f"  {label}: {_fmt(trend['first'], digits, units)} -> {_fmt(trend['last'], digits, units)}{pct}, "
+                f"range {_fmt(trend['min'], digits, units)}-{_fmt(trend['max'], digits, units)} (n {trend['n']}{reliability})"
+            )
+    else:
+        lines.append("Trends: fewer than two comparable activities.")
+    lines.extend(f"Note: {note}" for note in notes)
+    lines.append(f"API calls: {api.calls} {GEAR_CALL_NOTE}")
     return "\n".join(lines)
 
 

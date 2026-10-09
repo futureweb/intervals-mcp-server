@@ -160,3 +160,34 @@ def format_zone_table(  # pylint: disable=too-many-arguments,too-many-positional
             extra = f" ({row.get('slowest_pace') or 'slower'} to {row.get('fastest_pace') or 'faster'})"
         parts.append(f"{row['name']} {span}{extra}")
     return ", ".join(parts)
+
+
+# Sport families: activity types whose intensities (% of FTP, threshold pace) are comparable.
+SPORT_FAMILIES: dict[str, tuple[str, ...]] = {
+    "cycling": ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide", "EBikeRide", "EMountainBikeRide", "TrackRide", "Velomobile", "Handcycle"),
+    "running": ("Run", "TrailRun", "VirtualRun"),
+    "walking": ("Walk", "Hike", "Snowshoe"),
+    "swimming": ("Swim", "OpenWaterSwim"),
+    "skiing": ("NordicSki", "BackcountrySki", "VirtualSki", "RollerSki", "AlpineSki"),
+    "rowing": ("Rowing", "VirtualRow", "Canoeing", "Kayaking"),
+}
+
+
+def sport_family(activity_type: Any) -> str:
+    """Family name of an activity type ('cycling', 'running' ...); the type itself when unknown."""
+    wanted = str(activity_type or "").strip().lower()
+    for family, types in SPORT_FAMILIES.items():
+        if wanted in (t.lower() for t in types):
+            return family
+    return wanted or "unknown"
+
+
+def family_types(activity_type: Any) -> list[str]:
+    """All activity types of the family of ``activity_type`` (just the type when unknown)."""
+    family = sport_family(activity_type)
+    return list(SPORT_FAMILIES.get(family, (str(activity_type),)))
+
+
+def is_indoor(activity: dict[str, Any]) -> bool:
+    """True for trainer rides and virtual activities."""
+    return bool(activity.get("trainer")) or str(activity.get("type") or "").startswith("Virtual")
