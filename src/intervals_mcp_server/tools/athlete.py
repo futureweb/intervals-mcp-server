@@ -14,7 +14,8 @@ from intervals_mcp_server.api import client as api_client
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.dates import get_default_end_date, get_default_start_date
-from intervals_mcp_server.utils.sports import format_pace, zone_ranges
+from intervals_mcp_server.utils.custom_fields import assigned_codes
+from intervals_mcp_server.utils.sports import family_types, format_pace, zone_ranges
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -159,6 +160,22 @@ async def assigned_field_ids(athlete_id: str, api_key: str | None, activity_type
         if isinstance(ids, list) and ids:
             return ids
     return None
+
+
+async def field_assignments(
+    athlete_id: str, api_key: str | None, defs: dict[str, dict[str, Any]], activity_types: Any
+) -> dict[str, set[str] | None]:
+    """Assigned custom field codes per activity type (None = the sport lists no fields).
+
+    Covers the given types and the other types of their sport families, so a sport without its
+    own field list can follow its family (GravelRide -> Ride) in ``utils.field_policy``.
+    """
+    types: set[str] = set()
+    for activity_type in activity_types or []:
+        if activity_type:
+            types.add(str(activity_type))
+            types.update(family_types(activity_type))
+    return {sport: assigned_codes(defs, await assigned_field_ids(athlete_id, api_key, sport)) for sport in sorted(types)}
 
 
 def _setting_for_sport(

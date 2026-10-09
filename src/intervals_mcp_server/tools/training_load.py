@@ -21,9 +21,9 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.tools.athlete import assigned_field_ids
+from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, assigned_codes
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.field_policy import aggregate_field, aggregation_policy
 from intervals_mcp_server.utils.load_metrics import (
     ATL_DAYS,
@@ -256,6 +256,9 @@ def _device_loads(
         for label, (start, end) in windows.items():
             agg = aggregate_field(between(activities, start, end), code, definition, overrides.get(code), assigned)
             row[label] = {"sum": rnd(agg["sum"], 0), "n": agg["n"]} if agg else {"sum": None, "n": 0}
+            if agg and agg.get("values_from_unassigned_sports"):
+                row[label]["from_unassigned_sports"] = agg["values_from_unassigned_sports"]
+                row[label]["unassigned_sports"] = agg.get("unassigned_sports") or []
             any_value = any_value or bool(agg)
         if any_value:
             rows.append(row)
@@ -336,10 +339,15 @@ def _load_text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: di
         lines.extend(_week_line(row) for row in payload["weeks"])
         for row in payload["device_loads"]:
             units = f" {row['units']}" if row.get("units") else ""
+            unassigned = row["chronic"].get("from_unassigned_sports")
+            note = (
+                f"; incl. {unassigned} value(s) from sports without field assignment ({', '.join(row['chronic'].get('unassigned_sports') or [])})"
+                if unassigned else ""
+            )
             lines.append(
                 f"Device load {row['name']} [{row['code']}] (own scale, not comparable with or added to the Intervals.icu load): "
                 f"acute {fmt(row['acute']['sum'])}{units} (n {row['acute']['n']}), chronic {fmt(row['chronic']['sum'])}{units} "
-                f"(n {row['chronic']['n']}); activities without a value are not counted"
+                f"(n {row['chronic']['n']}); activities without a value are not counted{note}"
             )
     if detail_level == "full":
         lines.append("Daily load (chronic window): " + ", ".join(f"{d['date'][5:]} {fmt(d['load'])}" for d in payload["daily"]))
@@ -424,10 +432,9 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     total = load_metrics(activities, load_end, acute_days, chronic_days)
     chronic_start = load_end - timedelta(days=chronic_days - 1)
     acute_start = load_end - timedelta(days=acute_days - 1)
-    assigned = {
-        sport: assigned_codes(device_defs, await assigned_field_ids(athlete_id_to_use, api_key, sport))
-        for sport in sorted({str(a.get("type") or "") for a in activities} - {""})
-    } if device_defs else {}
+    assigned = await field_assignments(
+        athlete_id_to_use, api_key, device_defs, {str(a.get("type") or "") for a in activities} - {""}
+    ) if device_defs else {}
     daily = daily_loads(activities, chronic_start, load_end)
     payload: dict[str, Any] = {
         "athlete_id": athlete_id_to_use,

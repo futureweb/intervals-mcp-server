@@ -15,10 +15,10 @@ from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.tools.athlete import assigned_field_ids
+from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, assigned_codes, is_missing
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, is_missing
 from intervals_mcp_server.utils.field_policy import aggregate_custom_fields, format_aggregate, format_pair, pair_changes
 from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.sports import hms
@@ -236,9 +236,13 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     (percentages such as stamina, scores, training effects, running dynamics, temperatures,
     heart rate) get mean, median, min and max - they are never summed, even when the field
     definition says SUM. Fields without units or a recognisable meaning get no aggregate.
-    Values of a field on activities whose sport does not have it assigned (sport settings,
-    e.g. running dynamics stored as 0 on rides) are ignored; for estimates a stored 0 means
-    "no value" and is left out. Paired "... at start" / "... at end" fields (e.g. stamina)
+    Sport settings (field assignments) decide where a value counts: on a sport that lists the
+    field it counts; on a sport whose list excludes the field it is ignored (e.g. running
+    dynamics stored as 0 on rides); a sport without any field list (e.g. gravel rides without
+    own settings) follows the lists of its sport family (Ride), and there only real non-zero
+    values count, reported as "from sports without field assignment", while a stored 0 is a
+    placeholder and ignored. For estimates a
+    stored 0 means "no value" and is left out. Paired "... at start" / "... at end" fields (e.g. stamina)
     also get the typical start-to-end change. CUSTOM_AGGREGATE_OVERRIDES ("Code=sum|device_load_sum|trend|mean|none")
     overrides the policy per field. For a quick per-week view see also get_weekly_summary.
 
@@ -293,10 +297,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     )
     wellness = [w for w in wellness_result if isinstance(w, dict)] if isinstance(wellness_result, list) else []
 
-    assigned_by_type = {
-        sport: assigned_codes(defs, await assigned_field_ids(athlete_id_to_use, api_key, sport))
-        for sport in {str(a.get("type") or "") for a in activities} if sport
-    }
+    assigned_by_type = await field_assignments(athlete_id_to_use, api_key, defs, {str(a.get("type") or "") for a in activities})
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for activity in sorted(activities, key=lambda a: str(a.get("start_date_local"))):
         groups[_group_key(activity, group_by, gear_map)].append(activity)

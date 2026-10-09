@@ -148,7 +148,12 @@ def test_get_training_load_text_default_end(monkeypatch):
     assert "2026-W41 (2026-10-05 to 2026-10-08, partial 4 d)" in result
     assert "2026-W40 (2026-09-28 to 2026-10-04): load 350 (cycling 240, walking 60, running 50, weighttraining n/a), 5 sessions, 8.1 h, 2 rest days" in result
     assert "100 % of the trailing weekly mean" in result
-    assert "Device load EPOC [EPOC] (own scale, not comparable with or added to the Intervals.icu load): acute 180 ml/kg (n 2), chronic 720 ml/kg (n 8)" in result
+    # Run has no field list in its sport settings: its real EPOC values count (phase 5), reported separately.
+    assert (
+        "Device load EPOC [EPOC] (own scale, not comparable with or added to the Intervals.icu load): acute 220 ml/kg (n 3), "
+        "chronic 880 ml/kg (n 12); activities without a value are not counted; incl. 4 value(s) from sports without field "
+        "assignment (Run)"
+    ) in result
     assert "Coverage: 4 session(s) in the chronic window have no Intervals.icu load" in result
     assert "[1] Gabbett 2016" in result and "no assessment is made" in result
     activity_call = next(c for c in calls if c[0].endswith("/activities"))
@@ -166,7 +171,7 @@ def test_get_training_load_json_full_and_explicit_end(monkeypatch):
     assert payload["sports"]["primary_sport"] == "cycling" and payload["sports"]["multi_sport"] is True
     assert len(payload["daily"]) == 28 and payload["daily"][-1] == {"date": "2026-10-09", "load": 0.0, "sessions": 0}
     epoc = payload["device_loads"][0]
-    assert epoc["code"] == "EPOC" and epoc["acute"] == {"sum": 180.0, "n": 2}
+    assert epoc["code"] == "EPOC" and epoc["acute"] == {"sum": 220.0, "n": 3, "from_unassigned_sports": 1, "unassigned_sports": ["Run"]}
     assert payload["references"]["acwr"]["range"] == [0.8, 1.3]
     standard = json.loads(asyncio.run(get_training_load(end_date="2026-09-30", output_format="json")))
     assert "daily" not in standard and standard["fitness"]["source"] == "intervals.icu"
