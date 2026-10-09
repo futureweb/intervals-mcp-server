@@ -37,7 +37,7 @@ decision), `REJECT`.
 | #149 | tags and sub_type in activity summary | ADOPT | – | merged | two lines, tests | yes | low |
 | #150 | large "coach athlete" feature (28 files, removes uv.lock) | DEFER | partially overlapping with our analysis tools | not merged | needs a separate architecture and security review; no description; deletes the lock file | yes | high |
 | #151 | subjective wellness `/4 (1 = best)` | ALREADY COVERED | #143 labels each field explicitly | not merged | #143 is the better fix for the same bug | yes | low |
-| #152 | OAuth resource server for remote use | PARTIAL | built-in single-user OAuth 2.1 authorization server (`auth.py`, `MCP_AUTH=oauth`) | idea adopted, implemented differently | #152 needs an external JWT issuer; ChatGPT needs dynamic client registration + PKCE, so the fork ships its own small authorization server with a login page; still single-user (one API key) | yes (ours) | low |
+| #152 | OAuth resource server for remote use | PARTIAL | built-in OAuth 2.1 authorization server (`auth.py`, `MCP_AUTH=oauth`) with "Continue with Intervals.icu" sign-in | idea adopted, implemented differently | #152 needs an external JWT issuer; ChatGPT needs client metadata documents or dynamic registration, PKCE and RFC 9207, so the fork ships its own authorization server that delegates the identity check to Intervals.icu OAuth; single athlete per deployment (one API key) | yes (ours) | low |
 | #153 | our custom fields / streams PR | – | this fork | – | – | yes | – |
 
 ## Summary
@@ -47,7 +47,7 @@ decision), `REJECT`.
 - Re-implemented ideas: #123 (local message time), #125 (gear of the activity owner),
   #139 (extra event fields), #141 (sport settings, as richer read tools).
 - Already covered by our P0 work: #119, #120, #121, #122, #129, #133, #148, #151.
-- Deferred: #136 (SDK v2), #150 (coach feature), #152 (OAuth). Rejected: #118, #124, #126, #135.
+- Deferred: #136 (SDK v2), #150 (coach feature). Re-implemented differently: #152 (OAuth). Rejected: #118, #124, #126, #135.
 
 Every merged PR was based on upstream `cb1fbca`; conflicts were limited to the export lists
 in `server.py` / `tools/__init__.py`, the README tool list and the appended tests, which were

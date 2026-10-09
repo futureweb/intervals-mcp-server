@@ -23,8 +23,13 @@ First public beta of the Futureweb fork. Based on upstream
 - `detail_level` (compact / standard / full) for activity details, intervals and the recovery
   snapshot; custom fields are separated into "assigned to this sport" (from the sport settings)
   and others; interval stream statistics limited to the requested streams.
-- Remote hardening: `FASTMCP_MESSAGE_PATH`, secret-path deployment guide, built-in single-user
-  OAuth 2.1 authorization server (`MCP_AUTH=oauth`) for ChatGPT/Claude, `docs/REMOTE_ACCESS.md`.
+- Remote hardening: `FASTMCP_MESSAGE_PATH`, secret-path deployment guide, built-in OAuth 2.1
+  authorization server (`MCP_AUTH=oauth`) for ChatGPT/Claude, `docs/REMOTE_ACCESS.md`:
+  "Continue with Intervals.icu" sign-in restricted to allowlisted athletes (password sign-in as
+  alternative), consent page with per-connection permission scopes (`intervals:read`, ...)
+  enforced on `tools/list` and `tools/call`, Client ID Metadata Documents with `private_key_jwt`,
+  RFC 9207 `iss`, audience-bound tokens, redirect host allowlist for dynamic registration, and
+  `MCP_TRANSPORT=http+sse` serving `/mcp` and `/sse` from one process.
 - Eight coaching prompts and two MCP resources.
 - CI: actions pinned to commit SHAs, build and Docker smoke jobs on every PR, PEP 440 pre-release
   detection and explicit GHCR tags in the release workflow.

@@ -101,8 +101,13 @@ def format_status(status: dict[str, Any]) -> str:
     path_note = "secret path" if sse_path != "/sse" else "default path"
     lines.append(
         f"Transport: {status['transport']} on {status['host']}:{status['port']}, SSE path {path_note}; "
-        f"auth mode {auth.get('mode', 'none')}" + (f" (issuer {auth.get('issuer')})" if auth.get("issuer") else "")
-        + " (remote transports need a secret path or OAuth plus a TLS reverse proxy)"
+        f"auth mode {auth.get('mode', 'none')}"
+        + (
+            f" (issuer {auth.get('issuer')}, sign-in {'+'.join(auth.get('login') or [])}, "
+            f"Intervals.icu app {auth.get('intervals_app')}, allowed athletes {', '.join(auth.get('allowed_athletes') or []) or 'none'})"
+            if auth.get("mode") == "oauth"
+            else " (remote transports need a secret path or OAuth plus a TLS reverse proxy)"
+        )
     )
     lines.append(f"Athlete: {status['athlete_id'] or 'not configured'} | API key: {'configured' if status['api_key_configured'] else 'MISSING'} | base URL {status['api_base_url']}")
     lines.append(f"Intervals.icu API: {'OK' if status['api']['ok'] else 'FAILED'} - {status['api']['detail']}")

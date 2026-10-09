@@ -9,10 +9,12 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar, cast
 
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
+from mcp.server.fastmcp.exceptions import ToolError
 
 from intervals_mcp_server.api.client import setup_api_client
-from intervals_mcp_server.auth import install_login_routes, oauth_from_env
+from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 
 # FastMCP passes explicit defaults (e.g. host="127.0.0.1", port=8000) to its
@@ -55,14 +57,60 @@ def fastmcp_settings_from_env(environ: Mapping[str, str] | None = None) -> dict[
     return settings
 
 
+class IntervalsFastMCP(FastMCP[Any]):
+    """FastMCP that honours the permission scopes of an OAuth access token.
+
+    With the built-in OAuth server the athlete grants each connection a subset of the
+    enabled permission classes (``intervals:read``, ``intervals:write``, ...).  Tools of
+    classes the token was not granted are hidden from ``tools/list`` and refused by
+    ``tools/call``.  Without OAuth (stdio, secret path) nothing changes: the server-wide
+    ``MCP_PERMISSIONS`` decide which tools exist at all.
+    """
+
+    def _token_scopes(self) -> list[str] | None:
+        request: Any = None
+        try:
+            request = self.get_context().request_context.request
+        except (ValueError, LookupError, AttributeError):
+            request = None
+        user: Any = None
+        if request is not None:
+            try:
+                user = request.user
+            except (AssertionError, AttributeError):
+                user = None
+        token = getattr(user, "access_token", None) or get_access_token()
+        return list(token.scopes) if token is not None else None
+
+    async def list_tools(self) -> list[Any]:
+        """Tools of the classes the current connection was granted."""
+        tools = await super().list_tools()
+        allowed = granted_classes(self._token_scopes())
+        if allowed is None:
+            return tools
+        return [t for t in tools if _TOOL_PERMISSIONS.get(t.name, "read") in allowed]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Refuse tools whose permission class the access token does not include."""
+        allowed = granted_classes(self._token_scopes())
+        permission = _TOOL_PERMISSIONS.get(name, "read")
+        if allowed is not None and permission not in allowed:
+            raise ToolError(
+                f"Tool '{name}' needs the '{permission}' permission, but this connection was only granted "
+                f"{', '.join(sorted(allowed))}. Reconnect the MCP client and allow '{permission}' on the consent page."
+            )
+        return await super().call_tool(name, arguments)
+
+
 # Optional built-in OAuth 2.1 authorization server (MCP_AUTH=oauth), see auth.py.
 _oauth = oauth_from_env()
+oauth_provider: SingleUserOAuthProvider | None = _oauth.get("auth_server_provider")
 
-mcp: FastMCP = FastMCP(  # pylint: disable=invalid-name
+mcp: FastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
     "intervals-icu", lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
 )
-if _oauth:
-    install_login_routes(mcp, _oauth["auth_server_provider"])
+if oauth_provider is not None:
+    install_login_routes(mcp, oauth_provider)
 
 F = TypeVar("F", bound=Callable[..., Any])
 

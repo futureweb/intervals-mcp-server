@@ -188,3 +188,7 @@ CLAUDE.md
 .env
 .env.*
 !.env.example
+
+# OAuth state (registered clients, refresh token digests)
+oauth_state.json
+oauth_state.json.*

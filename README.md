@@ -78,11 +78,14 @@ automatically; see [.env.example](.env.example)).
 | `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
 | `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
 | `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
-| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `http` |
+| `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (both remote transports in one process: `/mcp` and `/sse`) |
 | `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8000` | Bind address for `sse`/`http` |
 | `FASTMCP_SSE_PATH` / `FASTMCP_MESSAGE_PATH` | `/sse` / `/messages/` | Endpoint paths; a secret path segment turns the URL into a credential |
-| `MCP_AUTH` | `none` | `oauth` enables the built-in single-user OAuth 2.1 server for remote clients (see [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md)) |
-| `MCP_PUBLIC_URL`, `OAUTH_PASSWORD` / `OAUTH_PASSWORD_HASH` | – | Required with `MCP_AUTH=oauth` |
+| `MCP_AUTH` | `none` | `oauth` enables the built-in OAuth 2.1 server for remote clients (see [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md)) |
+| `MCP_PUBLIC_URL` | – | Public base URL, required with `MCP_AUTH=oauth` |
+| `INTERVALS_OAUTH_CLIENT_ID` / `INTERVALS_OAUTH_CLIENT_SECRET` | – | Intervals.icu OAuth app for "Continue with Intervals.icu" |
+| `OAUTH_LOGIN`, `OAUTH_ALLOWED_ATHLETES` | `intervals` if an app is set, else `password`; `ATHLETE_ID` | Sign-in method(s) and who may sign in |
+| `OAUTH_PASSWORD` / `OAUTH_PASSWORD_HASH` | – | Password sign-in (alternative or fallback) |
 | `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
 
 ### Permission classes
@@ -122,18 +125,21 @@ Claude Code: `claude mcp add intervals-icu -- uv --directory /path/to/intervals-
 ### ChatGPT and other remote clients (SSE / HTTP)
 
 ```bash
-MCP_TRANSPORT=sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8000 uv run futureweb-intervals-mcp
+MCP_TRANSPORT=http+sse FASTMCP_HOST=127.0.0.1 FASTMCP_PORT=8001 uv run futureweb-intervals-mcp
 ```
 
-ChatGPT custom connectors support only "no authentication" or OAuth, so two protections are
-built in and documented in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md):
+ChatGPT connectors support only "no authentication" or OAuth, so two protections are built in
+and documented in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md):
 
-1. **Secret path** (immediate, works with every client): set `FASTMCP_SSE_PATH=/mcp-<random>/sse`
-   and `FASTMCP_MESSAGE_PATH=/mcp-<random>/messages/`, let the reverse proxy forward only that
-   prefix and deny everything else. The URL then acts as a credential (it never appears in
-   certificate transparency logs, unlike a hostname).
-2. **Built-in OAuth 2.1 server** (`MCP_AUTH=oauth`): dynamic client registration, PKCE, a login
-   page with the configured password; ChatGPT and Claude run the OAuth flow on first use.
+1. **Built-in OAuth 2.1 server** (`MCP_AUTH=oauth`, recommended): you sign in with your
+   Intervals.icu account ("Continue with Intervals.icu", only allowlisted athletes) or a server
+   password, choose on a consent page which permission classes the connection gets, and the
+   client receives its own short-lived tokens. Supports client metadata documents with
+   `private_key_jwt` (ChatGPT), dynamic client registration, PKCE and RFC 9207. Connect ChatGPT
+   with `https://<your-host>/mcp` and authentication OAuth.
+2. **Secret path** (for clients without OAuth): set `FASTMCP_SSE_PATH=/mcp-<random>/sse` and
+   `FASTMCP_MESSAGE_PATH=/mcp-<random>/messages/` and let the reverse proxy forward only that
+   prefix. The URL then acts as a credential.
 
 Keep the server bound to localhost behind a TLS-terminating reverse proxy that forwards
 `X-Forwarded-Proto`, and never expose the SSE/HTTP transport directly on a public interface.
