@@ -662,3 +662,25 @@ def test_get_activity_report_single_call(monkeypatch):
     assert payload["execution"]["summary"]["actual_intervals"] == 9
     assert payload["power_check"] is None
     assert payload["api_calls"] == 3
+
+
+# ----------------------------------------------------- phase 3: wellness periods
+def test_get_wellness_trends_separates_period_lookback_and_baseline(monkeypatch):
+    """Regression: requested period, fetched history and baseline are stated separately and the
+    day counts per metric refer to the requested period; native metrics carry units."""
+    calls = []
+    _install_router(monkeypatch, calls=calls)
+    result = asyncio.run(get_wellness_trends(start_date="2026-09-20", end_date="2026-10-09", metrics="hrv,restingHR,readiness"))
+    assert result.startswith(
+        "Wellness trends for athlete i1, 2026-09-20 to 2026-10-09: 20 days requested; 62 days fetched (2026-08-09 to "
+        "2026-10-09, including a 42-day lookback for rolling windows and the baseline); personal baseline = the 42 days ending 2026-10-09"
+    )
+    assert "hrv (ms): period 2026-09-20 to 2026-10-09, 20 days, 20 with values, 0 missing" in result
+    assert "restingHR (bpm): period 2026-09-20 to 2026-10-09, 20 days" in result
+    assert "readiness (/100): period" in result
+    assert "Personal baseline (42 days 2026-08-29 to 2026-10-09, n=30)" in result
+    wellness_call = next(c for c in calls if "/wellness" in c[0])
+    assert wellness_call[1]["oldest"] == "2026-08-09"
+    payload = json.loads(asyncio.run(get_wellness_trends(start_date="2026-09-20", end_date="2026-10-09", metrics="hrv", output_format="json")))
+    assert payload["windows"]["requested"]["days"] == 20 and payload["windows"]["fetched"]["days"] == 62
+    assert payload["metrics"][0]["days_total"] == 20 and payload["metrics"][0]["units"] == "ms"
