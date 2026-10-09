@@ -9,6 +9,44 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (phase 6: fatigue, tests, sensors)
+- `get_long_ride_fatigue_profile` (new, read-only): fatigue resistance at submaximal power for one ride or
+  the long rides of a period (rides reaching the highest threshold). Steady segments of a power band
+  (default 75-85 % FTP; 30 s rolling power within the band ±20 %, segment mean inside the band, at least
+  `min_segment_secs`, <= 10 % coasting, HR on >= 90 % of the samples, first 10 min and each segment's
+  first 60 s of HR left out, segments cut at the thresholds) are split into phases by work (default
+  750 / 1,500 kJ, `threshold_unit="kj_per_kg"` scales by body mass from the activity or the profile;
+  kJ/kg is always shown) and compared with the phase before the first threshold: HR at matched power,
+  W/bpm, cadence, temperature, Garmin stamina / potential stamina. Each threshold crossing, segment and
+  climb carries the prior work: kJ, kJ/kg, kJ above FTP (as Intervals.icu `icu_joules_above_ftp`), time
+  above FTP and efforts above FTP (30 s power >= FTP for >= 60 s), so easy and hard kJ can be told apart;
+  climbs (from `analyze_climbs`' detection) after `climb_after_hours` are marked with stamina at start
+  and end. Across rides: median, range and n of the changes per phase, rides split by their share of
+  work above FTP (from 4 rides), small samples flagged. Context: the forum threads
+  [Fatigue resistance](https://forum.intervals.icu/t/fatigue-resistance/4396),
+  [Power curve after kj/kg](https://forum.intervals.icu/t/power-curve-after-kj-kg/93688) and
+  [Three ways field data fooled me about durability](https://forum.intervals.icu/t/three-ways-field-data-fooled-me-about-durability-1-350-climbs-33-amateurs/132461)
+  (work above FTP is shown as context, not as a predictor).
+- `get_submax_test_trends` (new, read-only): the submaximal fatigue tests Intervals.icu detects
+  (`submax_fatigue_test` on the activity, sport settings `sft_*`;
+  [announcement](https://forum.intervals.icu/t/automatic-submaximal-fatigue-testing/132525)) over a
+  period with a validity filter: average within the target tolerance (default the test's own), CV
+  within its limit, not ignored and - from the intervals and streams around the test - not part of a
+  longer work interval, not continued after the test window and not preceded by hard riding; a
+  detection inside a regular workout is listed with its reason and never used as a benchmark. HRRc 0
+  without a recovery window counts as not measured; `require_recovery` makes recovery mandatory. Valid
+  tests are trended (HR at the end, efficiency factor, HRRc, HR rise, HR drop in an easy minute after
+  the test) with n, change, slope per week, SD and an ISO week table; differing targets, bikes and
+  indoor/outdoor are pointed out.
+- `compare_power_streams` several-rides mode: without `activity_id` (date range, default 180 days, or
+  `activity_ids`) every ride carrying the second power stream is compared on its own and summarised per
+  bike and power meter identity (from the file's device data or the bike's PowerMeter gear components):
+  n, mean, median, between-ride SD and range of the offset overall, per power band and in stable
+  windows, the within-ride spread, drift between the first and last quarter, lag counts, outlier share
+  and rides far from the group median; rides with fewer than 10 min of usable pairs are excluded with
+  the reason. No correction factor is derived or applied. New optional parameters `activity_ids`,
+  `start_date`, `end_date`, `limit`, `detail_level`, `athlete_id`.
+
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list
   (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count

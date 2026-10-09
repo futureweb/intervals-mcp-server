@@ -70,6 +70,7 @@ from intervals_mcp_server.tools.summary import get_training_summary  # noqa: F40
 from intervals_mcp_server.tools.training_load import get_load_projection, get_training_load  # noqa: F401
 from intervals_mcp_server.tools.intensity import get_intensity_distribution  # noqa: F401
 from intervals_mcp_server.tools.durability import get_durability  # noqa: F401
+from intervals_mcp_server.tools.fatigue import get_long_ride_fatigue_profile, get_submax_test_trends  # noqa: F401
 from intervals_mcp_server.tools.coach_context import get_coach_context  # noqa: F401
 from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: F401
 from intervals_mcp_server.tools.status import get_server_status  # noqa: F401
@@ -152,6 +153,8 @@ __all__ = [
     "get_load_projection",
     "get_intensity_distribution",
     "get_durability",
+    "get_long_ride_fatigue_profile",
+    "get_submax_test_trends",
     "get_coach_context",
     "preview_workout",
     "validate_workout",

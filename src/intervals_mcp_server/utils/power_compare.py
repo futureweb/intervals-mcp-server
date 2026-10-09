@@ -29,6 +29,11 @@ Conventions (also repeated in the ``notes`` of every result):
   the secondary at ``time + lag`` matches the primary at ``time``. The other
   statistics are computed at lag 0 (as recorded).
 - No calibration, scaling or smoothing is applied to either stream.
+
+Several rides (``ride_summary`` / ``summarize_rides``): each ride is compared on its own,
+then the per-ride numbers are summarised per bike and power meter identity with n, mean,
+median, the standard deviation between rides and the range, so the stability of the
+relation between rides becomes visible. No correction factor is ever derived.
 """
 
 import bisect
@@ -602,3 +607,180 @@ def comparison_to_json(result: dict[Any, Any]) -> dict[str, Any]:
     """JSON-serialisable copy of a comparison result (NaN -> None, non-string keys -> strings)."""
     out: dict[str, Any] = _json_value(result)
     return out
+
+
+# ------------------------------------------------------------- several rides
+# A ride enters the between-ride statistics with at least this many usable pairs (10 min at 1 Hz).
+MIN_RIDE_PAIRS = 600
+# A power bin of a ride counts with at least this many usable pairs.
+MIN_BIN_PAIRS = 60
+# Fewer rides than this in a group are flagged as a small sample.
+MIN_RIDES = 3
+# A ride whose mean difference lies further than max(this, 3 x MAD) from the group median is listed.
+FAR_FROM_MEDIAN_PP = 3.0
+
+
+def _spread(values: list[float]) -> dict[str, Any]:
+    """n, mean, median, standard deviation and range of per-ride values (None when empty)."""
+    clean = [value for value in values if value is not None and math.isfinite(value)]
+    if not clean:
+        return {"n": 0, "mean": None, "median": None, "sd": None, "min": None, "max": None}
+    return {
+        "n": len(clean),
+        "mean": round(statistics.fmean(clean), 2),
+        "median": round(statistics.median(clean), 2),
+        "sd": round(statistics.stdev(clean), 2) if len(clean) > 1 else None,
+        "min": round(min(clean), 2),
+        "max": round(max(clean), 2),
+    }
+
+
+def ride_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Key numbers of one ``compare_power_streams`` result for the comparison between rides."""
+    overall = result["overall"]
+    drift = [entry["mean_diff_pct"] for entry in result["drift"]]
+    first = next((value for value in drift if value is not None), None)
+    last = next((value for value in reversed(drift) if value is not None), None)
+    windows = result["stable_windows"] or {}
+    stable: dict[str, Any] = windows.get(60) or windows.get("60") or next(iter(windows.values()), {})
+    paired = result["paired_valid"]
+    return {
+        "samples": result["samples"],
+        "used": overall["n"],
+        "mean_primary_w": overall["mean_primary_w"],
+        "mean_diff_pct": overall["mean_diff_pct"],
+        "median_diff_pct": overall["median_diff_pct"],
+        "stdev_diff_pct": overall["stdev_diff_pct"],
+        "outlier_pct": result["excluded"]["outliers"] / paired * 100 if paired else None,
+        "best_lag_s": result["lag"]["best_lag_s"],
+        "correlation_at_best": result["lag"]["correlation_at_best"],
+        "drift_pct": drift,
+        "drift_last_minus_first_pp": last - first if first is not None and last is not None else None,
+        "stable_windows": (stable or {}).get("windows"),
+        "stable_diff_pct": (stable or {}).get("mean_diff_pct"),
+        "bins": {
+            f"{entry['range_w'][0]}-{entry['range_w'][1]}": {"n": entry["n"], "mean_diff_pct": entry["mean_diff_pct"]}
+            for entry in result["bins"]
+        },
+    }
+
+
+def _far_from_median(rides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rides whose mean difference lies more than max(3 pp, 3 x MAD) from the group median (needs 3 rides)."""
+    values = [(ride["id"], ride["summary"]["mean_diff_pct"]) for ride in rides if ride["summary"]["mean_diff_pct"] is not None]
+    if len(values) < MIN_RIDES:
+        return []
+    median = statistics.median(value for _, value in values)
+    mad = statistics.median(abs(value - median) for _, value in values)
+    limit = max(FAR_FROM_MEDIAN_PP, 3 * mad)
+    return [
+        {"id": ride_id, "diff_pct": round(value, 2), "deviation_pp": round(value - median, 2)}
+        for ride_id, value in values if abs(value - median) > limit
+    ]
+
+
+def _group_summary(label: str, rides: list[dict[str, Any]], bins: tuple[tuple[int, int], ...]) -> dict[str, Any]:
+    summaries = [ride["summary"] for ride in rides]
+    lags = [s["best_lag_s"] for s in summaries if s["best_lag_s"] is not None]
+    bin_rows = []
+    for low, high in bins:
+        key = f"{low}-{high}"
+        members = [s["bins"][key] for s in summaries if key in s["bins"] and s["bins"][key]["n"] >= MIN_BIN_PAIRS]
+        if members:
+            bin_rows.append({
+                "range_w": [low, high], "rides": len(members), "samples": sum(m["n"] for m in members),
+                "diff_pct": _spread([m["mean_diff_pct"] for m in members]),
+            })
+    return {
+        "group": label,
+        "rides": len(rides),
+        "ride_ids": [ride["id"] for ride in rides],
+        "small_sample": len(rides) < MIN_RIDES,
+        "samples_used": sum(s["used"] for s in summaries),
+        "overall_diff_pct": _spread([s["mean_diff_pct"] for s in summaries]),
+        "within_ride_sd_pct": _spread([s["stdev_diff_pct"] for s in summaries]),
+        "stable_diff_pct": _spread([s["stable_diff_pct"] for s in summaries]),
+        "drift_last_minus_first_pp": _spread([s["drift_last_minus_first_pp"] for s in summaries]),
+        "outlier_pct": _spread([s["outlier_pct"] for s in summaries]),
+        "lag_s": {"counts": {str(lag): lags.count(lag) for lag in sorted(set(lags))},
+                  "median": statistics.median(lags) if lags else None},
+        "bins": bin_rows,
+        "far_from_median": _far_from_median(rides),
+    }
+
+
+def summarize_rides(
+    rides: list[dict[str, Any]], bins: tuple[tuple[int, int], ...] = DEFAULT_BINS
+) -> dict[str, Any]:
+    """Between-ride statistics of several dual power rides, per group (bike / power meters).
+
+    ``rides`` are ``{"id", "date", "group", "summary"}`` with ``summary`` from
+    ``ride_summary``. Rides with fewer than ``MIN_RIDE_PAIRS`` usable pairs are listed as
+    excluded. Each ride counts once: per group the per-ride mean differences (overall, per
+    power bin with at least ``MIN_BIN_PAIRS`` pairs, stable windows), the drift between the
+    first and last quarter, the outlier share and the lag are summarised with n, mean,
+    median, standard deviation (between rides) and range. No correction factor is derived.
+    """
+    excluded = [
+        {"id": ride["id"], "reason": f"only {ride['summary']['used']} usable pairs (minimum {MIN_RIDE_PAIRS})"}
+        for ride in rides if ride["summary"]["used"] < MIN_RIDE_PAIRS
+    ]
+    included = [ride for ride in rides if ride["summary"]["used"] >= MIN_RIDE_PAIRS]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for ride in included:
+        groups.setdefault(ride["group"], []).append(ride)
+    notes = [
+        "Each ride counts once; sd is the standard deviation between rides of the per-ride mean difference "
+        "(secondary - primary in % of primary), within_ride_sd_pct the per-sample spread inside the rides.",
+        "Drift = last minus first quarter of the ride (percentage points); lag counts rides per best lag "
+        "(positive: secondary lags behind); rides further than max(3 pp, 3 x MAD) from the group median are listed.",
+        "No correction or calibration factor is derived or applied; the numbers describe the recorded streams.",
+    ]
+    if len(groups) > 1:
+        notes.append("Rides are grouped by bike and power meter identity; groups are not pooled.")
+    return {
+        "groups": [_group_summary(label, members, bins) for label, members in groups.items()],
+        "excluded": excluded,
+        "notes": notes,
+    }
+
+
+def _spread_text(spread: dict[str, Any], unit: str = "%") -> str:
+    if not spread["n"]:
+        return "n/a"
+    text = f"median {_fmt(spread['median'], 2)}{unit} (mean {_fmt(spread['mean'], 2)}{unit}"
+    if spread["sd"] is not None:
+        text += f", sd {_fmt(spread['sd'], 2)}{unit}"
+    return text + f", range {_fmt(spread['min'], 2)}..{_fmt(spread['max'], 2)}{unit}, n {spread['n']})"
+
+
+def _rides(count: int) -> str:
+    return f"{count} ride{'' if count == 1 else 's'}"
+
+
+def format_rides_summary(summary: dict[str, Any]) -> list[str]:
+    """Text lines of ``summarize_rides`` (one block per group)."""
+    lines: list[str] = []
+    for group in summary["groups"]:
+        flag = " - small sample, not reliable" if group["small_sample"] else ""
+        lines.append(f"Group {group['group']}: {_rides(group['rides'])}, {group['samples_used']} usable pairs{flag}")
+        lines.append(f"  Overall difference per ride: {_spread_text(group['overall_diff_pct'])}")
+        lines.append(f"  Stable windows per ride: {_spread_text(group['stable_diff_pct'])}")
+        lines.append(f"  Per-sample spread inside the rides (sd): {_spread_text(group['within_ride_sd_pct'])}")
+        lines.append(f"  Drift last - first quarter: {_spread_text(group['drift_last_minus_first_pp'], ' pp')}")
+        lines.append(f"  Outliers: {_spread_text(group['outlier_pct'])}")
+        counts = ", ".join(f"{lag} s: {count}" for lag, count in group["lag_s"]["counts"].items()) or "n/a"
+        lines.append(f"  Best lag (rides): {counts}")
+        for ride in group["far_from_median"]:
+            lines.append(
+                f"  Ride {ride['id']} lies {ride['deviation_pp']:+.2f} pp from the group median "
+                f"(diff {ride['diff_pct']:.2f}%)"
+            )
+        for entry in group["bins"]:
+            low, high = entry["range_w"]
+            lines.append(
+                f"  {low}-{high} W: {_rides(entry['rides'])}, {entry['samples']} pairs, diff {_spread_text(entry['diff_pct'])}"
+            )
+    for item in summary["excluded"]:
+        lines.append(f"Excluded {item['id']}: {item['reason']}")
+    return lines

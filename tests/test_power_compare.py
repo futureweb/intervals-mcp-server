@@ -13,10 +13,15 @@ import json
 import random
 from typing import Any
 
+import pytest
+
 from intervals_mcp_server.utils.power_compare import (
     compare_power_streams,
     comparison_to_json,
     format_power_comparison,
+    format_rides_summary,
+    ride_summary,
+    summarize_rides,
 )
 
 # (kind, start index, end index[, level]) of the primary power stream.
@@ -286,3 +291,59 @@ def test_degenerate_input() -> None:
     coasting = compare_power_streams([0] * 100, [0] * 100, list(range(100)))
     assert coasting["excluded"]["coasting_or_zero"] == 100
     assert coasting["best_efforts"][0]["primary_w"] == 0.0
+
+
+# ------------------------------------------------------------- several rides
+def _scaled_ride(scale: float, offset_w: float = 0.0, drift_pct: float = 0.0, samples: int = 1200) -> dict[str, Any]:
+    """Comparison of a steady ride whose secondary reads ``primary * scale + offset`` (+ a linear drift)."""
+    primary = [150.0 + (index % 300) / 2 for index in range(samples)]  # 150-300 W saw tooth
+    secondary = [w * scale * (1 + drift_pct / 100 * index / samples) + offset_w for index, w in enumerate(primary)]
+    return compare_power_streams(primary, secondary, list(range(samples)))
+
+
+def test_ride_summary_key_numbers() -> None:
+    """Per-ride summary: mean difference, drift between the first and last quarter, bins, lag, outliers."""
+    summary = ride_summary(_scaled_ride(0.95, drift_pct=2.0))
+    assert summary["used"] == 1200 and summary["samples"] == 1200
+    assert -5.5 < summary["mean_diff_pct"] < -3.5
+    assert summary["drift_last_minus_first_pp"] is not None and summary["drift_last_minus_first_pp"] > 1.0
+    assert summary["outlier_pct"] == 0.0 and summary["best_lag_s"] == 0
+    assert summary["stable_windows"] is not None
+    assert set(summary["bins"]) == {"150-200", "200-250", "250-300"}
+    empty = ride_summary(compare_power_streams([], [], []))
+    assert empty["used"] == 0 and empty["outlier_pct"] is None and empty["drift_last_minus_first_pp"] is None
+
+
+def _ride(ride_id: str, group: str, scale: float, samples: int = 1200) -> dict[str, Any]:
+    """A ride entry for summarize_rides."""
+    return {"id": ride_id, "date": "2026-09-01", "group": group, "summary": ride_summary(_scaled_ride(scale, samples=samples))}
+
+
+def test_summarize_rides_between_ride_spread_groups_and_exclusions() -> None:
+    """Between-ride statistics per group, rides far from the median, short rides excluded, no factor."""
+    rides = [
+        _ride("r1", "Ultimate", 0.95), _ride("r2", "Ultimate", 0.96), _ride("r3", "Ultimate", 0.94),
+        _ride("r4", "Ultimate", 0.80),  # far from the others
+        _ride("g1", "Grail", 1.02),
+        _ride("short", "Ultimate", 0.95, samples=300),
+    ]
+    summary = summarize_rides(rides)
+    assert summary["excluded"] == [{"id": "short", "reason": "only 300 usable pairs (minimum 600)"}]
+    ultimate, grail = summary["groups"]
+    assert ultimate["group"] == "Ultimate" and ultimate["rides"] == 4 and not ultimate["small_sample"]
+    assert ultimate["overall_diff_pct"]["n"] == 4
+    assert ultimate["overall_diff_pct"]["median"] == pytest.approx(-5.5, abs=0.1)
+    assert ultimate["overall_diff_pct"]["sd"] > 5  # the 0.80 ride widens the between-ride spread
+    assert [r["id"] for r in ultimate["far_from_median"]] == ["r4"]
+    assert ultimate["lag_s"] == {"counts": {"0": 4}, "median": 0}
+    assert {b["rides"] for b in ultimate["bins"]} == {4}
+    assert grail["small_sample"] and grail["overall_diff_pct"]["sd"] is None and not grail["far_from_median"]
+    assert any("No correction or calibration factor" in note for note in summary["notes"])
+    assert any("not pooled" in note for note in summary["notes"])
+    text = "\n".join(format_rides_summary(summary))
+    assert "Group Ultimate: 4 rides, 4800 usable pairs" in text
+    assert "Group Grail: 1 ride, 1200 usable pairs - small sample, not reliable" in text
+    assert "Ride r4 lies -14.50 pp from the group median" in text
+    assert "Excluded short: only 300 usable pairs" in text
+    json.dumps(comparison_to_json(summary), allow_nan=False)
+    assert not summarize_rides([])["groups"]
