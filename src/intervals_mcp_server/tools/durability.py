@@ -31,6 +31,7 @@ from intervals_mcp_server.utils.durability import (
     MAX_VI,
     REASONS,
     REFERENCES,
+    SMALL_SAMPLE,
     TREND_BAND_PP,
     decoupling_summary,
     efficiency_summary,
@@ -45,9 +46,19 @@ DEFAULT_DAYS = 42
 MAX_DAYS = 366
 
 
+def sample_note(entry: dict[str, Any]) -> str:
+    """'6 of 19 sessions qualify; small sample, not reliable; mixed: 2 different bikes/shoes' (per sport family)."""
+    parts = [f"{entry['n']} of {entry.get('considered', entry['n'])} sessions qualify"]
+    if entry["small_sample"]:
+        parts.append(f"small sample (< {SMALL_SAMPLE}), not reliable")
+    if entry.get("heterogeneity"):
+        parts.append("mixed sample: " + ", ".join(entry["heterogeneity"]))
+    return "; ".join(parts)
+
+
 def _family_text(family: str, entry: dict[str, Any], ef: dict[str, Any], threshold: float) -> str:
     if not entry["n"]:
-        text = f"  {family}: no qualifying sessions"
+        text = f"  {family}: no qualifying sessions ({entry.get('considered', 0)} considered)"
     else:
         spread = f", IQR {fmt(entry['p25'], 1)} to {fmt(entry['p75'], 1)}" if "p25" in entry else ""
         recent = entry["recent"]
@@ -60,8 +71,9 @@ def _family_text(family: str, entry: dict[str, Any], ef: dict[str, Any], thresho
         text = (
             f"  {family}: decoupling median {fmt(entry['median'], 1)} % (n {entry['n']}, range {fmt(entry['min'], 1)} "
             f"to {fmt(entry['max'], 1)}{spread}; {basis}; {entry['indoor_sessions']} indoor), {entry['above_threshold']} above "
-            f"{threshold:g} %{trend}" + (" - small sample, not reliable" if entry["small_sample"] else "")
+            f"{threshold:g} %{trend}"
         )
+        text += f"\n    sample: {sample_note(entry)}"
     if ef["n"]:
         change = (
             f", last 7 d mean {fmt(ef['recent_mean'], 2)} (n {ef['recent_n']}), {fmt(ef['change_pct'], 1, ' %', signed=True)}: "
@@ -138,8 +150,10 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
     are counted per reason. Per sport family: median, range and quartiles, how many sessions
     are above drift_threshold_pct (5 % is commonly cited, Friel / Allen & Coggan), and the
     median of the last recent_days against the window median with a +/- 1 percentage point
-    stability band (needs 2 recent and 3 window sessions). Fewer than 5 sessions are flagged
-    as a small sample. Also the efficiency factor (normalized power / average HR) of steady
+    stability band (needs 2 recent and 3 window sessions). Per sport the qualifying share
+    (e.g. 6 of 19 sessions) is shown; fewer than 8 qualifying sessions are flagged as a small
+    sample, not reliable, and a mix of indoor/outdoor sessions, several bikes/shoes or power
+    meters among them is pointed out. Also the efficiency factor (normalized power / average HR) of steady
     sessions with power of at least 20 min: window mean versus recent mean (+/- 2 % band);
     EF depends on the power meter, so several bikes are pointed out. For interval-level
     watts per heartbeat per power band and per bike use get_power_hr_efficiency. Filter and

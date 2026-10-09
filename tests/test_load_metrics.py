@@ -327,13 +327,29 @@ def test_decoupling_summary_trend_band_and_small_samples():
     assert cycling["n"] == 7 and cycling["median"] == 3.0 and cycling["above_threshold"] == 2
     assert cycling["recent"]["n"] == 2 and cycling["recent"]["median"] == 7.5
     assert cycling["recent"]["delta_pp"] == 4.5 and cycling["recent"]["direction"] == "higher"
-    assert cycling["p25"] == 2.5 and not cycling["small_sample"]
+    assert cycling["p25"] == 2.5 and cycling["small_sample"]  # 7 < 8 qualifying sessions (phase 5)
+    assert cycling["considered"] == 8 and cycling["qualifying_share_pct"] == 88
     assert running["n"] == 1 and running["small_sample"] and running["basis"] == {"pace:HR": 1}
     assert running["recent"]["direction"] is None
     assert result["considered"] == 9 and result["excluded_by_reason"] == {"short": 1}
     stable = dur.decoupling_summary([_steady(END - timedelta(days=i), decoupling=4.0 + i * 0.1) for i in range(6)], start, END)
     assert stable["by_sport"]["cycling"]["recent"]["direction"] == "within band"
     assert dur.decoupling_summary([], start, END)["by_sport"]["cycling"]["median"] is None
+
+
+def test_decoupling_sample_share_and_heterogeneity():
+    """Phase 5 (G): qualifying share per sport, < 8 sessions flagged, indoor/outdoor, bikes and power meters mixed."""
+    start = END - timedelta(days=27)
+    acts = [_steady(start + timedelta(days=i), decoupling=3.0, gear={"id": "b1"}, power_meter="Shimano") for i in range(0, 16, 2)]
+    uniform = dur.decoupling_summary(acts, start, END)["by_sport"]["cycling"]
+    assert uniform["n"] == 8 and not uniform["small_sample"] and uniform["heterogeneity"] == []
+    acts += [_steady(END - timedelta(days=1), decoupling=4.0, trainer=True, gear={"id": "b2"}, power_meter="Assioma")]
+    acts += [_steady(END, moving_time=1800)]  # considered, excluded (short)
+    mixed = dur.decoupling_summary(acts, start, END)["by_sport"]["cycling"]
+    assert mixed["considered"] == 10 and mixed["n"] == 9 and mixed["qualifying_share_pct"] == 90
+    assert mixed["heterogeneity"] == [
+        "indoor and outdoor mixed (1 indoor, 8 outdoor)", "2 different bikes/shoes", "2 different power meters (Assioma, Shimano)",
+    ]
 
 
 def test_efficiency_summary_change_and_gear():

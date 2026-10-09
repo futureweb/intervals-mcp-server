@@ -312,7 +312,9 @@ def test_get_durability_text_and_filters(monkeypatch):
     assert "cycling: decoupling median 3.0 % (n 11" in result and "5 above 5 %" in result
     assert "last 7 d median 4.8 % (n 2), +1.8 pp vs window: higher" in result
     assert "efficiency factor mean 1.43 (n 12)" in result and "2 different bikes/shoes" in result
-    assert "running: no qualifying sessions" in result
+    assert "running: no qualifying sessions (6 considered)" in result
+    # Phase 5 (G): qualifying share, small sample below 8 and the mix of the qualifying sessions.
+    assert "    sample: 11 of 12 sessions qualify; mixed sample: indoor and outdoor mixed (1 indoor, 10 outdoor), 2 different bikes/shoes" in result
     assert "Excluded:" in result and "(long stops)" in result
     outdoor = json.loads(asyncio.run(get_durability(environment="outdoor", output_format="json")))
     assert outdoor["decoupling"]["excluded_by_reason"]["environment"] == 1
