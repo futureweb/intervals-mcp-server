@@ -33,6 +33,7 @@ from intervals_mcp_server.mcp_instance import tool
 config = get_config()
 
 DEFAULT_RANGE_DAYS = 90
+REFERENCE_LOOKBACK_DAYS = 365  # default search window before a reference activity
 MAX_COMPARE_ACTIVITIES = 25
 MAX_WORKOUTS = 12
 MAX_EFFICIENCY_ACTIVITIES = 60
@@ -275,6 +276,25 @@ def _filter_text(sport_types: str | None, gear_id: str | None, start_date: str |
     if gear_id:
         parts.append(f"gear {gear_id}")
     return ", ".join(parts)
+
+
+def _reference_window(reference: dict[str, Any] | None, start_date: str | None) -> tuple[str | None, str | None]:
+    """(effective start date, note) of a search anchored on a reference activity.
+
+    Without an explicit start_date the search starts REFERENCE_LOOKBACK_DAYS before the
+    reference activity's local date; an explicit start_date (any range) wins.
+    """
+    if start_date or reference is None:
+        return start_date, None
+    try:
+        reference_day = date.fromisoformat(_day(reference))
+    except ValueError:
+        return start_date, None
+    start = (reference_day - timedelta(days=REFERENCE_LOOKBACK_DAYS)).isoformat()
+    return start, (
+        f"default window: {REFERENCE_LOOKBACK_DAYS} days before the reference activity ({start} onwards); "
+        "pass start_date for another range"
+    )
 
 
 async def _intervals_of(api: _Api, activity_id: Any) -> tuple[list[dict[str, Any]], str | None]:
@@ -857,8 +877,10 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     same gear, FTP context within ftp_tolerance_pct of the reference or newest result).
     Absolute watts of different bikes / power meters are not comparable; compare % of FTP
     across gear. The API has no date, sport or gear filter, so those are applied here on the
-    returned list (more results are requested from the API). One API call (plus two for a
-    reference activity and one for the gear catalog).
+    returned list (more results are requested from the API). With a reference activity and
+    no start_date only the 365 days before the reference count (default window, shown in the
+    output with the number of older matches; an explicit start_date allows any range). One
+    API call (plus two for a reference activity and one for the gear catalog).
 
     Args:
         min_secs: Minimum interval length in seconds (required unless reference_activity_id is given)
@@ -869,7 +891,8 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
         min_reps: Minimum number of matching repetitions in the activity (optional)
         max_reps: Maximum number of matching repetitions in the activity (optional)
         limit: Maximum number of activities to return (optional, default 20)
-        start_date: Keep only activities on or after this local date YYYY-MM-DD (optional)
+        start_date: Keep only activities on or after this local date YYYY-MM-DD (optional; with a
+            reference activity the default is 365 days before it, otherwise no limit)
         end_date: Keep only activities on or before this local date YYYY-MM-DD (optional)
         sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide"; "all" for every
             sport (optional, default: sport family of the reference or of most results)
@@ -924,7 +947,12 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
         return error
     found = _list_of_dicts(result)
     sport_filter, sport_text, other_families = _family_filter(found, sport_types, reference)
-    selected = _select_activities(found, sport_types=sport_filter, gear_id=gear_id, start_date=start_date, end_date=end_date)
+    window_start, window_note = _reference_window(reference, start_date)
+    selected = _select_activities(found, sport_types=sport_filter, gear_id=gear_id, start_date=window_start, end_date=end_date)
+    older = (
+        len(_select_activities(found, sport_types=sport_filter, gear_id=gear_id, end_date=end_date)) - len(selected)
+        if window_note else 0
+    )
     if ftp_bounds:
         selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key) if selected else {}
@@ -933,7 +961,12 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     if order == "comparability":
         scored.sort(key=lambda item: (item[1]["score"], str(item[0].get("start_date_local") or "")), reverse=True)
     scored = scored[:limit]
-    filters = ", ".join(p for p in (_filter_text(None, gear_id, start_date, end_date), sport_text, f"FTP {ftp_range}" if ftp_range else "") if p)
+    filters = ", ".join(p for p in (_filter_text(None, gear_id, window_start, end_date), sport_text, f"FTP {ftp_range}" if ftp_range else "") if p)
+    window = {
+        "start": window_start, "end": end_date,
+        "default_lookback_days": REFERENCE_LOOKBACK_DAYS if window_note else None,
+        "older_matches_outside_window": older,
+    }
 
     criteria = (
         f"{params['minSecs']}-{params['maxSecs']} s at {params['minIntensity']}-{params['maxIntensity']}% of FTP"
@@ -946,6 +979,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
             "athlete_id": athlete_id_to_use, "criteria": criteria, "api_params": params,
             "returned_by_api": len(found), "filters": filters or None, "other_sport_families": other_families,
             "reference": {"activity_id": reference_activity_id, "pattern": pattern} if reference else None,
+            "window": window,
             "sort_by": order,
             "activities": [
                 {
@@ -966,6 +1000,11 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
             + (f" @ {pattern['pct_ftp']:.0f}% FTP" if pattern.get("pct_ftp") is not None else "")
             + " (search window derived from its main work set unless given explicitly)"
         )
+    lines.append(
+        f"Date window: {window_start or 'any'} to {end_date or 'latest'}"
+        + (f" ({window_note})" if window_note else "")
+        + (f"; {older} older match(es) before {window_start} not shown" if older else "")
+    )
     lines.append(
         f"API returned {len(found)} activities; filters ({filters}) keep {len(selected)}; "
         + ("ranked by comparability." if order == "comparability" else "newest first.")
@@ -1228,7 +1267,9 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     """Compare repeated executions of the same workout over time on truly comparable work intervals
 
     Collects activities by name search (e.g. "Threshold" or a tag such as "#threshold"), by id
-    list or by date range (default the last 90 days). Per activity the WORK intervals are split
+    list or by date range (default the last 90 days). A name search with a reference activity
+    and no start_date keeps the 365 days before the reference (shown in the filters; an
+    explicit start_date allows any range). Per activity the WORK intervals are split
     into the main set (the largest group of intervals of similar length, within 25 %, and
     intensity, within 8 % of FTP), short surges/sprints under 2 min (listed, never averaged
     in), other WORK intervals and intervals below 70 % FTP (warm-ups / recoveries labelled
@@ -1248,7 +1289,8 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     Args:
         query: Text to match in activity names, tags with leading # (optional)
         activity_ids: Comma-separated activity IDs (optional)
-        start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date; also filters query results)
+        start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date; also filters query
+            results, which default to 365 days before reference_activity_id when one is given)
         end_date: End date YYYY-MM-DD (optional, default today)
         sport_types: Comma-separated sport types, e.g. "Ride,VirtualRide"; "all" for every sport
             (optional, default: the sport family of the reference / newest activity)
@@ -1298,6 +1340,10 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
             if error or not fetched:
                 return error or f"Reference activity {reference_activity_id} not found."
             reference = fetched[0]
+    window_note = None
+    if query and not activity_ids and reference is not None:
+        # A name search is not limited in time: anchor it on the reference like find_similar_intervals.
+        start_date, window_note = _reference_window(reference, start_date)
     newest = _select_activities(activities, start_date=start_date, end_date=end_date, limit=1)
     anchor = reference or (newest[0] if newest else None)
     if sport_types and sport_types.strip().lower() == "all":
@@ -1318,6 +1364,8 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     filters_text = _filter_text(sport_types if sport_types else None, gear_id, start_date, end_date)
     if sport_filter and not sport_types and anchor is not None:
         filters_text = ", ".join(p for p in (filters_text, f"sport family {sport_family(anchor.get('type'))} (default)") if p)
+    if window_note:
+        filters_text = ", ".join(p for p in (filters_text, window_note) if p)
     if not selected:
         return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})."
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
@@ -1356,6 +1404,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     if output_format.strip().lower() == "json":
         payload = {
             "athlete_id": athlete_id_to_use, "source": source, "filters": filters_text or None, "limit": capped,
+            "window": {"start": start_date, "end": end_date, "default_lookback_days": REFERENCE_LOOKBACK_DAYS if window_note else None},
             "reference": {"activity_id": ref_row["id"], "pattern": pattern, "explicit": reference is not None},
             "activities": rows, "trends": trends, "notes": notes, "api_calls": api.calls,
         }

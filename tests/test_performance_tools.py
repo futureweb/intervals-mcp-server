@@ -790,3 +790,42 @@ def test_find_similar_intervals_through_mcp_layer(monkeypatch):
     params = calls[0][1]
     assert params["minIntensity"] == 90 and isinstance(params["minIntensity"], int)
     assert params["maxIntensity"] == 105 and isinstance(params["maxIntensity"], int)
+
+
+def test_find_similar_intervals_reference_default_window(monkeypatch):
+    """Phase 5 (B): with a reference and no start_date only the 365 days before it count; start_date widens it."""
+    old = _activity("a0", "2023-06-02", "Ride", "b1", "Old threshold", icu_ftp=226, interval_summary=["3x 20m 240w"])
+    routes = {"/interval-search": ACTIVITIES + [old], "/activity/": lambda url, _p: {**ACTIVITY_BY_ID, "a0": old}.get(_activity_id_of(url), {})}
+    _install_router(monkeypatch, overrides=routes)
+    payload = json.loads(asyncio.run(find_similar_intervals(reference_activity_id="a4", output_format="json")))
+    assert "a0" not in {a["id"] for a in payload["activities"]}
+    assert payload["window"] == {"start": "2025-10-01", "end": None, "default_lookback_days": 365, "older_matches_outside_window": 1}
+    text = asyncio.run(find_similar_intervals(reference_activity_id="a4"))
+    assert (
+        "Date window: 2025-10-01 to latest (default window: 365 days before the reference activity (2025-10-01 onwards); "
+        "pass start_date for another range); 1 older match(es) before 2025-10-01 not shown"
+    ) in text
+    assert "dates 2025-10-01 to ..." in text
+    explicit = json.loads(asyncio.run(find_similar_intervals(reference_activity_id="a4", start_date="2020-01-01", output_format="json")))
+    assert "a0" in {a["id"] for a in explicit["activities"]} and explicit["window"]["default_lookback_days"] is None
+    # Without a reference nothing changes: no date limit unless given.
+    plain = json.loads(asyncio.run(find_similar_intervals(900, 1500, 95, 110, output_format="json")))
+    assert "a0" in {a["id"] for a in plain["activities"]} and plain["window"]["start"] is None
+
+
+def test_compare_workouts_query_with_reference_default_window(monkeypatch):
+    """Phase 5 (B): a name search anchored on a reference keeps the 365 days before it."""
+    old = _activity("t0", "2024-05-01", "Ride", "b1", "Threshold 3x10 old", icu_ftp=220)
+    routes = _threshold_routes()
+    routes["/search-full"] = THRESHOLD_ACTIVITIES + [old]
+    intervals = dict(THRESHOLD_INTERVALS, t0=[_iv("WORK", 600, 230, 155, 162, 90)] * 3)
+    routes["/intervals"] = lambda url, _p: {"icu_intervals": intervals.get(_activity_id_of(url), [])}
+    _install_router(monkeypatch, overrides=routes)
+    payload = json.loads(asyncio.run(compare_workouts(query="Threshold", reference_activity_id="t5", output_format="json")))
+    assert "t0" not in {r["id"] for r in payload["activities"]}
+    assert payload["window"] == {"start": "2025-10-09", "end": None, "default_lookback_days": 365}
+    assert "default window: 365 days before the reference activity (2025-10-09 onwards)" in payload["filters"]
+    wide = json.loads(asyncio.run(compare_workouts(query="Threshold", reference_activity_id="t5", start_date="2024-01-01", output_format="json")))
+    assert "t0" in {r["id"] for r in wide["activities"]} and wide["window"]["default_lookback_days"] is None
+    no_reference = json.loads(asyncio.run(compare_workouts(query="Threshold", output_format="json")))
+    assert "t0" in {r["id"] for r in no_reference["activities"]}  # unchanged without a reference

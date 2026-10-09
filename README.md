@@ -130,7 +130,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `compare_best_efforts` | Best efforts across activities (ids, date range, sport, gear) side by side |
-| `find_similar_intervals` | Activities with comparable intervals, from a reference activity or a given length and intensity; same sport family by default, ranked by comparability, with gear and power meter context |
+| `find_similar_intervals` | Activities with comparable intervals, from a reference activity or a given length and intensity; same sport family by default, ranked by comparability, with gear and power meter context; with a reference the 365 days before it by default (window shown, `start_date` for any range) |
 | `compare_workouts` | Repeated workouts over time, comparing only comparable work intervals (reference activity, sport family, length, intensity, reps, FTP range); surges kept apart, time-weighted means, power, HR, cadence and whole-activity RPE trends, gear and power meter flags |
 | `get_power_hr_efficiency` | Watts per heartbeat per power band and bike over time, with minimum sample sizes and filters for gear, indoor/outdoor and interval position |
 | `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
