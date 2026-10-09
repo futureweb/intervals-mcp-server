@@ -89,7 +89,7 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, ValidationError
 
 from intervals_mcp_server.auth_clients import ClientMetadataResolver, Fetcher, is_metadata_client_id
 
@@ -1019,23 +1019,24 @@ def oauth_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
 
 def auth_settings(config: OAuthConfig) -> AuthSettings:
     """The MCP SDK auth settings for *config* (issuer, resource, registration, scopes)."""
-    extra: dict[str, Any] = {}
-    if "validate_token_resource" in AuthSettings.model_fields:
-        # The provider checks the audience itself (same origin as MCP_PUBLIC_URL, so /mcp and
-        # /sse tokens and clients that send no resource indicator keep working).
-        extra["validate_token_resource"] = False
-    return AuthSettings(
-        issuer_url=AnyHttpUrl(config.public_url),
-        resource_server_url=AnyHttpUrl(config.public_url),
-        client_registration_options=ClientRegistrationOptions(
+    settings: dict[str, Any] = {
+        "issuer_url": AnyHttpUrl(config.public_url),
+        "resource_server_url": AnyHttpUrl(config.public_url),
+        "client_registration_options": ClientRegistrationOptions(
             enabled=config.dynamic_registration,
             valid_scopes=config.scopes_supported,
             default_scopes=config.scopes_supported,
         ),
-        revocation_options=RevocationOptions(enabled=True),
-        required_scopes=[SCOPE],
-        **extra,
-    )
+        "revocation_options": RevocationOptions(enabled=True),
+        "required_scopes": [SCOPE],
+    }
+    try:
+        # The provider checks the audience itself (same origin as MCP_PUBLIC_URL, so /mcp and
+        # /sse tokens and clients that send no resource indicator keep working). Older SDKs
+        # do not know the field.
+        return AuthSettings(**settings, validate_token_resource=False)
+    except (TypeError, ValidationError):
+        return AuthSettings(**settings)
 
 
 def auth_status_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:

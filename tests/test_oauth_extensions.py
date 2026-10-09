@@ -607,8 +607,8 @@ def test_transport_security_allows_the_public_host(tmp_path):
     assert transport_security_from_env({}) is None
     security = transport_security_from_env({"MCP_PUBLIC_URL": "https://mcp.example.com", "FASTMCP_ALLOWED_HOSTS": "legacy.example.com"})
     assert security is not None and security.enable_dns_rebinding_protection
-    assert "mcp.example.com" in security.allowed_hosts and "legacy.example.com" in security.allowed_hosts
-    assert "127.0.0.1:*" in security.allowed_hosts and "https://mcp.example.com" in security.allowed_origins
+    assert set(security.allowed_hosts) >= {"127.0.0.1:*", "mcp.example.com", "legacy.example.com"}
+    assert set(security.allowed_origins) >= {"http://127.0.0.1:*", "https://mcp.example.com"}
     off = transport_security_from_env({"FASTMCP_ALLOWED_HOSTS": "*"})
     assert off is not None and not off.enable_dns_rebinding_protection
 
