@@ -17,6 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("API_KEY", "test")
 os.environ.setdefault("ATHLETE_ID", "i1")
 
+from intervals_mcp_server import __version__
 from intervals_mcp_server import server  # noqa: E402,F401  # pylint: disable=wrong-import-position,unused-import
 from intervals_mcp_server.auth import install_login_routes, oauth_from_env  # noqa: E402  # pylint: disable=wrong-import-position
 from intervals_mcp_server.auth_pages import _page  # noqa: E402  # pylint: disable=wrong-import-position,protected-access
@@ -86,6 +87,7 @@ def test_server_info_carries_icons_and_website_on_initialize():
     payload = next(json.loads(line[5:]) for line in response.text.splitlines() if line.startswith("data:"))
     info = payload["result"]["serverInfo"]
     assert info["websiteUrl"] == WEBSITE_URL
+    assert info["version"] == __version__  # the package version, not the MCP SDK version
     icons = info["icons"]
     assert icons and icons[0]["mimeType"] == "image/svg+xml"
     if not os.environ.get("MCP_PUBLIC_URL"):

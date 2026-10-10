@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `serverInfo.version` in the MCP `initialize` answer reports this package's version instead of the
+  MCP SDK version (directories that read the server directly showed `1.30.0`).
+
 ## [1.0.0b1] - 2026-10-10
 
 First public beta of the Futureweb fork. Based on upstream
