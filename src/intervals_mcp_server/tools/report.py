@@ -320,13 +320,13 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, field_defs: 
     pairs = start_end_pairs(field_defs)
     codes = sorted({code for start, end, _ in pairs for code in (start, end)})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": "2000-01-01", "newest": str(activity.get("start_date_local") or "")[:10], "route_id": route_id,
                 "limit": MAX_ROUTE_HISTORY + 1, "fields": ",".join([ROUTE_FIELDS, *codes])},
     )
     candidates = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
     history = route_history(activity, candidates, pairs, truncated=len(candidates) >= MAX_ROUTE_HISTORY + 1)
-    route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}")
+    route = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/routes/{seg(route_id)}")
     history["route_name"] = route.get("name") if isinstance(route, dict) and "error" not in route else None
     if isinstance(result, dict) and "error" in result:
         history["error"] = result.get("message")

@@ -9,7 +9,7 @@ Custom item definitions come from the per-process cache. The logic lives in ``ut
 import json
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.training_load import filter_types, resolve_period, wanted_types
@@ -51,7 +51,7 @@ def intake_streams(stream_defs: CustomFieldDefs, listed: list[Any]) -> list[str]
 
 
 async def _single(activity_id: str, athlete_id: str | None) -> dict[str, Any] | str:  # pylint: disable=too-many-locals
-    result = await make_intervals_request(url=f"/activity/{activity_id}")
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching the activity: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -65,7 +65,7 @@ async def _single(activity_id: str, athlete_id: str | None) -> dict[str, Any] | 
     codes = intake_streams(stream_defs, [str(t) for t in activity.get("stream_types") or []])
     calls = 1
     if codes:
-        streams = await make_intervals_request(url=f"/activity/{activity_id}/streams",
+        streams = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams",
                                                params={"types": ",".join(["time", *codes])})
         calls += 1
         by_type = {s.get("type"): s.get("data") or [] for s in streams if isinstance(s, dict)} if isinstance(streams, list) else {}
@@ -117,7 +117,7 @@ async def _period(  # pylint: disable=too-many-arguments,too-many-positional-arg
     roles = fueling_fields(defs)
     codes = sorted({code for group in roles.values() for code in group})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": ",".join([FUELING_LIST_FIELDS, *codes])},
     )
     if isinstance(result, dict) and "error" in result:

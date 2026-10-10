@@ -12,6 +12,7 @@ judged. Methods: ``utils.fatigue_profile`` and ``utils.submax``.
 import json
 from typing import Any
 
+from intervals_mcp_server.api.client import seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
@@ -102,7 +103,7 @@ async def _ride_list(  # pylint: disable=too-many-arguments,too-many-positional-
     """Activities by id (already de-duplicated and capped) or of the date range (filtered by sport, newest first)."""
     if activity_ids:
         return await _activities_by_ids(api, activity_ids)
-    result = await api.get(f"/athlete/{athlete_id}/activities", {"oldest": span[0], "newest": span[1], "fields": fields})
+    result = await api.get(f"/athlete/{seg(athlete_id)}/activities", {"oldest": span[0], "newest": span[1], "fields": fields})
     error = _error(result, "activities")
     if error:
         return [], error
@@ -354,7 +355,7 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         return error
     profile_weight: float | None = None
     if any(not _num(a.get("icu_weight")) for a in activities):
-        result = await api.get(f"/athlete/{athlete}")
+        result = await api.get(f"/athlete/{seg(athlete)}")
         profile_weight = _num(result.get("icu_weight")) if isinstance(result, dict) else None
 
     def weight_of(activity: dict[str, Any]) -> tuple[float | None, str]:
@@ -397,7 +398,7 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         weight, weight_source = weight_of(activity)
         listed = [{"type": t} for t in activity.get("stream_types") or []]
         codes = stamina_codes(listed, names)
-        result = await api.get(f"/activity/{activity.get('id')}/streams", {"types": ",".join([*CORE_STREAMS, *codes.values()])})
+        result = await api.get(f"/activity/{seg(activity.get('id'))}/streams", {"types": ",".join([*CORE_STREAMS, *codes.values()])})
         streams = [s for s in result if isinstance(s, dict)] if isinstance(result, list) else []
         if not streams:
             skipped.append({"id": activity.get("id"), "reason": _error(result, "streams") or "no streams returned"})
@@ -625,7 +626,7 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     capped = min(max(limit, 1), MAX_SUBMAX_TESTS)
 
     api = _Api()
-    settings_result = await api.get(f"/athlete/{athlete}/sport-settings")
+    settings_result = await api.get(f"/athlete/{seg(athlete)}/sport-settings")
     settings = _sft_settings(settings_result) if not _error(settings_result, "sport settings") else {}
     activities, error = await _ride_list(api, athlete, [], span, SUBMAX_FIELDS, sport_types)
     if error:
@@ -635,10 +636,10 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     tests = tests[:capped]
     for test in tests:
         if check_context and test["test_type"] == "POWER":
-            intervals_result = await api.get(f"/activity/{test['activity_id']}/intervals")
+            intervals_result = await api.get(f"/activity/{seg(test['activity_id'])}/intervals")
             items = intervals_result.get("icu_intervals") if isinstance(intervals_result, dict) else None
             intervals = [i for i in items or [] if isinstance(i, dict)]
-            stream_result = await api.get(f"/activity/{test['activity_id']}/streams", {"types": "time,watts,heartrate"})
+            stream_result = await api.get(f"/activity/{seg(test['activity_id'])}/streams", {"types": "time,watts,heartrate"})
             streams = {
                 str(s.get("type")): s.get("data") or []
                 for s in (stream_result if isinstance(stream_result, list) else []) if isinstance(s, dict)

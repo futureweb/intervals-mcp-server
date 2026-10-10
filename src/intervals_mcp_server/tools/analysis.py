@@ -168,7 +168,7 @@ async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positiona
     if isinstance(span, str):
         return [], span, ""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": span[0], "newest": span[1], "fields": POWER_LIST_FIELDS},
     )
     if isinstance(result, dict) and "error" in result:

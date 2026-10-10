@@ -13,7 +13,7 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -82,7 +82,7 @@ def _error(result: Any, what: str) -> str | None:
 async def _recent(athlete_id: str, day: date, extra_codes: set[str]) -> tuple[list[dict[str, Any]], str | None]:
     fields = ",".join([AUDIT_LIST_FIELDS, *sorted(extra_codes)])
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": (day - timedelta(days=BASELINE_DAYS)).isoformat(), "newest": day.isoformat(), "fields": fields},
     )
     error = _error(result, "the activity list")
@@ -110,7 +110,7 @@ def _baseline(activity: dict[str, Any], recent: list[dict[str, Any]], codes: set
 async def _audit_activity(  # pylint: disable=too-many-locals
     activity_id: str, athlete_id: str | None, detail_level: str
 ) -> dict[str, Any] | str:
-    result = await make_intervals_request(url=f"/activity/{activity_id}", params={"intervals": "true"})
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", params={"intervals": "true"})
     error = _error(result, "the activity")
     if error:
         return error
@@ -138,10 +138,14 @@ async def _audit_activity(  # pylint: disable=too-many-locals
     baseline = _baseline(activity, recent, set(expected or field_defs))
     intervals = [i for i in activity.get("icu_intervals") or [] if isinstance(i, dict)] if "icu_intervals" in activity else None
     streams = None
+    streams_error = None
     if detail_level != "compact" and activity.get("stream_types"):
-        streams_result = await make_intervals_request(url=f"/activity/{activity_id}/streams")
+        streams_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams")
         calls += 1
-        streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
+        # A failed request is an API error, not "no streams": coverage stays unchecked (None).
+        streams_error = _error(streams_result, "the streams")
+        if streams_error is None:
+            streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
     time_data = next((s.get("data") for s in streams or [] if s.get("type") == "time"), None)
     fields = field_inventory(activity, field_defs, expected, baseline)
     return {
@@ -151,7 +155,7 @@ async def _audit_activity(  # pylint: disable=too-many-locals
         "recording": recording_summary(activity, time_data),
         "laps_and_intervals": laps_and_intervals(activity, intervals),
         "sensors": sensor_summary(activity),
-        "streams": stream_inventory(activity, stream_defs, streams, baseline),
+        "streams": {**stream_inventory(activity, stream_defs, streams, baseline), "error": streams_error},
         "fields": fields,
         "baseline": {k: v for k, v in (baseline or {}).items() if k != "ids"} or None,
         "context_data": {
@@ -183,6 +187,8 @@ def _stream_text(info: dict[str, Any], baseline: dict[str, Any] | None, detail_l
         elif info["coverage"]:
             lines.append(f"  coverage: every returned stream has a value in every sample ({len(info['coverage'])} streams)")
     lines.extend(f"  - {issue}" for issue in info["issues"])
+    if info.get("error"):
+        lines.append(f"  - {info['error']}; stream coverage not checked")
     return lines
 
 
@@ -265,7 +271,7 @@ async def _coverage(  # pylint: disable=too-many-arguments,too-many-positional-a
     index = await get_custom_item_index(athlete_id=athlete_id)
     field_defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities",
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": ",".join([AUDIT_LIST_FIELDS, *sorted(field_defs)])},
     )
     error = _error(result, "activities")

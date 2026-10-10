@@ -186,6 +186,22 @@ def test_seg_confines_an_internal_id_to_one_segment(monkeypatch):
     assert api_client.seg("i194378945") == "i194378945" and api_client.seg(12) == "12"
 
 
+def test_every_value_in_an_api_path_goes_through_seg():
+    """Stage 3 follow-up: every placeholder of an API path f-string is one path segment (seg)."""
+    import re  # pylint: disable=import-outside-toplevel
+
+    source = pathlib.Path(api_client.__file__).resolve().parents[1]
+    unsafe = []
+    for path in sorted(source.rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for literal in re.findall(r'f"(/(?:athlete|activity|events?|gear|custom-item|workouts?)[^"]*)"', line):
+                for placeholder in re.findall(r"\{([^}]*)\}", literal):
+                    # endpoint: a fixed sub-path chosen by the code (hr-curves, power-histogram ...), not an id
+                    if placeholder != "endpoint" and not re.match(r"(?:api_client\.)?seg\(", placeholder):
+                        unsafe.append(f"{path.name}:{number}: {{{placeholder}}}")
+    assert not unsafe, unsafe
+
+
 def test_guard_keeps_the_tool_schema_and_checks_ids_through_mcp(monkeypatch):
     sent = _transport(monkeypatch, lambda req, n: httpx.Response(200, json={}))
     tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
