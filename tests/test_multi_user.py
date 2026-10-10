@@ -948,6 +948,10 @@ def test_doctor_reports_multi_user_problems(tmp_path, monkeypatch):
     assert any("MCP_ATHLETE_DAILY_REQUESTS" in e for e in errors)
     assert any("ATHLETE_TIMEZONE applies to every athlete" in w for w in warnings)
     assert any("grants remove --legacy" in w for w in warnings)
+    _, warnings = configuration_problems({**env, "MCP_ATHLETE_DAILY_REQUESTS": "", "MCP_ATHLETE_SHARE_PERCENT": "0",
+                                          "MCP_OWNER_RESERVED_PERCENT": "100"})
+    assert any("one request per 15 minutes" in w for w in warnings)
+    assert any("every other athlete is refused" in w for w in warnings)
     errors, _ = configuration_problems({**env, "OAUTH_TOKEN_KEY": "", "MCP_ATHLETE_DAILY_REQUESTS": ""})
     assert any("OAUTH_TOKEN_KEY" in e for e in errors)
     monkeypatch.setenv("MCP_TRANSPORT", "stdio")
@@ -1049,11 +1053,14 @@ def test_fair_share_of_the_shared_window(monkeypatch):
     budgets = RequestBudgets(clock=lambda: 1_760_000_000.0)
     alpha, bravo, charlie = (Credential(a, "bearer", "t", f"g{a}", None) for a in (ALPHA, BRAVO, "i1003"))
     owner_token = Credential(OWNER, "bearer", "t", "g0", None, owner=True)
-    assert all(budgets.admit(alpha) is None for _ in range(50))
+    assert all(budgets.admit(alpha) is None for _ in range(25))  # default share 25 %
     refused = budgets.admit(alpha)
-    assert refused is not None and "for one athlete (50 of the 100" in refused
-    assert all(budgets.admit(bravo) is None for _ in range(30))
-    assert budgets.admit(charlie) is not None and "reserved for the server owner" in (budgets.admit(charlie) or "")
+    assert refused is not None and "for one athlete (25 of the 100" in refused
+    assert all(budgets.admit(bravo) is None for _ in range(25))
+    assert all(budgets.admit(charlie) is None for _ in range(25))  # a third friend still gets its share
+    dave = Credential("i1004", "bearer", "t", "g4", None)
+    assert all(budgets.admit(dave) is None for _ in range(5))
+    assert "reserved for the server owner" in (budgets.admit(dave) or "")  # friends together: 80 of 100
     assert all(budgets.admit(owner_token) is None for _ in range(20))  # the owner's reserve
     assert "for all connected athletes together" in (budgets.admit(owner_token) or "")
 
@@ -1087,6 +1094,36 @@ def _client_with(handler: Any) -> Any:
         return shared
 
     return get_client
+
+
+def test_owner_grants_are_never_evicted(tmp_path, monkeypatch):
+    """The owner's connections (e.g. the long-lived ChatGPT grant) are exempt from both caps."""
+    clock = Clock()
+    provider = make_provider(tmp_path, clock=clock, OAUTH_MAX_GRANTS_PER_ATHLETE="2")
+    client = _client(provider)
+    owner_tokens = []
+    for _ in range(4):
+        clock.now += 60
+        owner_tokens.append(sign_in_password(provider, client))
+    assert all(asyncio.run(provider.load_access_token(t.access_token)) is not None for t in owner_tokens)
+    monkeypatch.setattr(auth, "MAX_GRANT_RECORDS", 5)
+    friends = []
+    for athlete in (ALPHA, BRAVO, ALPHA):
+        clock.now += 60
+        friends.append(sign_in_intervals(provider, client, athlete))
+    assert all(asyncio.run(provider.load_access_token(t.access_token)) is not None for t in owner_tokens)
+    assert asyncio.run(provider.load_access_token(friends[0].access_token)) is None  # the total cap took a friend's
+
+
+def test_single_user_mode_has_no_grant_cap(tmp_path):
+    single = SingleUserOAuthProvider(
+        oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER,
+                                        OAUTH_MAX_GRANTS_PER_ATHLETE="2")), fetch=FakeWeb(),
+    )
+    client = _client(single)
+    tokens = [sign_in_password(single, client) for _ in range(4)]
+    assert all(asyncio.run(single.load_access_token(t.access_token)) is not None for t in tokens)
+    assert len(json.loads(single.config.state_file.read_text())["refresh_tokens"]) == 4
 
 
 def test_grants_per_athlete_are_limited(tmp_path):
@@ -1200,3 +1237,79 @@ def test_cli_run_as_root_keeps_the_owner_of_the_state_file(multi):
     assert (path.stat().st_uid, path.stat().st_gid) == (4321, 4321)
     lock = path.with_name(path.name + ".lock")
     assert lock.exists()
+
+
+# --------------------------------------------------------------------------- #
+# R30-15: the grants CLI never follows links planted next to the state file
+# --------------------------------------------------------------------------- #
+
+
+def _victim(tmp_path: Path) -> Path:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not touch")
+    victim.chmod(0o600)
+    return victim
+
+
+def _untouched(victim: Path, before: os.stat_result) -> bool:
+    after = victim.stat()
+    return victim.read_text() == "do not touch" and (after.st_uid, after.st_gid, after.st_mode) == (
+        before.st_uid, before.st_gid, before.st_mode)
+
+
+@pytest.mark.parametrize("command", [["remove", "1002"], ["remove", "--grant", "none"], ["prune", "--days", "1"]])
+def test_symlinked_lock_file_is_refused(multi, tmp_path, command, capsys):
+    provider, _, _ = multi
+    state = provider.config.state_file
+    lock = state.with_name(state.name + ".lock")
+    lock.unlink(missing_ok=True)
+    victim = _victim(tmp_path)
+    before = victim.stat()
+    lock.symlink_to(victim)
+    env = {"OAUTH_STATE_FILE": str(state), "ATHLETE_ID": OWNER}
+    assert grants_main(command, env) == 2
+    assert "grants:" in capsys.readouterr().err
+    assert _untouched(victim, before)
+    # The server refuses to write through it as well.
+    with pytest.raises(OSError):
+        asyncio.run(provider.register_client(dcr_client("c-link")))
+    assert _untouched(victim, before)
+
+
+def test_hard_linked_lock_file_is_refused(multi, tmp_path):
+    provider, _, _ = multi
+    state = provider.config.state_file
+    lock = state.with_name(state.name + ".lock")
+    lock.unlink(missing_ok=True)
+    victim = _victim(tmp_path)
+    before = victim.stat()
+    os.link(victim, lock)
+    assert grants_main(["adopt-legacy", "--owner"], {"OAUTH_STATE_FILE": str(state), "ATHLETE_ID": OWNER}) == 2
+    assert _untouched(victim, before)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to create files of other users")
+def test_foreign_owned_lock_file_is_refused(multi):
+    provider, _, _ = multi
+    state = provider.config.state_file
+    lock = state.with_name(state.name + ".lock")
+    lock.touch()
+    os.chown(lock, 4321, 4321)  # neither root nor the owner of the state file
+    assert grants_main(["remove", "1002"], {"OAUTH_STATE_FILE": str(state)}) == 2
+    assert (lock.stat().st_uid, json.loads(state.read_text())["version"]) == (4321, 2)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root")
+def test_root_refuses_a_state_directory_of_another_user(tmp_path, capsys):
+    directory = tmp_path / "state"
+    directory.mkdir()
+    state = directory / "state.json"
+    state.write_text(json.dumps({"version": 1, "clients": {}, "refresh_tokens": {}}))
+    os.chown(directory, 4321, 4321)
+    os.chown(state, 4321, 4321)
+    env = {"OAUTH_STATE_FILE": str(state)}
+    assert grants_main(["remove", "--grant", "x"], env) == 2
+    assert "refusing to run as root" in capsys.readouterr().err
+    assert grants_main(["remove", "--grant", "x", "--allow-root"], env) == 1  # nothing to remove, but it ran
+    lock = directory / "state.json.lock"
+    assert lock.stat().st_uid == 4321  # created by this run: given to the state file's owner
