@@ -49,10 +49,13 @@ and never given to the MCP client.
   `/mcp` (what ChatGPT expects) and SSE at `/sse` + `/messages/`.
 * Access tokens in memory (default 1 h); clients and refresh tokens (default 30 days)
   persisted as digests in `OAUTH_STATE_FILE` (mode 0600). Restarts do not disconnect clients.
-  Refresh tokens rotate; a rotated token presented again after a short grace period revokes
-  the whole connection (RFC 9700), and clients whose metadata document declares
-  `private_key_jwt` (ChatGPT) must sign every token request, so a leaked refresh token alone
-  is useless.
+  Refresh tokens rotate. A retry with the previous token within a short grace period gets the
+  same answer again; presented later, it revokes the whole connection (RFC 9700 reuse
+  detection, `OAUTH_REFRESH_REUSE_REVOKE`). Clients whose metadata document declares
+  `private_key_jwt` (ChatGPT) must sign every token request, so for them a leaked refresh token
+  alone is useless; for public clients (e.g. Claude via dynamic registration) rotation and reuse
+  detection limit what a leaked token is worth. `/token` and `/revoke` accept only
+  `application/x-www-form-urlencoded` bodies (RFC 6749).
 
 ## 1. Register an Intervals.icu OAuth app (for "Continue with Intervals.icu")
 
@@ -84,16 +87,17 @@ instead) use the API-key or password sign-in: no app is needed for those.
 | `OAUTH_PASSWORD` or `OAUTH_PASSWORD_HASH`, `OAUTH_USERNAME` | Password sign-in (required for `password`). Username default `athlete`. |
 | `API_KEY` | The Intervals.icu API key of the deployment; also the secret of the `apikey` sign-in. |
 | `OAUTH_TOTP_SECRET` | Optional second factor for `password` and `apikey` (create with `python -m intervals_mcp_server.auth totp-secret`). |
-| `OAUTH_CLIENT_HOSTS` | Where client metadata documents are accepted: a host (every path on it) or `host/path` (that document only), comma-separated. Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. Client ids with a query string are never accepted, and a document's redirect URIs must stay on its own host, another listed host or loopback. Stricter: `chatgpt.com/oauth/client.json,claude.ai,claude.com`. |
-| `OAUTH_REDIRECT_HOSTS` | Redirect URIs allowed for dynamically registered clients: a host or a `host/path` prefix. Same default; `*` allows any https host. Redirect URIs with a query string are refused; loopback http is always allowed. Stricter: `claude.ai/api/mcp/auth_callback,claude.com/api/mcp/auth_callback,chatgpt.com/connector_platform_oauth_redirect,chatgpt.com/connector/oauth`. |
+| `OAUTH_CLIENT_HOSTS` | Where client metadata documents are accepted, comma-separated: a host (every path on it), `host/path` (exactly that document URL) or `host/path/` (every path below it). Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. Client ids with a query string, percent-encoding, `.`/`..` or empty path segments are never accepted, and a document's redirect URIs must stay on its own host, another listed host or loopback. Documents of unknown client ids are fetched at most 10 times per minute in total; pinned ids (`host/path`), ids accepted before and ids holding a refresh token (read from the state file at startup) are never held back by that budget. Stricter (only ChatGPT's document, which also stops random client ids from causing any fetch): `chatgpt.com/oauth/client.json`. |
+| `OAUTH_REDIRECT_HOSTS` | Redirect URIs allowed for dynamically registered clients: a host, an exact `host/path`, or a `host/path/` prefix. Same default; `*` allows any https host. Redirect URIs with a query string are refused; loopback http is always allowed. Stricter: `claude.ai/api/mcp/auth_callback,claude.com/api/mcp/auth_callback,chatgpt.com/connector_platform_oauth_redirect,chatgpt.com/connector/oauth/`. |
 | `OAUTH_DYNAMIC_REGISTRATION` | `true` (default) or `false`. At most 10 registrations per client address and hour; 50 clients are kept (idle ones are evicted first). |
 | `OAUTH_PRIVATE_KEY_JWT` | Advertise and verify `private_key_jwt` for metadata-document clients, default `true`. |
 | `OAUTH_REQUIRE_PRIVATE_KEY_JWT` | Default `true`: a token request without a client assertion is refused (`invalid_client`) when the client's metadata document declares `token_endpoint_auth_method: private_key_jwt` (ChatGPT does, and signs its code and refresh requests). `false` accepts such clients without an assertion again (PKCE still protects the code). |
-| `OAUTH_REFRESH_REUSE_GRACE` | Seconds in which a just-rotated refresh token is still accepted, for a client that lost the response and retries (default 120; `0` disables the grace). Later reuse revokes the connection. The rotation history is kept in memory: after a restart an old token is simply rejected. |
+| `OAUTH_REFRESH_REUSE_GRACE` | Seconds in which a just-rotated refresh token gets the same answer again (the same new tokens), for a client that lost the response or refreshed twice concurrently (default 120; `0` = no grace). The grant never forks into several live chains; once the new refresh token was used, the old one is refused. The new tokens are kept in memory for this period only. |
+| `OAUTH_REFRESH_REUSE_REVOKE` | Default `true`: a rotated refresh token used after the grace period revokes the whole connection (both parties then have to sign in again, which exposes a stolen token). `false` only refuses that request and keeps the connection, for a client that keeps stale copies of its refresh token. The rotation history is kept in memory: after a restart an old token is simply rejected. |
 | `OAUTH_STATE_FILE` | Clients and refresh tokens, default `./oauth_state.json` (`/data/oauth_state.json` in the Docker image). Keep it on persistent storage; one server process per file. |
 | `OAUTH_ACCESS_TOKEN_TTL` / `OAUTH_REFRESH_TOKEN_TTL` | Seconds, defaults 3600 and 2592000. |
 | `OAUTH_LOGIN_RATE_LIMIT` | Failed sign-ins per client address (IPv4 address, IPv6 /64) per 15 minutes before `429`, default 5. |
-| `OAUTH_LOGIN_GLOBAL_RATE_LIMIT` | Failed password / API-key sign-ins from all addresses together per 15 minutes before those sign-ins pause, default 50 (limits distributed guessing; the Intervals.icu sign-in is not affected). |
+| `OAUTH_LOGIN_GLOBAL_RATE_LIMIT` | Failed password / API-key sign-ins from all addresses together per 15 minutes before those sign-ins pause, default 500. Trade-off: it limits distributed guessing of a weak password, but enough attacking addresses (default: 100) can pause the athlete's own password sign-in for 15 minutes (existing connections keep working). With `OAUTH_TOTP_SECRET` it never pauses a sign-in, since a guess cannot succeed without the code; with a long random password a high value is fine. The Intervals.icu sign-in is not affected. |
 | `MCP_PERMISSIONS` | Upper limit of what any connection can be granted (default `read`). |
 
 Minimal configuration:
@@ -212,11 +216,13 @@ Claude: Settings → Connectors → *Add custom connector* with the same URL; th
    with a key from its JWKS; it is verified, including audience, lifetime and replay, and
    required because ChatGPT's document declares it).
 6. Access tokens are refreshed with rotating refresh tokens; a retry with the previous token
-   within `OAUTH_REFRESH_REUSE_GRACE` works, later reuse revokes the connection.
+   within `OAUTH_REFRESH_REUSE_GRACE` gets the same answer, later reuse revokes the connection
+   (unless `OAUTH_REFRESH_REUSE_REVOKE=false`).
 
 Sign-in links live 10 minutes, codes 5 minutes; both are single use. Each client address
-may have at most 20 pending sign-ins, so a flood of `/authorize` requests cannot push out
-your own.
+may have at most 20 pending sign-ins, and a full table (500) drops entries of the busiest
+network first (IPv6 counted per /48), so a flood of `/authorize` requests from one address or
+network cannot push out your own; an attacker with hundreds of separate networks still can.
 
 ## Operations
 

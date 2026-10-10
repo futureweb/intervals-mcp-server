@@ -27,27 +27,38 @@ First public beta of the Futureweb fork. Based on upstream
   registrations per client address and hour, and a client in the middle of its consent is no
   longer evicted from the 50-client table.
 - Pending sign-ins and Intervals.icu sign-ins in progress are capped per client address (IPv4
-  address or IPv6 /64, 20 each); a flood of `/authorize` requests can no longer push out the
-  athlete's own pending sign-in.
+  address or IPv6 /64, 20 each), and a full table drops entries of the busiest network first
+  (IPv6 per /48); a flood of `/authorize` requests from one address or network can no longer
+  push out the athlete's own pending sign-in.
 - Client metadata documents: bounded cache (256 documents, rejected ones evicted first), one
-  shared fetch per document, a global budget of 30 fetches per minute, a known document is kept
-  for up to a day while its host is unreachable, and client ids with a query string, control
-  characters or more than 512 characters are refused (an invalid URL gave HTTP 500). A document's
-  redirect URIs must stay on its own host, another allowlisted host or loopback.
-- `OAUTH_CLIENT_HOSTS` and `OAUTH_REDIRECT_HOSTS` accept `host/path` entries (an exact document
-  URL or a redirect path prefix) in addition to hosts; redirect URIs of dynamically registered
-  clients may not contain a query string.
-- Refresh tokens: a rotated refresh token presented again after `OAUTH_REFRESH_REUSE_GRACE`
-  seconds (default 120) revokes the whole grant (RFC 9700 reuse detection); within the grace
-  period a client that lost the response can retry. A client whose metadata document declares
-  `private_key_jwt` (ChatGPT) must send its client assertion with every token request
-  (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified from the production journal that
-  ChatGPT signs its code and refresh requests). Verified assertions are logged at INFO.
-- Sign-in: the PBKDF2 password check runs in a worker thread instead of blocking the event loop
-  for 0.3 s per attempt; failed password / API-key sign-ins also count against a global budget
-  (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`, default 50 per 15 minutes); the per-address limit groups IPv6
-  addresses by /64 and its table is bounded; an authenticator code is only used up when the
-  password or API key was right.
+  shared fetch per document, at most 10 fetches per minute for unknown client ids (pinned ids,
+  ids accepted before and ids holding a refresh token - loaded from the state file at startup -
+  are exempt, so random client ids cannot keep ChatGPT's document from being fetched), a known
+  document is kept for up to a day while its host is unreachable, and client ids with a query
+  string, percent-encoding, dot or empty segments, control characters or more than 512
+  characters are refused (an invalid URL gave HTTP 500). A document's redirect URIs must stay on
+  its own host, another allowlisted host or loopback.
+- `OAUTH_CLIENT_HOSTS` and `OAUTH_REDIRECT_HOSTS` accept `host/path` entries (exactly that path)
+  and `host/path/` entries (every path below it) in addition to hosts; redirect URIs of
+  dynamically registered clients may not contain a query string.
+- `/token` and `/revoke` accept only `application/x-www-form-urlencoded` bodies with each
+  parameter once (RFC 6749); a `multipart/form-data` body, which the SDK would have parsed,
+  could otherwise skip the client assertion check.
+- Refresh tokens: a rotated refresh token presented again within `OAUTH_REFRESH_REUSE_GRACE`
+  seconds (default 120) gets the same answer again (retry after a lost response, concurrent
+  refreshes), so a grant never forks into parallel chains; presented later it revokes the whole
+  grant (RFC 9700 reuse detection; `OAUTH_REFRESH_REUSE_REVOKE=false` only refuses the request).
+  A client whose metadata document declares `private_key_jwt` (ChatGPT) must send its client
+  assertion with every token request (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified
+  from the production journal that ChatGPT signs its code and refresh requests). Verified
+  assertions are logged at INFO. A refresh narrowed to permission scopes keeps `mcp`.
+- Sign-in: the PBKDF2 password check runs in a worker thread (its own pool of 4) instead of
+  blocking the event loop for 0.3 s per attempt; an attempt is counted before the check, so a
+  concurrent burst from one address gets no more checks than the limit; failed password /
+  API-key sign-ins also count against a global budget (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`, default
+  500 per 15 minutes; with TOTP it never pauses a sign-in, so others cannot lock the athlete
+  out); the per-address limit groups IPv6 addresses by /64 and its table is bounded; an
+  authenticator code is only used up when the password or API key was right.
 - `get_server_status` no longer tells connected clients the OAuth user name, password source,
   allowed athletes, state file path, bind address, port or SSE path (a secret path is a
   credential); `--doctor` on the server still shows them.

@@ -19,13 +19,16 @@ the upstream project should be reported there as well.
   that opened it, client metadata documents only from allowlisted hosts or document URLs, redirect
   URIs of registered clients only on allowlisted hosts or path prefixes (no query strings), RFC 9207
   `iss`, audience-bound tokens, rotating refresh tokens with reuse detection, `private_key_jwt`
-  required for clients that declare it. The Intervals.icu token is used for the identity check only
+  required for clients that declare it (ChatGPT), urlencoded token requests only. The Intervals.icu token is used for the identity check only
   and never stored. See `docs/REMOTE_ACCESS.md`.
 - Behind a proxy that is not on 127.0.0.1, set `FORWARDED_ALLOW_IPS` to the proxy's address so the
   sign-in rate limits see the real client addresses.
 - Keep OAuth secrets out of the proxy's access log (the Intervals.icu callback carries a short-lived
-  authorization code in its query string) and limit request bodies at the proxy; see
-  `docs/REMOTE_ACCESS.md`, section 3.
+  authorization code in its query string, and the consent POST's `Referer` the sign-in request id)
+  and limit request bodies at the proxy; see `docs/REMOTE_ACCESS.md`, section 3. Until the proxy's
+  log format is changed, its access log keeps containing these values.
+- Use a long random password or the TOTP second factor: the global failed sign-in budget
+  (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`) is also a lever to pause password sign-ins, which TOTP removes.
 - Optionally restrict a transitional legacy path to the published OpenAI egress ranges
   (`https://openai.com/chatgpt-connectors.json`) at the proxy.
 - Keep `MCP_PERMISSIONS` minimal; write, destructive and admin classes stay hidden unless enabled.
