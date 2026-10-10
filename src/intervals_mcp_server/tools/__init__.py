@@ -52,6 +52,8 @@ from intervals_mcp_server.tools.analysis import (  # noqa: F401
 )
 from intervals_mcp_server.tools.climbs import analyze_climbs  # noqa: F401
 from intervals_mcp_server.tools.report import get_activity_report  # noqa: F401
+from intervals_mcp_server.tools.data_audit import get_activity_data_audit  # noqa: F401
+from intervals_mcp_server.tools.fueling import get_fueling_analysis  # noqa: F401
 from intervals_mcp_server.tools.performance import (  # noqa: F401
     compare_best_efforts,
     compare_workouts,
@@ -70,6 +72,7 @@ from intervals_mcp_server.tools.summary import get_training_summary  # noqa: F40
 from intervals_mcp_server.tools.training_load import get_load_projection, get_training_load  # noqa: F401
 from intervals_mcp_server.tools.intensity import get_intensity_distribution  # noqa: F401
 from intervals_mcp_server.tools.durability import get_durability  # noqa: F401
+from intervals_mcp_server.tools.fatigue import get_long_ride_fatigue_profile, get_submax_test_trends  # noqa: F401
 from intervals_mcp_server.tools.coach_context import get_coach_context  # noqa: F401
 from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: F401
 from intervals_mcp_server.tools.status import get_server_status  # noqa: F401
@@ -136,6 +139,8 @@ __all__ = [
     "analyze_workout_execution",
     "analyze_climbs",
     "get_activity_report",
+    "get_activity_data_audit",
+    "get_fueling_analysis",
     "compare_best_efforts",
     "compare_workouts",
     "find_similar_intervals",
@@ -152,6 +157,8 @@ __all__ = [
     "get_load_projection",
     "get_intensity_distribution",
     "get_durability",
+    "get_long_ride_fatigue_profile",
+    "get_submax_test_trends",
     "get_coach_context",
     "preview_workout",
     "validate_workout",

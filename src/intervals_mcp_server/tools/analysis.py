@@ -1,6 +1,6 @@
 """
-Analysis MCP tools for Intervals.icu: dual power meter comparison and planned-vs-executed
-workout analysis. Climb/descent segmentation lives in tools/climbs.py.
+Analysis MCP tools for Intervals.icu: dual power meter comparison (one ride or several) and
+planned-vs-executed workout analysis. Climb/descent segmentation lives in tools/climbs.py.
 
 All tools are read-only; they combine the activity, its intervals, its streams and (when
 paired) the planned workout, and compute statistics from recorded samples only.
@@ -16,6 +16,8 @@ from intervals_mcp_server.api.client import make_intervals_request
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
+from intervals_mcp_server.tools.gear import get_gear_raw
+from intervals_mcp_server.tools.performance import _resolve_range, cap_ids, ids_note  # pylint: disable=protected-access
 from intervals_mcp_server.utils.custom_fields import (
     ACTIVITY_FIELD,
     ACTIVITY_STREAM,
@@ -28,9 +30,13 @@ from intervals_mcp_server.utils.power_compare import (
     compare_power_streams as compute_power_comparison,
     comparison_to_json,
     format_power_comparison,
+    format_rides_summary,
+    ride_summary,
+    summarize_rides,
 )
-from intervals_mcp_server.utils.sports import format_start_times, hms, start_times
+from intervals_mcp_server.utils.sports import format_start_times, hms, is_indoor, start_times
 from intervals_mcp_server.utils.streams import find_stream
+from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -79,15 +85,211 @@ def _activity_header(activity: dict[str, Any]) -> str:
 
 
 # ------------------------------------------------------------------ power meters
+POWER_RIDES_DEFAULT_DAYS = 180
+MAX_POWER_RIDES = 20
+POWER_LIST_FIELDS = (
+    "id,name,type,start_date_local,gear,stream_types,power_field_names,device_name,power_meter,"
+    "power_meter_serial,power_field,trainer"
+)
+
+
+def _device_text(activity: dict[str, Any]) -> str:
+    device = ", ".join(
+        f"{label} {activity[key]}"
+        for key, label in (
+            ("device_name", "device"),
+            ("power_meter", "power meter"),
+            ("power_meter_serial", "serial"),
+            ("power_field", "primary power field"),
+        )
+        if activity.get(key)
+    )
+    fields = activity.get("power_field_names")
+    if isinstance(fields, list) and fields:
+        device += f"; power fields in file: {', '.join(str(f) for f in fields)}"
+    return device
+
+
+def _has_stream(activity: dict[str, Any], stream_type: str) -> bool:
+    """True when the activity lists the stream (or, for secondary_power, a second power field)."""
+    types = activity.get("stream_types")
+    if isinstance(types, list) and types:
+        return stream_type in types
+    fields = activity.get("power_field_names")
+    return stream_type == "secondary_power" and isinstance(fields, list) and len(fields) > 1
+
+
+def _secondary_identity(activity: dict[str, Any], secondary: str) -> str:
+    """Label of the second power source: its field name in the file when known; the device is never in the activity data."""
+    if secondary != "secondary_power":
+        return f"stream '{secondary}' (device not identified)"
+    fields = [str(f) for f in activity.get("power_field_names") or [] if f]
+    primary_field = str(activity.get("power_field") or (fields[0] if fields else ""))
+    others = [f for f in fields if f != primary_field]
+    if others:
+        return f"file field '{others[0]}' (device not identified)"
+    return "'secondary_power' (field and device not identified)"
+
+
+def _meter_identity(activity: dict[str, Any], gear_items: list[dict[str, Any]]) -> tuple[str, str]:
+    """(gear label, primary power meter label) from the file's device data or the bike's gear components."""
+    gear = activity.get("gear")
+    gear_id = str(gear.get("id")) if isinstance(gear, dict) and gear.get("id") else None
+    by_id = {str(item.get("id")): item for item in gear_items if isinstance(item, dict)}
+    bike = by_id.get(gear_id or "")
+    gear_label = f"{bike.get('name')} ({gear_id})" if bike and bike.get("name") else (gear_id or "no gear")
+    if activity.get("power_meter"):
+        meter = str(activity["power_meter"]) + (f" #{activity['power_meter_serial']}" if activity.get("power_meter_serial") else "")
+        return gear_label, f"{meter} (file)"
+    components = [
+        str(by_id[str(cid)].get("name")) for cid in (bike or {}).get("component_ids") or []
+        if str(cid) in by_id and str(by_id[str(cid)].get("type")) == "PowerMeter" and not by_id[str(cid)].get("retired")
+    ]
+    if components:
+        return gear_label, f"{', '.join(components)} (gear component)"
+    return gear_label, "not identified"
+
+
+async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    athlete_id: str, api_key: str | None, activity_ids: list[str], start_date: str | None,
+    end_date: str | None, secondary: str,
+) -> tuple[list[dict[str, Any]], str | None, str]:
+    """Activities for the multi-ride comparison (by id - already de-duplicated and capped - or by date range
+    with the second stream, newest first)."""
+    if activity_ids:
+        rides = []
+        for activity_id in activity_ids:
+            activity, error = await _get_activity(activity_id, api_key)
+            if error or activity is None:
+                return [], error, ""
+            rides.append(activity)
+        return rides, None, f"{len(rides)} activity id(s)"
+    span = _resolve_range(start_date, end_date, POWER_RIDES_DEFAULT_DAYS)
+    if isinstance(span, str):
+        return [], span, ""
+    result = await make_intervals_request(
+        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        params={"oldest": span[0], "newest": span[1], "fields": POWER_LIST_FIELDS},
+    )
+    if isinstance(result, dict) and "error" in result:
+        return [], f"Error fetching activities: {result.get('message', 'Unknown error')}", ""
+    activities = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
+    rides = [a for a in activities if _has_stream(a, secondary)]
+    rides.sort(key=lambda a: str(a.get("start_date_local") or ""), reverse=True)
+    return rides, None, f"{span[0]} to {span[1]}, {len(rides)} of {len(activities)} activities with '{secondary}'"
+
+
+def _ride_line(ride: dict[str, Any]) -> str:
+    s = ride["summary"]
+    lag = s["best_lag_s"]
+    return (
+        f"{ride['date']} '{ride['name']}' ({ride['id']}), {ride['gear']}, {ride['environment']}, primary {ride['meter']}, "
+        f"secondary {ride['secondary_source']}: {s['used']} pairs, "
+        f"mean primary {_fmt_num(s['mean_primary_w'])} W, diff {_fmt_num(s['mean_diff_pct'], 2)}% (median "
+        f"{_fmt_num(s['median_diff_pct'], 2)}%, sd {_fmt_num(s['stdev_diff_pct'], 2)}%), stable windows "
+        f"{_fmt_num(s['stable_diff_pct'], 2, '%')} (n {s['stable_windows'] or 0}), drift last-first quarter "
+        f"{_fmt_num(s['drift_last_minus_first_pp'], 2, ' pp')}, lag {_fmt_num(lag, 0, ' s')}, "
+        f"outliers {_fmt_num(s['outlier_pct'], 1, '%')}"
+    )
+
+
+def _fmt_num(value: Any, digits: int = 0, unit: str = "") -> str:
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value:.{digits}f}{unit}"
+
+
+async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    athlete_id: str, api_key: str | None, primary: str, secondary: str, activity_ids: str | None,
+    start_date: str | None, end_date: str | None, limit: int, output_format: str, detail_level: str,
+) -> str:
+    """Multi-ride mode of compare_power_streams."""
+    capped = min(max(limit, 1), MAX_POWER_RIDES)
+    ids, dropped, duplicates = cap_ids(activity_ids, capped)
+    rides, error, source = await _power_rides(athlete_id, api_key, ids, start_date, end_date, secondary)
+    if error:
+        return error
+    skipped = len(rides) - capped if len(rides) > capped else 0
+    rides = rides[:capped]
+    source += ids_note(dropped, duplicates, capped)
+    if not rides:
+        return f"No activities with a '{secondary}' stream found ({source})."
+    gear_items = await get_gear_raw(athlete_id=athlete_id, api_key=api_key)
+    rows: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for activity in rides:
+        activity_id = str(activity.get("id"))
+        streams, _ = await _get_streams(activity_id, api_key, ["time", primary, secondary])
+        first, second, time_stream = (find_stream(streams, t) for t in (primary, secondary, "time"))
+        if first is None or second is None:
+            missing.append({"id": activity_id, "reason": f"no '{primary if first is None else secondary}' stream returned"})
+            continue
+        result = compute_power_comparison(first.get("data") or [], second.get("data") or [], (time_stream or {}).get("data") or [])
+        gear, meter = _meter_identity(activity, gear_items)
+        source_label = _secondary_identity(activity, secondary)
+        setting = "indoor" if is_indoor(activity) else "outdoor"
+        rows.append({
+            "id": activity_id, "name": activity.get("name"), "date": str(activity.get("start_date_local") or "")[:10],
+            "type": activity.get("type"), "gear": gear, "environment": setting, "meter": meter, "secondary_source": source_label,
+            "device": _device_text(activity), "group": f"{gear} | {setting} | primary {meter} | secondary {source_label}",
+            "summary": ride_summary(result), "comparison": result,
+        })
+    summary = summarize_rides(rows)
+    summary["excluded"].extend(missing)
+    if any(row["meter"] == "not identified" for row in rows):
+        summary["notes"].append(
+            "Primary power meter not identified (no power meter in the file data and no PowerMeter component on the bike): "
+            "the rides of such a group may come from different meters.")
+    if any("device not identified" in row["secondary_source"] for row in rows):
+        summary["notes"].append(
+            "The second power source is known only by its field name in the file; the activity data does not say which "
+            "device recorded it (pedals, trainer, another crank), so groups assume the same device per bike, setting and field.")
+    if output_format.strip().lower() == "json":
+        keep = ("id", "name", "date", "type", "gear", "environment", "meter", "secondary_source", "device", "group", "summary")
+        payload = {
+            "mode": "rides", "source": source, "primary": primary, "secondary": secondary, "limit": capped,
+            "not_analysed_beyond_limit": skipped, "ids_beyond_limit": dropped, "duplicate_ids_ignored": duplicates,
+            "rides": [
+                {**{k: row[k] for k in keep}, **({"comparison": comparison_to_json(row["comparison"])} if detail_level == "full" else {})}
+                for row in rows
+            ] if detail_level != "compact" else [{"id": row["id"], "date": row["date"], "group": row["group"]} for row in rows],
+            "between_rides": comparison_to_json(summary),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+    lines = [
+        f"Power meter comparison over {len(rows)} ride{'' if len(rows) == 1 else 's'} ({source}; limit {capped}"
+        + (f", {skipped} older not analysed" if skipped else "") + f"): '{secondary}' vs '{primary}', "
+        "difference = secondary - primary in % of primary, each ride compared on its own (see compare_power_streams "
+        "for one ride)."
+    ]
+    if detail_level != "compact":
+        lines.append("Per ride:")
+        for row in rows:
+            lines.append("  " + _ride_line(row))
+            if detail_level == "full":
+                bins = ", ".join(f"{label} W {_fmt_num(b['mean_diff_pct'], 2)}% (n {b['n']})" for label, b in row["summary"]["bins"].items())
+                lines.append(f"    bins: {bins or 'none'}; device: {row['device'] or 'not available'}")
+    lines.append("Between rides (per bike and power meter identity):")
+    lines.extend("  " + line for line in format_rides_summary(summary))
+    lines.extend(f"Note: {note}" for note in summary["notes"])
+    return "\n".join(lines)
+
+
 @tool("read")
-async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    activity_id: str,
+async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+    activity_id: str | None = None,
     api_key: str | None = None,
     primary: str = "watts",
     secondary: str = "secondary_power",
     start_index: int | None = None,
     end_index: int | None = None,
     output_format: str = "text",
+    activity_ids: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 10,
+    detail_level: str = "standard",
+    athlete_id: str | None = None,
 ) -> str:
     """Compare two power streams of an activity sample by sample (e.g. head unit vs. second power meter)
 
@@ -100,15 +302,38 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
     physical sensor each stream belongs to must be taken from the device data shown in the
     header (power meter name/serial), not assumed.
 
+    Without activity_id (or with activity_ids) several rides are compared: the rides of the
+    date range (default 180 days) that carry the second stream, each analysed on its own and
+    summarised per bike and power meter identity with n, median, between-ride SD and range of
+    the offset (overall, per power band, stable windows), drift, lag and outliers. No
+    correction factor is derived.
+
     Args:
-        activity_id: The Intervals.icu activity ID
+        activity_id: The Intervals.icu activity ID (one ride)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         primary: Stream type of the primary power source (default "watts")
         secondary: Stream type of the second power source (default "secondary_power")
-        start_index: First sample index to compare (optional, e.g. an interval's start_index)
-        end_index: Sample index to stop before (optional, e.g. an interval's end_index)
+        start_index: First sample index to compare (one ride only)
+        end_index: Sample index to stop before (one ride only)
         output_format: "text" (default) or "json"
+        activity_ids: Comma-separated activity IDs to compare as several rides (optional)
+        start_date: Several rides from YYYY-MM-DD (optional, default 180 days before end_date)
+        end_date: Several rides until YYYY-MM-DD (optional, default today)
+        limit: Several rides: at most this many, newest first, 1-20 (default 10)
+        detail_level: Several rides: "compact" (summary only), "standard" (default, plus one line
+            per ride) or "full" (plus bins and device data per ride)
+        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
     """
+    if not activity_id or activity_ids:
+        if start_index is not None or end_index is not None:
+            return "Error: start_index / end_index apply to one activity_id only."
+        if detail_level not in DETAIL_LEVELS:
+            return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."
+        athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
+        if error_msg:
+            return error_msg
+        return await _compare_rides(athlete, api_key, primary, secondary, activity_ids, start_date, end_date,
+                                    limit, output_format, detail_level)
     activity, error = await _get_activity(activity_id, api_key)
     if error or activity is None:
         return error or "Error"
@@ -127,19 +352,7 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
     result = compute_power_comparison(
         (first.get("data") or [])[sl], (second.get("data") or [])[sl], time_data[sl]
     )
-    device = ", ".join(
-        f"{label} {activity[key]}"
-        for key, label in (
-            ("device_name", "device"),
-            ("power_meter", "power meter"),
-            ("power_meter_serial", "serial"),
-            ("power_field", "primary power field"),
-        )
-        if activity.get(key)
-    )
-    fields = activity.get("power_field_names")
-    if isinstance(fields, list) and fields:
-        device += f"; power fields in file: {', '.join(str(f) for f in fields)}"
+    device = _device_text(activity)
     header = (
         f"Power stream comparison for {_activity_header(activity)}\n"
         f"Primary '{primary}' vs secondary '{secondary}'"

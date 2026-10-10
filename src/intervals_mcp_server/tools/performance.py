@@ -115,6 +115,27 @@ def _split(csv: str | None) -> list[str]:
     return [part.strip() for part in (csv or "").split(",") if part.strip()]
 
 
+def cap_ids(csv: str | None, cap: int) -> tuple[list[str], list[str], int]:
+    """Comma-separated ids de-duplicated (first occurrence kept) and cut to ``cap`` before any request.
+
+    Returns (ids to fetch, ids beyond the cap, number of duplicates ignored).
+    """
+    unique = list(dict.fromkeys(_split(csv)))
+    duplicates = len(_split(csv)) - len(unique)
+    return unique[:cap], unique[cap:], duplicates
+
+
+def ids_note(dropped: list[str], duplicates: int, cap: int) -> str:
+    """'; 2 ids beyond the limit of 10 not fetched (i5, i6); 1 duplicate id ignored' or ''."""
+    parts = []
+    if dropped:
+        shown = ", ".join(dropped[:5]) + (", ..." if len(dropped) > 5 else "")
+        parts.append(f"{len(dropped)} id{'s' if len(dropped) != 1 else ''} beyond the limit of {cap} not fetched ({shown})")
+    if duplicates:
+        parts.append(f"{duplicates} duplicate id{'s' if duplicates != 1 else ''} ignored")
+    return "".join(f"; {part}" for part in parts)
+
+
 def _numbers(csv: str | None, name: str) -> list[int] | str:
     """Comma-separated positive numbers as a de-duplicated int list, or an error string."""
     try:

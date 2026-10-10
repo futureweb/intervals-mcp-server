@@ -54,6 +54,13 @@ class _KeyTracker(dict):
         return super().__contains__(key)
 
 
+def _wind_text(value: Any) -> str:
+    """Wind speed as stored by Intervals.icu (m/s) with km/h."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value):
+        return "N/A"
+    return f"{value:.1f} m/s ({value * 3.6:.0f} km/h)"
+
+
 def format_activity_summary(activity: dict[str, Any]) -> str:
     """Format an activity into a readable string."""
     # Local and UTC start are reported side by side (P0: timezone clarity).
@@ -144,7 +151,7 @@ Trainer: {activity.get("trainer", "N/A")}
 Average Temp: {temperature_text(activity.get("average_temp"))}
 Min Temp: {temperature_text(activity.get("min_temp"))}
 Max Temp: {temperature_text(activity.get("max_temp"))}
-Avg Wind Speed: {activity.get("average_wind_speed", "N/A")} km/h
+Avg Wind Speed: {_wind_text(activity.get("average_wind_speed"))}
 Headwind %: {activity.get("headwind_percent", "N/A")}%
 Tailwind %: {activity.get("tailwind_percent", "N/A")}%
 
