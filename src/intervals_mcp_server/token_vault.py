@@ -9,15 +9,14 @@ line): the first seals, all of them open, so a key can be rotated. Create a key 
 
     futureweb-intervals-mcp token-key --file /etc/intervals-mcp/token.key
 
-The key never leaves the process and is never logged; a sealed value carries only a short
-key fingerprint (the first 8 hex digits of SHA-256 of the key) to pick the key for opening.
+The key never leaves the process and is never logged. A sealed value does not name its key:
+opening tries the configured keys in turn (AES-GCM authenticates, so only the right key opens it).
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import json
 import os
 import stat
@@ -42,10 +41,6 @@ class VaultError(Exception):
 def _b64decode(text: str) -> bytes:
     padded = text.strip() + "=" * (-len(text.strip()) % 4)
     return base64.urlsafe_b64decode(padded.replace("+", "-").replace("/", "_"))
-
-
-def _fingerprint(key: bytes) -> str:
-    return hashlib.sha256(key).hexdigest()[:8]
 
 
 def generate_key() -> str:
@@ -79,7 +74,7 @@ class TokenVault:
     def __init__(self, keys: list[bytes]) -> None:
         if not keys:
             raise ValueError("at least one key is required")
-        self._keys = [(_fingerprint(key), AESGCM(key)) for key in keys]
+        self._keys = [AESGCM(key) for key in keys]
 
     def __repr__(self) -> str:
         return f"TokenVault({len(self._keys)} key(s))"
@@ -91,29 +86,35 @@ class TokenVault:
 
     def seal(self, payload: Mapping[str, Any], context: str) -> str:
         """Encrypt *payload* bound to *context* (grant and athlete) with the first key."""
-        fingerprint, aead = self._keys[0]
         nonce = os.urandom(_NONCE_BYTES)
         data = json.dumps(dict(payload), separators=(",", ":"), sort_keys=True).encode("utf-8")
-        sealed = aead.encrypt(nonce, data, context.encode("utf-8"))
-        return ".".join((_PREFIX, fingerprint, base64.urlsafe_b64encode(nonce + sealed).decode("ascii").rstrip("=")))
+        sealed = self._keys[0].encrypt(nonce, data, context.encode("utf-8"))
+        return ".".join((_PREFIX, base64.urlsafe_b64encode(nonce + sealed).decode("ascii").rstrip("=")))
 
     def open(self, value: str, context: str) -> dict[str, Any]:
         """Decrypt a value made by :meth:`seal` with the same *context*; raise VaultError otherwise."""
         parts = value.split(".") if isinstance(value, str) else []
-        if len(parts) != 3 or parts[0] != _PREFIX:
+        if len(parts) != 2 or parts[0] != _PREFIX:
             raise VaultError("not a sealed value of this server")
-        aead = next((candidate for fingerprint, candidate in self._keys if fingerprint == parts[1]), None)
-        if aead is None:
-            raise VaultError("sealed with a key the server does not have (OAUTH_TOKEN_KEY changed?)")
         try:
-            raw = _b64decode(parts[2])
-            data = aead.decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], context.encode("utf-8"))
-            payload = json.loads(data.decode("utf-8"))
-        except (InvalidTag, binascii.Error, ValueError) as exc:
-            raise VaultError("the sealed value is damaged or belongs to another grant") from exc
-        if not isinstance(payload, dict):
-            raise VaultError("unexpected sealed payload")
-        return payload
+            raw = _b64decode(parts[1])
+        except (binascii.Error, ValueError) as exc:
+            raise VaultError("the sealed value is damaged") from exc
+        for aead in self._keys:
+            try:
+                data = aead.decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], context.encode("utf-8"))
+            except InvalidTag:
+                continue
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise VaultError("unexpected sealed payload") from exc
+            if not isinstance(payload, dict):
+                raise VaultError("unexpected sealed payload")
+            return payload
+        raise VaultError(
+            "no configured key opens it (OAUTH_TOKEN_KEY changed?), or it is damaged or belongs to another grant"
+        )
 
 
 def _read_key_file(path: Path) -> str:

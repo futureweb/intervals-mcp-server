@@ -12,7 +12,7 @@ share a ``grant_id``. In the single-user mode the state file stores no grant rec
         "method": "intervals" | "password" | "apikey",
         "client_id": "...", "created_at": 1760000000, "last_used_at": 1760000000,
         "intervals_scopes": ["ACTIVITY:READ", ...],
-        "credential": "v1.<key id>.<AES-GCM sealed token>"   # kind athlete only
+        "credential": "v1.<AES-GCM sealed token>"   # kind athlete only
       }
     }
 
