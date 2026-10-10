@@ -251,7 +251,8 @@ async def make_intervals_request(  # pylint: disable=too-many-locals
     async def _send_request(client: httpx.AsyncClient) -> httpx.Response:
         if method in {"POST", "PUT"} and data is not None:
             body = json.dumps(data)
-            logger.debug("Request %s %s body: %s", method, full_url, body)
+            # Bodies hold athlete data: log their size only (SECURITY.md).
+            logger.debug("Request %s %s body: %d bytes", method, full_url, len(body))
             return await client.request(
                 method=method,
                 url=full_url,
@@ -319,7 +320,8 @@ def _handle_http_status_error(e: httpx.HTTPStatusError) -> dict[str, Any]:
     """
     error_code = e.response.status_code
     error_text = e.response.text
-    logger.error("HTTP error: %s - %s", error_code, error_text)
+    # The body can echo athlete data; a short excerpt is enough to diagnose the error.
+    logger.error("HTTP error: %s - %.200r", error_code, error_text)
     return {
         "error": True,
         "status_code": error_code,

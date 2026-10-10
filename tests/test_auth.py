@@ -40,6 +40,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.testclient import TestClient
 
 from intervals_mcp_server import auth
+from tests.oauth_helpers import submit_consent
 from intervals_mcp_server.auth import (
     SingleUserOAuthProvider,
     auth_status_from_env,
@@ -148,9 +149,9 @@ def login(
     client: TestClient, request_id: str, password: str, username: str = "athlete"
 ) -> Any:
     """Submit the login form."""
-    return client.post(
-        "/oauth/login",
-        data={"request": request_id, "username": username, "password": password},
+    return submit_consent(
+        client,
+        {"request": request_id, "username": username, "password": password},
     )
 
 
@@ -451,8 +452,12 @@ def test_streamable_http_initialize_with_bearer(oauth_env):
 # --------------------------------------------------------------------------- #
 
 
-def test_refresh_token_rotation(client):
-    """The refresh grant returns new tokens and the old refresh token stops working."""
+def test_refresh_token_rotation(oauth_env):
+    """The refresh grant returns new tokens and the old refresh token stops working.
+
+    Without a grace period the replay is reuse: it fails and revokes the grant.
+    """
+    client = build_app({**oauth_env, "OAUTH_REFRESH_REUSE_GRACE": "0"})[1]
     client_id, tokens = obtain_tokens(client)
     response = client.post(
         "/token",
@@ -470,6 +475,8 @@ def test_refresh_token_rotation(client):
     )
     assert replay.status_code == 400
     assert replay.json()["error"] == "invalid_grant"
+    # the reuse revoked the grant: the rotated tokens stopped working too
+    assert client.get("/whoami", headers=bearer(rotated["access_token"])).json()["client_id"] is None
 
 
 def test_revocation(client):
@@ -638,15 +645,27 @@ def test_oauth_from_env_reads_process_environment(monkeypatch, tmp_path):
 
 def test_auth_status_never_contains_password(oauth_env):
     """The status dictionary describes the mode without leaking secrets."""
-    status = auth_status_from_env(oauth_env)
+    status = auth_status_from_env(oauth_env, include_private=True)
     assert status["mode"] == "oauth"
     assert status["issuer"] == ISSUER
     assert status["state_file"] == oauth_env["OAUTH_STATE_FILE"]
     assert status["password_source"] == "plain"
     assert PASSWORD not in json.dumps(status)
-    assert auth_status_from_env({}) == {"mode": "none", "issuer": None, "state_file": None}
-    hashed = auth_status_from_env({"MCP_AUTH": "oauth", "OAUTH_PASSWORD_HASH": hash_password("x", 1)})
+    assert auth_status_from_env({}, include_private=True) == {"mode": "none", "issuer": None, "state_file": None}
+    hashed = auth_status_from_env({"MCP_AUTH": "oauth", "OAUTH_PASSWORD_HASH": hash_password("x", 1)}, include_private=True)
     assert hashed["password_source"] == "hash" and "x" not in json.dumps(hashed).replace('"', "")
+
+
+def test_auth_status_for_clients_omits_deployment_details(oauth_env):
+    """SEC-11: the status an MCP client can read names no user name, state file or athlete list."""
+    env = {**oauth_env, "OAUTH_USERNAME": "coach", "OAUTH_ALLOWED_ATHLETES": "i42,i43"}
+    status = auth_status_from_env(env)
+    assert status["mode"] == "oauth" and status["login"] == ["password"]
+    for private in ("state_file", "username", "password_source", "allowed_athletes"):
+        assert private not in status
+    text = json.dumps(status)
+    assert "coach" not in text and "42" not in text and oauth_env["OAUTH_STATE_FILE"] not in text
+    assert auth_status_from_env({}) == {"mode": "none", "issuer": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -693,9 +712,9 @@ def obtain_granted_tokens(client: TestClient, grants: list[str]) -> tuple[str, d
     client_id = register(client)["client_id"]
     verifier, challenge = pkce_pair()
     request_id = start_authorization(client, client_id, challenge)
-    redirect = client.post(
-        "/oauth/login",
-        data={"request": request_id, "username": "athlete", "password": PASSWORD, "grant": grants},
+    redirect = submit_consent(
+        client,
+        {"request": request_id, "username": "athlete", "password": PASSWORD, "grant": grants},
     )
     assert redirect.status_code == 302, redirect.text
     query = parse_qs(urlsplit(redirect.headers["location"]).query)

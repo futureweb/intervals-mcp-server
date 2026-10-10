@@ -7,8 +7,13 @@
 #
 # Environment variables (see README.md / .env.example for the full list):
 #   API_KEY, ATHLETE_ID          required, Intervals.icu credentials
-#   MCP_TRANSPORT                stdio (default) | sse | http (alias of streamable-http)
+#   MCP_TRANSPORT                stdio (default) | sse | http (alias of streamable-http) | http+sse
 #   FASTMCP_HOST, FASTMCP_PORT   listen address for sse/http, defaults 127.0.0.1:8000
+#   OAUTH_STATE_FILE             /data/oauth_state.json; with MCP_AUTH=oauth mount a volume
+#                                on /data (owned by uid 10001), e.g. -v intervals-mcp:/data,
+#                                or every re-created container disconnects all clients
+#
+# Base images are pinned by digest; Dependabot (docker ecosystem) proposes updates.
 #
 # Transports and port exposure
 # ----------------------------
@@ -33,10 +38,10 @@
 ###########################################
 # Stage 1: build the virtual environment  #
 ###########################################
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS builder
 
 # uv, pinned. Keep in sync with the version used by CI and the maintainers.
-COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.3@sha256:90bbb3c16635e9627f49eec6539f956d70746c409209041800a0280b93152823 /uv /uvx /bin/
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_COMPILE_BYTECODE=1 \
@@ -61,28 +66,36 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ###########################################
 # Stage 2: runtime image                  #
 ###########################################
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runtime
 
 LABEL org.opencontainers.image.title="intervals-mcp-server" \
       org.opencontainers.image.description="Model Context Protocol server for Intervals.icu" \
       org.opencontainers.image.source="https://github.com/futureweb/intervals-mcp-server" \
       org.opencontainers.image.licenses="GPL-3.0-only"
 
-# Unprivileged runtime user without a login shell.
+# Unprivileged runtime user without a login shell; /data holds the OAuth state.
 RUN groupadd --system --gid 10001 mcp \
-    && useradd --system --uid 10001 --gid mcp --home-dir /app --shell /usr/sbin/nologin mcp
+    && useradd --system --uid 10001 --gid mcp --home-dir /app --shell /usr/sbin/nologin mcp \
+    && mkdir /data && chown 10001:10001 /data && chmod 700 /data
 
 WORKDIR /app
-COPY --from=builder --chown=mcp:mcp /app /app
+# Only the virtual environment: the project is installed into it (non-editable), so no
+# second copy of the sources ends up on sys.path.
+COPY --from=builder --chown=mcp:mcp /app/.venv /app/.venv
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    MCP_TRANSPORT=stdio
+    MCP_TRANSPORT=stdio \
+    OAUTH_STATE_FILE=/data/oauth_state.json
 
 USER 10001:10001
 
-# Only meaningful with MCP_TRANSPORT=sse|http, see the note at the top of this file.
+# Only meaningful with MCP_TRANSPORT=sse|http|http+sse, see the note at the top of this file.
 EXPOSE 8000
 
-CMD ["python", "src/intervals_mcp_server/server.py"]
+# The network transports must accept connections; stdio has nothing to probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import os, socket, sys; t = os.environ.get('MCP_TRANSPORT', 'stdio').strip().lower(); t == 'stdio' and sys.exit(0); socket.create_connection(('127.0.0.1', int(os.environ.get('FASTMCP_PORT') or 8000)), 3).close()"]
+
+CMD ["futureweb-intervals-mcp"]
