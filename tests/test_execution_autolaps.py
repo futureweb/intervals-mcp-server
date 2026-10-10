@@ -480,3 +480,70 @@ def test_device_auto_laps_of_a_planned_step_length_are_still_auto_laps():
     result = run(presses, *build(segments, laps="steps"), RUN)
     assert result["summary"]["alignment_confidence"] == "high" and result["summary"]["auto_laps"] is None
     assert any("shorter than planned" in t for t in texts(result["rows"][4]))
+
+
+# ------------------------------------------------------------------ last check (L1, L2)
+def ramp_segments(seconds, start, end, hr=150):
+    """Per-second segments of a power ramp from ``start`` to ``end`` watts."""
+    return [(1, start + (end - start) * i / (seconds - 1), None, hr) for i in range(seconds)]
+
+
+def build_steps(segments_per_step, **kwargs):
+    """Like ``build`` with laps="steps", but a lap press per planned step (each a list of segments)."""
+    flat, cuts, position = [], [], 0
+    for step_segments in segments_per_step:
+        flat.extend(step_segments)
+        position += sum(int(secs) for secs, *_ in step_segments)
+        cuts.append(position)
+    return build(flat, laps="none", extra_cuts=cuts[:-1], **kwargs)
+
+
+RAMP_PLAN = ([{"duration": 600, "warmup": True, **pw(50, 65)}]
+             + [x for _ in range(5) for x in ({"duration": 300, "ramp": True, **pw(60, 110)}, {"duration": 300, **pw(45, 55)})]
+             + [{"duration": 600, "cooldown": True, **pw(50, 60)}])
+
+
+def test_lap_pressed_ramps_are_not_auto_laps():
+    """L1: 5 x (5 min ramp 60 -> 110 % FTP / 5 min) with lap presses: a ramp's own intensity change
+    inside its lap is no step change; no caveat, nothing moved, 0 deviations (perfect) and exactly
+    the 2 real deviations (rep 3 1:30 longer, recovery 3 1:30 shorter)."""
+    for real in (False, True):
+        steps = [[(600, 0.58 * FTP, None, 120)]]
+        for rep in range(5):
+            work, rest = (390, 210) if real and rep == 2 else (300, 300)
+            steps += [ramp_segments(work, 0.6 * FTP, 1.1 * FTP, 160), [(rest, 0.5 * FTP, None, 125)]]
+        steps.append([(600, 0.55 * FTP, None, 120)])
+        result = run(RAMP_PLAN, *build_steps(steps), RIDE)
+        summary = result["summary"]
+        assert summary["alignment_confidence"] == "high" and summary["auto_laps"] is None and summary["boundaries_off_lap"] == 0
+        flagged = [r["planned"]["index"] for r in result["rows"] if texts(r)]
+        assert flagged == ([6, 7] if real else []), real
+
+
+def test_ramps_with_device_auto_laps_are_cut_at_the_ramp_start():
+    """L1: with real 2 km auto-laps, the boundary before a ramp is placed against the ramp's start
+    value (not its midpoint), so no seconds of the ramp move into the recovery."""
+    plan = ([{"duration": 600, "warmup": True, **pw(50, 65)}]
+            + [x for _ in range(4) for x in ({"duration": 600, "ramp": True, **pw(60, 110)}, {"duration": 300, **pw(45, 55)})]
+            + [{"duration": 600, "cooldown": True, **pw(50, 60)}])
+    segments = [(600, 0.58 * FTP, None, 120)]
+    for _ in range(4):
+        segments += ramp_segments(600, 0.6 * FTP, 1.1 * FTP) + [(300, 0.5 * FTP, None, 125)]
+    segments.append((600, 0.55 * FTP, None, 125))
+    result = run(plan, *build(segments, lap_m=2000), RIDE)
+    assert result["summary"]["auto_laps"] is not None and result["summary"]["steps_with_deviations"] == 0
+    for row in result["rows"]:
+        assert abs(row["metrics"]["moving_time_s"] - row["planned"]["duration"]) <= 3
+
+
+def test_surges_inside_one_step_do_not_look_like_auto_laps():
+    """L2: over-unders 120/80 % as one 6 min step with lap presses: no auto-lap caveat."""
+    plan = ([{"duration": 600, "warmup": True, **pw(50, 65)}]
+            + [x for _ in range(6) for x in ({"duration": 360, **pw(80, 120)}, {"duration": 360, **pw(45, 55)})]
+            + [{"duration": 600, "cooldown": True, **pw(50, 60)}])
+    steps = [[(600, 0.58 * FTP, None, 120)]]
+    for _ in range(6):
+        steps += [[(60, 1.2 * FTP, None, 160), (120, 0.8 * FTP, None, 155)] * 2, [(360, 0.5 * FTP, None, 125)]]
+    steps.append([(600, 0.55 * FTP, None, 120)])
+    result = run(plan, *build_steps(steps), RIDE)
+    assert result["summary"]["alignment_confidence"] == "high" and "Caveat" not in format_execution(result, "")

@@ -199,14 +199,32 @@ def resolve_target(step: dict[str, Any], context: dict[str, Any]) -> dict[str, A
         if isinstance(resolved, dict):
             low, high, units = _range_from_value(resolved)
             if low is not None:
-                return {"kind": kind, "low": low, "high": high, "units": units, "source": "resolved by Intervals.icu"}
+                resolved_target: dict[str, Any] = {"kind": kind, "low": low, "high": high, "units": units, "source": "resolved by Intervals.icu"}
+                return _with_direction(resolved_target, resolved)
     for kind in ("power", "hr", "pace"):
         raw = step.get(kind)
         if isinstance(raw, dict):
             target = _resolve_raw_target(kind, raw, context)
             if target:
-                return target
+                return _with_direction(target, raw)
     return None
+
+
+def _with_direction(target: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Mark a range written from high to low (a descending ramp, e.g. a cool-down 125 -> 90 W)."""
+    start, end = _num(value.get("start")), _num(value.get("end"))
+    if start is not None and end is not None and start > end:
+        target["descending"] = True
+    return target
+
+
+def _boundary_level(step: dict[str, Any], at_end: bool) -> float:
+    """Target level of a step at its start or end: the ramp value there, else the midpoint."""
+    target = step["target"]
+    if step.get("ramp") and target["high"] is not None:
+        first, last = (target["high"], target["low"]) if target.get("descending") else (target["low"], target["high"])
+        return last if at_end else first
+    return _target_mid(target)
 
 
 def _zone_target(kind: str, bounds: Any, low: float, high: float | None, scale: float | None, units: str) -> dict[str, Any] | None:
@@ -590,11 +608,13 @@ def _spans(intervals: list[dict[str, Any]], profile: Profile) -> list[_Span]:
     return spans
 
 
-def _lap_has_change(profile: Profile, span: _Span, stream: str) -> bool:
-    """Whether the samples of a lap change level clearly inside it (a lap across a step change).
+def _lap_has_change(profile: Profile, span: _Span, stream: str, targets: list[dict[str, Any]]) -> bool:
+    """Whether the samples of a lap change level clearly inside it, as across a step change.
 
-    The best split into two parts of at least 15 s and 10 % of the lap must differ by at
-    least ``LAP_CHANGE_PCT`` of the higher mean.
+    The split into two parts (at least 15 s and 10 % of the lap each) with the largest
+    difference must differ by at least ``LAP_CHANGE_PCT`` of the higher mean, and no single
+    planned step may cover both levels: a ramp, an over-under, a tempo finish or surges
+    inside one step's own target range are no step change.
     """
     if span.start is None or span.end is None:
         return False
@@ -606,11 +626,15 @@ def _lap_has_change(profile: Profile, span: _Span, stream: str) -> bool:
     for value in values:
         sums.append(sums[-1] + value)
     total = sums[-1]
+    best = (0.0, 0.0, 0.0)
     for cut in range(minimum, len(values) - minimum + 1):
         first, second = sums[cut] / cut, (total - sums[cut]) / (len(values) - cut)
-        if abs(first - second) >= LAP_CHANGE_PCT / 100 * max(first, second, 1e-9):
-            return True
-    return False
+        if abs(first - second) > best[0]:
+            best = (abs(first - second), first, second)
+    difference, first, second = best
+    if difference < LAP_CHANGE_PCT / 100 * max(first, second, 1e-9):
+        return False
+    return not any(_intensity_cost(first, t) == 0.0 and _intensity_cost(second, t) == 0.0 for t in targets)
 
 
 def _laps_follow_steps(spans: list[_Span], layout: dict[str, Any], planned: list[dict[str, Any]], profile: Profile | None) -> bool:
@@ -619,14 +643,16 @@ def _laps_follow_steps(spans: list[_Span], layout: dict[str, Any], planned: list
     Equal-length steps (30/30 s, 3/3 min, 1 km / 1 km, hill repeats) give lap presses of the
     planned length; device auto-laps of the same length (1 km auto-lap on 1 km repeats) are
     told apart by their position: auto-laps run across step changes, so the intensity changes
-    clearly inside several of them, lap presses do not.
+    clearly inside several of them (beyond what one step's own target covers), lap presses do not.
     """
     kinds = [step["target"]["kind"] for step in planned if step.get("target")]
-    stream = STREAM_KEYS[max(set(kinds), key=kinds.count)] if kinds else "watts"
+    kind = max(set(kinds), key=kinds.count) if kinds else "power"
+    stream = STREAM_KEYS[kind]
     if profile is None or not profile.has(stream):
         return True  # without samples the length decides
+    targets = [step["target"] for step in planned if step.get("target") and step["target"]["kind"] == kind]
     typical = [s for s in spans[:-1] if _is_auto_lap(s, layout)]
-    changed = sum(1 for s in typical if _lap_has_change(profile, s, stream))
+    changed = sum(1 for s in typical if _lap_has_change(profile, s, stream, targets))
     return changed < max(2, 0.15 * len(typical))
 
 
@@ -1417,7 +1443,7 @@ def _refine_boundary(  # pylint: disable=too-many-locals,too-many-return-stateme
     if not target_a or not target_b or target_a["kind"] != target_b["kind"]:
         return "unverifiable"
     stream = STREAM_KEYS[target_a["kind"]]
-    mid_a, mid_b = _target_mid(target_a), _target_mid(target_b)
+    mid_a, mid_b = _boundary_level(step_a, at_end=True), _boundary_level(step_b, at_end=False)  # ramps: their value there
     if not profile.has(stream) or abs(mid_a - mid_b) < CHANGE_MIN_PCT / 100 * max(mid_a, mid_b):
         return "unverifiable"
     laps_a, laps_b = seg_a["laps"], seg_b["laps"]
@@ -1494,7 +1520,7 @@ def _carve_step(  # pylint: disable=too-many-locals,too-many-return-statements
     if not seg_a["auto_end"] or len(targets) != 3 or len({t["kind"] for t in targets}) != 1:
         return None
     stream = STREAM_KEYS[targets[0]["kind"]]
-    mids = (_target_mid(targets[0]), _target_mid(targets[1]), _target_mid(targets[2]))
+    mids = (_boundary_level(steps[0], at_end=True), _target_mid(targets[1]), _boundary_level(steps[2], at_end=False))
     if not profile.has(stream) or min(abs(mids[1] - mids[0]), abs(mids[1] - mids[2])) < CHANGE_MIN_PCT / 100 * max(mids):
         return None
     # The plan bounds the search (the first step ends within half to one and a half of its
