@@ -33,9 +33,10 @@ the upstream project should be reported there as well.
 - Optionally restrict a transitional legacy path to the published OpenAI egress ranges
   (`https://openai.com/chatgpt-connectors.json`) at the proxy.
 - Keep `MCP_PERMISSIONS` minimal; write, destructive and admin classes stay hidden unless enabled.
-- In the default single-user mode one Intervals.icu API key serves every client of the server:
-  never put other athletes on `OAUTH_ALLOWED_ATHLETES` (they would see the owner's data). To share
-  a deployment use the multi-user mode (`MCP_TENANCY=multi`, threat model below).
+- In the default single-user mode one Intervals.icu API key serves every client of the server, so
+  the server refuses to start when `OAUTH_ALLOWED_ATHLETES` names anyone but `ATHLETE_ID` (the
+  owner's own other accounts go into `OAUTH_OWNER_ACCOUNTS`). To share a deployment use the
+  multi-user mode (`MCP_TENANCY=multi`, threat model below).
 
 ## Multi-user mode threat model
 
@@ -43,22 +44,31 @@ With `MCP_TENANCY=multi` several athletes use one deployment. What protects them
 
 | Threat | Mitigation |
 | --- | --- |
-| A connection reads another athlete's data by naming their id (`athlete_id` argument, prompt injection) | The tool guard allows only the connection's own athlete (`0`/`i0` are aliases of it) and refuses anything else before a request; the API client refuses every path outside `/athlete/<own id>/...` and `/activity/<id>/...` and every activity whose `icu_athlete_id` is another athlete's. |
-| A friend's request reaches Intervals.icu with the owner's API key | The credential comes from the MCP access token of the request (context variable), never from tool arguments; athlete grants carry the athlete's own OAuth token (Bearer). The API key is only used for grants of the owner: the password / API-key sign-in, an Intervals.icu sign-in as `ATHLETE_ID`, or connections from the single-user mode. A request without a connection credential is refused (fail closed, also for an unknown `MCP_TENANCY` value at runtime). Explicit API keys passed to the client are refused. |
+| A connection reads another athlete's data by naming their id (`athlete_id` argument, prompt injection) | The tool guard allows only the connection's own athlete (`0`/`i0` are aliases of it) and refuses anything else before a request; the API client refuses every path outside `/athlete/<own id>/...` and `/activity/<id>/...`, refuses a fetched activity whose `icu_athlete_id` is another athlete's, and sends requests for an activity's sub-resources (streams, intervals, comments) or writes to it only after checking its owner (once per connection, cached). |
+| A friend's request reaches Intervals.icu with the owner's API key | The credential comes from the MCP access token of the request (context variable), never from tool arguments; athlete grants carry the athlete's own OAuth token (Bearer). The API key is only used for owner grant records: the password / API-key sign-in (multi-user mode: only with TOTP), an Intervals.icu sign-in as `ATHLETE_ID`, single-user connections whose record names the owner, and those the operator adopted (`grants adopt-legacy --owner`). **Fail closed:** a token without a grant record is refused, never treated as the owner's; a missing or damaged `grants` table stops the server; tokens kept verbatim keep their grant record; every token record names its athlete. A request without a connection credential is refused (also for an unknown `MCP_TENANCY` value at runtime), and so is an explicit API key. |
+| Friends who connected in the single-user mode | The single-user mode refuses other athletes on the allowlist; sign-ins record the athlete; connections from before that are refused in the multi-user mode until the operator adopts them, and those recorded with another athlete are never adopted. |
 | One athlete's data in another's answer via caches | Cache keys carry the connection's partition (the grant id, not a digest of a token); the owner's API key keeps its own partition. Cookies are never stored by the shared HTTP client. |
 | Session confusion | The SDK binds a session to the token's subject, which is the grant id: another connection's session id is answered with 404. |
 | Stolen state file | Tokens are sealed with AES-256-GCM (key in `OAUTH_TOKEN_KEY` / a 0600 `OAUTH_TOKEN_KEY_FILE`, never in the file) and bound to grant and athlete; refresh tokens are stored as SHA-256 digests. With the file *and* the key an attacker can use every stored token within its scopes until the athlete revokes the app at Intervals.icu. Keep the key out of backups of the state file. |
-| Excessive permissions | The Intervals.icu scopes requested follow the permission classes chosen on the consent page; a request outside the connection's scopes is refused with a "reconnect and allow" message. `INTERVALS_OAUTH_EXCLUDE_AREAS` removes areas (e.g. `CHATS`, which would also allow reading private chats). |
+| Excessive permissions | The Intervals.icu scopes requested follow the permission classes chosen on the consent page; a request outside the connection's scopes is refused with a "reconnect and allow" message. `CHATS` (activity comments, but also private chats) is requested only when the operator offers it (`INTERVALS_OAUTH_OFFER_CHATS`) and the athlete ticks it. |
+| The owner's password on a page friends use | In the multi-user mode the password and API-key sign-ins require `OAUTH_TOTP_SECRET`; recommended is `OAUTH_LOGIN=intervals` (the owner signs in with Intervals.icu as `ATHLETE_ID`). |
 | Old releases or a switch back to single-user mode serving friends with the owner's key | The multi-user state file is format 2, which older releases refuse to read. In the single-user mode only the owner's connections are loaded; other athletes' connections and tokens are removed at the next write. |
 | Unwanted sign-ins | Only athletes on `OAUTH_ALLOWED_ATHLETES`; `*` needs `OAUTH_ALLOW_ANY_ATHLETE=true`. Removing an athlete from the list makes their connections unusable at the next start. |
-| One athlete exhausts the shared Intervals.icu app limit | Daily soft budget per athlete (`MCP_ATHLETE_DAILY_REQUESTS`) and a shared 15-minute budget (`MCP_APP_REQUESTS_PER_15MIN`), plus the per-call limits. |
-| Tokens in logs or answers | Tokens and keys are never logged; error texts from Intervals.icu are redacted; `get_server_status` shows only the calling connection (no other athletes, no allowlist). |
+| One athlete exhausts the shared Intervals.icu app limit | Daily soft budget per athlete (`MCP_ATHLETE_DAILY_REQUESTS`), a shared 15-minute budget (`MCP_APP_REQUESTS_PER_15MIN`) of which one athlete may use at most `MCP_ATHLETE_SHARE_PERCENT` and the others leave `MCP_OWNER_RESERVED_PERCENT` to the owner, retries counted, plus the per-call limits. |
+| State file growth | At most `OAUTH_MAX_GRANTS_PER_ATHLETE` grants per athlete and 500 in total (least recently used revoked). |
+| Tokens in logs or answers | Tokens and keys are never logged; error texts from Intervals.icu are redacted; `get_server_status` shows only the calling connection (no other athletes, no allowlist, and to friends not how the owner signs in). |
+| Key rotation | Several keys in `OAUTH_TOKEN_KEY`: the first seals, a token opened with an older key is sealed again at its next use; `--doctor` counts the tokens still waiting. |
 
 Not covered: the operator (and anyone controlling the host) can read the logs (athlete ids, tool
 names, request paths, errors) and, with the key, the stored tokens; friends must trust the
-operator. A compromised MCP client of one athlete can act within that athlete's grant. Deleting a
-connection removes the token from the server; it stays valid at Intervals.icu until the athlete
-revokes the app there.
+operator. Friends' wellness data is health data (in the EU a special category, Art. 9 GDPR); the
+operator is responsible for it (explicit consent, a short privacy note, log retention, a deletion
+procedure: README "Sharing the server with friends"). A compromised MCP client of one athlete can
+act within that athlete's grant. Deleting a connection removes the token from the server; it
+stays valid at Intervals.icu until the athlete revokes the app there. A token is deleted on
+disconnect only when the MCP client calls `/revoke`; otherwise when the refresh token expires,
+by retention or with `grants remove`. A consent link opened in someone else's browser is an OAuth
+request-phishing pattern that predates this mode; the redirect-host allowlist limits it.
 
 ## Supported versions
 
