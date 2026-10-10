@@ -144,6 +144,8 @@ from intervals_mcp_server.tools.analysis import (  # pylint: disable=wrong-impor
 )
 from intervals_mcp_server.tools.climbs import analyze_climbs  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.report import get_activity_report  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.data_audit import get_activity_data_audit  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.fueling import get_fueling_analysis  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.performance import (  # pylint: disable=wrong-import-position  # noqa: E402
     compare_best_efforts,
     compare_workouts,
@@ -222,6 +224,8 @@ __all__ = [
     "analyze_workout_execution",
     "analyze_climbs",
     "get_activity_report",
+    "get_activity_data_audit",
+    "get_fueling_analysis",
     "compare_best_efforts",
     "compare_workouts",
     "find_similar_intervals",

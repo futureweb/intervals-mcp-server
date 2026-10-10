@@ -79,7 +79,8 @@ DETAIL_LEVELS = ("compact", "standard", "full")
 LOAD_FIELDS = "id,start_date_local,type,name,moving_time,icu_training_load,icu_intensity"
 ZONE_FIELDS = "icu_zone_times,icu_hr_zone_times,pace_zone_times"
 DURABILITY_FIELDS = (
-    "elapsed_time,decoupling,icu_efficiency_factor,icu_variability_index,average_temp,average_heartrate,trainer,gear,power_meter"
+    "elapsed_time,decoupling,icu_efficiency_factor,icu_variability_index,average_temp,average_heartrate,trainer,gear,power_meter,"
+    "average_weather_temp,average_feels_like"
 )
 FITNESS_FIELDS = "id,ctl,atl,rampRate,ctlLoad,atlLoad"
 RACE_CATEGORIES = ("RACE_A", "RACE_B", "RACE_C")

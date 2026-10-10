@@ -52,6 +52,8 @@ from intervals_mcp_server.tools.analysis import (  # noqa: F401
 )
 from intervals_mcp_server.tools.climbs import analyze_climbs  # noqa: F401
 from intervals_mcp_server.tools.report import get_activity_report  # noqa: F401
+from intervals_mcp_server.tools.data_audit import get_activity_data_audit  # noqa: F401
+from intervals_mcp_server.tools.fueling import get_fueling_analysis  # noqa: F401
 from intervals_mcp_server.tools.performance import (  # noqa: F401
     compare_best_efforts,
     compare_workouts,
@@ -137,6 +139,8 @@ __all__ = [
     "analyze_workout_execution",
     "analyze_climbs",
     "get_activity_report",
+    "get_activity_data_audit",
+    "get_fueling_analysis",
     "compare_best_efforts",
     "compare_workouts",
     "find_similar_intervals",
