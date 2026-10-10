@@ -342,7 +342,7 @@ def verify_password_hash(password: str, encoded: str) -> bool:
 
 
 def normalize_athlete_id(value: Any) -> str:
-    """``i219504``, ``I219504`` and ``219504`` all become ``219504``."""
+    """``i765432``, ``I765432`` and ``765432`` all become ``765432``."""
     text = str(value).strip().lower()
     return text[1:] if text.startswith("i") and text[1:].isdigit() else text
 

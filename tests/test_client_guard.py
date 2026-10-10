@@ -56,7 +56,7 @@ def test_unsafe_paths_are_rejected_without_a_request(monkeypatch, url):
 
 @pytest.mark.parametrize(
     "url",
-    ["/activity/i194378945/streams", "/athlete/i1/events/12345", "/athlete/0/activities",
+    ["/activity/i900000001/streams", "/athlete/i1/events/12345", "/athlete/0/activities",
      "/athlete/i1/wellness/2026-10-09", "/athlete/i1/athlete-summary.json", "/athlete/i1/gear/b12345"],
 )
 def test_normal_paths_pass(monkeypatch, url):

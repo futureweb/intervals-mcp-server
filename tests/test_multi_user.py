@@ -1,7 +1,7 @@
 # pylint: disable=missing-function-docstring,protected-access,redefined-outer-name,too-many-lines
 """Multi-user mode (MCP_TENANCY=multi): isolation between athletes, credentials, lifecycle.
 
-Synthetic athletes only: the owner i219504 (server API key), ALPHA i1001 and BRAVO i1002
+Synthetic athletes only: the owner i765432 (server API key), ALPHA i1001 and BRAVO i1002
 (their own Intervals.icu OAuth tokens). The Intervals.icu API is a MockTransport keyed by the
 credential: a request for an athlete path with another athlete's credential is recorded as a
 violation and fails the test, like any Basic-auth (API key) request for a non-owner.
@@ -47,7 +47,7 @@ from intervals_mcp_server.utils.cache import cache_key
 from tests.test_oauth_extensions import FakeWeb
 from tests.test_oauth_hardening import VERSION_1_STATE, Clock, dcr_client, refresh_with, write_state
 
-OWNER, ALPHA, BRAVO = "i219504", "i1001", "i1002"
+OWNER, ALPHA, BRAVO = "i765432", "i1001", "i1002"
 OWNER_KEY = "owner-api-key-0123456789"
 TOKENS = {"tok-alpha-secret-0001": ALPHA, "tok-bravo-secret-0002": BRAVO}
 TAGS = {OWNER: "OWNERDATA", ALPHA: "ALPHADATA", BRAVO: "BRAVODATA"}
@@ -520,7 +520,7 @@ def test_two_athletes_in_parallel_never_see_each_other(multi):
 def test_athlete_id_spoofing_is_refused_before_any_request(multi):
     provider, tokens, fake = multi
     before = len(fake.requests)
-    for spoof in (BRAVO, "1002", "I1002", OWNER, "219504"):
+    for spoof in (BRAVO, "1002", "I1002", OWNER, "765432"):
         text = call_as(provider, tokens[ALPHA].access_token, "get_activities", {"athlete_id": spoof})
         assert "not the athlete of this connection" in text and "BRAVODATA" not in text and "OWNERDATA" not in text
     assert len(fake.requests) == before

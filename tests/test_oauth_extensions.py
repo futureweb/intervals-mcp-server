@@ -85,7 +85,7 @@ class FakeWeb:
 class FakeIntervals:
     """Replacement for the Intervals.icu token endpoint."""
 
-    def __init__(self, athlete_id: str = "219504") -> None:
+    def __init__(self, athlete_id: str = "765432") -> None:
         self.athlete_id = athlete_id
         self.codes: list[str] = []
 
@@ -106,7 +106,7 @@ def make_env(tmp_path: Path, **extra: str) -> dict[str, str]:
         "OAUTH_PASSWORD": PASSWORD,
         "OAUTH_STATE_FILE": str(tmp_path / "state.json"),
         "MCP_PERMISSIONS": "read,write",
-        "ATHLETE_ID": "i219504",
+        "ATHLETE_ID": "i765432",
     }
     env.update(extra)
     return env
@@ -448,7 +448,7 @@ def start_intervals(client: TestClient, grant: list[str] | None = None) -> tuple
 
 
 def test_intervals_sign_in_happy_path(tmp_path):
-    intervals = FakeIntervals("219504")
+    intervals = FakeIntervals("765432")
     _, _, client = make_app(intervals_env(tmp_path), intervals=intervals)
     client_id, verifier, params = start_intervals(client, ["read", "write"])
     callback = client.get("/oauth/intervals/callback", params={"code": "up-code", "state": params["state"]})
@@ -516,7 +516,7 @@ def test_intervals_configuration_validation(tmp_path):
         oauth_config_from_env(make_env(tmp_path, OAUTH_CLIENT_HOSTS="*"))
     with pytest.raises(ValueError, match="OAUTH_LOGIN"):
         oauth_config_from_env(make_env(tmp_path, OAUTH_LOGIN="github"))
-    assert normalize_athlete_id("i219504") == normalize_athlete_id(219504) == "219504"
+    assert normalize_athlete_id("i765432") == normalize_athlete_id(765432) == "765432"
 
 
 # --------------------------------------------------------------------------- #

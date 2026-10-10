@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0b1] - 2026-10-10
+
+First public beta of the Futureweb fork. Based on upstream
+[mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
+
 ### Added (publishing)
 - The release workflow publishes a tag to PyPI (`futureweb-intervals-mcp`, Trusted Publishing via
   OIDC with PEP 740 attestations, pre-releases included), after the GHCR image and before the
@@ -181,11 +186,6 @@ All notable changes to this project are documented here. The format follows
 - `get_activities` and `get_wellness_data` with a past `end_date` and no `start_date` asked for a
   range starting after its end; the default start is now 30 days before the earlier of `end_date`
   and today.
-
-## [1.0.0b1] - 2026-10-09
-
-First public beta of the Futureweb fork. Based on upstream
-[mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
 ### Security
 
