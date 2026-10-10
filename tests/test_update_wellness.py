@@ -80,11 +80,13 @@ def test_update_wellness_out_of_range(monkeypatch):
     assert not calls
 
 
-def test_update_wellness_empty_comment_is_sent(monkeypatch):
-    """An empty string comment is a deliberate value (clears the comment) and is sent."""
+def test_update_wellness_empty_comment_needs_the_clear_flag(monkeypatch):
+    """An empty comment is a client placeholder and never wipes the comment; clear_comments does."""
     calls: list = []
     _patch(monkeypatch, {"id": "2024-01-01", "comments": ""}, calls)
-    asyncio.run(update_wellness(date="2024-01-01", comments="", athlete_id="1"))
+    assert "No wellness fields provided" in asyncio.run(update_wellness(date="2024-01-01", comments="", athlete_id="1"))
+    assert not calls
+    asyncio.run(update_wellness(date="2024-01-01", clear_comments=True, athlete_id="1"))
     assert calls[0][1]["data"] == {"comments": ""}
 
 

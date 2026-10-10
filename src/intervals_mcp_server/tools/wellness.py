@@ -46,10 +46,10 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
         end_date: End date in YYYY-MM-DD format (optional, defaults to today)
+        include_all_fields: If True, include additional and custom fields beyond the standard set (optional, defaults to False)
 
     Long ranges are paged by day: when the answer would get too large it stops with a note
     giving the start_date to continue with.
-        include_all_fields: If True, include additional and custom fields beyond the standard set (optional, defaults to False)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -127,7 +127,7 @@ _SUBJECTIVE_SCALE_MAX = 4
 
 
 @tool("write", overwrites=True)
-async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     date: str,
     soreness: int | None = None,
     fatigue: int | None = None,
@@ -138,6 +138,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
     comments: str | None = None,
     athlete_id: str | None = None,
     api_key: str | None = None,
+    clear_comments: bool = False,
 ) -> str:
     """WRITE: Update (modify) the subjective wellness fields of one day in Intervals.icu.
 
@@ -160,7 +161,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
 
     NOTE: comments REPLACES the day's existing comment, it does not append. To append,
     read the existing record first (get_wellness_data) and send the combined text.
-    An empty string clears the comment.
+    An empty string is ignored (it never wipes the comment); clear_comments=true empties it.
 
     Args:
         date: The day to update in YYYY-MM-DD format
@@ -173,6 +174,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
         comments: Free-text comment for the day; replaces any existing comment (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        clear_comments: Empty the day's comment (optional, default false)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -202,8 +204,10 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
                 f"and {_SUBJECTIVE_SCALE_MAX}."
             )
         body[name] = value
-    if comments is not None:
-        body["comments"] = comments
+    if clear_comments:
+        body["comments"] = ""
+    elif comments is not None and comments.strip():
+        body["comments"] = comments  # a placeholder "" never wipes the comment
 
     if not body:
         return (

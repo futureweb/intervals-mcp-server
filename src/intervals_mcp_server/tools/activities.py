@@ -1276,12 +1276,14 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     name: str | None = None,
     description: str | None = None,
     api_key: str | None = None,
+    clear_description: bool = False,
 ) -> str:
     """WRITE TOOL: modifies an existing activity in Intervals.icu (PUT /activity/{id}).
 
     Only the fields that are passed are sent; all other activity values stay untouched.
     name and description REPLACE the current text (read it first with get_activity_details to
-    extend it). At least one of rpe, feel, name or description must be provided.
+    extend it); an empty description is ignored, clear_description=true empties it on purpose.
+    At least one of rpe, feel, name or description must be provided.
     Activities imported from Strava cannot be updated via the API; the API returns an error.
 
     Args:
@@ -1289,8 +1291,9 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
         rpe: Rate of perceived exertion, integer 1-10 (sent as `icu_rpe`; 1 = very easy, 10 = maximal)
         feel: How the athlete felt, integer 1-5 (1 = Strong, 2 = Good, 3 = Normal, 4 = Poor, 5 = Weak)
         name: New activity name
-        description: New activity description
+        description: New activity description (an empty string is ignored)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        clear_description: Empty the activity description (optional, default false)
     """
     if rpe is not None and (isinstance(rpe, bool) or not 1 <= rpe <= 10):
         return "Error: rpe must be an integer between 1 and 10."
@@ -1307,8 +1310,10 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
         payload["feel"] = feel
     if name is not None:
         payload["name"] = name
-    if description is not None:
-        payload["description"] = description
+    if clear_description:
+        payload["description"] = ""
+    elif description is not None and description.strip():
+        payload["description"] = description  # a placeholder "" never wipes the text
 
     if not payload:
         return "Error: at least one of rpe, feel, name or description must be provided."
