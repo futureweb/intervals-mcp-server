@@ -25,6 +25,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "python-dotenv>=1.0.0",
     "pyjwt[crypto]>=2.15.0",
+    "cryptography>=46.0.0",
     "tzdata>=2024.1",
 ]
 classifiers = [
