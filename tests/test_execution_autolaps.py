@@ -266,3 +266,163 @@ def test_short_overrun_of_the_last_step_is_summarised():
     segments = [(600, 0.58 * FTP, None, 120), (600, 0.92 * FTP, None, 155), (390, 0.55 * FTP, None, 125)]
     text = format_execution(run(plan, *build(segments, laps="steps"), RIDE), "")
     assert "The last step ran 1:30 beyond its planned duration (less than 2:00, not reported as a separate block)." in text
+
+
+# ----------------------------------------------------------------- re-check (N1-N5)
+def build_reset(segments, manual_cuts, lap_m=1000.0, seed=0):  # pylint: disable=too-many-locals
+    """Garmin-like auto-laps whose distance counter restarts at every lap press."""
+    streams, _ = build(segments, laps="steps", seed=seed)
+    n, dist, heart = len(streams[0]["data"]), streams[2]["data"], streams[1]["data"]
+    watts = next((s["data"] for s in streams if s["type"] == "watts"), None)
+    cuts, last, manual = set(manual_cuts), 0.0, set(manual_cuts)
+    for index in range(n):
+        if index in manual:
+            last = dist[index]
+        elif dist[index] - last >= lap_m:
+            cuts.add(index)
+            last = dist[index]
+    edges = [0] + sorted(c for c in cuts if 0 < c < n) + [n]
+    intervals = []
+    for start, end in zip(edges, edges[1:], strict=False):
+        metres = (dist[end] if end < n else dist[-1] + 1.0) - dist[start]
+        row = {"type": "WORK", "start_index": start, "end_index": end, "start_time": start, "end_time": end, "elapsed_time": end - start,
+               "moving_time": end - start, "distance": metres, "average_speed": metres / (end - start),
+               "average_heartrate": sum(heart[start:end]) / (end - start)}
+        if watts:
+            row["average_watts"] = sum(w for w in watts[start:end] if w is not None) / (end - start)
+        intervals.append(row)
+    return streams, intervals
+
+
+def random_auto_lap_activity(seed):  # pylint: disable=too-many-locals
+    """A random run/ride plan recorded with device auto-laps (the review's fuzz generator)."""
+    rnd = random.Random(seed)
+    sport = rnd.choice(["run", "ride"])
+    levels = [(0.65, 0.75), (0.78, 0.87), (0.88, 0.93), (0.97, 1.03), (1.05, 1.12), (1.15, 1.25)]
+    plan, segments = [], []
+
+    def add(duration, low, high, warm=False, cool=False, no_target=False):
+        step = {"duration": duration}
+        if warm:
+            step["warmup"] = True
+        if cool:
+            step["cooldown"] = True
+        if no_target:
+            step["text"] = "easy"
+        else:
+            step.update(pc(int(low * 100), int(high * 100)) if sport == "run" else pw(int(low * 100), int(high * 100)))
+        plan.append(step)
+        actual = max(10, int(duration * rnd.choice([1, 1, 1, 1, 0.8, 1.2, 1.5, 0.6])))
+        mid = (low + high) / 2 * rnd.uniform(0.98, 1.02)
+        segments.append((actual, None if sport == "run" else mid * FTP, mid * T if sport == "run" else None, 140))
+
+    add(rnd.choice([600, 900, 1200]), 0.65, 0.75, warm=True)
+    for _ in range(rnd.randint(3, 14)):
+        low, high = rnd.choice(levels)
+        add(rnd.choice([15, 20, 30, 60, 90, 120, 180, 240, 300, 480, 600, 900, 1200, 1800]), low, high, no_target=rnd.random() < 0.1)
+    add(rnd.choice([300, 600]), 0.65, 0.75, cool=True)
+    lap = rnd.choice([1000, 1000, 500, 1609]) if sport == "run" else rnd.choice([1000, 5000, 2000])
+    if rnd.choice(["grid", "reset"]) == "grid":
+        streams, intervals = build(segments, lap_m=lap, seed=seed)
+    else:
+        bounds = [0]
+        for segment in segments:
+            bounds.append(bounds[-1] + segment[0])
+        streams, intervals = build_reset(segments, [b for b in bounds[1:-1] if rnd.random() < 0.3], lap_m=lap, seed=seed)
+    return plan, streams, intervals, RUN if sport == "run" else RIDE
+
+
+def test_strides_inside_auto_laps_do_not_crash():
+    """N1: a long run with strides inside 1 km auto-laps (no lap of their own) used to raise
+    IndexError after an earlier boundary move left stale lap lists; also the review's crash seeds."""
+    plan = [{"duration": 1200, "warmup": True, **pc(70, 78)}, {"duration": 3600, **pc(78, 87)},
+            {"reps": 6, "steps": [{"duration": 20, **pc(115, 125)}, {"duration": 100, **pc(65, 77)}]}, {"duration": 600, "cooldown": True, **pc(70, 78)}]
+    segments = [(1200, None, 0.74 * T, 135), (3600, None, 0.83 * T, 145)] + [(20, None, 1.2 * T, 160), (100, None, 0.72 * T, 150)] * 6
+    segments.append((600, None, 0.74 * T, 140))
+    result = run(plan, *build(segments), RUN)
+    assert "plan_skipped" not in result["summary"] and result["summary"]["matched"] >= 10
+    for row in result["rows"]:
+        if row.get("metrics"):
+            assert row["interval_indices"] and row["metrics"]["moving_time_s"] > 0
+    format_execution(result, "", True)
+    for seed in (171, 257, 264, 306, 413) + tuple(range(30)):  # the first five crashed on the previous head
+        plan, streams, intervals, ctx = random_auto_lap_activity(seed)
+        result = run(plan, streams, intervals, ctx)
+        assert "plan_skipped" not in result["summary"], seed
+        format_execution(result, "", ctx is RUN)
+
+
+def test_an_internal_error_degrades_to_the_interval_analysis(monkeypatch):
+    """N1 guard: whatever goes wrong in the plan comparison, the tool still reports the intervals."""
+    from intervals_mcp_server.utils import execution  # pylint: disable=import-outside-toplevel
+
+    def broken(*_args, **_kwargs):
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(execution, "_analyze_plan", broken)
+    plan = [{"duration": 600, **pw(50, 65)}, {"duration": 600, **pw(90, 95)}]
+    result = run(plan, *build([(600, 0.58 * FTP, None, 120), (600, 0.92 * FTP, None, 155)], laps="steps"), RIDE)
+    text = format_execution(result, "")
+    assert "Note: plan comparison failed (IndexError: list index out of range); intervals shown without the plan." in text
+    assert "No planned workout: 2 intervals" in text
+
+
+def test_equal_length_lap_presses_are_not_auto_laps():
+    """N2: 3/3 min with an untargeted recovery and hill repeats with lap presses have laps of the
+    planned step length: no auto-lap caveat, and a real 50 % overrun stays a deviation."""
+    plan = [{"duration": 180, "warmup": True, **pw(50, 65)}, {"reps": 6, "steps": [{"duration": 180, **pw(106, 120)}, {"duration": 180, "text": "easy"}]},
+            {"duration": 180, "cooldown": True, **pw(50, 60)}]
+    segments = [(180, 0.58 * FTP, None, 120)] + [(180, 1.13 * FTP, None, 165), (180, 0.5 * FTP, None, 125)] * 2
+    segments += [(270, 1.13 * FTP, None, 165), (90, 0.5 * FTP, None, 125)] + [(180, 1.13 * FTP, None, 165), (180, 0.5 * FTP, None, 125)] * 3
+    segments.append((180, 0.55 * FTP, None, 125))
+    result = run(plan, *build(segments, laps="steps"), RIDE)
+    assert result["summary"]["alignment_confidence"] == "high" and result["summary"]["auto_laps"] is None
+    rows = result["rows"]
+    assert rows[5]["overrun"]["moving_time_s"] == 90 and any("longer than planned" in t for t in texts(rows[5]))
+    assert texts(rows[6]) == ["1:30 shorter than planned"]
+    rnd = random.Random(3)
+    hills = [{"duration": 900, "warmup": True, **pw(50, 65)}, {"reps": 6, "steps": [{"duration": 360, **pw(100, 105)}, {"duration": 360, "text": "descent"}]},
+             {"duration": 600, "cooldown": True, **pw(50, 60)}]
+    segments = [(900, 0.58 * FTP, None, 120)]
+    for rep in range(6):
+        up, down = (450, 270) if rep == 2 else (360 + rnd.randint(-8, 8), 360 + rnd.randint(-8, 8))
+        segments += [(up, 1.02 * FTP, None, 165), (down, 0.45 * FTP, None, 125)]
+    segments.append((600, 0.55 * FTP, None, 125))
+    result = run(hills, *build(segments, laps="steps"), RIDE)
+    assert result["summary"]["alignment_confidence"] == "high" and result["summary"]["steps_with_deviations"] == 2
+    assert "Caveat" not in format_execution(result, "")
+
+
+def test_final_partial_lap_goes_back_to_the_cool_down():
+    """N3: after the tempo's overrun moved a boundary, the activity's last partial lap belongs to the
+    cool-down again, so a cool-down of exactly 10 min is not "shorter than planned"."""
+    plan = [{"duration": 900, "warmup": True, **pc(70, 78)}, {"duration": 2400, **pc(88, 93)}, {"duration": 600, "cooldown": True, **pc(70, 78)}]
+    for extra in (300, 600, 1200):
+        segments = [(900, None, 0.74 * T, 135), (2400 + extra, None, 0.905 * T, 158), (600, None, 0.74 * T, 140)]
+        rows = run(plan, *build(segments), RUN)["rows"]
+        assert abs(rows[2]["metrics"]["moving_time_s"] - 600) <= 3 and not texts(rows[2]), extra
+        assert abs(rows[1]["overrun"]["moving_time_s"] - extra) <= 3, extra
+
+
+def test_alignment_stays_bounded_with_similar_targets_and_many_laps(monkeypatch):
+    """N4: surplus-lap absorption with similar neighbouring targets stays fast; a time budget makes
+    the plan comparison give up (intervals only, with a note) instead of running for minutes."""
+    from intervals_mcp_server.utils import execution  # pylint: disable=import-outside-toplevel
+
+    streams, intervals = build([(7200, 0.7 * FTP, None, 140)], laps="time", lap_s=12)
+    plan = [{"duration": 600, **pw(65, 75)} for _ in range(20)]
+    began = time.perf_counter()
+    result = run(plan, streams, intervals, RIDE)
+    assert time.perf_counter() - began < 10 and result["summary"]["matched"] == 12
+    monkeypatch.setattr(execution, "ALIGN_TIME_BUDGET_S", 0.0)
+    result = run(plan, streams, intervals, RIDE)
+    assert "plan comparison skipped" in result["summary"]["plan_skipped"]
+    assert "Note: plan comparison skipped: 20 planned steps x 600 intervals exceed the 0 s budget." in format_execution(result, "")
+
+
+def test_np_of_sparse_recordings_holds_the_value():
+    """N5: a constant 200 W recorded every 2 or 3 s has NP 200 W; only pauses count as 0 W."""
+    for spacing in (1, 2, 3):
+        seconds = list(range(0, 1200, spacing))
+        profile = Profile([{"type": "time", "data": seconds}, {"type": "watts", "data": [200.0] * len(seconds)}])
+        assert round(profile.normalized_power(0, len(seconds)), 3) == 200.0

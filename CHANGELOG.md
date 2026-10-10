@@ -22,7 +22,10 @@ First public beta of the Futureweb fork. Based on upstream
   lap presses are never moved, and an auto-lap boundary the samples cannot place is kept with its
   durations not judged (ANA-2, second review R26-1/2/5). With auto-laps the text carries a caveat
   and JSON `alignment_confidence` (high / medium / low) with `alignment_notes` and `auto_laps`
-  (R26-4). Open-ended targets (top zone, a %/W range with a start only; a start-only zone is that
+  (R26-4). Laps of the length of a planned step (30/30 s, 3/3 min, 1 km / 1 km, hill repeats)
+  are lap presses, never auto-laps; an internal error or an exhausted time budget of the plan
+  comparison falls back to the interval analysis with a note instead of failing the tool.
+  Open-ended targets (top zone, a %/W range with a start only; a start-only zone is that
   zone) are lower bounds in adherence, time in target and the alignment, shown as "352 W or more";
   zone watts are floored like the zone table (ANA-3, R26-11). Distance steps are matched and
   flagged on distance; the plan clock restarts at the actual end of every step without duration,
@@ -32,8 +35,8 @@ First public beta of the Futureweb fork. Based on upstream
   null` (race, note) no longer crashes the analysis (API-6).
 - Pw:HR drift has the Intervals.icu decoupling sign (positive = HR rose relative to power; exact
   intervals keep Intervals' own value) and the convention is stated (ANA-4).
-- NP of split or merged steps uses the 30 s rolling mean over the whole activity (recording pauses
-  as 0 W on a 1 s grid) and stream speeds are distance / moving time, as Intervals.icu computes
+- NP of split or merged steps uses the 30 s rolling mean over the whole activity (on a 1 s grid:
+  recording pauses as 0 W, sparser sampling held) and stream speeds are distance / moving time, as Intervals.icu computes
   interval values (ANA-10, R26-7).
 - `get_activity_report` key finding compares work steps in the unit of their targets (pace, HR or
   W) instead of labelling pace/HR targets as watts, clearly different targets listed apart (ANA-7,

@@ -376,16 +376,18 @@ def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int
 
 
 NP_MAX_GRID_S = 200_000  # longer clocks (multi-day recordings) fall back to the recorded samples
+NP_PAUSE_GAP_S = 5  # a longer gap between samples is a recording pause (0 W in the NP window)
 
 
-def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | None]:
+def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | None]:  # pylint: disable=too-many-locals
     """Per sample: the 4th power of the 30 s rolling mean power ending at it (None without power).
 
-    The window runs over the whole activity on a 1 s grid (partial at its start), recording
-    pauses counting as 0 W, so the NP of a slice computed from these values includes the
-    30 s before the slice and a pause does not restart the window. This is how Intervals.icu
-    computes the NP of an interval, so NP values of split or merged steps are comparable
-    with the NP of the Intervals.icu intervals.
+    The window runs over the whole activity on a 1 s grid (partial at its start): a sample
+    spacing up to ``NP_PAUSE_GAP_S`` holds the last value (recordings every 2-3 s), a longer
+    gap is a recording pause and counts as 0 W. So the NP of a slice computed from these
+    values includes the 30 s before the slice and a pause does not restart the window. This
+    is how Intervals.icu computes the NP of an interval, so NP values of split or merged
+    steps are comparable with the NP of the Intervals.icu intervals.
     """
     out: list[float | None] = [None] * len(time)
     points: list[tuple[int, int, float | None]] = []  # (sample index, second, watts)
@@ -399,8 +401,12 @@ def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | Non
     if span <= 0 or span > NP_MAX_GRID_S or any(b[1] <= a[1] for a, b in zip(points, points[1:], strict=False)):
         return _rolling_fourth_powers_samples(points, out)
     grid = [0.0] * span
-    for _, second, power in points:
-        grid[second - origin] = power or 0.0
+    for position, (_, second, power) in enumerate(points):
+        value = power or 0.0
+        following = points[position + 1][1] if position + 1 < len(points) else second + 1
+        hold = following - second if following - second <= NP_PAUSE_GAP_S else 1
+        for offset in range(hold):  # sparse recording: hold the value; a pause stays at 0 W
+            grid[second - origin + offset] = value
     rolling, total = [], 0.0
     for second, power in enumerate(grid):
         total += power
