@@ -150,7 +150,15 @@ def _tenancy_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  #
         return errors, warnings
     if not oauth:
         return ["MCP_TENANCY=multi requires MCP_AUTH=oauth: every connection signs in with its own account"], warnings
-    errors.extend(budget_settings(env).errors)
+    budgets = budget_settings(env)
+    errors.extend(budgets.errors)
+    if budgets.window and budgets.athlete_share == 0:
+        warnings.append(
+            "MCP_ATHLETE_SHARE_PERCENT=0 allows each athlete one request per 15 minutes (it does not switch the share "
+            "off; 100 means no per-athlete limit)"
+        )
+    if budgets.window and budgets.owner_reserve >= 100:
+        warnings.append("MCP_OWNER_RESERVED_PERCENT=100 reserves the whole 15-minute budget for the owner: every other athlete is refused")
     if env.get("ATHLETE_TIMEZONE", "").strip():
         warnings.append(
             "ATHLETE_TIMEZONE applies to every athlete of the shared server; leave it empty so that each athlete's "

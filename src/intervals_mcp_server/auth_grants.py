@@ -36,6 +36,7 @@ import argparse
 import contextlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -176,6 +177,51 @@ def file_signature(path: Path) -> tuple[int, int, int] | None:
     return info.st_ino, info.st_mtime_ns, info.st_size
 
 
+def _reference_owner(path: Path) -> tuple[int, int] | None:
+    """(uid, gid) of the state file, or of its directory when there is none yet (never following a link)."""
+    for candidate in (path, path.parent):
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
+            return info.st_uid, info.st_gid
+    return None
+
+
+def _open_lock(lock_path: Path, state_path: Path) -> int:
+    """Open (or create) the lock file safely, also when run as root in a directory others can write.
+
+    Never follows a symbolic link (``O_NOFOLLOW``); the file must be a regular file with one link,
+    owned by this user or by the owner of the state file. Only a lock file this call created is
+    given to the state file's owner (``fchown`` on the open descriptor).
+    """
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    created = True
+    try:
+        fd = os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        created = False
+        fd = os.open(lock_path, flags)  # ELOOP for a symbolic link
+    try:
+        info = os.fstat(fd)
+        owner = _reference_owner(state_path)
+        allowed = {info.st_uid}  # not POSIX: no owners to compare
+        if hasattr(os, "geteuid"):
+            allowed = {os.geteuid()} | ({owner[0]} if owner else set())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in allowed:
+            raise OSError(
+                f"{lock_path} is not a plain lock file of this server (a link, or owned by another user); "
+                "remove it and try again"
+            )
+        if created:
+            _keep_owner(fd, owner)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 @contextlib.contextmanager
 def state_file_lock(path: Path) -> Iterator[None]:
     """Exclusive advisory lock on ``<path>.lock`` while the state file is read and replaced."""
@@ -185,9 +231,8 @@ def state_file_lock(path: Path) -> Iterator[None]:
         yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_lock(path.with_name(path.name + ".lock"), path)
     try:
-        _keep_owner(fd, path if path.exists() else path.parent)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -210,37 +255,53 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def _keep_owner(new: Path | int, reference: Path) -> None:
-    """When run as root (``docker exec``, sudo), give a new file the owner of *reference*, so the
-    server running as another user can still read and replace the state file."""
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+def _keep_owner(fd: int, owner: tuple[int, int] | None) -> None:
+    """When run as root (``docker exec``, sudo), give a file this process created (open *fd*) the
+    owner of the state file, so a server running as another user can still read and replace it.
+    Only ever on a descriptor, never by path (no link can redirect it)."""
+    if owner is None or not hasattr(os, "geteuid") or os.geteuid() != 0:
         return
-    try:
-        info = reference.stat()
-    except OSError:
-        return
-    if isinstance(new, int):
-        os.fchown(new, info.st_uid, info.st_gid)
-    else:
-        os.chown(new, info.st_uid, info.st_gid)
+    os.fchown(fd, owner[0], owner[1])
 
 
 def write_state_file(path: Path, data: Mapping[str, Any]) -> None:
     """Atomically replace *path* with *data* (mode 0600, fsynced, owner of the old file kept)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    owner = _reference_owner(path)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            _keep_owner(handle.fileno(), owner)
             json.dump(data, handle, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o600)
-        _keep_owner(Path(tmp_name), path if path.exists() else path.parent)
         os.replace(tmp_name, path)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
     _fsync_directory(path.parent)
+
+
+def root_refusal(path: Path) -> str | None:
+    """Why the grants CLI should not change *path* as root: the directory belongs to another user.
+
+    That user could plant links for root to follow; run the command as that user instead
+    (``sudo -u <user>``, ``docker exec -u <uid>``), or pass ``--allow-root`` (the files are still
+    opened without following links).
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    try:
+        directory = os.lstat(path.parent)
+    except OSError:
+        return None
+    if directory.st_uid != 0:
+        return (
+            f"refusing to run as root: {path.parent} belongs to uid {directory.st_uid}. Run the command as that user "
+            "(sudo -u <user> / docker exec -u <uid>) or add --allow-root"
+        )
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +451,7 @@ def _select(data: Mapping[str, Any], args: argparse.Namespace, now: float) -> se
     return {gid for gid, raw in grants.items() if isinstance(raw, dict) and same_athlete(raw.get("athlete_id", ""), args.athlete)}
 
 
-def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> int:  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
+def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> int:  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements,too-many-branches
     """``grants list``, ``grants remove <athlete> | --grant ID | --legacy`` and ``grants prune --days N``."""
     env = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
@@ -415,11 +476,21 @@ def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None
     default_days = env.get("OAUTH_TOKEN_RETENTION_DAYS", "").strip()
     pruner.add_argument("--days", type=int, default=int(default_days) if default_days.isdigit() and int(default_days) > 0 else None,
                         help="days without use (default: OAUTH_TOKEN_RETENTION_DAYS)")
+    for command in (remover, adopter, pruner):
+        command.add_argument("--allow-root", action="store_true",
+                             help="run as root although the state directory belongs to another user")
     args = parser.parse_args(argv)
     if args.command == "prune" and (args.days is None or args.days < 1):
         parser.error("prune needs --days N (N >= 1) or OAUTH_TOKEN_RETENTION_DAYS")
     path = Path(env.get("OAUTH_STATE_FILE", "").strip() or DEFAULT_STATE_FILE)
     now = time.time()
+    if args.command != "list":
+        refusal = None if args.allow_root else root_refusal(path)
+        if refusal is None and path.is_symlink():
+            refusal = f"{path} is a symbolic link; point OAUTH_STATE_FILE at the file itself"
+        if refusal:
+            print(f"grants: {refusal}", file=sys.stderr)
+            return 2
     try:
         if args.command == "list":
             rows = grant_rows(_read_state(path), now)

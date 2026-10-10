@@ -387,7 +387,7 @@ def rejected_token_message(status: int) -> str:
 
 DEFAULT_ATHLETE_DAILY_REQUESTS = 1000
 DEFAULT_APP_REQUESTS_PER_15MIN = 2000
-DEFAULT_ATHLETE_SHARE_PERCENT = 50
+DEFAULT_ATHLETE_SHARE_PERCENT = 25
 DEFAULT_OWNER_RESERVED_PERCENT = 20
 APP_WINDOW_S = 15 * 60
 
@@ -434,8 +434,10 @@ class RequestBudgets:
     Intervals.icu limits an OAuth app as a whole, so every athlete's requests count against
     one shared limit. Each athlete gets a daily budget (UTC day, ``MCP_ATHLETE_DAILY_REQUESTS``);
     all of them together a 15-minute budget (``MCP_APP_REQUESTS_PER_15MIN``), of which one athlete
-    may use at most ``MCP_ATHLETE_SHARE_PERCENT`` and the other athletes together leave
-    ``MCP_OWNER_RESERVED_PERCENT`` to the owner. Every attempt counts, retries included. The
+    may use at most ``MCP_ATHLETE_SHARE_PERCENT`` (default 25; ``0`` still allows one request per
+    window, ``100`` means no per-athlete limit) and the other athletes together leave
+    ``MCP_OWNER_RESERVED_PERCENT`` to the owner (``100`` blocks every athlete but the owner). Every
+    attempt counts, retries included. The
     owner's API key is not an OAuth token and is not counted. The per-call budget
     (``MCP_TOOL_MAX_REQUESTS``) applies on top.
     """

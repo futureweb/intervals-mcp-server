@@ -1702,17 +1702,28 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         return pending.athlete_id, pending.method
 
     def _limit_grants(self, athlete_id: str) -> None:
-        """Make room for one more grant of *athlete_id* (per athlete and in total), least recently used first."""
+        """Multi-user mode: make room for one more grant of *athlete_id*, least recently used first.
+
+        The owner's grants (``ATHLETE_ID``, e.g. the long-lived ChatGPT connection) are never
+        evicted: neither by the per-athlete cap nor by the total cap.
+        """
         def by_use(grant_id: str) -> int:
             return self._grants[grant_id].last_used_at
 
-        mine = sorted((gid for gid, g in self._grants.items() if same_athlete(g.athlete_id, athlete_id)), key=by_use)
+        def evictable(grant: Grant) -> bool:
+            return grant.kind == "athlete" and not self._config.is_owner(grant.athlete_id)
+
+        if self._config.is_owner(athlete_id):
+            return
+        mine = sorted(
+            (gid for gid, g in self._grants.items() if evictable(g) and same_athlete(g.athlete_id, athlete_id)), key=by_use
+        )
         while mine and len(mine) >= self._config.max_grants_per_athlete:
-            victim = mine.pop(0)
             logger.info("Athlete %s has too many connections; revoking the least recently used one", _for_log(athlete_id))
-            self._revoke_grant(victim)
-        while len(self._grants) >= MAX_GRANT_RECORDS:
-            self._revoke_grant(min(self._grants, key=by_use))
+            self._revoke_grant(mine.pop(0))
+        others = sorted((gid for gid, g in self._grants.items() if evictable(g)), key=by_use)
+        while others and len(self._grants) >= MAX_GRANT_RECORDS:
+            self._revoke_grant(others.pop(0))
 
     async def load_refresh_token(  # pylint: disable=too-many-return-statements
         self, client: OAuthClientInformationFull, refresh_token: str
