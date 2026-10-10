@@ -7,6 +7,10 @@ key, how many custom items (fields, streams, wellness fields) the account define
 which display-unit overrides are active. It never prints the API key. Deployment details
 (bind address and port, SSE path, OAuth user name, password source, allowed athletes and
 the state file) are only part of ``--doctor`` on the server itself, not of the tool's answer.
+
+In the multi-user mode (``MCP_TENANCY=multi``) the report describes the calling connection
+only: its own athlete, how it authenticates (its Intervals.icu sign-in or, for the owner, the
+server's API key), its Intervals.icu scopes and its request budget, never other athletes.
 """
 
 import json
@@ -18,6 +22,7 @@ from intervals_mcp_server import __version__
 from intervals_mcp_server.api import client as api_client
 from intervals_mcp_server.auth import auth_status_from_env
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.tenancy import BUDGETS, budget_settings, current_credential, default_athlete, multi_user
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INPUT_FIELD, INTERVAL_FIELD
 from intervals_mcp_server.utils.params import OutputFormat
@@ -47,6 +52,9 @@ async def server_status(include_private: bool = False) -> dict[str, Any]:
     hidden = disabled_tools()
     outside = tools_outside_toolset()
     registered = {name: cls for name, cls in permissions.items() if name not in hidden and name not in outside}
+    multi = multi_user()
+    credential = current_credential() if multi else None
+    athlete = default_athlete(config.athlete_id)
     status: dict[str, Any] = {
         "version": _package_version(),
         "permissions_enabled": sorted(config.permissions),
@@ -59,9 +67,10 @@ async def server_status(include_private: bool = False) -> dict[str, Any]:
         "tools_outside_toolset": sorted(outside),
         "transport": os.getenv("MCP_TRANSPORT", "stdio"),
         "auth": auth_status_from_env(include_private=include_private),
-        "athlete_id_configured": bool(config.athlete_id),
-        "athlete_id": config.athlete_id or None,
-        "api_key_configured": bool(config.api_key),
+        "tenancy": "multi" if multi else "single",
+        "athlete_id_configured": bool(athlete),
+        "athlete_id": athlete or None,
+        "api_key_configured": bool(config.api_key) if not multi or include_private or (credential and credential.owner) else None,
         "api_base_url": config.intervals_api_base_url,
         "units_overrides": config.custom_units_overrides,
         "api": {"ok": False, "detail": "not checked"},
@@ -75,20 +84,35 @@ async def server_status(include_private: bool = False) -> dict[str, Any]:
                 "sse_path": os.getenv("FASTMCP_SSE_PATH", "/sse"),
             }
         )
-    if not config.athlete_id:
+    if multi:
+        daily, _, _ = budget_settings()
+        status["connection"] = (
+            {
+                "credential": credential.description,
+                "intervals_scopes": sorted(credential.intervals_scopes) if credential.intervals_scopes is not None else None,
+                "requests_today": BUDGETS.used_today(credential.athlete_id) if credential.kind == "bearer" else None,
+                "daily_request_budget": (daily or None) if credential.kind == "bearer" else None,
+            }
+            if credential is not None
+            else None
+        )
+        if credential is None:
+            status["api"] = {"ok": False, "detail": "multi-user mode: checked per connection (no signed-in connection here)"}
+            return status
+    elif not config.athlete_id:
         status["api"] = {"ok": False, "detail": "ATHLETE_ID is not set"}
         return status
-    if not config.api_key:
+    elif not config.api_key:
         status["api"] = {"ok": False, "detail": "API_KEY is not set"}
         return status
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings"
+        url=f"/athlete/{api_client.seg(athlete)}/sport-settings"
     )
     if isinstance(result, dict) and "error" in result:
         status["api"] = {"ok": False, "detail": str(result.get("message"))}
         return status
     status["api"] = {"ok": True, "detail": f"sport settings for {len(result) if isinstance(result, list) else '?'} sport group(s) readable"}
-    index = await get_custom_item_index(athlete_id=config.athlete_id)
+    index = await get_custom_item_index(athlete_id=athlete)
     status["custom_items"] = {
         "activity_fields": len(index.get(ACTIVITY_FIELD, {})),
         "activity_streams": len(index.get(ACTIVITY_STREAM, {})),
@@ -132,7 +156,24 @@ def format_status(status: dict[str, Any]) -> str:
             else " (remote transports need a secret path or OAuth plus a TLS reverse proxy)"
         )
     )
-    lines.append(f"Athlete: {status['athlete_id'] or 'not configured'} | API key: {'configured' if status['api_key_configured'] else 'MISSING'} | base URL {status['api_base_url']}")
+    connection = status.get("connection")
+    if status.get("tenancy") == "multi":
+        lines.append("Tenancy: multi-user (MCP_TENANCY=multi): every connection uses its own Intervals.icu credential")
+    if connection:
+        scopes = connection.get("intervals_scopes")
+        budget = connection.get("daily_request_budget")
+        lines.append(
+            f"Athlete: {status['athlete_id']} (this connection) | credential: {connection['credential']}"
+            + (f" | Intervals.icu scopes: {', '.join(scopes)}" if scopes else "")
+            + (f" | requests today: {connection.get('requests_today') or 0} of {budget}" if budget else "")
+            + f" | base URL {status['api_base_url']}"
+        )
+    else:
+        key = status["api_key_configured"]
+        lines.append(
+            f"Athlete: {status['athlete_id'] or 'not configured'} | API key: "
+            f"{'configured' if key else 'MISSING' if key is not None else 'not shown'} | base URL {status['api_base_url']}"
+        )
     lines.append(f"Intervals.icu API: {'OK' if status['api']['ok'] else 'FAILED'} - {status['api']['detail']}")
     items = status.get("custom_items") or {}
     if items:
@@ -373,9 +414,10 @@ def coach_handoff(end_date: str = "") -> str:
 @mcp.resource("intervals://custom-items")
 async def custom_items_resource() -> str:
     """The athlete's custom item definitions (codes, names, units, types) as compact JSON."""
-    if not config.athlete_id:
+    athlete = default_athlete(config.athlete_id)
+    if not athlete:
         return json.dumps({"error": "ATHLETE_ID is not configured"})
-    index = await get_custom_item_index(athlete_id=config.athlete_id)
+    index = await get_custom_item_index(athlete_id=athlete)
     return json.dumps(
         {
             item_type: [

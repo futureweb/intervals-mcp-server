@@ -10,6 +10,7 @@ from typing import Annotated
 
 from pydantic import Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -79,7 +80,7 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
             "another activity with the same start time."
         )
 
-    athlete = str(activity.get("icu_athlete_id") or config.athlete_id or "")
+    athlete = str(activity.get("icu_athlete_id") or default_athlete(config.athlete_id) or "")
     stream_defs = (await get_custom_item_index(athlete_id=athlete)).get(ACTIVITY_STREAM, {}) if athlete else {}
     for stream in streams:  # custom stream names help to recognise counters and other-sport streams
         if stream.get("custom") and not stream.get("name") and stream.get("type") in stream_defs:

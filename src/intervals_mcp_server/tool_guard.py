@@ -12,7 +12,10 @@ outermost tool call only:
 - caps the size of the result: text is cut at a line boundary with a note on how to get the
   rest, JSON that does not fit is replaced by a JSON error object (never cut into invalid JSON);
 - runs a tool called with ``dry_run=true`` with read-only requests: the API client refuses
-  anything but GET (api.client.read_only_requests), so a dry run can never write.
+  anything but GET (api.client.read_only_requests), so a dry run can never write;
+- in the multi-user mode (``MCP_TENANCY=multi``): refuses a call without the connection's
+  credential and an ``athlete_id`` that is not the connection's own athlete (``0`` is an alias
+  of it), and fills in the connection's athlete when none is given (tenancy.athlete_argument).
 
 Nested calls (a tool calling another tool function) pass straight through, except that a nested
 dry run is read-only as well.
@@ -30,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 from intervals_mcp_server.api.client import call_limits, read_only_requests, unsafe_segment_reason
+from intervals_mcp_server.tenancy import athlete_argument, current_credential, multi_user
 from intervals_mcp_server.utils.dates import activate_athlete_timezone, reset_athlete_timezone
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -285,6 +289,22 @@ def _is_dry_run(signature: inspect.Signature, arguments: Mapping[str, Any]) -> b
     return value is not inspect.Parameter.empty and bool(value)
 
 
+_ATHLETE_PARAMETER = "athlete_id"
+
+
+def _connection_athlete(signature: inspect.Signature, bound: inspect.BoundArguments) -> tuple[str | None, str | None]:
+    """Multi-user mode: (the connection's athlete, error); ``athlete_id`` is checked and filled in."""
+    credential = current_credential()
+    if credential is None:
+        return None, "Error: this server runs in multi-user mode and the call does not belong to a signed-in connection."
+    if _ATHLETE_PARAMETER in signature.parameters:
+        athlete, error = athlete_argument(bound.arguments.get(_ATHLETE_PARAMETER), credential)
+        if error:
+            return None, error
+        bound.arguments[_ATHLETE_PARAMETER] = athlete
+    return credential.athlete_id, None
+
+
 def guarded(func: F) -> F:
     """Wrap a tool coroutine function with the checks described in the module docstring."""
     signature = inspect.signature(func)
@@ -303,7 +323,13 @@ def guarded(func: F) -> F:
             return error
         from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
 
-        athlete = bound.arguments.get("athlete_id") or get_config().athlete_id
+        if multi_user():
+            athlete, error = _connection_athlete(signature, bound)
+            if error:
+                return error
+            args, kwargs = bound.args, bound.kwargs
+        else:
+            athlete = bound.arguments.get("athlete_id") or get_config().athlete_id
         marker = _IN_TOOL.set(True)
         writes = read_only_requests() if _is_dry_run(signature, bound.arguments) else nullcontext()
         try:

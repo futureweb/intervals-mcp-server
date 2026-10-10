@@ -14,6 +14,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.activities import _compact_details, _compact_intervals  # pylint: disable=protected-access
@@ -387,7 +388,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
             return json.dumps({"activity": {k: activity.get(k) for k in ("id", "name", "type", "start_date_local", "source")},
                                "strava_stub": True, "notes": [STRAVA_STUB_NOTE], "api_calls": 1}, ensure_ascii=False, default=str)
         return f"== Overview\n{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')})\n== Data quality\n- {STRAVA_STUB_NOTE}"
-    athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
+    athlete_id = str(activity.get("icu_athlete_id") or default_athlete(config.athlete_id) or "")
     await resolve_gear_for_activity(activity, athlete_id=athlete_id or None)
     index = await get_custom_item_index(athlete_id=athlete_id) if athlete_id else {}
     field_defs, stream_defs, interval_defs = (index.get(t, {}) for t in (ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD))

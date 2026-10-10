@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
@@ -471,7 +472,7 @@ async def _custom_defs(
     The athlete is taken from the payload (``icu_athlete_id``) when given, otherwise
     from the configured ATHLETE_ID. Without an athlete there are no definitions.
     """
-    athlete_id_to_use = str(athlete_id) if athlete_id else config.athlete_id
+    athlete_id_to_use = str(athlete_id) if athlete_id else default_athlete(config.athlete_id)
     if not athlete_id_to_use:
         return {}
     index = await get_custom_item_index(athlete_id=athlete_id_to_use)
@@ -687,7 +688,7 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
             ACTIVITY_FIELD, activity_data.get("icu_athlete_id")
         )
         field_ids = await assigned_field_ids(
-            str(activity_data.get("icu_athlete_id") or config.athlete_id or ""), activity_data.get("type")
+            str(activity_data.get("icu_athlete_id") or default_athlete(config.athlete_id) or ""), activity_data.get("type")
         )
         assigned = assigned_codes(custom_field_defs, field_ids)
 
@@ -834,7 +835,7 @@ async def _planned_step_types(
     if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
         steps, source = planned_workout_doc["steps"], "workout document provided by the caller"
     elif activity.get("paired_event_id"):
-        athlete = str(activity.get("icu_athlete_id") or config.athlete_id or "")
+        athlete = str(activity.get("icu_athlete_id") or default_athlete(config.athlete_id) or "")
         event = await _get_event(athlete, activity["paired_event_id"]) if athlete else None
         if event:
             steps = (event.get("workout_doc") or {}).get("steps")
