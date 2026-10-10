@@ -31,7 +31,9 @@ config = get_config()
 ATHLETE_CACHE_TTL_S = 600
 _ATHLETE_CACHE: TTLCache[dict[str, Any]] = TTLCache(ATHLETE_CACHE_TTL_S)
 _SPORT_SETTINGS_CACHE: TTLCache[list[dict[str, Any]]] = TTLCache(ATHLETE_CACHE_TTL_S)
-# Athletes whose time zone lookup failed recently (not retried on every tool call).
+# The athlete's time zone (rarely changes) and lookups that failed recently (not retried on
+# every tool call).
+_TIMEZONE_CACHE: TTLCache[str] = TTLCache(24 * 3600)
 _TIMEZONE_FAILURES: TTLCache[bool] = TTLCache(300)
 
 # Fields of the athlete object that are safe and useful for coaching.
@@ -123,15 +125,27 @@ async def get_athlete_raw(
 
 
 async def athlete_timezone(athlete_id: str, api_key: str | None = None) -> str | None:
-    """IANA time zone of the athlete profile (cached with the profile); None when unknown."""
+    """IANA time zone of the athlete profile; None when unknown.
+
+    Cached for a day on its own (a sport-settings write does not drop it). Taken from an
+    already cached athlete object, otherwise from the lighter /profile endpoint.
+    """
     key = cache_key(athlete_id, api_key)
+    cached = _TIMEZONE_CACHE.get(key)
+    if cached:
+        return cached
     if _TIMEZONE_FAILURES.get(key):
         return None
-    athlete, error = await fetch_athlete(athlete_id, api_key)
+    athlete = _ATHLETE_CACHE.get(key)
     zone = athlete.get("timezone") if isinstance(athlete, dict) else None
-    if error or not zone:
+    if not zone:
+        result = await api_client.make_intervals_request(url=f"/athlete/{seg(athlete_id)}/profile", api_key=api_key)
+        profile = result.get("athlete") if isinstance(result, dict) and "error" not in result else None
+        zone = profile.get("timezone") if isinstance(profile, dict) else None
+    if not zone:
         _TIMEZONE_FAILURES.set(key, True)
         return None
+    _TIMEZONE_CACHE.set(key, str(zone))
     return str(zone)
 
 
@@ -596,7 +610,7 @@ _SETTING_LIMITS: dict[str, tuple[float, float, str]] = {
     "max_hr": (100, 230, "bpm"),
     "w_prime": (1000, 60000, "J"),
     "p_max": (300, 2500, "W"),
-    "threshold_pace": (0.5, 10.0, "m/s"),
+    "threshold_pace": (0.35, 10.0, "m/s"),  # 0.35 m/s = 4:46/100m (slow swim CSS)
 }
 
 # Distance in metres per pace unit ("4:30/km" = 1000 m in 270 s).
@@ -636,8 +650,10 @@ def parse_threshold_pace(value: Any, pace_units: Any) -> float | str:
 
 
 def _setting_value_text(name: str, value: Any, pace_units: Any) -> str:
-    if name == "threshold_pace" and isinstance(value, (int, float)):
-        return f"{value:.2f} m/s ({format_pace(value, pace_units)})"
+    if name == "threshold_pace" and isinstance(value, (int, float)) and value > 0:
+        suffix = _PACE_UNIT_SUFFIX.get(str(pace_units or "").upper(), "/km")
+        minutes, seconds = divmod(int(round(_PACE_DISTANCES[suffix] / value)), 60)
+        return f"{value:.2f} m/s ({minutes}:{seconds:02d}{suffix})"
     return str(value)
 
 
@@ -659,7 +675,7 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
     Only the values passed are sent; zones are NOT recalculated (the request asks Intervals.icu
     explicitly not to recalculate HR zones; the configured zone percentages/bpm stay, so check
     get_training_zones afterwards). Values are sanity-checked (FTP 50-600 W, LTHR 80-220 and
-    below max HR 100-230 bpm, W' 1000-60000 J, Pmax 300-2500 W, threshold pace 0.5-10 m/s).
+    below max HR 100-230 bpm, W' 1000-60000 J, Pmax 300-2500 W, threshold pace 0.35-10 m/s).
     Affects future analysis of every activity of the sport group (e.g. Ride) and the training
     load of new activities. Use only on explicit request of the athlete.
 
