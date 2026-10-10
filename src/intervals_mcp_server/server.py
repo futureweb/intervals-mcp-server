@@ -165,6 +165,10 @@ from intervals_mcp_server.tools.training_load import (  # pylint: disable=wrong-
 )
 from intervals_mcp_server.tools.intensity import get_intensity_distribution  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.durability import get_durability  # pylint: disable=wrong-import-position  # noqa: E402
+from intervals_mcp_server.tools.fatigue import (  # pylint: disable=wrong-import-position  # noqa: E402
+    get_long_ride_fatigue_profile,
+    get_submax_test_trends,
+)
 from intervals_mcp_server.tools.coach_context import get_coach_context  # pylint: disable=wrong-import-position  # noqa: E402
 from intervals_mcp_server.tools.workout_check import (  # pylint: disable=wrong-import-position  # noqa: E402
     preview_workout,
@@ -234,6 +238,8 @@ __all__ = [
     "get_load_projection",
     "get_intensity_distribution",
     "get_durability",
+    "get_long_ride_fatigue_profile",
+    "get_submax_test_trends",
     "get_coach_context",
     "preview_workout",
     "validate_workout",
