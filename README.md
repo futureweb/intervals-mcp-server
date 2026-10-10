@@ -139,7 +139,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_training_load` | Acute and chronic load, acute:chronic ratio, Foster monotony and strain (rest days as 0), deload-like weeks, per sport with the primary sport, ISO week table, CTL/ATL/form/ramp; device loads kept separate; reference ranges with sources, no verdict |
 | `get_intensity_distribution` | Three-zone distribution from power, HR or pace zones (mapping by zone count), polarization index after Treff et al. 2019, class, hard sessions and days, drift between the halves, per sport and week, zone coverage, a caveat when totals mix power and HR zones |
 | `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out |
-| `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned |
+| `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned. What-if simulation (`scenario`): sessions or weekly templates that are not in the calendar (load given or estimated as hours x IF² x 100), added to or replacing the plan, compared with the calendar plan; form at a target day or the next RACE_A and a grid search for the load of the last days that reaches a given form range; per-week plan statistics (ramp, monotony, longest session, rest days) with commonly cited ranges and sources. Nothing is written |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
 | `get_training_summary` | Totals per week, month, sport or gear with separate load sources and time in zones; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
@@ -212,6 +212,9 @@ final versions, beta tags such as `1.0.0b1` explicitly):
 ```bash
 docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:1.0.0b1
 ```
+
+With `MCP_AUTH=oauth` mount a volume on `/data` (the image keeps `OAUTH_STATE_FILE` there), e.g.
+`-v intervals-mcp:/data`; otherwise every re-created container disconnects all clients.
 
 ## Connect an AI client
 

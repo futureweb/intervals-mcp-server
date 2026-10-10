@@ -115,7 +115,10 @@ jobs:
         run: |
           docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" \
             python -c "import intervals_mcp_server.server; print('import ok')"
-          docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" python src/intervals_mcp_server/server.py --version
+          test "$(docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" futureweb-intervals-mcp --version)" = "$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)"
+          # --doctor reports a broken configuration (exit 1) instead of a traceback
+          out="$(docker run --rm -e MCP_PERMISSIONS=reed "${IMAGE_NAME}:ci" futureweb-intervals-mcp --doctor || true)"
+          echo "${out}" | grep -q "MCP_PERMISSIONS contains unknown class"
           test "$(docker run --rm "${IMAGE_NAME}:ci" id -u)" != "0"
 
   pylint:

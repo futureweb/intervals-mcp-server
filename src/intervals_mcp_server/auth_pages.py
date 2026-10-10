@@ -5,18 +5,27 @@
                                     ``action=password`` (password sign-in) or ``action=deny``
 ``GET  /oauth/intervals/callback``  return from Intervals.icu; checks the athlete
 
-The sign-in at Intervals.icu is bound to the browser that started it with an HttpOnly
-cookie, so a callback URL cannot be replayed in another browser.  Pages are served with
-``no-store``, a strict content security policy and frame protection.
+The consent form is bound to the browser that loaded it (CSRF protection): the consent
+page sets a random HttpOnly cookie and puts an HMAC of it and the request id into the
+form; a POST needs both, and a POST whose ``Origin`` or ``Sec-Fetch-Site`` names another
+site is refused.  A page elsewhere therefore cannot submit the consent (and pick the
+permissions) in the athlete's browser.  The sign-in at Intervals.icu is bound to the
+browser that started it with a second HttpOnly cookie, so a callback URL cannot be
+replayed in another browser.  Pages are served with ``no-store``, a strict content
+security policy and frame protection.
 """
 
 from __future__ import annotations
 
 import html
 import logging
-from collections.abc import Mapping
+import re
+import secrets
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
+import anyio
+import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -24,9 +33,12 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from intervals_mcp_server.auth import (
     INTERVALS_CALLBACK_PATH,
     LOGIN_PATH,
+    LOGIN_REQUEST_TTL,
     LoginError,
     SingleUserOAuthProvider,
+    client_key,
 )
+from intervals_mcp_server.auth_clients import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +46,16 @@ __all__ = ["install_routes"]
 
 COOKIE_NAME = "intervals_mcp_login"
 SECURE_COOKIE_NAME = "__Host-intervals_mcp_login"
+CSRF_COOKIE_NAME = "intervals_mcp_csrf"
+SECURE_CSRF_COOKIE_NAME = "__Host-intervals_mcp_csrf"
+CSRF_FIELD = "csrf"
+# The consent form is small; Starlette would otherwise parse bodies of any size.
+MAX_FORM_BYTES = 16 * 1024
+MAX_FORM_FIELDS = 50
+_BROWSER_VALUE = re.compile(r"[A-Za-z0-9_-]{32,64}")
+# Worker threads for the password hash: a sign-in flood queues here instead of filling the
+# shared pool that also writes the OAuth state file.
+HASH_THREADS = 4
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -45,7 +67,10 @@ _SECURITY_HEADERS = {
     ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    # same-origin (not no-referrer): with no-referrer browsers send "Origin: null" on the
+    # form POST, which the same-origin check below could not tell apart from a sandboxed
+    # frame. Cross-origin requests still get no referrer.
+    "Referrer-Policy": "same-origin",
 }
 
 _PERMISSION_TEXT = {
@@ -114,7 +139,9 @@ def _esc(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def _consent_body(provider: SingleUserOAuthProvider, request_id: str, username: str, error: str | None) -> str:
+def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    provider: SingleUserOAuthProvider, request_id: str, username: str, error: str | None, form_token: str
+) -> str:
     pending = provider.pending_login(request_id)
     assert pending is not None  # checked by the caller
     config = provider.config
@@ -135,8 +162,9 @@ def _consent_body(provider: SingleUserOAuthProvider, request_id: str, username: 
     parts = [
         f'<p><span class="client">{_esc(name)}</span>{badge} wants to access your Intervals.icu data through this server.</p>',
         f'<p class="note">Redirect after sign-in: {_esc(pending.redirect_host or "unknown")}</p>',
-        f'<form method="post" action="{LOGIN_PATH}" autocomplete="on">',
+        f'<form method="post" action="{_esc(urlsplit(config.login_url).path or LOGIN_PATH)}" autocomplete="on">',
         f'<input type="hidden" name="request" value="{_esc(request_id)}">',
+        f'<input type="hidden" name="{CSRF_FIELD}" value="{_esc(form_token)}">',
         "<fieldset><legend>Permissions for this connection</legend>" + "".join(perms) + "</fieldset>",
         f'<p class="error">{_esc(error)}</p>' if error else "",
     ]
@@ -170,17 +198,96 @@ def _consent_body(provider: SingleUserOAuthProvider, request_id: str, username: 
     return "".join(parts)
 
 
-def _form_value(form: Mapping[str, Any], key: str) -> str:
-    value = form.get(key)
-    return value if isinstance(value, str) else ""
+class _Form:
+    """The fields of a small urlencoded form."""
+
+    def __init__(self, fields: list[tuple[str, str]]) -> None:
+        self._fields = fields
+
+    def get(self, key: str) -> str:
+        """First value of *key*, or ``""``."""
+        return next((value for name, value in self._fields if name == key), "")
+
+    def getlist(self, key: str) -> list[str]:
+        """Every value of *key*."""
+        return [value for name, value in self._fields if name == key]
+
+
+class _FormError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+async def _read_form(request: Request) -> _Form:
+    """Read an urlencoded form of at most MAX_FORM_BYTES (the route has no other body limit)."""
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in ("", "application/x-www-form-urlencoded"):
+        raise _FormError(415, "Unsupported form encoding.")
+    declared = request.headers.get("content-length", "")
+    if declared and (not declared.isdigit() or int(declared) > MAX_FORM_BYTES):
+        raise _FormError(413, "The form is too large.")
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_FORM_BYTES:
+            raise _FormError(413, "The form is too large.")
+    try:
+        fields = parse_qsl(body.decode("utf-8"), keep_blank_values=True, max_num_fields=MAX_FORM_FIELDS)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _FormError(400, "The form could not be read.") from exc
+    return _Form(fields)
 
 
 def _login_key(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    return client_key(request.client.host if request.client else None)
+
+
+def _secure(provider: SingleUserOAuthProvider) -> bool:
+    return provider.config.public_url.startswith("https://")
 
 
 def _cookie_name(provider: SingleUserOAuthProvider) -> str:
-    return SECURE_COOKIE_NAME if provider.config.public_url.startswith("https://") else COOKIE_NAME
+    return SECURE_COOKIE_NAME if _secure(provider) else COOKIE_NAME
+
+
+def _csrf_cookie_name(provider: SingleUserOAuthProvider) -> str:
+    return SECURE_CSRF_COOKIE_NAME if _secure(provider) else CSRF_COOKIE_NAME
+
+
+def _browser_value(request: Request, provider: SingleUserOAuthProvider) -> str:
+    """The consent cookie of this browser, or ``""`` when it has none (or a malformed one)."""
+    value = request.cookies.get(_csrf_cookie_name(provider), "")
+    return value if _BROWSER_VALUE.fullmatch(value) else ""
+
+
+def _set_browser_cookie(response: Response, provider: SingleUserOAuthProvider, value: str) -> None:
+    response.set_cookie(
+        _csrf_cookie_name(provider),
+        value,
+        max_age=LOGIN_REQUEST_TTL,
+        path="/",
+        secure=_secure(provider),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _same_origin_post(request: Request, provider: SingleUserOAuthProvider) -> bool:
+    """Reject a POST that a browser marks as coming from another site.
+
+    Headers that are absent (non-browser clients, old browsers) do not fail the check;
+    the cookie-bound form token is required in any case.
+    """
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site.strip().lower() != "same-origin":
+        return False
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    if origin.strip() == "null":
+        return site is not None
+    return provider.config.same_origin(origin.strip())
 
 
 def _redirect(location: str, headers: dict[str, str] | None = None) -> RedirectResponse:
@@ -192,57 +299,100 @@ def _redirect(location: str, headers: dict[str, str] | None = None) -> RedirectR
 
 def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None:  # pylint: disable=too-many-statements
     """Register the consent page, the sign-in handlers and the Intervals.icu callback on *mcp*."""
+    hash_limiter = anyio.CapacityLimiter(HASH_THREADS)
+
+    def consent_page(request: Request, request_id: str, username: str, error: str | None, status: int) -> Response:
+        """The consent page with a form token bound to this browser's consent cookie."""
+        if provider.pending_login(request_id) is None:
+            # Expired or finished in another tab while the credentials were checked.
+            return _page(_INVALID_LINK, 400)
+        browser = _browser_value(request, provider) or secrets.token_urlsafe(32)
+        body = _consent_body(provider, request_id, username, error, provider.form_token(browser, request_id))
+        response = _page(body, status)
+        _set_browser_cookie(response, provider, browser)
+        return response
+
+    def error_page(message: str, status: int, headers: dict[str, str] | None = None) -> Response:
+        return _page(f'<p class="error">{_esc(message)}</p>', status, headers=headers)
 
     async def login_form(request: Request) -> Response:
         request_id = request.query_params.get("request", "")
         if provider.pending_login(request_id) is None:
             return _page(_INVALID_LINK, 400)
-        return _page(_consent_body(provider, request_id, provider.config.username, None), 200)
+        return consent_page(request, request_id, provider.config.username, None, 200)
 
-    async def login_submit(request: Request) -> Response:  # pylint: disable=too-many-return-statements
-        form = await request.form()
-        request_id = _form_value(form, "request")
+    async def login_submit(request: Request) -> Response:  # pylint: disable=too-many-return-statements,too-many-branches
+        try:
+            form = await _read_form(request)
+        except _FormError as exc:
+            return error_page(str(exc), exc.status)
+        request_id = form.get("request")
         pending = provider.pending_login(request_id)
         if pending is None:
             return _page(_INVALID_LINK, 400)
-        action = _form_value(form, "action") or ("apikey" if _form_value(form, "api_key") else "password")
-        if action == "deny":
-            return _redirect(provider.deny_login(request_id))
-        granted = provider.grant_for(pending, [v for v in form.getlist("grant") if isinstance(v, str)])
         key = _login_key(request)
+        if not _same_origin_post(request, provider):
+            logger.warning(
+                "Consent form posted from another site refused (origin %s, sec-fetch-site %s, from %s)",
+                log_safe(request.headers.get("origin", "-"), 80),
+                log_safe(request.headers.get("sec-fetch-site", "-"), 20),
+                key,
+            )
+            return error_page("This form can only be submitted from the sign-in page itself.", 403)
+        if not provider.check_form_token(_browser_value(request, provider), request_id, form.get(CSRF_FIELD)):
+            # No or another browser's consent cookie: show the page again in this browser.
+            logger.warning("Consent form without a valid form token from %s; page shown again", key)
+            message = "Please confirm again: this browser did not open the sign-in page (cookies are required)."
+            return consent_page(request, request_id, provider.config.username, message, 403)
+        action = form.get("action") or ("apikey" if form.get("api_key") else "password")
+        try:
+            if action == "deny":
+                return _redirect(provider.deny_login(request_id))
+            return await finish_submit(request, form, request_id, pending, action, key)
+        except LoginError as exc:
+            return error_page(str(exc), exc.status)
+
+    async def finish_submit(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+        request: Request, form: _Form, request_id: str, pending: Any, action: str, key: str
+    ) -> Response:
+        granted = provider.grant_for(pending, form.getlist("grant"))
+        retry_after = {"Retry-After": str(provider.config.login_rate_window)}
         if provider.login_blocked(key):
             logger.warning("Login rate limit reached for %s", key)
-            return _page(
-                '<p class="error">Too many failed sign-in attempts. Please try again later.</p>',
-                429,
-                headers={"Retry-After": str(provider.config.login_rate_window)},
-            )
+            return error_page("Too many failed sign-in attempts. Please try again later.", 429, retry_after)
         if action == "intervals" and "intervals" in provider.config.login_methods:
-            try:
-                location, browser = provider.begin_intervals_login(request_id, granted)
-            except LoginError as exc:
-                return _page(f'<p class="error">{_esc(str(exc))}</p>', exc.status)
-            secure = provider.config.public_url.startswith("https://")
+            location, browser = provider.begin_intervals_login(request_id, granted, key)
             response = _redirect(location)
             response.set_cookie(
-                _cookie_name(provider), browser, max_age=600, path="/", secure=secure, httponly=True, samesite="lax"
+                _cookie_name(provider), browser, max_age=600, path="/", secure=_secure(provider), httponly=True, samesite="lax"
             )
             return response
         if action not in ("password", "apikey") or action not in provider.config.login_methods:
-            return _page('<p class="error">This sign-in method is not enabled.</p>', 400)
-        username = _form_value(form, "username")
+            return error_page("This sign-in method is not enabled.", 400)
+        # Check and count the attempt before the threaded check (no await in between).
+        refused = provider.begin_local_login(key)
+        if refused is not None:
+            if refused == "global":
+                logger.warning("Global sign-in failure limit reached; %s sign-in from %s paused", action, key)
+            else:
+                logger.warning("Login rate limit reached for %s", key)
+            return error_page("Too many failed sign-in attempts. Please try again later.", 429, retry_after)
+        username = form.get("username")
         if action == "password":
-            valid = provider.verify_credentials(username, _form_value(form, "password"))
+            # PBKDF2 with 600k iterations takes ~0.3 s: keep it off the event loop.
+            valid = await anyio.to_thread.run_sync(
+                provider.verify_credentials, username, form.get("password"), limiter=hash_limiter
+            )
         else:
-            valid = provider.verify_api_key(_form_value(form, "api_key"))
-        # Evaluate the second factor even after a wrong first factor (no early exit).
-        second = provider.verify_second_factor(_form_value(form, "totp"))
+            valid = provider.verify_api_key(form.get("api_key"))
+        # Evaluate the second factor even after a wrong first factor (no early exit), but
+        # only use up the code when the first factor was right.
+        second = provider.verify_second_factor(form.get("totp"), consume=valid)
         if not (valid and second):
-            provider.record_login_failure(key)
             logger.warning("Failed %s sign-in from %s", action, key)
             message = "Invalid credentials or authenticator code." if provider.totp_required else "Invalid credentials."
-            body = _consent_body(provider, request_id, username or provider.config.username, message)
-            return _page(body, 401)
+            return consent_page(request, request_id, username or provider.config.username, message, 401)
+        provider.local_login_succeeded(key)
         return _redirect(provider.complete_login(request_id, key, granted))
 
     async def intervals_callback(request: Request) -> Response:

@@ -53,6 +53,123 @@ First public beta of the Futureweb fork. Based on upstream
   small samples; rides with fewer than 10 min of usable pairs are excluded with the reason. No correction factor is derived or applied. New optional parameters `activity_ids`,
   `start_date`, `end_date`, `limit`, `detail_level`, `athlete_id`.
 
+### Added (phase 6: plan simulation)
+- `get_load_projection` simulates what-if plans without writing anything (`scenario`): single
+  sessions with a load, or with `duration_min` and `intensity_factor` (load estimated as
+  hours x IF² x 100 and flagged as an estimate), and weekly templates (`weekly`: start, weeks,
+  weekly load or a list per week, or hours with an IF; sessions or weekdays, long day and its
+  share, sport). `calendar` adds them to the planned workouts, replaces the planned workouts
+  inside the scenario's span or ignores the calendar. Scenario and calendar plan are compared
+  day by day (full), per ISO week (load per sport, CTL, ATL, form, ramp) and at the end; the four
+  completed weeks before are summarised for comparison.
+- Target day (`target_date`, default the next RACE_A within 180 days): CTL, ATL and form at the
+  start of the day for the calendar plan and the scenario; with `target_form` (points or percent
+  of CTL) a grid search over the load of the last `taper_days` days (percent of the planned load,
+  or a constant weekly load) that puts the form into the range, with the CTL that goes with it.
+  Assumptions are listed (time constants 42/7 d, sessions done as listed, no illness).
+- Plan statistics per ISO week for the calendar plan and the scenario: sessions, hours, longest
+  session (and its share of the race's planned duration), rest days and monotony; weeks with a
+  CTL ramp above 5-8 per week (Friel 2015), monotony above 2.0 (Foster 1998) or no rest day
+  (Meeusen et al. 2013) are listed as outside the commonly cited range, nothing more. Identical
+  daily loads (monotony undefined, maximal) are flagged too; weeks without durations say "hours n/a".
+- `get_load_projection` reports race days at the start of the day (before the race's own load),
+  like the target day; days, weeks, the end and the lowest form are labelled as end-of-day values
+  (JSON `value_basis`, races `basis`).
+
+### Security (review findings)
+- OAuth: refreshing a token with a narrower scope (for example only `mcp`) keeps the grant's
+  permission scopes; a token without any `intervals:*` scope is read-only and never falls back
+  to the server-wide `MCP_PERMISSIONS`.
+- `/register` (dynamic client registration, reachable without credentials) limits `client_name`
+  to 100 printable characters, `redirect_uris` to 10 and the whole metadata to 8 KB; client-supplied
+  values are escaped and clipped in log lines, and the server logs through a plain stream handler
+  instead of the SDK's rich handler (whose rendering time grows quadratically with long tokens).
+- OAuth consent page: the form only accepts a submission from the browser that opened it. The page
+  sets an HttpOnly consent cookie (`__Host-` prefixed on https) and the form carries an HMAC bound
+  to it and to the sign-in request; a POST whose `Origin` or `Sec-Fetch-Site` names another site is
+  refused. Previously another web page could submit the consent (and pick all permissions) in the
+  athlete's browser when the Intervals.icu sign-in was enabled. The pages now send
+  `Referrer-Policy: same-origin` (no form-action CSP, which would block the redirects).
+- The consent form body is limited to 16 KB / 50 fields; `/register` accepts at most 10
+  registrations per client address and hour, and a client in the middle of its consent is no
+  longer evicted from the 50-client table.
+- Pending sign-ins and Intervals.icu sign-ins in progress are capped per client address (IPv4
+  address or IPv6 /64, 20 each), and a full table drops the oldest entry of the busiest address
+  inside the busiest network (IPv6 per /48); a flood of `/authorize` requests from one address or
+  network (also one sharing the athlete's /48) can no longer push out the athlete's own pending
+  sign-in.
+- Client metadata documents: bounded cache (256 documents, rejected ones evicted first), one
+  shared fetch per document, at most 10 fetches per minute for unknown client ids (pinned ids,
+  ids accepted before and ids holding a refresh token - loaded from the state file at startup -
+  are exempt, so random client ids cannot keep ChatGPT's document from being fetched), a known
+  document is kept for up to a day while its host is unreachable, and client ids with a query
+  string, percent-encoding, dot or empty segments, control characters or more than 512
+  characters are refused (an invalid URL gave HTTP 500). A document's redirect URIs must stay on
+  its own host, another allowlisted host or loopback.
+- `OAUTH_CLIENT_HOSTS` and `OAUTH_REDIRECT_HOSTS` accept `host/path` entries (exactly that path)
+  and `host/path/` entries (every path below it) in addition to hosts; redirect URIs of
+  dynamically registered clients may not contain a query string.
+- `/token` and `/revoke` accept only `application/x-www-form-urlencoded` bodies with each
+  parameter once (RFC 6749); a `multipart/form-data` body, which the SDK would have parsed,
+  could otherwise skip the client assertion check.
+- Refresh tokens: a rotated refresh token presented again within `OAUTH_REFRESH_REUSE_GRACE`
+  seconds (default 120) gets the same answer again once that answer is stored (retry after a
+  lost response, concurrent refreshes), so a grant never forks into parallel chains; presented later it revokes the whole
+  grant (RFC 9700 reuse detection; `OAUTH_REFRESH_REUSE_REVOKE=false` only refuses the request).
+  A client whose metadata document declares `private_key_jwt` (ChatGPT) must send its client
+  assertion with every token request (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified
+  from the production journal that ChatGPT signs its code and refresh requests). Verified
+  assertions are logged at INFO. A refresh narrowed to permission scopes keeps `mcp`.
+- Sign-in: the PBKDF2 password check runs in a worker thread (its own pool of 4) instead of
+  blocking the event loop for 0.3 s per attempt; an attempt is counted before the check, so a
+  concurrent burst from one address gets no more checks than the limit; failed password /
+  API-key sign-ins also count against a global budget (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`, default
+  500 per 15 minutes; with TOTP it never pauses a sign-in, so others cannot lock the athlete
+  out); the per-address limit groups IPv6 addresses by /64 and its table is bounded; an
+  authenticator code is only used up when the password or API key was right.
+- `get_server_status` no longer tells connected clients the OAuth user name, password source,
+  allowed athletes, state file path, bind address, port or SSE path (a secret path is a
+  credential); `--doctor` on the server still shows them.
+- Logging: uvicorn's access log keeps query parameter names but drops their values (the
+  Intervals.icu callback code, the sign-in request id, SSE session ids); request bodies are no
+  longer logged at DEBUG and Intervals.icu error bodies are shortened; httpx's per-request INFO
+  lines are off unless `FASTMCP_LOG_LEVEL=DEBUG`. The documentation no longer claims that no
+  log contains codes (the reverse proxy's does unless configured, see `docs/REMOTE_ACCESS.md`).
+- Docker base images are pinned by digest (Dependabot updates them).
+
+### Fixed (review findings: operations)
+- OAuth state file: written in a worker thread and only committed to memory once the write
+  succeeded (a full disk no longer loses the refresh token or authorization code of the request,
+  the client can retry); the directory is fsynced after the rename; the server checks at startup
+  that the directory is writable.
+- A state file that cannot be used (not JSON, wrong structure, written by a newer version) stops
+  the server with a one-line error and is never overwritten or moved; entries that the current
+  SDK cannot read are kept in the file unchanged instead of crashing the server. The format stays
+  version 1; existing files load unchanged.
+- New command line front end (`futureweb-intervals-mcp`, also used by
+  `python src/intervals_mcp_server/server.py`): `--version` and `--help` work with a broken
+  configuration, unknown flags are refused, `--doctor` lists every configuration problem
+  (permissions, transport, port range, log level, path settings, OAuth settings, state file)
+  without starting anything, and a configuration error at startup is reported in one line
+  (exit code 2) instead of a traceback. A network transport without `API_KEY` / `ATHLETE_ID`
+  logs a warning.
+- `FASTMCP_PORT` must be 1-65535, `FASTMCP_LOG_LEVEL` a known level and the path settings must
+  start with `/`.
+- `MCP_PUBLIC_URL` with a path: the protected resource metadata is served once, at the path the
+  SDK advertises, with the permission scopes (previously a second document without them was
+  added at the root), and the consent form posts to the prefixed path.
+- An Intervals.icu sign-in whose request was denied or expired while Intervals.icu answered
+  shows the "expired" page instead of HTTP 500.
+- Docker image: runs the `futureweb-intervals-mcp` console script from the installed package
+  (no second copy of the sources), keeps the OAuth state in `/data` (mount a volume), and has a
+  health check for the network transports.
+- Release workflow: the GitHub release is created only after the image was pushed, one run per
+  tag at a time, and the tag must also match `__version__` (a test checks it against
+  `pyproject.toml`).
+- Dependencies: floors raised to the security-updated versions (`mcp>=1.30`, `httpx>=0.28.1`,
+  `starlette>=1.7`, `python-multipart>=0.0.32`), direct imports (`starlette`, `uvicorn`, `anyio`)
+  declared, and the unused `mcp[cli]` extra (typer) dropped.
+
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list
   (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count
