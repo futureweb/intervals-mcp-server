@@ -76,6 +76,7 @@ from intervals_mcp_server.tools.fatigue import get_long_ride_fatigue_profile, ge
 from intervals_mcp_server.tools.coach_context import get_coach_context  # noqa: F401
 from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: F401
 from intervals_mcp_server.tools.status import get_server_status  # noqa: F401
+from intervals_mcp_server.tools.guide import get_guide  # noqa: F401
 from intervals_mcp_server.tools.training_review import (  # noqa: F401
     get_plan_compliance,
     get_weekly_summary,
@@ -163,6 +164,7 @@ __all__ = [
     "preview_workout",
     "validate_workout",
     "get_server_status",
+    "get_guide",
     "get_wellness_data",
     "get_weekly_summary",
     "get_plan_compliance",

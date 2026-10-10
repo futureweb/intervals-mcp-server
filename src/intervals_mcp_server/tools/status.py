@@ -20,9 +20,10 @@ from intervals_mcp_server.auth import auth_status_from_env
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INPUT_FIELD, INTERVAL_FIELD
+from intervals_mcp_server.utils.params import OutputFormat
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import disabled_tools, mcp, tool, tool_permissions
+from intervals_mcp_server.mcp_instance import disabled_tools, mcp, tool, tool_permissions, tools_outside_toolset
 
 config = get_config()
 
@@ -44,15 +45,18 @@ async def server_status(include_private: bool = False) -> dict[str, Any]:
     """
     permissions = tool_permissions()
     hidden = disabled_tools()
-    registered = {name: cls for name, cls in permissions.items() if name not in hidden}
+    outside = tools_outside_toolset()
+    registered = {name: cls for name, cls in permissions.items() if name not in hidden and name not in outside}
     status: dict[str, Any] = {
         "version": _package_version(),
         "permissions_enabled": sorted(config.permissions),
+        "toolset": config.toolset,
         "tools_registered": len(registered),
         "tools_by_class": {
             cls: sorted(n for n, c in registered.items() if c == cls) for cls in ("read", "write", "destructive", "admin")
         },
         "tools_hidden": hidden,
+        "tools_outside_toolset": sorted(outside),
         "transport": os.getenv("MCP_TRANSPORT", "stdio"),
         "auth": auth_status_from_env(include_private=include_private),
         "athlete_id_configured": bool(config.athlete_id),
@@ -100,13 +104,15 @@ def format_status(status: dict[str, Any]) -> str:
     lines = [
         f"Futureweb Intervals MCP {status['version']}",
         f"Permissions enabled: {', '.join(status['permissions_enabled'])} (MCP_PERMISSIONS); "
-        f"{status['tools_registered']} tools registered",
+        f"tool set {status.get('toolset', 'full')} (MCP_TOOLSET); {status['tools_registered']} tools registered",
     ]
     for cls, names in status["tools_by_class"].items():
         if names:
             lines.append(f"  {cls}: {', '.join(names)}")
     if status["tools_hidden"]:
         lines.append("  hidden (class not enabled): " + ", ".join(f"{n} [{c}]" for n, c in sorted(status["tools_hidden"].items())))
+    if status.get("tools_outside_toolset"):
+        lines.append(f"  outside the tool set: {len(status['tools_outside_toolset'])} tools (MCP_TOOLSET=full shows them)")
     auth = status.get("auth") or {}
     where = ""
     if "host" in status:
@@ -141,18 +147,8 @@ def format_status(status: dict[str, Any]) -> str:
 
 
 @tool("read")
-async def get_server_status(output_format: str = "text") -> str:
-    """Diagnostics: server version, enabled permission classes, registered tools, API reachability
-
-    Shows which tool classes are enabled (read / write / destructive / admin), which tools
-    are hidden because their class is disabled, the transport configuration, whether an
-    athlete and API key are configured, whether Intervals.icu answers, and how many custom
-    activity fields, streams, interval fields and wellness fields the account defines
-    (a sync bridge typically adds streams such as stamina). The API key is never shown.
-
-    Args:
-        output_format: "text" (default) or "json"
-    """
+async def get_server_status(output_format: OutputFormat = "text") -> str:
+    """Use to check the connection when tools are missing or fail: server version, enabled permission classes and tool set, registered and hidden tools, whether Intervals.icu answers, and the athlete's custom field and stream counts. The API key is never shown."""
     status = await server_status()
     if output_format.strip().lower() == "json":
         return json.dumps(status, ensure_ascii=False)
@@ -287,34 +283,6 @@ def workout_planning_validation(start_date: str = "") -> str:
 
 
 # ------------------------------------------------------------------ resources
-@mcp.resource("intervals://guide")
-def usage_guide() -> str:
-    """How to use this server: tool groups, recommended call order and conventions."""
-    return (
-        "Futureweb Intervals MCP usage guide\n"
-        "1. Start with get_server_status to see enabled tool classes and custom item counts. For a weekly analysis the "
-        "recommended first call is get_coach_context (load, intensity, recovery, durability, plan and method in about 2k "
-        "characters); go to the detail tools below only where needed.\n"
-        "2. One activity: get_activity_report (compact, 3-4 API calls) then get_activity_details, "
-        "get_activity_intervals(detail_level='compact'), get_best_efforts, compare_power_streams, analyze_climbs as needed.\n"
-        "3. Streams: list_activity_streams first, then get_activity_streams with output_format='full', slicing and downsample.\n"
-        "4. Recovery: get_recovery_snapshot, get_wellness_trends, get_nutrition_summary.\n"
-        "5. Periods: get_training_summary (week/month/sport/gear), get_weekly_summary, get_plan_compliance, "
-        "compare_workouts, get_power_hr_efficiency, get_fatigue_resistance, curves.\n"
-        "5a. Load and intensity: get_coach_context first (compact weekly overview) then get_training_load (ACWR, monotony, "
-        "strain, deload weeks), get_intensity_distribution (three zones, polarization index, hard days), get_durability "
-        "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts; with scenario a "
-        "what-if plan that is not written to the calendar, target_date/target_form for the form on race day).\n"
-        "6. Planning: get_sport_settings / get_training_zones, get_training_plan, get_workout_library, "
-        "validate_workout, then (if the write class is enabled) add_or_update_event.\n"
-        "Conventions: times are local (timezone name when stored, else the UTC offset) and UTC; run/walk/hike "
-        "cadence in steps per minute (spm = 2 x the stored per-leg value, shown as stored), bike cadence in rpm; "
-        "temperatures in °C; 'no value' = null/NaN; a 0 in a device-file field may "
-        "mean the source field was absent; Intervals.icu load is never mixed with device loads; custom fields come "
-        "from the athlete's own definitions; most tools accept output_format='json' and detail_level.\n"
-    )
-
-
 @mcp.resource("intervals://custom-items")
 async def custom_items_resource() -> str:
     """The athlete's custom item definitions (codes, names, units, types) as compact JSON."""

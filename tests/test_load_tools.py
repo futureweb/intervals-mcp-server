@@ -399,12 +399,13 @@ def test_new_tools_are_read_only_and_prompt():
 
 def test_coach_context_is_the_recommended_first_call():
     """Phase 5 (I): the guide and both weekly prompts make get_coach_context the first call."""
-    from intervals_mcp_server.tools.status import usage_guide, weekly_training_review  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.guides import guide_text  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tools.status import weekly_training_review  # pylint: disable=import-outside-toplevel
 
     assert "Call get_coach_context first" in training_load_review()
     assert "Call get_coach_context first" in weekly_training_review()
-    guide = usage_guide()
-    assert "For a weekly analysis the recommended first call is get_coach_context" in guide
+    guide = " ".join(guide_text("usage").split())
+    assert "For a weekly analysis the recommended first call is `get_coach_context`" in guide
     assert guide.index("get_coach_context") < guide.index("get_activity_report")
     assert "cadence in steps per minute" in guide
 

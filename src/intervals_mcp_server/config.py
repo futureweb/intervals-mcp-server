@@ -7,6 +7,7 @@ This module handles loading and validation of configuration from environment var
 import os
 from dataclasses import dataclass, field
 
+from intervals_mcp_server.toolsets import DEFAULT_TOOLSET, parse_toolset
 from intervals_mcp_server.utils.validation import validate_athlete_id
 
 # Try to load environment variables from .env file if it exists
@@ -20,7 +21,7 @@ except ImportError:
 
 
 @dataclass
-class Config:
+class Config:  # pylint: disable=too-many-instance-attributes
     """Configuration settings for the Intervals.icu MCP Server."""
 
     api_key: str
@@ -35,6 +36,8 @@ class Config:
     custom_aggregate_overrides: dict[str, str] = field(default_factory=dict)
     # Enabled tool permission classes (MCP_PERMISSIONS="read,write"); default read-only.
     permissions: frozenset[str] = frozenset({"read"})
+    # Tool set (MCP_TOOLSET="full" or "core"); see toolsets.py.
+    toolset: str = DEFAULT_TOOLSET
 
 
 _config_instance: Config | None = None  # pylint: disable=invalid-name
@@ -48,7 +51,7 @@ def load_config() -> Config:
         Config: Configuration instance with loaded values.
 
     Raises:
-        ValueError: If athlete_id is invalid (when non-empty).
+        ValueError: If athlete_id is invalid (when non-empty), MCP_PERMISSIONS or MCP_TOOLSET unknown.
     """
     api_key = os.getenv("API_KEY", "")
     athlete_id = os.getenv("ATHLETE_ID", "")
@@ -67,6 +70,7 @@ def load_config() -> Config:
         custom_units_overrides=parse_units_overrides(os.getenv("CUSTOM_UNITS_OVERRIDES", "")),
         custom_aggregate_overrides=parse_units_overrides(os.getenv("CUSTOM_AGGREGATE_OVERRIDES", "")),
         permissions=parse_permissions(os.getenv("MCP_PERMISSIONS", "read")),
+        toolset=parse_toolset(os.getenv("MCP_TOOLSET", "")),
     )
 
 
