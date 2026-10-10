@@ -312,7 +312,7 @@ def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-ar
     return notes
 
 
-async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str | None, field_defs: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+async def _route_history(activity: dict[str, Any], athlete_id: str, field_defs: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     """Earlier activities on the activity's Intervals.icu route (one list request, one for the route name)."""
     route_id = activity.get("route_id")
     if not route_id or not athlete_id:
@@ -320,13 +320,13 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str
     pairs = start_end_pairs(field_defs)
     codes = sorted({code for start, end, _ in pairs for code in (start, end)})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{athlete_id}/activities",
         params={"oldest": "2000-01-01", "newest": str(activity.get("start_date_local") or "")[:10], "route_id": route_id,
                 "limit": MAX_ROUTE_HISTORY + 1, "fields": ",".join([ROUTE_FIELDS, *codes])},
     )
     candidates = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
     history = route_history(activity, candidates, pairs, truncated=len(candidates) >= MAX_ROUTE_HISTORY + 1)
-    route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}", api_key=api_key)
+    route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}")
     history["route_name"] = route.get("name") if isinstance(route, dict) and "error" not in route else None
     if isinstance(result, dict) and "error" in result:
         history["error"] = result.get("message")
@@ -336,7 +336,6 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str
 @tool("read")
 async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,too-many-return-statements
     activity_id: str,
-    api_key: str | None = None,
     planned_workout_doc: dict[str, Any] | None = None,
     include_climbs: bool | None = None,
     output_format: str = "text",
@@ -369,7 +368,6 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         planned_workout_doc: Workout document with "steps" to compare against when the calendar
             event no longer exists (optional)
         include_climbs: Force (True) or suppress (False) the climb section; default: only when
@@ -387,7 +385,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
         return tolerances
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -399,14 +397,14 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
                                "strava_stub": True, "notes": [STRAVA_STUB_NOTE], "api_calls": 1}, ensure_ascii=False, default=str)
         return f"== Overview\n{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')})\n== Data quality\n- {STRAVA_STUB_NOTE}"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    await resolve_gear_for_activity(activity, athlete_id=athlete_id or None, api_key=api_key)
-    index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key) if athlete_id else {}
+    await resolve_gear_for_activity(activity, athlete_id=athlete_id or None)
+    index = await get_custom_item_index(athlete_id=athlete_id) if athlete_id else {}
     field_defs, stream_defs, interval_defs = (index.get(t, {}) for t in (ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD))
-    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, activity.get("type")))
     sport = str(activity.get("type") or "")
-    expected = (await expected_field_codes(athlete_id, api_key, field_defs, [sport])).get(sport) if athlete_id and sport else assigned
+    expected = (await expected_field_codes(athlete_id, field_defs, [sport])).get(sport) if athlete_id and sport else assigned
 
-    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
     intervals_payload = intervals_result if isinstance(intervals_result, dict) and "error" not in intervals_result else {}
     intervals = [i for i in intervals_payload.get("icu_intervals") or [] if isinstance(i, dict)]
 
@@ -415,7 +413,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     if "watts" in available:
         wanted.append("w_bal")  # computed by Intervals.icu on request; silently omitted without W′ data
     streams_result = await make_intervals_request(
-        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params={"types": ",".join(wanted)}
+        url=f"/activity/{seg(activity_id)}/streams", params={"types": ",".join(wanted)}
     )
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
     w_bal = find_stream(streams, "w_bal")
@@ -429,7 +427,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
         doc, plan_source = planned_workout_doc, "workout document provided by the caller"
     elif activity.get("paired_event_id") and athlete_id:
-        event = await _get_event(athlete_id, activity["paired_event_id"], api_key)
+        event = await _get_event(athlete_id, activity["paired_event_id"])
         if event:
             doc = event.get("workout_doc") or {}
             plan_source = f"event {event.get('id')} ('{event.get('name')}')"
@@ -446,7 +444,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     climbs = _climb_summary(streams, activity.get("type"), None if detail_level == "full" else MAX_CLIMBS) if want_climbs and streams else None
     notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution,
                            provenance_notes(activity, field_defs, expected, intervals, compact=detail_level == "compact"))
-    route, route_calls = await _route_history(activity, athlete_id, api_key, field_defs) if include_route_history else (None, 0)
+    route, route_calls = await _route_history(activity, athlete_id, field_defs) if include_route_history else (None, 0)
     # An API error is not "no intervals" / "file not retained": say what failed (API-7).
     notes = [_load_error_note(note, intervals_result, streams_result) for note in notes]
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)

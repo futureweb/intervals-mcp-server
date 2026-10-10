@@ -316,7 +316,6 @@ def _activity_gear_id(activity: dict[str, Any]) -> str:
 
 async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
     athlete_id: str,
-    api_key: str | None,
     dates: tuple[str, str],
     limit: int,
     include_unnamed: bool,
@@ -340,7 +339,7 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
     params: dict[str, Any] = {"oldest": dates[0], "newest": dates[1]}
     if detail_level == "compact" or output_format == "json":
         params["fields"] = ACTIVITY_LIST_FIELDS
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", params=params)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activities: {result.get('message', 'Unknown error')}"
     activities = _in_window(_parse_activities_from_result(result), dates[0], dates[1])
@@ -356,7 +355,7 @@ async def _list_activities_filtered(  # pylint: disable=too-many-arguments,too-m
         activities = [a for a in activities if needle in str(a.get("power_meter") or "").lower()]
     total = len(activities)
     page = _sort_activities(activities, sort_by)[offset : offset + limit]
-    await resolve_gear_for_activities(page, athlete_id=athlete_id, api_key=api_key)
+    await resolve_gear_for_activities(page, athlete_id=athlete_id)
     filters = ", ".join(
         f for f in (f"types {sport_types}" if sport_types else "", f"gear {gear_id}" if gear_id else "",
                     f"power meter contains '{power_meter}'" if power_meter else "", f"sort {sort_by}") if f
@@ -449,7 +448,7 @@ def _format_activities_response(
 
 
 async def _custom_defs(
-    item_type: str, api_key: str | None, athlete_id: Any = None
+    item_type: str, athlete_id: Any = None
 ) -> CustomFieldDefs:
     """Custom item definitions of one type for the athlete (cached per process).
 
@@ -459,7 +458,7 @@ async def _custom_defs(
     athlete_id_to_use = str(athlete_id) if athlete_id else config.athlete_id
     if not athlete_id_to_use:
         return {}
-    index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
+    index = await get_custom_item_index(athlete_id=athlete_id_to_use)
     return index.get(item_type, {})
 
 
@@ -494,12 +493,11 @@ def _stream_request_params(
 
 
 async def _fetch_streams(
-    activity_id: str, api_key: str | None, params: dict[str, str] | None
+    activity_id: str, params: dict[str, str] | None
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch streams for an activity. Returns (streams, error_message)."""
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}/streams",
-        api_key=api_key,
         params=params,
     )
 
@@ -516,7 +514,6 @@ async def _fetch_streams(
 @tool("read")
 async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches,too-many-positional-arguments,too-many-locals
     athlete_id: str | None = None,
-    api_key: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 10,
@@ -537,7 +534,6 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
         end_date: End date in YYYY-MM-DD format (optional, defaults to today)
         limit: Maximum number of activities to return per page (optional, defaults to 10)
@@ -560,7 +556,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
     if any((sport_types, gear_id, power_meter, sort_by != "date_desc", offset, detail_level != "summary", output_format != "text")):
         return await _list_activities_filtered(
-            athlete_id_to_use, api_key, (start_date, end_date), limit, include_unnamed,
+            athlete_id_to_use, (start_date, end_date), limit, include_unnamed,
             sport_types, gear_id, sort_by, offset, detail_level, output_format, power_meter,
         )
 
@@ -570,7 +566,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
     # Call the Intervals.icu API
     params = {"oldest": start_date, "newest": end_date, "limit": api_limit}
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", params=params
     )
 
     # Check for error
@@ -596,7 +592,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
         named = _filter_named_activities(activities)
         if len(named) < limit and len(raw) >= api_limit:
             whole = await make_intervals_request(
-                url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key,
+                url=f"/athlete/{seg(athlete_id_to_use)}/activities",
                 params={"oldest": start_date, "newest": end_date},
             )
             if isinstance(whole, list):
@@ -615,7 +611,7 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
     # Resolve gear names (in-place injection of `_resolved_gear_name`)
     await resolve_gear_for_activities(
-        activities, athlete_id=athlete_id_to_use, api_key=api_key
+        activities, athlete_id=athlete_id_to_use
     )
 
     return _format_activities_response(activities, athlete_id_to_use, include_unnamed, note)
@@ -624,7 +620,6 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 @tool("read")
 async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
     activity_id: str,
-    api_key: str | None = None,
     include_custom_fields: bool = True,
     include_all_fields: bool = False,
     output_format: str = "text",
@@ -643,7 +638,6 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         include_custom_fields: Include the custom activity fields section (optional, default True)
         include_all_fields: Also list every other non-empty field of the raw activity payload
             that is not part of the standard summary, e.g. time in zones, running dynamics,
@@ -657,7 +651,7 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
     if detail_level not in DETAIL_LEVELS_3:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
     # Call the Intervals.icu API
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -674,17 +668,17 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
 
     # Resolve gear name against the activity owner's catalog (falls back to ATHLETE_ID)
     await resolve_gear_for_activity(
-        activity_data, athlete_id=activity_data.get("icu_athlete_id"), api_key=api_key
+        activity_data, athlete_id=activity_data.get("icu_athlete_id")
     )
 
     custom_field_defs: CustomFieldDefs | None = None
     assigned: set[str] | None = None
     if include_custom_fields:
         custom_field_defs = await _custom_defs(
-            ACTIVITY_FIELD, api_key, activity_data.get("icu_athlete_id")
+            ACTIVITY_FIELD, activity_data.get("icu_athlete_id")
         )
         field_ids = await assigned_field_ids(
-            str(activity_data.get("icu_athlete_id") or config.athlete_id or ""), api_key, activity_data.get("type")
+            str(activity_data.get("icu_athlete_id") or config.athlete_id or ""), activity_data.get("type")
         )
         assigned = assigned_codes(custom_field_defs, field_ids)
 
@@ -807,9 +801,9 @@ def _fmt_short(value: Any) -> str:
     return f"{value:.0f}" if float(value).is_integer() or abs(value) >= 100 else f"{value:.1f}"
 
 
-async def _activity_payload(activity_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
+async def _activity_payload(activity_id: str) -> tuple[dict[str, Any] | None, str | None]:
     """The activity (for its sport, thresholds and owner) and why it could not be loaded."""
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return None, str(result.get("message", "Unknown error"))
     activity = result[0] if isinstance(result, list) and result else result
@@ -819,7 +813,7 @@ async def _activity_payload(activity_id: str, api_key: str | None) -> tuple[dict
 
 
 async def _planned_step_types(
-    activity: dict[str, Any] | None, intervals: list[dict[str, Any]], api_key: str | None, planned_workout_doc: dict[str, Any] | None
+    activity: dict[str, Any] | None, intervals: list[dict[str, Any]], planned_workout_doc: dict[str, Any] | None
 ) -> tuple[dict[int, dict[str, Any]], str]:
     """Planned step matched to each interval index (alignment by order, duration and target) and the plan source."""
     from intervals_mcp_server.tools.analysis import _get_event, _threshold_context  # pylint: disable=import-outside-toplevel,protected-access
@@ -832,7 +826,7 @@ async def _planned_step_types(
         steps, source = planned_workout_doc["steps"], "workout document provided by the caller"
     elif activity.get("paired_event_id"):
         athlete = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-        event = await _get_event(athlete, activity["paired_event_id"], api_key) if athlete else None
+        event = await _get_event(athlete, activity["paired_event_id"]) if athlete else None
         if event:
             steps = (event.get("workout_doc") or {}).get("steps")
             source = f"event {event.get('id')} ('{event.get('name')}')"
@@ -860,7 +854,6 @@ def _plan_mapping_lines(intervals: list[dict[str, Any]], mapping: dict[int, dict
 @tool("read")
 async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
     activity_id: str,
-    api_key: str | None = None,
     stream_types: str | None = None,
     include_custom_fields: bool = True,
     output_format: str = "text",
@@ -888,7 +881,6 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         stream_types: Comma-separated stream types to evaluate per interval, e.g.
             "Stamina,PotentialStamina,secondary_power"; "custom" = every custom stream of the
             activity plus secondary_power; "all" = every stream. Use list_activity_streams to
@@ -913,7 +905,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
     if detail_level == "full" and not stream_types:
         stream_types = "custom"
     # Call the Intervals.icu API
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -938,20 +930,20 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
 
     # The intervals carry no sport and no athlete: the activity tells how to show cadence (steps
     # per minute on foot) and whose custom definitions label the fields (the owner, e.g. for a coach).
-    activity, activity_error = await _activity_payload(activity_id, api_key)
+    activity, activity_error = await _activity_payload(activity_id)
     activity_type = activity.get("type") if activity else None
     owner = activity.get("icu_athlete_id") if activity else None
 
     interval_field_defs: CustomFieldDefs = {}
     if include_custom_fields:
-        interval_field_defs = await _custom_defs(INTERVAL_FIELD, api_key, owner)
+        interval_field_defs = await _custom_defs(INTERVAL_FIELD, owner)
 
     streams: list[dict[str, Any]] | None = None
     stream_defs: CustomFieldDefs = {}
     note = ""
     if stream_types:
         streams, error = await _fetch_streams(
-            activity_id, api_key, _stream_request_params(stream_types, ensure_time=True)
+            activity_id, _stream_request_params(stream_types, ensure_time=True)
         )
         if error:
             note = f"\nNote: stream metrics unavailable. {error}\n"
@@ -965,7 +957,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             elif selector != "all":
                 requested = set(_split_stream_types(stream_types)) | {"time"}
                 streams = [s for s in streams if s.get("type") in requested]
-            stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key, owner)
+            stream_defs = await _custom_defs(ACTIVITY_STREAM, owner)
     if activity_error:
         note += (
             f"\nNote: the activity itself could not be loaded ({activity_error}); cadence is shown as stored "
@@ -976,7 +968,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
     plan_source = ""
     if include_planned_types or planned_workout_doc:
         plan_map, plan_source = await _planned_step_types(
-            activity, [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)], api_key, planned_workout_doc
+            activity, [i for i in result.get("icu_intervals") or [] if isinstance(i, dict)], planned_workout_doc
         )
 
     if output_format.strip().lower() == "json":
@@ -1121,7 +1113,6 @@ def _render_stream_rows(  # pylint: disable=too-many-arguments,too-many-position
 @tool("read")
 async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     activity_id: str,
-    api_key: str | None = None,
     stream_types: str | None = None,
     output_format: str = "summary",
     start_index: int | None = None,
@@ -1145,7 +1136,6 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         stream_types: Comma-separated stream types to retrieve, or "all" for every stream of
             the activity (optional, defaults to time,watts,heartrate,cadence,altitude,distance,velocity_smooth)
         output_format: "summary" (default) = per-stream metadata, statistics and a short preview;
@@ -1174,16 +1164,16 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
     max_points = min(max_points, MAX_STREAM_POINTS)
 
     params = _stream_request_params(stream_types, ensure_time=output_format != "summary")
-    streams, error = await _fetch_streams(activity_id, api_key, params)
+    streams, error = await _fetch_streams(activity_id, params)
     if error:
         return error
 
     owner = None
     if any(s.get("custom") for s in streams):
         # Custom streams are labelled with the definitions of the activity's owner.
-        activity, _ = await _activity_payload(activity_id, api_key)
+        activity, _ = await _activity_payload(activity_id)
         owner = activity.get("icu_athlete_id") if activity else None
-    stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key, owner)
+    stream_defs = await _custom_defs(ACTIVITY_STREAM, owner)
 
     if output_format == "summary":
         return format_streams_summary(activity_id, streams, stream_defs)
@@ -1245,7 +1235,6 @@ def _format_stream_listing(
 @tool("read")
 async def list_activity_streams(
     activity_id: str,
-    api_key: str | None = None,
     include_stats: bool = False,
 ) -> str:
     """List every data stream available for an activity on Intervals.icu
@@ -1259,11 +1248,10 @@ async def list_activity_streams(
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         include_stats: Also download the streams and report sample count, non-null count and
             start/end/min/max/mean per stream (optional, default False)
     """
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
 
     if isinstance(result, dict) and "error" in result:
         error_message = result.get("message", "Unknown error")
@@ -1273,12 +1261,12 @@ async def list_activity_streams(
     if not isinstance(activity, dict) or not activity:
         return f"No details found for activity {activity_id}."
 
-    stream_defs = await _custom_defs(ACTIVITY_STREAM, api_key, activity.get("icu_athlete_id"))
+    stream_defs = await _custom_defs(ACTIVITY_STREAM, activity.get("icu_athlete_id"))
 
     available = activity.get("stream_types")
     streams: list[dict[str, Any]] = []
     if include_stats or not isinstance(available, list) or not available:
-        streams, error = await _fetch_streams(activity_id, api_key, None)
+        streams, error = await _fetch_streams(activity_id, None)
         if error and not available:
             return error
         if streams:
@@ -1291,16 +1279,14 @@ async def list_activity_streams(
 
 
 @tool("read")
-async def get_activity_messages(activity_id: str, api_key: str | None = None) -> str:
+async def get_activity_messages(activity_id: str) -> str:
     """Get messages (notes/comments) for a specific activity from Intervals.icu
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}/messages",
-        api_key=api_key,
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -1326,20 +1312,17 @@ async def get_activity_messages(activity_id: str, api_key: str | None = None) ->
 async def add_activity_message(
     activity_id: str,
     content: str,
-    api_key: str | None = None,
 ) -> str:
     """Add a message (note/comment) to an activity on Intervals.icu
 
     Args:
         activity_id: The Intervals.icu activity ID
         content: The message text to add
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     if not (content or "").strip():
         return "Error: content must not be blank; nothing was posted."
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}/messages",
-        api_key=api_key,
         method="POST",
         data={"content": content},
     )
@@ -1364,7 +1347,6 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     feel: int | None = None,
     name: str | None = None,
     description: str | None = None,
-    api_key: str | None = None,
     clear_description: bool = False,
 ) -> str:
     """WRITE TOOL: modifies an existing activity in Intervals.icu (PUT /activity/{id}).
@@ -1381,7 +1363,6 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
         feel: How the athlete felt, integer 1-5 (1 = Strong, 2 = Good, 3 = Normal, 4 = Poor, 5 = Weak)
         name: New activity name
         description: New activity description (an empty string is ignored)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         clear_description: Empty the activity description (optional, default false)
     """
     if rpe is not None and (isinstance(rpe, bool) or not 1 <= rpe <= 10):
@@ -1411,7 +1392,6 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
 
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}",
-        api_key=api_key,
         method="PUT",
         data=payload,
     )
@@ -1424,7 +1404,7 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     if not activity_data or not isinstance(activity_data, dict):
         return f"Error: Unexpected response when updating activity {activity_id}."
 
-    await resolve_gear_for_activity(activity_data, api_key=api_key)
+    await resolve_gear_for_activity(activity_data)
     # List the changed fields with the values returned by the API, because the summary
     # formatter prefers `perceived_exertion` over `icu_rpe` and could show a stale RPE.
     updated = ", ".join(f"{field}={activity_data.get(field)!r}" for field in payload)

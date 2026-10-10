@@ -73,7 +73,6 @@ def _derive_gear_map(items: list[dict[str, Any]]) -> dict[str, str]:
 
 async def fetch_gear(
     athlete_id: str | None = None,
-    api_key: str | None = None,
     *,
     refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
@@ -85,13 +84,13 @@ async def fetch_gear(
     if error_msg or not athlete_id_to_use:
         return [], error_msg or "no athlete id"
 
-    key = cache_key(athlete_id_to_use, api_key)
+    key = cache_key(athlete_id_to_use)
     cached = None if refresh else _GEAR_RAW_CACHE.get(key)
     if cached is not None:
         return cached, None
 
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/gear", api_key=api_key
+        url=f"/athlete/{seg(athlete_id_to_use)}/gear"
     )
     if isinstance(result, dict) and "error" in result:
         return [], str(result.get("message", "Unknown error"))
@@ -102,7 +101,6 @@ async def fetch_gear(
 
 async def get_gear_raw(
     athlete_id: str | None = None,
-    api_key: str | None = None,
     *,
     refresh: bool = False,
 ) -> list[dict[str, Any]]:
@@ -114,28 +112,25 @@ async def get_gear_raw(
 
     Args:
         athlete_id: Athlete to look up. Defaults to ATHLETE_ID env var via config.
-        api_key: Override the configured API key.
         refresh: If True, ignore the cache and re-fetch from the API.
     """
-    items, _ = await fetch_gear(athlete_id, api_key, refresh=refresh)
+    items, _ = await fetch_gear(athlete_id, refresh=refresh)
     return items
 
 
 async def get_gear_map(
     athlete_id: str | None = None,
-    api_key: str | None = None,
     *,
     refresh: bool = False,
 ) -> dict[str, str]:
     """Return the {gear_id: gear_name} lookup for an athlete (derived from cache)."""
-    items = await get_gear_raw(athlete_id=athlete_id, api_key=api_key, refresh=refresh)
+    items = await get_gear_raw(athlete_id=athlete_id, refresh=refresh)
     return _derive_gear_map(items)
 
 
 async def resolve_gear_for_activity(
     activity: dict[str, Any],
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> None:
     """Inject `_resolved_gear_name` into an activity dict if gear info is present.
 
@@ -146,7 +141,7 @@ async def resolve_gear_for_activity(
     if not gear_id:
         return
 
-    gear_map = await get_gear_map(athlete_id=athlete_id, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id)
     name = gear_map.get(gear_id)
     if name:
         activity["_resolved_gear_name"] = name
@@ -155,24 +150,22 @@ async def resolve_gear_for_activity(
 async def resolve_gear_for_activities(
     activities: list[dict[str, Any]],
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> None:
     """Inject `_resolved_gear_name` into each activity in a list. In-place."""
     if not activities:
         return
     # Pre-warm the cache once, then iterate.
-    _ = await get_gear_map(athlete_id=athlete_id, api_key=api_key)
+    _ = await get_gear_map(athlete_id=athlete_id)
     for activity in activities:
         if isinstance(activity, dict):
             await resolve_gear_for_activity(
-                activity, athlete_id=athlete_id, api_key=api_key
+                activity, athlete_id=athlete_id
             )
 
 
 @tool("read")
 async def get_gear_list(  # pylint: disable=too-many-locals
     athlete_id: str | None = None,
-    api_key: str | None = None,
     refresh: bool = False,
 ) -> str:
     """Get the gear catalog (bikes, shoes, etc.) for an athlete from Intervals.icu.
@@ -182,7 +175,6 @@ async def get_gear_list(  # pylint: disable=too-many-locals
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         refresh: If True, bypass the cache and re-fetch from the API (default False)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -193,7 +185,7 @@ async def get_gear_list(  # pylint: disable=too-many-locals
 
     # Single fetch path: get_gear_raw consults the cache and only hits the API
     # on a cold cache or when refresh=True.
-    items, error = await fetch_gear(athlete_id_to_use, api_key, refresh=refresh)
+    items, error = await fetch_gear(athlete_id_to_use, refresh=refresh)
     if error:
         return f"Error fetching gear for athlete {athlete_id_to_use}: {error}"
 
@@ -230,7 +222,6 @@ def _gear_stats_line(item: dict[str, Any]) -> str:
 async def get_gear_details(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     gear_id: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     refresh: bool = False,
 ) -> str:
     """Get details of one gear item (bike, shoes, component) from Intervals.icu
@@ -245,13 +236,12 @@ async def get_gear_details(  # pylint: disable=too-many-locals,too-many-branches
     Args:
         gear_id: The gear ID, e.g. "b12472159" for a bike or "30303" for a component
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         refresh: Re-fetch the gear catalog instead of using the cache (optional, default False)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    items, error = await fetch_gear(athlete_id_to_use, api_key, refresh=refresh)
+    items, error = await fetch_gear(athlete_id_to_use, refresh=refresh)
     if error:
         return f"Error fetching gear for athlete {athlete_id_to_use}: {error}"
     by_id = {str(it.get("id")): it for it in items}

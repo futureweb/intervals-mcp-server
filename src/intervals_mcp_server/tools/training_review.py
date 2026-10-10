@@ -115,7 +115,6 @@ async def get_weekly_summary(
     start_date: str,
     end_date: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Get a weekly training summary (read-only) from Intervals.icu.
 
@@ -131,7 +130,6 @@ async def get_weekly_summary(
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -142,7 +140,6 @@ async def get_weekly_summary(
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/athlete-summary.json",
-        api_key=api_key,
         params={"start": start_date, "end": end_date},
     )
     if isinstance(result, dict) and "error" in result:
@@ -153,7 +150,7 @@ async def get_weekly_summary(
     # The endpoint may also return rows for other athletes (followed/coached) when called
     # with an API key; keep only the requested athlete (rows without athlete_id are kept).
     # The alias "0" (the key's own athlete) is resolved to the real id the rows carry.
-    wanted = await canonical_athlete_id(athlete_id_to_use, api_key)
+    wanted = await canonical_athlete_id(athlete_id_to_use)
     rows = [
         w
         for w in result
@@ -335,7 +332,6 @@ async def get_plan_compliance(
     start_date: str,
     end_date: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Compare planned workouts with executed activities (read-only) for a date range.
 
@@ -355,7 +351,6 @@ async def get_plan_compliance(
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -366,12 +361,12 @@ async def get_plan_compliance(
 
     params = {"oldest": start_date, "newest": end_date}
     events = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", params=params
     )
     if isinstance(events, dict) and "error" in events:
         return f"Error fetching events: {events.get('message')}"
     activities = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", params=params
     )
     if isinstance(activities, dict) and "error" in activities:
         return f"Error fetching activities: {activities.get('message')}"

@@ -47,8 +47,8 @@ PACE_SPORTS = ("Run", "TrailRun", "VirtualRun", "Walk", "Hike", "Swim", "OpenWat
 CORE_STREAMS = ("time", "watts", "heartrate", "cadence", "velocity_smooth", "distance", "altitude")
 
 
-async def _get_activity(activity_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+async def _get_activity(activity_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return None, f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -58,11 +58,11 @@ async def _get_activity(activity_id: str, api_key: str | None) -> tuple[dict[str
 
 
 async def _get_streams(
-    activity_id: str, api_key: str | None, types: list[str] | None
+    activity_id: str, types: list[str] | None
 ) -> tuple[list[dict[str, Any]], str | None]:
     params = {"types": ",".join(types)} if types else None
     result = await make_intervals_request(
-        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params=params
+        url=f"/activity/{seg(activity_id)}/streams", params=params
     )
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching activity streams: {result.get('message', 'Unknown error')}"
@@ -70,11 +70,11 @@ async def _get_streams(
     return streams, None if streams else f"No stream data found for activity {activity_id}."
 
 
-async def _defs(item_type: str, api_key: str | None, athlete_id: Any) -> dict[str, dict[str, Any]]:
+async def _defs(item_type: str, athlete_id: Any) -> dict[str, dict[str, Any]]:
     athlete = str(athlete_id) if athlete_id else config.athlete_id
     if not athlete:
         return {}
-    return (await get_custom_item_index(athlete_id=athlete, api_key=api_key)).get(item_type, {})
+    return (await get_custom_item_index(athlete_id=athlete)).get(item_type, {})
 
 
 def _activity_header(activity: dict[str, Any]) -> str:
@@ -151,7 +151,7 @@ def _meter_identity(activity: dict[str, Any], gear_items: list[dict[str, Any]]) 
 
 
 async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    athlete_id: str, api_key: str | None, activity_ids: list[str], start_date: str | None,
+    athlete_id: str, activity_ids: list[str], start_date: str | None,
     end_date: str | None, secondary: str,
 ) -> tuple[list[dict[str, Any]], str | None, str]:
     """Activities for the multi-ride comparison (by id - already de-duplicated and capped - or by date range
@@ -159,7 +159,7 @@ async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positiona
     if activity_ids:
         rides = []
         for activity_id in activity_ids:
-            activity, error = await _get_activity(activity_id, api_key)
+            activity, error = await _get_activity(activity_id)
             if error or activity is None:
                 return [], error, ""
             rides.append(activity)
@@ -168,7 +168,7 @@ async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positiona
     if isinstance(span, str):
         return [], span, ""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{athlete_id}/activities",
         params={"oldest": span[0], "newest": span[1], "fields": POWER_LIST_FIELDS},
     )
     if isinstance(result, dict) and "error" in result:
@@ -200,13 +200,13 @@ def _fmt_num(value: Any, digits: int = 0, unit: str = "") -> str:
 
 
 async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    athlete_id: str, api_key: str | None, primary: str, secondary: str, activity_ids: str | None,
+    athlete_id: str, primary: str, secondary: str, activity_ids: str | None,
     start_date: str | None, end_date: str | None, limit: int, output_format: str, detail_level: str,
 ) -> str:
     """Multi-ride mode of compare_power_streams."""
     capped = min(max(limit, 1), MAX_POWER_RIDES)
     ids, dropped, duplicates = cap_ids(activity_ids, capped)
-    rides, error, source = await _power_rides(athlete_id, api_key, ids, start_date, end_date, secondary)
+    rides, error, source = await _power_rides(athlete_id, ids, start_date, end_date, secondary)
     if error:
         return error
     skipped = len(rides) - capped if len(rides) > capped else 0
@@ -214,12 +214,12 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
     source += ids_note(dropped, duplicates, capped)
     if not rides:
         return f"No activities with a '{secondary}' stream found ({source})."
-    gear_items = await get_gear_raw(athlete_id=athlete_id, api_key=api_key)
+    gear_items = await get_gear_raw(athlete_id=athlete_id)
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     for activity in rides:
         activity_id = str(activity.get("id"))
-        streams, _ = await _get_streams(activity_id, api_key, ["time", primary, secondary])
+        streams, _ = await _get_streams(activity_id, ["time", primary, secondary])
         first, second, time_stream = (find_stream(streams, t) for t in (primary, secondary, "time"))
         if first is None or second is None:
             missing.append({"id": activity_id, "reason": f"no '{primary if first is None else secondary}' stream returned"})
@@ -278,7 +278,6 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
 @tool("read")
 async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     activity_id: str | None = None,
-    api_key: str | None = None,
     primary: str = "watts",
     secondary: str = "secondary_power",
     start_index: int | None = None,
@@ -310,7 +309,6 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
 
     Args:
         activity_id: The Intervals.icu activity ID (one ride)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         primary: Stream type of the primary power source (default "watts")
         secondary: Stream type of the second power source (default "secondary_power")
         start_index: First sample index to compare (one ride only)
@@ -332,12 +330,12 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
         athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
         if error_msg:
             return error_msg
-        return await _compare_rides(athlete, api_key, primary, secondary, activity_ids, start_date, end_date,
+        return await _compare_rides(athlete, primary, secondary, activity_ids, start_date, end_date,
                                     limit, output_format, detail_level)
-    activity, error = await _get_activity(activity_id, api_key)
+    activity, error = await _get_activity(activity_id)
     if error or activity is None:
         return error or "Error"
-    streams, error = await _get_streams(activity_id, api_key, ["time", primary, secondary])
+    streams, error = await _get_streams(activity_id, ["time", primary, secondary])
     if error:
         return error
     first, second, time_stream = (find_stream(streams, t) for t in (primary, secondary, "time"))
@@ -409,15 +407,15 @@ def _threshold_context(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _get_event(athlete_id: str, event_id: Any, api_key: str | None) -> dict[str, Any] | None:
+async def _get_event(athlete_id: str, event_id: Any) -> dict[str, Any] | None:
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", api_key=api_key, params={"resolve": "true"}
+        url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", params={"resolve": "true"}
     )
     return result if isinstance(result, dict) and "error" not in result else None
 
 
 async def _match_candidates(  # pylint: disable=too-many-locals
-    athlete_id: str, activity: dict[str, Any], api_key: str | None
+    athlete_id: str, activity: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Read-only suggestion of planned workouts that could belong to an unpaired activity.
 
@@ -431,7 +429,7 @@ async def _match_candidates(  # pylint: disable=too-many-locals
     except ValueError:
         return []
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/events",
         params={"oldest": start, "newest": end, "category": "WORKOUT"},
     )
     if not isinstance(result, list):
@@ -478,7 +476,6 @@ def _stream_types_for_execution(activity: dict[str, Any], stream_defs: dict[str,
 @tool("read")
 async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
     activity_id: str,
-    api_key: str | None = None,
     event_id: str | None = None,
     planned_workout_doc: dict[str, Any] | None = None,
     suggest_matches: bool = True,
@@ -527,7 +524,6 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         event_id: Planned workout (event) to compare against (optional; default: the event
             paired with the activity, if any)
         planned_workout_doc: Workout document with "steps" (same format as add_or_update_event)
@@ -547,11 +543,11 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
         return tolerances
-    activity, error = await _get_activity(activity_id, api_key)
+    activity, error = await _get_activity(activity_id)
     if error or activity is None:
         return error or "Error"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
     intervals: list[dict[str, Any]] = []
     load_errors: list[str] = []  # API errors are reported, never shown as missing data (API-7)
     if isinstance(intervals_result, dict) and "error" not in intervals_result:
@@ -559,9 +555,9 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     elif isinstance(intervals_result, dict):
         load_errors.append(f"intervals could not be loaded: {intervals_result.get('message', 'Unknown error')}")
 
-    stream_defs = await _defs(ACTIVITY_STREAM, api_key, athlete_id)
-    field_defs = await _defs(ACTIVITY_FIELD, api_key, athlete_id)
-    streams, streams_error = await _get_streams(activity_id, api_key, _stream_types_for_execution(activity, stream_defs))
+    stream_defs = await _defs(ACTIVITY_STREAM, athlete_id)
+    field_defs = await _defs(ACTIVITY_FIELD, athlete_id)
+    streams, streams_error = await _get_streams(activity_id, _stream_types_for_execution(activity, stream_defs))
     if streams_error and streams_error.startswith("Error"):
         load_errors.append(streams_error)
 
@@ -573,14 +569,14 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
         plan_source = "workout document provided by the caller"
     paired = event_id or activity.get("paired_event_id")
     if steps is None and paired and athlete_id:
-        event = await _get_event(athlete_id, paired, api_key)
+        event = await _get_event(athlete_id, paired)
         steps = ((event or {}).get("workout_doc") or {}).get("steps") if event else None
         if event:
             plan_source = f"event {event.get('id')} ('{event.get('name')}', {str(event.get('start_date_local', ''))[:10]})"
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
     candidates: list[dict[str, Any]] = []
     if not planned and not paired and suggest_matches and athlete_id:
-        candidates = await _match_candidates(athlete_id, activity, api_key)
+        candidates = await _match_candidates(athlete_id, activity)
 
     doc = planned_workout_doc if isinstance(planned_workout_doc, dict) else ((event or {}).get("workout_doc") or {})
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
@@ -589,7 +585,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     result = await asyncio.to_thread(analyze, planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
-    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, activity.get("type")))
     device_lines = format_custom_field_lines(activity, field_defs, prefix="", only=assigned)
     header = f"Workout execution for {_activity_header(activity)}"
     if planned:

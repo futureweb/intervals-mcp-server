@@ -24,9 +24,9 @@ SERVER_CLOCK = ("server", "local")
 
 _ACTIVE_TIMEZONE: ContextVar[str | None] = ContextVar("athlete_timezone", default=None)
 
-# Looks up the IANA time zone of an athlete: async (athlete_id, api_key) -> name or None.
+# Looks up the IANA time zone of an athlete: async (athlete_id) -> name or None.
 # Registered by tools.athlete (which owns the cached athlete profile) to avoid an import cycle.
-TimezoneResolver = Callable[[str, str | None], Awaitable[str | None]]
+TimezoneResolver = Callable[[str], Awaitable[str | None]]
 _RESOLVER: TimezoneResolver | None = None  # pylint: disable=invalid-name
 
 
@@ -77,7 +77,7 @@ def set_timezone_resolver(resolver: TimezoneResolver | None) -> None:
     _RESOLVER = resolver
 
 
-async def activate_athlete_timezone(athlete_id: str | None, api_key: str | None = None) -> Token[str | None] | None:
+async def activate_athlete_timezone(athlete_id: str | None) -> Token[str | None] | None:
     """Look up the athlete's time zone and use it for "today" in the current tool call.
 
     Nothing is looked up when ATHLETE_TIMEZONE is set (a zone name or 'server'), when there is
@@ -86,7 +86,7 @@ async def activate_athlete_timezone(athlete_id: str | None, api_key: str | None 
     if configured_timezone() or not athlete_id or _RESOLVER is None:
         return None
     try:
-        name = await _RESOLVER(athlete_id, api_key)
+        name = await _RESOLVER(athlete_id)
     except Exception:  # pylint: disable=broad-exception-caught  # a failed lookup must never break the tool
         logger.warning("Could not look up the athlete's time zone; using the server clock", exc_info=True)
         return None

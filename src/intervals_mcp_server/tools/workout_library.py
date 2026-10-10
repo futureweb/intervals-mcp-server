@@ -93,10 +93,10 @@ def _available_folders(folders: list[dict[str, Any]]) -> str:
 
 
 async def _fetch_folders(
-    athlete_id: str, api_key: str | None
+    athlete_id: str
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch all folders/plans. Returns (folders, error_message)."""
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/folders", api_key=api_key)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/folders")
     if isinstance(result, dict) and "error" in result:
         return [], str(result.get("message", "Unknown error"))
     folders = [f for f in result if isinstance(f, dict)] if isinstance(result, list) else []
@@ -107,20 +107,18 @@ async def _fetch_folders(
 async def get_workout_library(
     folder: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """List the athlete's workout library (folders/plans and their workouts) from Intervals.icu.
 
     Args:
         folder: Optional folder or plan filter, either the folder name (case-insensitive) or its id
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
 
-    folders, error = await _fetch_folders(athlete_id_to_use, api_key)
+    folders, error = await _fetch_folders(athlete_id_to_use)
     if error:
         return f"Error fetching workout library: {error}"
 
@@ -150,10 +148,10 @@ async def get_workout_library(
 
 
 async def _resolve_folder_id(
-    athlete_id: str, api_key: str | None, folder: str | None
+    athlete_id: str, folder: str | None
 ) -> tuple[int | None, str | None]:
     """Resolve a folder name/id to a folder id. Returns (folder_id, error_message)."""
-    folders, error = await _fetch_folders(athlete_id, api_key)
+    folders, error = await _fetch_folders(athlete_id)
     if error:
         return None, f"Error fetching folders: {error}"
     if not folders:
@@ -200,7 +198,6 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     moving_time: int | None = None,
     distance: int | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """WRITES to Intervals.icu: create a new workout template in the athlete's workout library.
 
@@ -217,7 +214,6 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
         moving_time: Expected total moving time in seconds (optional)
         distance: Expected total distance in meters (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -236,7 +232,7 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     if text is not None and workout.text_only and description is not None and description.strip():
         return "Error: pass the text either as description or as workout_doc, not both. Nothing was written."
 
-    folder_id, error = await _resolve_folder_id(athlete_id_to_use, api_key, folder)
+    folder_id, error = await _resolve_folder_id(athlete_id_to_use, folder)
     if error:
         return error
 
@@ -256,7 +252,6 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/workouts",
-        api_key=api_key,
         data=workout_data,
         method="POST",
     )
@@ -272,7 +267,6 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
     workout_id: str,
     date: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """WRITES to Intervals.icu: schedule a workout from the workout library on the calendar.
 
@@ -286,7 +280,6 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
             numbered per athlete, so small values such as 1 are normal.
         date: Date in YYYY-MM-DD format
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -299,7 +292,7 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
         return f"Error: {e}"
 
     workout = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}", api_key=api_key
+        url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}"
     )
     if isinstance(workout, dict) and "error" in workout:
         return f"Error fetching library workout: {workout.get('message', 'Unknown error')}"
@@ -314,7 +307,6 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/events",
-        api_key=api_key,
         data=event_data,
         method="POST",
     )
@@ -341,7 +333,6 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
 async def delete_library_workout(
     workout_id: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """DELETES from Intervals.icu: permanently remove a workout from the workout library.
 
@@ -353,7 +344,6 @@ async def delete_library_workout(
         workout_id: The id of the library workout (see get_workout_library). Library ids are
             numbered per athlete, so small values such as 1 are normal.
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -362,13 +352,13 @@ async def delete_library_workout(
         return "Error: workout_id must be a numeric library workout ID."
 
     url = f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}"
-    workout = await make_intervals_request(url=url, api_key=api_key)
+    workout = await make_intervals_request(url=url)
     if isinstance(workout, dict) and "error" in workout:
         return f"Error fetching library workout: {workout.get('message', 'Unknown error')}"
     if not isinstance(workout, dict) or not workout:
         return f"No library workout found with id {workout_id}."
 
-    result = await make_intervals_request(url=url, api_key=api_key, method="DELETE")
+    result = await make_intervals_request(url=url, method="DELETE")
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting library workout: {result.get('message', 'Unknown error')}"
     return f"Deleted library workout {workout_id} '{workout.get('name') or 'unnamed'}'."
@@ -378,7 +368,6 @@ async def delete_library_workout(
 async def get_library_workout(
     workout_id: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Get one workout template from the athlete's library (steps, planned time, load, targets)
@@ -389,13 +378,12 @@ async def get_library_workout(
     Args:
         workout_id: The library workout id
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json" (the complete workout including workout_doc)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching library workout: {result.get('message', 'Unknown error')}"
     if not isinstance(result, dict) or not result:

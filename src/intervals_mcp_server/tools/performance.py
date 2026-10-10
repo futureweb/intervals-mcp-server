@@ -93,8 +93,7 @@ GEAR_CALL_NOTE = "(plus 1 for the gear catalog unless cached)"
 class _Api:  # pylint: disable=too-few-public-methods
     """Issues GET requests for one tool call and counts them."""
 
-    def __init__(self, api_key: str | None) -> None:
-        self.api_key = api_key
+    def __init__(self) -> None:
         self.calls = 0
 
     async def get(
@@ -102,7 +101,7 @@ class _Api:  # pylint: disable=too-few-public-methods
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """GET an endpoint (path relative to the API base) and count the call."""
         self.calls += 1
-        return await make_intervals_request(url=url, api_key=self.api_key, params=params)
+        return await make_intervals_request(url=url, params=params)
 
 
 # ------------------------------------------------------------------ helpers
@@ -502,7 +501,6 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
     exclude_intervals: bool = False,
     start_index: int | None = None,
     end_index: int | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Best efforts of one activity for given durations or distances (peak power, HR, pace)
@@ -530,7 +528,6 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
         exclude_intervals: Ignore samples inside detected intervals (optional, default False)
         start_index: First sample index to search from (optional)
         end_index: Sample index to stop before (optional)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     duration_list = _numbers(durations, "durations")
@@ -544,7 +541,7 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
     if not 1 <= count <= MAX_EFFORT_COUNT:
         return f"Error: count must be between 1 and {MAX_EFFORT_COUNT}."
 
-    api = _Api(api_key)
+    api = _Api()
     time_data = _time_stream(await api.get(f"/activity/{seg(activity_id)}/streams", {"types": "time"}))
     pace_units = None
     if stream == "velocity_smooth":  # pace in the sport's units (per 100 m for swims)
@@ -626,7 +623,6 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
     durations: str = "60,300,1200",
     limit: int = 10,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Compare the best efforts (e.g. 1 / 5 / 20 min power) of several activities side by side
@@ -650,7 +646,6 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         durations: Comma-separated durations in seconds (optional, default "60,300,1200")
         limit: Maximum number of activities, newest first, 1-25 (optional, default 10)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -671,7 +666,7 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         return date_error
     capped = min(max(limit, 1), MAX_COMPARE_ACTIVITIES)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error, source = await _collect_activities(
         api, athlete_id_to_use, activity_ids=activity_ids, start_date=start_date, end_date=end_date
     )
@@ -683,7 +678,7 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
     filters = _filter_text(sport_types, gear_id, start_date, end_date)
     if not selected:
         return f"No activities found ({source}{'; ' + filters if filters else ''})."
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
 
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -957,7 +952,6 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     sport_types: str | None = None,
     gear_id: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     reference_activity_id: str | None = None,
     ftp_range: str | None = None,
@@ -1001,7 +995,6 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
             sport (optional, default: sport family of the reference or of most results)
         gear_id: Keep only activities done on this gear id (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         reference_activity_id: Activity whose main work set defines the search window and the
             comparability ranking (optional)
@@ -1022,7 +1015,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     order = (sort_by or ("comparability" if reference_activity_id else "date")).strip().lower()
     if order not in ("comparability", "date"):
         return "Error: sort_by must be 'comparability' or 'date'."
-    api = _Api(api_key)
+    api = _Api()
     reference: dict[str, Any] | None = None
     pattern: dict[str, Any] | None = None
     if reference_activity_id:
@@ -1059,7 +1052,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     )
     if ftp_bounds:
         selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key) if selected else {}
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use) if selected else {}
     anchor = reference or (selected[0] if selected else None)
     scored = [(a, _comparability(a, params, pattern, anchor, ftp_tolerance_pct, gear_map)) for a in selected]
     if order == "comparability":
@@ -1153,7 +1146,6 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
     activity_id: str,
     metric: str = "power",
     bucket_size: int | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Time-in-bucket histogram of an activity for power, heart rate, pace or grade-adjusted pace
@@ -1169,7 +1161,6 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
         activity_id: The Intervals.icu activity ID
         metric: "power" (default), "hr", "pace" or "gap"
         bucket_size: Bucket width in W (power, default 25) or bpm (hr, default 5) (optional)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     key = metric.strip().lower()
@@ -1182,7 +1173,7 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
         if bucket_size <= 0:
             return "Error: bucket_size must be positive."
     width = bucket_size or default_bucket
-    api = _Api(api_key)
+    api = _Api()
     result = await api.get(f"/activity/{seg(activity_id)}/{endpoint}", {"bucketSize": width} if width else None)
     error = _error(result, f"{key} histogram")
     if error:
@@ -1357,7 +1348,6 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     sport_types: str | None = None,
     limit: int = 8,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     reference_activity_id: str | None = None,
     gear_id: str | None = None,
@@ -1403,7 +1393,6 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
             (optional, default: the sport family of the reference / newest activity)
         limit: Maximum number of activities, newest first, 1-12 (optional, default 8)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         reference_activity_id: Activity whose main set defines the pattern to compare (optional)
         gear_id: Keep only activities done on this gear id (optional)
@@ -1432,7 +1421,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         return reps
     capped = min(max(limit, 1), MAX_WORKOUTS)
 
-    api = _Api(api_key)
+    api = _Api()
     fetch_limit = min(capped * 4, MAX_SEARCH_RESULTS)
     name_search = bool(query) and not activity_ids and not (start_date or end_date)
     activities, error, source = await _collect_activities(
@@ -1480,7 +1469,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})." + (
             f" Note: {truncated} A name search with start_date/end_date lists that range instead." if truncated else ""
         )
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
     split_filters = {"min_secs": min_interval_secs, "max_secs": max_interval_secs, "min_pct": min_intensity, "max_pct": max_intensity}
     rows: list[dict[str, Any]] = []
     for activity in reversed(selected):
@@ -1696,7 +1685,6 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
     min_interval_secs: int = 300,
     limit: int = 30,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     gear_id: str | None = None,
     environment: str | None = None,
@@ -1732,7 +1720,6 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
         min_interval_secs: Minimum WORK interval length in seconds (optional, default 300)
         limit: Maximum number of activities, newest first, 1-60 (optional, default 30)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         gear_id: Keep only activities done on this gear id (optional)
         environment: "indoor" (trainer / virtual) or "outdoor" (optional, default both)
@@ -1759,7 +1746,7 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
         return span
     capped = min(max(limit, 1), MAX_EFFICIENCY_ACTIVITIES)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error, _ = await _collect_activities(api, athlete_id_to_use, start_date=span[0], end_date=span[1])
     if error:
         return error
@@ -1769,7 +1756,7 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
     selected = selected[:capped]
     if not selected:
         return f"No activities found between {span[0]} and {span[1]} for sports {sport_types}."
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
     rows: list[dict[str, Any]] = []
     for activity in reversed(selected):
         intervals, error = await _work_intervals(api, activity.get("id"))
@@ -1979,7 +1966,6 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
     durations: str = "60,300,1200",
     curves: str = "42d",
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     suggest_thresholds: bool = True,
 ) -> str:
@@ -2005,7 +1991,6 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
         durations: Comma-separated durations in seconds (optional, default "60,300,1200")
         curves: Comma-separated athlete curve ids such as "42d,90d,s0" (optional, default "42d")
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         suggest_thresholds: Suggest kJ thresholds when they are not configured (optional, default
             True; read-only, nothing is saved)
@@ -2022,7 +2007,7 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
     if not activity_id and not curve_ids:
         return "Error: at least one curve id is required when no activity_id is given."
 
-    api = _Api(api_key)
+    api = _Api()
     thresholds, note = await _kj_thresholds(api, athlete_id_to_use, activity_type)
     if thresholds is None:
         keys: tuple[str, ...] = ("kj0", "kj1")  # thresholds unknown: show what Intervals.icu returns, with the caveat

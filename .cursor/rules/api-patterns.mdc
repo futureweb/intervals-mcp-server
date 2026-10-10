@@ -52,7 +52,7 @@ All errors return a consistent structure:
 ## MCP Tool Implementation Pattern
 
 1. **Parameter Validation**: Check required parameters and provide defaults
-2. **API Key Resolution**: Use provided key or fall back to global `API_KEY`
+2. **Credentials**: Tools never take an API key; `make_intervals_request()` uses `API_KEY` from the server environment
 3. **Athlete ID Handling**: Support both numeric and i-prefixed formats
 4. **Date Validation**: Parse and validate date strings
 5. **API Request**: Call `make_intervals_request()` with appropriate parameters

@@ -50,22 +50,22 @@ def intake_streams(stream_defs: CustomFieldDefs, listed: list[Any]) -> list[str]
     return [code for code, d in stream_defs.items() if code in listed and field_words(d) & (CARB_WORDS | INTAKE_WORDS)]
 
 
-async def _single(activity_id: str, athlete_id: str | None, api_key: str | None) -> dict[str, Any] | str:  # pylint: disable=too-many-locals
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+async def _single(activity_id: str, athlete_id: str | None) -> dict[str, Any] | str:  # pylint: disable=too-many-locals
+    result = await make_intervals_request(url=f"/activity/{activity_id}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching the activity: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
     if not isinstance(activity, dict) or not activity:
         return f"No activity {activity_id} found."
     owner = str(activity.get("icu_athlete_id") or athlete_id or config.athlete_id or "")
-    index = await get_custom_item_index(athlete_id=owner, api_key=api_key) if owner else {}
+    index = await get_custom_item_index(athlete_id=owner) if owner else {}
     defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     figures = activity_fueling(activity, defs)
     timing: dict[str, Any] = {"available": False, "note": TIMING_NOTE, "streams": {}}
     codes = intake_streams(stream_defs, [str(t) for t in activity.get("stream_types") or []])
     calls = 1
     if codes:
-        streams = await make_intervals_request(url=f"/activity/{activity_id}/streams", api_key=api_key,
+        streams = await make_intervals_request(url=f"/activity/{activity_id}/streams",
                                                params={"types": ",".join(["time", *codes])})
         calls += 1
         by_type = {s.get("type"): s.get("data") or [] for s in streams if isinstance(s, dict)} if isinstance(streams, list) else {}
@@ -107,17 +107,17 @@ def _single_text(payload: dict[str, Any], detail_level: str) -> str:
 
 
 async def _period(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    athlete_id: str, api_key: str | None, start_date: str | None, end_date: str | None, sport_types: str | None, min_minutes: float,
+    athlete_id: str, start_date: str | None, end_date: str | None, sport_types: str | None, min_minutes: float,
 ) -> dict[str, Any] | str:
     period = resolve_period(start_date, end_date, DEFAULT_PERIOD_DAYS, MAX_PERIOD_DAYS)
     if isinstance(period, str):
         return period
     start, end = period
-    defs = (await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)).get(ACTIVITY_FIELD, {})
+    defs = (await get_custom_item_index(athlete_id=athlete_id)).get(ACTIVITY_FIELD, {})
     roles = fueling_fields(defs)
     codes = sorted({code for group in roles.values() for code in group})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{athlete_id}/activities",
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": ",".join([FUELING_LIST_FIELDS, *codes])},
     )
     if isinstance(result, dict) and "error" in result:
@@ -165,7 +165,6 @@ async def get_fueling_analysis(  # pylint: disable=too-many-arguments,too-many-p
     sport_types: str | None = None,
     min_minutes: float = 90,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -192,14 +191,14 @@ async def get_fueling_analysis(  # pylint: disable=too-many-arguments,too-many-p
         return "Error: min_minutes must not be negative."
     as_json = output_format.strip().lower() == "json"
     if activity_id:
-        payload = await _single(activity_id, athlete_id, api_key)
+        payload = await _single(activity_id, athlete_id)
         if isinstance(payload, str):
             return payload
         return json.dumps(payload, ensure_ascii=False, default=str) if as_json else _single_text(payload, detail_level)
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    result = await _period(athlete_id_to_use, api_key, start_date, end_date, sport_types, min_minutes)
+    result = await _period(athlete_id_to_use, start_date, end_date, sport_types, min_minutes)
     if isinstance(result, str):
         return result
     if as_json:

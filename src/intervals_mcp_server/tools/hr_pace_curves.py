@@ -131,7 +131,6 @@ async def _fetch_curves(
     endpoint: str,
     params: dict[str, Any],
     athlete_id: str | None,
-    api_key: str | None,
     label: str,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Fetch a curve set and return (curve_list, error_message)."""
@@ -142,7 +141,6 @@ async def _fetch_curves(
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/{endpoint}",
         params=params,
-        api_key=api_key,
     )
     if isinstance(result, dict) and "error" in result:
         return None, f"Error fetching {label}: {result.get('message', 'Unknown error')}"
@@ -163,7 +161,6 @@ async def get_hr_curves(
     start_date: str | None = None,
     end_date: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Get heart rate curves for an athlete from Intervals.icu.
 
@@ -178,7 +175,6 @@ async def get_hr_curves(
         start_date: Start date (YYYY-MM-DD) for an additional custom range curve. Must be used with end_date.
         end_date: End date (YYYY-MM-DD) for an additional custom range curve. Must be used with start_date.
         athlete_id: Intervals.icu athlete ID (optional, uses ATHLETE_ID from .env if not provided)
-        api_key: Optional API key override. Uses API_KEY from .env if not provided.
     """
     date_error = _validate_dates(start_date, end_date)
     if date_error:
@@ -190,7 +186,7 @@ async def get_hr_curves(
         "type": activity_type,
     }
 
-    curve_list, error = await _fetch_curves("hr-curves", params, athlete_id, api_key, "HR curves")
+    curve_list, error = await _fetch_curves("hr-curves", params, athlete_id, "HR curves")
     if error:
         return error
     if not curve_list:
@@ -209,7 +205,6 @@ async def get_pace_curves(
     end_date: str | None = None,
     gap: bool = False,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Get pace curves for an athlete from Intervals.icu.
 
@@ -227,7 +222,6 @@ async def get_pace_curves(
         end_date: End date (YYYY-MM-DD) for an additional custom range curve. Must be used with start_date.
         gap: Use gradient adjusted pace (GAP) instead of raw pace (default False).
         athlete_id: Intervals.icu athlete ID (optional, uses ATHLETE_ID from .env if not provided)
-        api_key: Optional API key override. Uses API_KEY from .env if not provided.
     """
     date_error = _validate_dates(start_date, end_date)
     if date_error:
@@ -247,7 +241,7 @@ async def get_pace_curves(
         params["gap"] = True
 
     curve_list, error = await _fetch_curves(
-        "pace-curves", params, athlete_id, api_key, "pace curves"
+        "pace-curves", params, athlete_id, "pace curves"
     )
     if error:
         return error

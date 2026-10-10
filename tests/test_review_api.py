@@ -231,7 +231,7 @@ def test_unknown_time_zone_falls_back_to_the_server_clock(monkeypatch):
 
 
 # ------------------------------------------------------------------ API-3 / API-4 / OPS-7 / API-13 caches
-def test_caches_expire_and_are_keyed_by_api_key(monkeypatch):
+def test_caches_expire_and_are_keyed_by_athlete(monkeypatch):
     clock = {"t": 1000.0}
     monkeypatch.setattr(cache_module.time, "monotonic", lambda: clock["t"])
     gear_module._GEAR_RAW_CACHE.clear()
@@ -244,8 +244,8 @@ def test_caches_expire_and_are_keyed_by_api_key(monkeypatch):
     monkeypatch.setattr(gear_module, "make_intervals_request", fake_request)
     asyncio.run(gear_module.get_gear_raw("i1"))
     asyncio.run(gear_module.get_gear_raw("i1"))
-    asyncio.run(gear_module.get_gear_raw("i1", api_key="other-account-key"))
-    assert len(calls) == 2
+    asyncio.run(gear_module.get_gear_raw("i2"))
+    assert len(calls) == 2 and all(key is None for _, key in calls)  # credentials only from the environment
     clock["t"] += gear_module.GEAR_CACHE_TTL_S + 1
     asyncio.run(gear_module.get_gear_raw("i1"))
     assert len(calls) == 3

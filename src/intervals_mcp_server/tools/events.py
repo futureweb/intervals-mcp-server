@@ -165,7 +165,6 @@ def _event_json(event: dict[str, Any], include_workout_doc: bool = False) -> dic
 @tool("read")
 async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     athlete_id: str | None = None,
-    api_key: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     categories: str | None = None,
@@ -179,7 +178,6 @@ async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to today)
         end_date: End date in YYYY-MM-DD format (optional, defaults to 30 days from today)
         categories: Comma-separated categories to return, e.g. "WORKOUT" or "WORKOUT,RACE_A,RACE_B"
@@ -203,7 +201,7 @@ async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-
         params["category"] = ",".join(c.strip().upper() for c in categories.split(",") if c.strip())
 
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", params=params
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -240,7 +238,6 @@ async def get_events(  # pylint: disable=too-many-arguments,too-many-positional-
 async def get_event_by_id(
     event_id: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     resolve_targets: bool = False,
 ) -> str:
@@ -253,7 +250,6 @@ async def get_event_by_id(
     Args:
         event_id: The Intervals.icu event ID
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json" (complete event including workout_doc)
         resolve_targets: Ask Intervals.icu to resolve %FTP / %LTHR / pace targets to watts, bpm
             and m/s inside the workout steps (optional, default False)
@@ -266,7 +262,7 @@ async def get_event_by_id(
     # Call the Intervals.icu API (the endpoint is /events/{id}, plural)
     params = {"resolve": "true"} if resolve_targets else None
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}", params=params
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -290,12 +286,10 @@ async def get_event_by_id(
 async def delete_event(
     event_id: str,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Delete event for an athlete from Intervals.icu
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         event_id: The Intervals.icu event ID
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -304,7 +298,7 @@ async def delete_event(
     if not event_id:
         return "Error: No event ID provided."
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}", api_key=api_key, method="DELETE"
+        url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}", method="DELETE"
     )
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting event: {result.get('message')}"
@@ -371,7 +365,6 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
     confirm_ids: str | None = None,
     include_paired: bool = False,
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """DELETES calendar events of the given categories in a date range, in two steps.
 
@@ -398,7 +391,6 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
         include_paired: Also delete planned workouts that are paired with a completed activity
             (optional, default false)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
 
     Returns:
         JSON with dry_run, the range and categories, "events" (id, date, category, type, name)
@@ -441,7 +433,6 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/events",
-        api_key=api_key,
         params={"oldest": start, "newest": end, "category": ",".join(wanted)},
     )
     if isinstance(result, dict) and "error" in result:
@@ -474,7 +465,7 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
     failed: list[dict[str, Any]] = []
     for row in to_delete:
         answer = await make_intervals_request(
-            url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(row['id'])}", api_key=api_key, method="DELETE"
+            url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(row['id'])}", method="DELETE"
         )
         if isinstance(answer, dict) and "error" in answer:
             if answer.get("status_code") == 404:
@@ -497,9 +488,9 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-async def _fetch_event(athlete_id: str, event_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
+async def _fetch_event(athlete_id: str, event_id: str) -> tuple[dict[str, Any] | None, str | None]:
     """The current event (for checks before an update) or an error message."""
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}")
     if isinstance(result, dict) and "error" in result:
         return None, str(result.get("message", "Unknown error"))
     if not isinstance(result, dict) or not result:
@@ -522,7 +513,6 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     workout_type: str | None = None,
     name: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     event_id: str | None = None,
     start_date: str | None = None,
     workout_doc: WorkoutDoc | None = None,
@@ -552,7 +542,6 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         event_id: The Intervals.icu event ID (optional; given = update this event)
         start_date: Start date in YYYY-MM-DD format (optional; defaults to today when creating,
             unchanged when updating)
@@ -682,7 +671,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     start_local = None
     existing: dict[str, Any] | None = None
     if is_update and (validated_date or replaces_with_text):
-        existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id), api_key)
+        existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id))
         if fetch_error:
             return f"Error: could not read event {event_id} before changing it: {fetch_error}. Nothing was changed."
         if replaces_with_text and is_structured_workout(existing) and not replace_workout:
@@ -700,7 +689,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     if is_update and not event_data:
         return "Error: nothing to update; pass at least one field to change."
     answer = await _create_or_update_event_request(
-        athlete_id_to_use, api_key, event_data, validated_date, event_id
+        athlete_id_to_use, event_data, validated_date, event_id
     )
     return answer + (warnings_note(workout.warnings) if answer.startswith("Successfully") else "")
 
@@ -712,7 +701,6 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
     start_date: str | None = None,
     color: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     event_id: str | None = None,
     clear_description: bool = False,
 ) -> str:
@@ -731,7 +719,6 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
             unchanged when updating)
         color: Color of the note (e.g. green, orange, red, blue; default green when creating)
         athlete_id: The Intervals.icu athlete ID (optional)
-        api_key: The Intervals.icu API key (optional)
         event_id: The Intervals.icu event ID of a NOTE (optional, for updates)
         clear_description: Empty the note's text on update (optional, default false)
     """
@@ -764,7 +751,7 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
     if is_update:
         if not event_data:
             return "Error: nothing to update; pass at least one field to change."
-        existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id), api_key)
+        existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id))
         if fetch_error:
             return f"Error: could not read event {event_id}: {fetch_error}. Nothing was changed."
         if (existing or {}).get("category") != "NOTE":
@@ -775,13 +762,12 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
         if "start_date_local" in event_data:
             event_data["start_date_local"] = str(validated_date) + _time_of_day(existing)
     return await _create_or_update_event_request(
-        athlete_id_to_use, api_key, event_data, validated_date, event_id
+        athlete_id_to_use, event_data, validated_date, event_id
     )
 
 
 async def _create_or_update_event_request(
     athlete_id: str,
-    api_key: str | None,
     event_data: dict[str, Any],
     start_date: str | None,
     event_id: str | None,
@@ -790,7 +776,6 @@ async def _create_or_update_event_request(
 
     Args:
         athlete_id: The athlete ID.
-        api_key: Optional API key.
         event_data: Prepared event data dictionary.
         start_date: Start date string for response formatting.
         event_id: Optional event ID for updates.
@@ -803,7 +788,6 @@ async def _create_or_update_event_request(
         url += f"/{seg(event_id)}"
     result = await make_intervals_request(
         url=url,
-        api_key=api_key,
         data=event_data,
         method="PUT" if event_id else "POST",
     )
@@ -913,7 +897,6 @@ def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> di
 async def add_events_bulk(  # pylint: disable=too-many-locals
     events: list[dict[str, Any]],
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """WRITES to Intervals.icu: create many calendar events (planned workouts and/or notes) in one call.
 
@@ -926,7 +909,6 @@ async def add_events_bulk(  # pylint: disable=too-many-locals
     Args:
         events: List of entry objects (see below), at most 100.
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
 
     Entry keys (keys that do not apply to the entry's category are rejected, not ignored):
         name (str, required, not blank): Name/title of the event
@@ -992,7 +974,6 @@ async def add_events_bulk(  # pylint: disable=too-many-locals
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/events/bulk",
-        api_key=api_key,
         method="POST",
         params={"upsert": False, "upsertOnUid": False, "updatePlanApplied": False},
         data=bodies,
@@ -1067,7 +1048,6 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     start_date: str | None = None,
     end_date: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Annual training plan view: plan phases, weekly targets, races and fitness-model events
@@ -1082,7 +1062,6 @@ async def get_training_plan(  # pylint: disable=too-many-locals
         start_date: Start date YYYY-MM-DD (optional, default 30 days ago)
         end_date: End date YYYY-MM-DD (optional, default 180 days ahead)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -1096,22 +1075,22 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     except ValueError as exc:
         return f"Error: {exc}"
 
-    plan = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/training-plan", api_key=api_key)
+    plan = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/training-plan")
     plan_info = plan if isinstance(plan, dict) and "error" not in plan else {}
     plan_error = plan.get("message", "unknown error") if isinstance(plan, dict) and "error" in plan else None
     events = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id_to_use)}/events",
         params={"oldest": start, "newest": end, "category": ",".join(PLAN_CATEGORIES)},
     )
     if isinstance(events, dict) and "error" in events:
         # Older API versions reject unknown category names: fall back to all events.
         events = await make_intervals_request(
-            url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params={"oldest": start, "newest": end}
+            url=f"/athlete/{seg(athlete_id_to_use)}/events", params={"oldest": start, "newest": end}
         )
     plan_events = [
         e for e in (events if isinstance(events, list) else []) if isinstance(e, dict) and e.get("category") in PLAN_CATEGORIES
     ]
-    model_events = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/fitness-model-events", api_key=api_key)
+    model_events = await make_intervals_request(url=f"/athlete/{seg(athlete_id_to_use)}/fitness-model-events")
     model_list = [e for e in (model_events if isinstance(model_events, list) else []) if isinstance(e, dict)]
 
     phases = [e for e in plan_events if e.get("category") in ("PLAN", "SEASON_START")]

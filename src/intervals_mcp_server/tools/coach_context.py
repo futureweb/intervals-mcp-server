@@ -270,7 +270,6 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
 async def get_coach_context(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-return-statements
     end_date: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
     threshold_as: str = "moderate",
@@ -301,7 +300,6 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     Args:
         end_date: Last day YYYY-MM-DD (optional, default today; not in the future)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json" (the full structure)
         detail_level: "compact" (load, fitness, intensity, recovery, durability, method), "standard" (default,
             plus sports, drift, top sessions, plan and coverage) or "full" (plus the last 4 ISO weeks and references)
@@ -320,12 +318,12 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     today, end = days
 
     activities, error = await fetch_activities(
-        athlete_id_to_use, api_key, end - timedelta(days=56), end, f"{LOAD_FIELDS},{ZONE_FIELDS},{DURABILITY_FIELDS}"
+        athlete_id_to_use, end - timedelta(days=56), end, f"{LOAD_FIELDS},{ZONE_FIELDS},{DURABILITY_FIELDS}"
     )
     if error:
         return error
     wellness_list, error = await fetch_wellness(
-        athlete_id_to_use, api_key, end - timedelta(days=SPREAD_DAYS + RECENT_DAYS), end,
+        athlete_id_to_use, end - timedelta(days=SPREAD_DAYS + RECENT_DAYS), end,
         FITNESS_FIELDS + "," + ",".join(m for m, _, _ in RECOVERY_METRICS),
     )
     if error:
@@ -333,14 +331,14 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     events: list[dict[str, Any]] = []
     completeness: dict[str, Any] | None = None
     if end == today:
-        events, error = await fetch_events(athlete_id_to_use, api_key, today, today + timedelta(days=RACE_LOOKAHEAD_DAYS))
+        events, error = await fetch_events(athlete_id_to_use, today, today + timedelta(days=RACE_LOOKAHEAD_DAYS))
         if error:
             return error
         # All fields of the last 14 days; custom display names only from cached definitions (no request).
-        recent, recent_error = await fetch_wellness(athlete_id_to_use, api_key, completeness_start(today), today, None)
+        recent, recent_error = await fetch_wellness(athlete_id_to_use, completeness_start(today), today, None)
         completeness = (
             {"date": today.isoformat(), "error": recent_error} if recent_error
-            else today_completeness(recent, today, (cached_custom_item_index(athlete_id_to_use, api_key) or {}).get(INPUT_FIELD))
+            else today_completeness(recent, today, (cached_custom_item_index(athlete_id_to_use) or {}).get(INPUT_FIELD))
         )
 
     load_end, note = load_end_for(end_date, end, activities)

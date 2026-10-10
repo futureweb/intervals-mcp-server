@@ -271,11 +271,10 @@ def guarded(func: F) -> F:
         from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
 
         athlete = bound.arguments.get("athlete_id") or get_config().athlete_id
-        api_key = bound.arguments.get("api_key")
         marker = _IN_TOOL.set(True)
         try:
             with call_limits() as limits:
-                zone_token = await activate_athlete_timezone(str(athlete) if athlete else None, api_key)
+                zone_token = await activate_athlete_timezone(str(athlete) if athlete else None)
                 try:
                     result = await func(*args, **kwargs)
                 finally:

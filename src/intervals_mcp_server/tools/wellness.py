@@ -37,7 +37,6 @@ COMPLETENESS_NAMES = 15  # names per group in the line on today's missing usual 
 @tool("read")
 async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branches
     athlete_id: str | None = None,
-    api_key: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     include_all_fields: bool = False,
@@ -56,7 +55,6 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
         end_date: End date in YYYY-MM-DD format (optional, defaults to today)
         include_all_fields: If True, include additional and custom fields beyond the standard set (optional, defaults to False)
@@ -82,7 +80,7 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     params = {"oldest": oldest, "newest": end_date}
 
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/wellness", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/wellness", params=params
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -106,13 +104,13 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
 
     field_definitions: CustomFieldDefs | None = None
     if include_all_fields and entries:
-        index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
+        index = await get_custom_item_index(athlete_id=athlete_id_to_use)
         field_definitions = index.get(INPUT_FIELD) or None
 
     completeness = today_completeness(fetched, today, field_definitions) if check_today else None
     if not (include_all_fields and entries) and has_missing_custom_fields(completeness):
         # Display names of the missing custom fields (the definitions are cached per athlete).
-        index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
+        index = await get_custom_item_index(athlete_id=athlete_id_to_use)
         completeness = today_completeness(fetched, today, index.get(INPUT_FIELD))
     today_line = completeness_line(completeness, COMPLETENESS_NAMES, " (all: get_recovery_snapshot detail_level=full)")
 
@@ -168,7 +166,6 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
     injury: int | None = None,
     comments: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     clear_comments: bool = False,
 ) -> str:
     """WRITE: Update (modify) the subjective wellness fields of one day in Intervals.icu.
@@ -204,7 +201,6 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
         injury: Injury level, 1-4 (optional)
         comments: Free-text comment for the day; replaces any existing comment (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         clear_comments: Empty the day's comment (optional, default false)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -250,7 +246,6 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/wellness/{seg(date)}",
-        api_key=api_key,
         method="PUT",
         data=body,
     )

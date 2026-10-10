@@ -102,12 +102,12 @@ def _resolve_range(start_date: str | None, end_date: str | None, default_days: i
 
 
 async def _fetch_wellness(
-    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None
+    athlete_id: str, start: str, end: str, fields: str | None = None
 ) -> tuple[list[dict[str, Any]], str | None]:
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/wellness", params=params)
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching wellness data: {result.get('message', 'Unknown error')}"
     if isinstance(result, dict):
@@ -118,14 +118,14 @@ async def _fetch_wellness(
 
 
 async def _fetch_activities(  # pylint: disable=too-many-arguments
-    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None,
+    athlete_id: str, start: str, end: str, fields: str | None = None,
     errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Activities of the range; an API error is appended to *errors* (it is not "no activities")."""
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", params=params)
     if isinstance(result, dict) and "error" in result and errors is not None:
         errors.append(f"activities could not be loaded: {result.get('message', 'Unknown error')}")
     if not isinstance(result, list):
@@ -133,8 +133,8 @@ async def _fetch_activities(  # pylint: disable=too-many-arguments
     return [a for a in result if isinstance(a, dict)]
 
 
-async def _defs(athlete_id: str, api_key: str | None, item_type: str) -> CustomFieldDefs:
-    return (await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)).get(item_type, {})
+async def _defs(athlete_id: str, item_type: str) -> CustomFieldDefs:
+    return (await get_custom_item_index(athlete_id=athlete_id)).get(item_type, {})
 
 
 def flatten_sport_info(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -289,7 +289,6 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     days_back: int = 3,
     baseline_metrics: str = DEFAULT_BASELINE_METRICS,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -315,7 +314,6 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         baseline_metrics: Comma-separated wellness metrics for the baseline block
             (optional, default "hrv,restingHR,avgSleepingHR,sleepScore,readiness,respiration,spO2")
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact" (native values, fitness, baselines, activities, planned; no custom
             field dump), "standard" (default, plus up to 20 custom wellness fields per day) or
@@ -342,20 +340,20 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     check_today = target == today
     fetch_start = min(start, completeness_start(date.fromisoformat(target)).isoformat()) if check_today else start
 
-    fetched, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, target)
+    fetched, error = await _fetch_wellness(athlete_id_to_use, fetch_start, target)
     if error:
         return error
     entries = [e for e in fetched if start <= str(e.get("id"))[:10] <= target]
     baseline_entries, _ = await _fetch_wellness(
-        athlete_id_to_use, api_key, baseline_start, target, fields="id," + ",".join(metrics)
+        athlete_id_to_use, baseline_start, target, fields="id," + ",".join(metrics)
     )
-    input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
-    field_defs = await _defs(athlete_id_to_use, api_key, ACTIVITY_FIELD)
+    input_defs = await _defs(athlete_id_to_use, INPUT_FIELD)
+    field_defs = await _defs(athlete_id_to_use, ACTIVITY_FIELD)
     completeness = today_completeness(fetched, date.fromisoformat(target), input_defs) if check_today else None
     load_errors: list[str] = []
-    activities = await _fetch_activities(athlete_id_to_use, api_key, start, target, errors=load_errors)
+    activities = await _fetch_activities(athlete_id_to_use, start, target, errors=load_errors)
     events_result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params={"oldest": target, "newest": target}
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", params={"oldest": target, "newest": target}
     )
     events = [e for e in events_result if isinstance(e, dict)] if isinstance(events_result, list) else []
     if isinstance(events_result, dict) and "error" in events_result:
@@ -426,7 +424,6 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
     windows: str = "7,14,42",
     correlations: str | None = None,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Wellness trends with rolling means, personal baselines, outliers and optional correlations
@@ -458,7 +455,6 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
         correlations: Comma-separated pairs "a:b" or "a:b:lag_days", e.g.
             "hrv:readiness,restingHR:sleepScore:1" (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -478,12 +474,12 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
         return f"Error: at most {MAX_TREND_METRICS} metrics per call."
 
     fetch_start = (date.fromisoformat(start) - timedelta(days=BASELINE_DAYS)).isoformat()
-    entries, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, end)
+    entries, error = await _fetch_wellness(athlete_id_to_use, fetch_start, end)
     if error:
         return error
     entries = flatten_sport_info(entries)
     in_range = [e for e in entries if start <= str(e.get("id")) <= end]
-    input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
+    input_defs = await _defs(athlete_id_to_use, INPUT_FIELD)
 
     trends = [
         compute_metric_trend(entries, m, windows=window_tuple, baseline_days=BASELINE_DAYS, period_start=start, period_end=end)
@@ -542,7 +538,6 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     balance_field: str = "GarminKcalBalance",
     include_training_load: bool = True,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Nutrition, calorie balance and weight trends from the wellness records (read-only)
@@ -565,7 +560,6 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
         balance_field: Custom wellness field code holding a device-computed balance (optional)
         include_training_load: Append the Intervals.icu training load per day (optional, default True)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -579,7 +573,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     if isinstance(window_tuple, str):
         return window_tuple
 
-    entries, error = await _fetch_wellness(athlete_id_to_use, api_key, start, end)
+    entries, error = await _fetch_wellness(athlete_id_to_use, start, end)
     if error:
         return error
     summary = nutrition_summary(
@@ -590,7 +584,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     load_errors: list[str] = []
     if include_training_load:
         for activity in await _fetch_activities(
-            athlete_id_to_use, api_key, start, end, fields="id,start_date_local,icu_training_load", errors=load_errors
+            athlete_id_to_use, start, end, fields="id,start_date_local,icu_training_load", errors=load_errors
         ):
             day = str(activity.get("start_date_local", ""))[:10]
             load = activity.get("icu_training_load")

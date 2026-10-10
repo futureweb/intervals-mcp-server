@@ -23,7 +23,6 @@ config = get_config()
 @tool("read")
 async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     activity_id: str,
-    api_key: str | None = None,
     min_climb_gain_m: float = 30.0,
     min_descent_loss_m: float = 30.0,
     min_grade_pct: float = 2.0,
@@ -64,7 +63,6 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
 
     Args:
         activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         min_climb_gain_m: Minimum elevation gain for a climb in metres (optional, default 30)
         min_descent_loss_m: Minimum elevation loss for a descent in metres (optional, default 30)
         min_grade_pct: Minimum average grade in percent for climbs/descents (optional, default 2)
@@ -82,14 +80,14 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
         stationary_speed_m_s: Speed below which a stretch is a pause candidate (optional; default
             0.3 m/s for foot sports, 0.5 m/s otherwise)
     """
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
     if not isinstance(activity, dict) or not activity:
         return f"No details found for activity {activity_id}."
 
-    streams_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams", api_key=api_key)
+    streams_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams")
     if isinstance(streams_result, dict) and "error" in streams_result:
         return f"Error fetching activity streams: {streams_result.get('message', 'Unknown error')}"
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
@@ -103,7 +101,7 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
         )
 
     athlete = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    stream_defs = (await get_custom_item_index(athlete_id=athlete, api_key=api_key)).get(ACTIVITY_STREAM, {}) if athlete else {}
+    stream_defs = (await get_custom_item_index(athlete_id=athlete)).get(ACTIVITY_STREAM, {}) if athlete else {}
     for stream in streams:  # custom stream names help to recognise counters and other-sport streams
         if stream.get("custom") and not stream.get("name") and stream.get("type") in stream_defs:
             stream["name"] = stream_defs[stream["type"]].get("name")

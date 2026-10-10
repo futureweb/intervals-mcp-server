@@ -157,7 +157,6 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
     environment: str | None = None,
     temperature_source: str = "device",
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -196,7 +195,6 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
         temperature_source: Temperature for max_temp_c: "device" (sensor, default; reads body and sun heat as well),
             "weather" (Intervals.icu weather along the track) or "feels_like" (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact" (per sport summary), "standard" (default, plus the qualifying sessions and the
             reference) or "full" (plus the excluded sessions; JSON includes session lists only at standard and full)
@@ -216,7 +214,7 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
     if isinstance(period, str):
         return period
     start, end = period
-    activities, error = await fetch_activities(athlete_id_to_use, api_key, start, end, f"{LOAD_FIELDS},{DURABILITY_FIELDS}")
+    activities, error = await fetch_activities(athlete_id_to_use, start, end, f"{LOAD_FIELDS},{DURABILITY_FIELDS}")
     if error:
         return error
     wanted = wanted_types(sport_types)

@@ -256,7 +256,6 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     sport_types: str | None = None,
     include_gear: bool = True,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -295,7 +294,6 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         sport_types: Comma-separated activity types to include, e.g. "Ride,GravelRide" (optional)
         include_gear: Show the per-gear split inside each group (optional, default True)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact" (totals, loads, fitness, sessions per sport and device loads per
             group), "standard" (default, everything above plus zones, gear, feel/RPE and custom
@@ -318,10 +316,10 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     if start_date > end:
         return "Error: start_date must not be after end_date."
 
-    defs = (await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)).get(ACTIVITY_FIELD, {})
+    defs = (await get_custom_item_index(athlete_id=athlete_id_to_use)).get(ACTIVITY_FIELD, {})
     fields = BASE_FIELDS + "".join(f",{code}" for code in defs)
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities",
         params={"oldest": start_date, "newest": end, "fields": fields},
     )
     if isinstance(result, dict) and "error" in result:
@@ -332,14 +330,14 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         activities = [a for a in activities if str(a.get("type", "")).lower() in wanted]
     if not activities:
         return f"No activities found for athlete {athlete_id_to_use} between {start_date} and {end}."
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
     wellness_result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/wellness", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id_to_use)}/wellness",
         params={"oldest": start_date, "newest": end, "fields": "id,ctl,atl,rampRate"},
     )
     wellness = [w for w in wellness_result if isinstance(w, dict)] if isinstance(wellness_result, list) else []
 
-    assigned_by_type = await field_assignments(athlete_id_to_use, api_key, defs, {str(a.get("type") or "") for a in activities})
+    assigned_by_type = await field_assignments(athlete_id_to_use, defs, {str(a.get("type") or "") for a in activities})
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for activity in sorted(activities, key=lambda a: str(a.get("start_date_local"))):
         groups[_group_key(activity, group_by, gear_map)].append(activity)

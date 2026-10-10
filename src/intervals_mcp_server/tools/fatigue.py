@@ -271,9 +271,9 @@ def _heterogeneity(rides: list[dict[str, Any]]) -> list[str]:
     return notes
 
 
-async def _stamina_names(athlete_id: str, api_key: str | None) -> dict[str, str]:
+async def _stamina_names(athlete_id: str) -> dict[str, str]:
     try:
-        index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)
+        index = await get_custom_item_index(athlete_id=athlete_id)
     except Exception:  # pylint: disable=broad-exception-caught  # names only help to recognise streams
         return {}
     return {str(code): str(item.get("name") or "") for code, item in (index.get(ACTIVITY_STREAM) or {}).items()}
@@ -295,7 +295,6 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     output_format: str = "text",
     detail_level: str = "standard",
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Long-ride fatigue profile: HR, W/bpm, cadence and stamina at matched power before vs after work thresholds
 
@@ -324,7 +323,6 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         output_format: "text" (default) or "json"
         detail_level: "compact", "standard" (default) or "full" (adds every segment)
         athlete_id: The Intervals.icu athlete ID (optional, default ATHLETE_ID)
-        api_key: The Intervals.icu API key (optional, default API_KEY)
     """
     athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -350,7 +348,7 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     capped = min(max(limit, 1), MAX_PROFILE_RIDES)
     ids, dropped_ids, duplicate_ids = cap_ids(activity_ids, capped)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error = await _ride_list(api, athlete, ids, span, PROFILE_FIELDS, None if ids else sport_types)
     if error:
         return error
@@ -390,8 +388,8 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         band_source = f"default 75-85 % of FTP {_num(selected[0].get('icu_ftp')):g} W of the newest ride"
     else:
         band_source = "given"
-    names = await _stamina_names(athlete, api_key)
-    gear_map = await get_gear_map(athlete_id=athlete, api_key=api_key)
+    names = await _stamina_names(athlete)
+    gear_map = await get_gear_map(athlete_id=athlete)
     unit_label = "kJ/kg" if unit == "kj_per_kg" else "kJ"
     labels = phase_labels(thresholds, unit_label)
     rides: list[dict[str, Any]] = []
@@ -589,7 +587,6 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     output_format: str = "text",
     detail_level: str = "standard",
     athlete_id: str | None = None,
-    api_key: str | None = None,
 ) -> str:
     """Submaximal fatigue tests detected by Intervals.icu (#SFT): validity and trend over the weeks
 
@@ -614,7 +611,6 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
         output_format: "text" (default) or "json"
         detail_level: "compact", "standard" (default) or "full"
         athlete_id: The Intervals.icu athlete ID (optional, default ATHLETE_ID)
-        api_key: The Intervals.icu API key (optional, default API_KEY)
     """
     athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -628,7 +624,7 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
         return span
     capped = min(max(limit, 1), MAX_SUBMAX_TESTS)
 
-    api = _Api(api_key)
+    api = _Api()
     settings_result = await api.get(f"/athlete/{athlete}/sport-settings")
     settings = _sft_settings(settings_result) if not _error(settings_result, "sport settings") else {}
     activities, error = await _ride_list(api, athlete, [], span, SUBMAX_FIELDS, sport_types)

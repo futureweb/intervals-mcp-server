@@ -110,11 +110,11 @@ def _error(result: Any, what: str) -> str | None:
 
 
 async def fetch_activities(
-    athlete_id: str, api_key: str | None, start: date, end: date, fields: str
+    athlete_id: str, start: date, end: date, fields: str
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Activities from start to end (local days, inclusive) with the given field selection."""
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": fields},
     )
     error = _error(result, "activities")
@@ -124,14 +124,14 @@ async def fetch_activities(
 
 
 async def fetch_wellness(
-    athlete_id: str, api_key: str | None, start: date, end: date, fields: str | None
+    athlete_id: str, start: date, end: date, fields: str | None
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Wellness records from start to end with the given field selection (None: all fields)."""
     params = {"oldest": start.isoformat(), "newest": end.isoformat()}
     if fields is not None:
         params["fields"] = fields
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id)}/wellness", params=params
     )
     error = _error(result, "wellness data")
     if error:
@@ -142,11 +142,11 @@ async def fetch_wellness(
 
 
 async def fetch_events(
-    athlete_id: str, api_key: str | None, start: date, end: date
+    athlete_id: str, start: date, end: date
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Calendar events from start to end (all categories)."""
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/events",
         params={"oldest": start.isoformat(), "newest": end.isoformat()},
     )
     error = _error(result, "events")
@@ -155,9 +155,9 @@ async def fetch_events(
     return [e for e in result if isinstance(e, dict)] if isinstance(result, list) else [], None
 
 
-async def device_load_fields(athlete_id: str, api_key: str | None) -> CustomFieldDefs:
+async def device_load_fields(athlete_id: str) -> CustomFieldDefs:
     """Custom activity fields that hold a device training load (policy device_load_sum)."""
-    defs = (await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)).get(ACTIVITY_FIELD, {})
+    defs = (await get_custom_item_index(athlete_id=athlete_id)).get(ACTIVITY_FIELD, {})
     overrides = get_config().custom_aggregate_overrides
     return {
         code: definition for code, definition in defs.items()
@@ -395,7 +395,6 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     chronic_days: int = 28,
     weeks: int = 4,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -423,7 +422,6 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
         chronic_days: Chronic window in days, 14-120 and longer than acute_days (optional, default 28)
         weeks: Number of ISO weeks in the weekly table, 1-26 (optional, default 4)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact" (windows, ratio, monotony, fitness, top sports), "standard" (default, plus
             all sports, the weekly table and device loads) or "full" (plus the daily loads and definitions;
@@ -444,12 +442,12 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     # One extra week: the windows may end yesterday (see load_end_for), which can move the weeks back.
     first_monday = end - timedelta(days=end.weekday() + 7 * weeks)
     fetch_start = min(end - timedelta(days=chronic_days + 1), first_monday - timedelta(days=chronic_days))
-    device_defs = await device_load_fields(athlete_id_to_use, api_key)
+    device_defs = await device_load_fields(athlete_id_to_use)
     fields = LOAD_FIELDS + "".join(f",{code}" for code in device_defs)
-    activities, error = await fetch_activities(athlete_id_to_use, api_key, fetch_start, end, fields)
+    activities, error = await fetch_activities(athlete_id_to_use, fetch_start, end, fields)
     if error:
         return error
-    wellness_list, error = await fetch_wellness(athlete_id_to_use, api_key, end - timedelta(days=14), end, FITNESS_FIELDS)
+    wellness_list, error = await fetch_wellness(athlete_id_to_use, end - timedelta(days=14), end, FITNESS_FIELDS)
     if error:
         return error
     load_end, note = load_end_for(end_date, end, activities)
@@ -459,7 +457,7 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     chronic_start = load_end - timedelta(days=chronic_days - 1)
     acute_start = load_end - timedelta(days=acute_days - 1)
     assigned = await field_assignments(
-        athlete_id_to_use, api_key, device_defs, {str(a.get("type") or "") for a in activities} - {""}
+        athlete_id_to_use, device_defs, {str(a.get("type") or "") for a in activities} - {""}
     ) if device_defs else {}
     daily = daily_loads(activities, chronic_start, load_end)
     payload: dict[str, Any] = {
@@ -1032,7 +1030,6 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     ctl_days: int = CTL_DAYS,
     atl_days: int = ATL_DAYS,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
     scenario: dict[str, Any] | list[dict[str, Any]] | str | None = None,
@@ -1056,7 +1053,6 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         ctl_days: CTL time constant in days (optional, default 42)
         atl_days: ATL time constant in days (optional, default 7)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact", "standard" (default, plus weeks and checks) or "full" (plus days; JSON has the days
             always, with a scenario only at full)
@@ -1088,15 +1084,15 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     parsed = inputs["scenario"]
     fetch_end = limit if inputs["active"] and not end_date else given_end
 
-    wellness_list, error = await fetch_wellness(athlete_id_to_use, api_key, today - timedelta(days=21), fetch_end, FITNESS_FIELDS)
+    wellness_list, error = await fetch_wellness(athlete_id_to_use, today - timedelta(days=21), fetch_end, FITNESS_FIELDS)
     if error:
         return error
-    events, error = await fetch_events(athlete_id_to_use, api_key, today, fetch_end)
+    events, error = await fetch_events(athlete_id_to_use, today, fetch_end)
     if error:
         return error
     # With a scenario, the four completed ISO weeks before this one are summarised for comparison.
     recent_start = today - timedelta(days=today.weekday() + 28)
-    activities, error = await fetch_activities(athlete_id_to_use, api_key, recent_start if parsed else today, today, LOAD_FIELDS)
+    activities, error = await fetch_activities(athlete_id_to_use, recent_start if parsed else today, today, LOAD_FIELDS)
     if error:
         return error
     wellness = wellness_by_day(wellness_list)

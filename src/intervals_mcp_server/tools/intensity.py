@@ -156,7 +156,6 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
     sport_types: str | None = None,
     threshold_as: str = "moderate",
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
     detail_level: str = "standard",
 ) -> str:
@@ -187,7 +186,6 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
         threshold_as: How power zone Z4 (91-105 % FTP, threshold work) is counted: "moderate"
             (default, three-zone Z2) or "high" (three-zone Z3)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
         detail_level: "compact" (period, sports, drift), "standard" (default, plus ISO weeks, zone mapping
             and rules) or "full" (plus every session; JSON includes the sessions only at full)
@@ -206,7 +204,7 @@ async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-
         return period
     start, end = period
     activities, error = await fetch_activities(
-        athlete_id_to_use, api_key, start, end, f"{LOAD_FIELDS},{ZONE_FIELDS}"
+        athlete_id_to_use, start, end, f"{LOAD_FIELDS},{ZONE_FIELDS}"
     )
     if error:
         return error

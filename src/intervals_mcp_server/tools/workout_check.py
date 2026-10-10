@@ -54,7 +54,6 @@ async def validate_workout(  # pylint: disable=too-many-arguments,too-many-posit
     moving_time: int | None = None,
     check_calendar: bool = True,
     athlete_id: str | None = None,
-    api_key: str | None = None,
     output_format: str = "text",
 ) -> str:
     """Validate a workout document before writing it to the calendar (read-only)
@@ -75,7 +74,6 @@ async def validate_workout(  # pylint: disable=too-many-arguments,too-many-posit
         moving_time: Expected moving time in seconds to compare against the step sum (optional)
         check_calendar: Look up existing events on start_date (optional, default True)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
     result = validate_workout_doc(workout_doc, workout_type, moving_time)
@@ -94,7 +92,7 @@ async def validate_workout(  # pylint: disable=too-many-arguments,too-many-posit
                     calendar_note = error_msg
                 else:
                     events = await make_intervals_request(
-                        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key,
+                        url=f"/athlete/{seg(athlete_id_to_use)}/events",
                         params={"oldest": start_date, "newest": start_date},
                     )
                     if isinstance(events, dict) and "error" in events:

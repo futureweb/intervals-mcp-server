@@ -36,7 +36,7 @@ def _package_version() -> str:
     return __version__
 
 
-async def server_status(api_key: str | None = None, include_private: bool = False) -> dict[str, Any]:
+async def server_status(include_private: bool = False) -> dict[str, Any]:
     """Collect the status as a dict (shared by the tool and the --doctor CLI flag).
 
     *include_private* adds what only the operator needs (``--doctor``): bind address, port,
@@ -57,7 +57,7 @@ async def server_status(api_key: str | None = None, include_private: bool = Fals
         "auth": auth_status_from_env(include_private=include_private),
         "athlete_id_configured": bool(config.athlete_id),
         "athlete_id": config.athlete_id or None,
-        "api_key_configured": bool(config.api_key or api_key),
+        "api_key_configured": bool(config.api_key),
         "api_base_url": config.intervals_api_base_url,
         "units_overrides": config.custom_units_overrides,
         "api": {"ok": False, "detail": "not checked"},
@@ -74,17 +74,17 @@ async def server_status(api_key: str | None = None, include_private: bool = Fals
     if not config.athlete_id:
         status["api"] = {"ok": False, "detail": "ATHLETE_ID is not set"}
         return status
-    if not (config.api_key or api_key):
+    if not config.api_key:
         status["api"] = {"ok": False, "detail": "API_KEY is not set"}
         return status
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings", api_key=api_key
+        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings"
     )
     if isinstance(result, dict) and "error" in result:
         status["api"] = {"ok": False, "detail": str(result.get("message"))}
         return status
     status["api"] = {"ok": True, "detail": f"sport settings for {len(result) if isinstance(result, list) else '?'} sport group(s) readable"}
-    index = await get_custom_item_index(athlete_id=config.athlete_id, api_key=api_key)
+    index = await get_custom_item_index(athlete_id=config.athlete_id)
     status["custom_items"] = {
         "activity_fields": len(index.get(ACTIVITY_FIELD, {})),
         "activity_streams": len(index.get(ACTIVITY_STREAM, {})),
@@ -141,7 +141,7 @@ def format_status(status: dict[str, Any]) -> str:
 
 
 @tool("read")
-async def get_server_status(api_key: str | None = None, output_format: str = "text") -> str:
+async def get_server_status(output_format: str = "text") -> str:
     """Diagnostics: server version, enabled permission classes, registered tools, API reachability
 
     Shows which tool classes are enabled (read / write / destructive / admin), which tools
@@ -151,10 +151,9 @@ async def get_server_status(api_key: str | None = None, output_format: str = "te
     (a sync bridge typically adds streams such as stamina). The API key is never shown.
 
     Args:
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
     """
-    status = await server_status(api_key)
+    status = await server_status()
     if output_format.strip().lower() == "json":
         return json.dumps(status, ensure_ascii=False)
     return format_status(status)
