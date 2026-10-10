@@ -1,0 +1,75 @@
+{
+  "manifest_version": "0.4",
+  "name": "futureweb-intervals-mcp",
+  "display_name": "Futureweb Intervals MCP",
+  "version": "1.0.0b1",
+  "description": "Intervals.icu training analysis for Claude: activities, Garmin-enriched metrics, wellness, load and workout planning.",
+  "long_description": "Reads and analyses your Intervals.icu training data the way a coach would: activities with every custom field and stream, intervals, wellness against personal baselines, thresholds and zones, planned-versus-executed workouts, training load and the calendar. Works with the Garmin Intervals Bridge, but does not need it.\n\nThe server runs on your computer and talks only to the Intervals.icu API with your own API key. It is read-only unless you enable writing (Permissions: `read,write`).\n\nDocumentation: https://github.com/futureweb/intervals-mcp-server#readme",
+  "author": {
+    "name": "Futureweb",
+    "url": "https://www.futureweb.at"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/futureweb/intervals-mcp-server"
+  },
+  "homepage": "https://github.com/futureweb/intervals-mcp-server",
+  "documentation": "https://github.com/futureweb/intervals-mcp-server#readme",
+  "support": "https://github.com/futureweb/intervals-mcp-server/issues",
+  "icon": "src/intervals_mcp_server/assets/icon-futureweb-512.png",
+  "server": {
+    "type": "uv",
+    "entry_point": "src/intervals_mcp_server/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "--directory", "${__dirname}", "--frozen", "--no-dev", "futureweb-intervals-mcp"],
+      "env": {
+        "API_KEY": "${user_config.api_key}",
+        "ATHLETE_ID": "${user_config.athlete_id}",
+        "MCP_PERMISSIONS": "${user_config.permissions}",
+        "MCP_TOOLSET": "${user_config.toolset}",
+        "MCP_TRANSPORT": "stdio"
+      }
+    }
+  },
+  "tools_generated": true,
+  "prompts_generated": true,
+  "keywords": ["intervals.icu", "cycling", "running", "triathlon", "training", "coaching", "garmin", "endurance"],
+  "license": "GPL-3.0-only",
+  "privacy_policies": ["https://intervals.icu/privacy-policy/"],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Intervals.icu API key",
+      "description": "Intervals.icu > Settings > Developer Settings > API key. Masked and stored as a secret by the client.",
+      "sensitive": true,
+      "required": true
+    },
+    "athlete_id": {
+      "type": "string",
+      "title": "Athlete ID",
+      "description": "Your Intervals.icu athlete ID, e.g. i123456 (shown next to the API key).",
+      "required": true
+    },
+    "permissions": {
+      "type": "string",
+      "title": "Permissions",
+      "description": "Enabled tool classes: read (read-only, default), read,write (plan workouts, update wellness and activities) or all (adds delete and admin tools).",
+      "default": "read",
+      "required": false
+    },
+    "toolset": {
+      "type": "string",
+      "title": "Tool set",
+      "description": "full (every tool of the enabled classes, default) or core (a smaller curated coaching set).",
+      "default": "full",
+      "required": false
+    }
+  }
+}

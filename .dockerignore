@@ -32,10 +32,16 @@ dist
 # Not needed at runtime
 tests
 docs
+packaging
+scripts
+server.json
+dist-mcpb
+.tools
 Dockerfile
 .dockerignore
 .pre-commit-config.yaml
 AGENTS.md
 CONTRIBUTING.md
+RELEASING.md
 SECURITY.md
 MANIFEST.in

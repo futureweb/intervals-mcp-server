@@ -73,10 +73,14 @@ and tick the boxes. A release is only cut when every gate is green.
 
 ## Release steps
 
+The exact commands, the one-time setup (environment `pypi`, Docker Hub, GHCR visibility) and what
+to do when a job fails are in [RELEASING.md](../RELEASING.md). In short:
+
 1. Make sure `main` is up to date and every gate above is ticked.
-2. Bump the version in `pyproject.toml` (`uv version X.Y.Z`, or edit `[project].version`) and run
-   `uv lock` so that `uv.lock` reflects the new version. The release workflow refuses tags whose
-   version does not match `pyproject.toml`.
+2. Set the new version in `pyproject.toml` (`uv version X.Y.Z`, which also updates `uv.lock`),
+   `__version__`, `server.json` (server version, PyPI package version, GHCR image tag) and
+   `packaging/mcpb/manifest.json`; `uv run --no-project python scripts/check_release_metadata.py`
+   must pass. The release workflow refuses tags whose version does not match all of them.
 3. Update `CHANGELOG.md`: move the *Unreleased* entries under `## [X.Y.Z] - YYYY-MM-DD`.
 4. Commit (`git commit -am "Release vX.Y.Z"`), open a pull request and merge it into `main`
    once CI is green.
@@ -89,29 +93,31 @@ and tick the boxes. A release is only cut when every gate is green.
    ```
 
 6. Verify the **Release** workflow (`.github/workflows/release.yml`) on the Actions tab:
-   - the `checks` jobs are green;
-   - `build` produced `futureweb_intervals_mcp-X.Y.Z.tar.gz` and
-     `futureweb_intervals_mcp-X.Y.Z-py3-none-any.whl`;
-   - the GitHub release `vX.Y.Z` exists with auto-generated notes and both artifacts attached
-     (edit the notes if they need polishing);
-   - the `docker` job pushed `ghcr.io/futureweb/intervals-mcp-server:X.Y.Z`, `:X.Y` and
-     `:latest`.
-7. Verify that the GHCR image runs:
+   - the `checks` jobs are green (including the bundle and `server.json` checks);
+   - the `docker` job pushed `ghcr.io/futureweb/intervals-mcp-server:X.Y.Z` (finals also `:X.Y`
+     and `:latest`), and, if configured, `dockerhub` copied it to Docker Hub;
+   - the `pypi` job published `futureweb_intervals_mcp-X.Y.Z.tar.gz` and
+     `futureweb_intervals_mcp-X.Y.Z-py3-none-any.whl` (approve the `pypi` deployment if the
+     environment requires a reviewer);
+   - the GitHub release `vX.Y.Z` exists with auto-generated notes, both distributions and
+     `futureweb-intervals-mcp-X.Y.Z.mcpb` attached (edit the notes if they need polishing);
+   - the `mcp-registry` job published `io.github.futureweb/intervals-mcp-server` `X.Y.Z`.
+7. Verify that the image runs:
 
    ```sh
-   docker pull ghcr.io/futureweb/intervals-mcp-server:latest
-   docker run --rm -e API_KEY=... -e ATHLETE_ID=... ghcr.io/futureweb/intervals-mcp-server:latest
+   docker pull ghcr.io/futureweb/intervals-mcp-server:X.Y.Z
+   docker run --rm -e API_KEY=... -e ATHLETE_ID=... ghcr.io/futureweb/intervals-mcp-server:X.Y.Z
    ```
 
    The server must start without a traceback. Without `-i` its stdin is closed immediately, so it
    logs the stdio start-up line and exits with status 0; add `-i` to keep it attached to a client.
    A quick import check that needs no client:
-   `docker run --rm -e API_KEY=x -e ATHLETE_ID=i1 ghcr.io/futureweb/intervals-mcp-server:latest python -c "import intervals_mcp_server.server"`.
-8. First release only: the GHCR package is private after the first push. Make it public in the
-   package settings (<https://github.com/orgs/futureweb/packages>) and confirm it is linked to the
-   repository.
-9. If the PyPI job is enabled (it is disabled by default, see `release.yml`): check
-   <https://pypi.org/project/futureweb-intervals-mcp/> and install the new version into a fresh
-   virtual environment (`pip install futureweb-intervals-mcp==X.Y.Z`).
+   `docker run --rm -e API_KEY=x -e ATHLETE_ID=i1 ghcr.io/futureweb/intervals-mcp-server:X.Y.Z python -c "import intervals_mcp_server.server"`.
+8. First release only: the GHCR package may be private after the first push. Make it public in
+   the package settings (<https://github.com/orgs/futureweb/packages>) and confirm it is linked to
+   the repository; the `mcp-registry` job needs a public image and can be re-run afterwards.
+9. Check <https://pypi.org/project/futureweb-intervals-mcp/> and install the new version into a
+   fresh environment (`uvx futureweb-intervals-mcp@X.Y.Z --version` or
+   `pip install futureweb-intervals-mcp==X.Y.Z`).
 10. Announce the release (GitHub Discussions, upstream issue if the change is relevant there) and
     open the next *Unreleased* section in `CHANGELOG.md`.

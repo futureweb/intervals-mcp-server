@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added (publishing)
+- The release workflow publishes a tag to PyPI (`futureweb-intervals-mcp`, Trusted Publishing via
+  OIDC with PEP 740 attestations, pre-releases included), after the GHCR image and before the
+  GitHub release; no API token is stored.
+- Optional Docker Hub mirror: with the repository variable `DOCKERHUB_IMAGE` and the secrets
+  `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` the multi-arch GHCR image is copied to Docker Hub
+  (`futurewebat/futureweb-intervals-mcp`) with the same tags, and the Docker Hub overview is
+  synced from `docs/DOCKERHUB.md`; skipped without the variable.
+- Official MCP Registry entry `io.github.futureweb/intervals-mcp-server`: `server.json` with the
+  PyPI package and the GHCR image (stdio, `API_KEY` as secret, `ATHLETE_ID`, `MCP_PERMISSIONS`,
+  `MCP_TOOLSET`, `ATHLETE_TIMEZONE`), ownership proofs (`mcp-name:` in the README, the
+  `io.modelcontextprotocol.server.name` image label) and a release job that publishes it with
+  `mcp-publisher` via GitHub OIDC once PyPI and GHCR are done. Packages only, no hosted endpoint.
+- Claude Desktop bundle: `packaging/mcpb/manifest.json` (MCPB manifest 0.4, `uv` server type,
+  user settings for the API key (sensitive), athlete ID, permissions and tool set), built with
+  the official MCPB CLI in CI, smoke-tested over stdio and attached to the GitHub release as
+  `futureweb-intervals-mcp-<version>.mcpb`.
+- Release checks: the tag must match `pyproject.toml`, `__version__`, `server.json` and the bundle
+  manifest (`scripts/check_release_metadata.py`, also run in CI and by the tests).
+- CI: `twine check --strict`, a check that sdist and wheel contain every package file
+  (`assets/`, `guides/`) and that the README has only absolute links for PyPI
+  (`scripts/check_dist.py`), `server.json` validation against the published schema and with
+  `mcp-publisher validate`, the image label check, and actionlint/shellcheck for the workflows.
+- `RELEASING.md`: one-time setup (environment `pypi`, Docker Hub, GHCR visibility), release
+  steps, verification and what to do when a job fails.
+
+### Changed (publishing)
+- README for PyPI: absolute image and link URLs; install section for `uvx` / `pip` (with the
+  pre-release note), Docker (GHCR and Docker Hub), the Claude Desktop bundle, the MCP Registry
+  and Claude Desktop configurations for `uvx` and Docker.
+
 ### Added (multi-user mode)
 - Optional multi-user mode `MCP_TENANCY=multi` (default `single`: unchanged). Each connection
   uses its own Intervals.icu credential: athletes other than the owner sign in with "Continue with

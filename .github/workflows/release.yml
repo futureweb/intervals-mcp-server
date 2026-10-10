@@ -1,11 +1,19 @@
 name: Release
 
 # Triggered by version tags. Tag format (PEP 440, prefixed with v):
-#   v1.0.0        final release   -> GitHub release, GHCR tags 1.0.0, 1.0 and latest
-#   v1.0.0b1      beta            -> GitHub PRE-release, GHCR tag 1.0.0b1 only
-#   v1.0.0rc1     release cand.   -> GitHub PRE-release, GHCR tag 1.0.0rc1 only
-# The tag must match the version in pyproject.toml. All CI checks (tests on
-# 3.12/3.13, build, Docker smoke test) must pass before anything is published.
+#   v1.0.0        final release   -> GitHub release, image tags 1.0.0, 1.0 and latest
+#   v1.0.0b1      beta            -> GitHub PRE-release, image tag 1.0.0b1 only
+#   v1.0.0rc1     release cand.   -> GitHub PRE-release, image tag 1.0.0rc1 only
+# The tag must match the version in pyproject.toml, __version__, server.json and the Claude
+# Desktop bundle manifest. All CI checks (tests on 3.12/3.13, build, Docker smoke test, bundle)
+# must pass before anything is published. Order (details and failure handling: RELEASING.md):
+#
+#   checks -> version -> docker (GHCR) -> pypi -> github-release (sdist, wheel, .mcpb)
+#                               |              \-> mcp-registry
+#                               \-> dockerhub (optional, only when DOCKERHUB_IMAGE is set)
+#
+# A failed job can be re-run on its own ("Re-run failed jobs"): the distributions and the bundle
+# are the CI artifacts of the same run, so a re-run publishes exactly the same files.
 on:
   push:
     tags: ["v*"]
@@ -20,6 +28,7 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/futureweb/intervals-mcp-server
+  SERVER_NAME: io.github.futureweb/intervals-mcp-server
 
 jobs:
   checks:
@@ -35,6 +44,7 @@ jobs:
     outputs:
       version: ${{ steps.classify.outputs.version }}
       prerelease: ${{ steps.classify.outputs.prerelease }}
+      image_tags: ${{ steps.classify.outputs.image_tags }}
       docker_tags: ${{ steps.classify.outputs.docker_tags }}
     steps:
       - name: Check out
@@ -45,7 +55,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Classify the tag (PEP 440) and compare with pyproject.toml
+      - name: Compare the tag with pyproject.toml, __version__, server.json and the bundle manifest
+        run: uv run --no-project python scripts/check_release_metadata.py --tag "${GITHUB_REF_NAME}"
+
+      - name: Classify the tag (PEP 440)
         id: classify
         run: |
           tag="${GITHUB_REF_NAME}"
@@ -54,52 +67,29 @@ jobs:
             echo "::error::Tag ${tag} is not a supported version (vX.Y.Z, vX.Y.ZaN, vX.Y.ZbN or vX.Y.ZrcN)"
             exit 1
           fi
+          # Second, independent check next to check_release_metadata.py (--version prints __version__).
           project_version="$(uv version --short)"
-          if [ "${version}" != "${project_version}" ]; then
-            echo "::error::Tag ${tag} does not match version ${project_version} in pyproject.toml"
-            exit 1
-          fi
-          # --version prints __version__ from the package; it must match as well.
           package_version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/intervals_mcp_server/__init__.py)"
-          if [ "${version}" != "${package_version}" ]; then
-            echo "::error::Tag ${tag} does not match __version__ ${package_version} in src/intervals_mcp_server/__init__.py"
+          if [ "${version}" != "${project_version}" ] || [ "${version}" != "${package_version}" ]; then
+            echo "::error::Tag ${tag} does not match pyproject.toml (${project_version}) and __version__ (${package_version})"
             exit 1
           fi
           if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             prerelease=false
-            major_minor="${version%.*}"
-            docker_tags="${IMAGE_NAME}:${version},${IMAGE_NAME}:${major_minor},${IMAGE_NAME}:latest"
+            image_tags="${version} ${version%.*} latest"
           else
             prerelease=true
-            docker_tags="${IMAGE_NAME}:${version}"
+            image_tags="${version}"
           fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
-          echo "docker_tags=${docker_tags}" >> "$GITHUB_OUTPUT"
-          echo "version ${version}, prerelease ${prerelease}, docker tags ${docker_tags}"
-
-  github-release:
-    name: GitHub release
-    # After the image: a failed image build must not leave a release without an image.
-    needs: [version, docker]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download distributions (built by the CI workflow)
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: dist
-          path: dist/
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          docker_tags=""
+          for t in ${image_tags}; do docker_tags="${docker_tags:+${docker_tags},}${IMAGE_NAME}:${t}"; done
+          {
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+            echo "image_tags=${image_tags}"
+            echo "docker_tags=${docker_tags}"
+          } >> "$GITHUB_OUTPUT"
+          echo "version ${version}, prerelease ${prerelease}, image tags ${image_tags}"
 
   docker:
     name: Docker image (GHCR)
@@ -128,6 +118,7 @@ jobs:
       - name: Build and push (amd64, arm64)
         # Tags are computed explicitly from the PEP 440 version (docker/metadata-action's
         # semver parser does not understand 1.0.0b1); `latest` only for final releases.
+        # The Dockerfile sets the io.modelcontextprotocol.server.name label (MCP Registry).
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -143,32 +134,219 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  dockerhub:
+    name: Docker Hub (optional)
+    # Optional mirror of the GHCR image. Runs only when the repository variable DOCKERHUB_IMAGE
+    # (e.g. futurewebat/futureweb-intervals-mcp) is set and is skipped otherwise; it also needs
+    # the secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (without them it warns and does nothing).
+    # The multi-arch image is copied, not rebuilt: same digest and same tags as on GHCR. Nothing
+    # waits for this job, so a Docker Hub problem never blocks PyPI or the GitHub release.
+    if: ${{ vars.DOCKERHUB_IMAGE != '' }}
+    needs: [version, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check the Docker Hub configuration
+        id: hub
+        env:
+          HUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          HUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          image="${HUB_IMAGE#docker.io/}"
+          if ! [[ "${image}" =~ ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+            echo "::error::DOCKERHUB_IMAGE must be <namespace>/<repository>, got '${HUB_IMAGE}'"
+            exit 1
+          fi
+          if [ -z "${HUB_USERNAME}" ] || [ -z "${HUB_TOKEN}" ]; then
+            echo "::warning::DOCKERHUB_IMAGE is set, but DOCKERHUB_USERNAME or DOCKERHUB_TOKEN is missing: Docker Hub skipped"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          { echo "enabled=true"; echo "image=${image}"; } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR (read)
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy the image to Docker Hub (all architectures, same tags)
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        env:
+          HUB_IMAGE: ${{ steps.hub.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+          IMAGE_TAGS: ${{ needs.version.outputs.image_tags }}
+        run: |
+          source="${IMAGE_NAME}:${VERSION}"
+          args=()
+          for t in ${IMAGE_TAGS}; do args+=(--tag "docker.io/${HUB_IMAGE}:${t}"); done
+          docker buildx imagetools create "${args[@]}" "${source}"
+          ghcr_digest="$(docker buildx imagetools inspect "${source}" --format '{{ json .Manifest }}' | jq -r .digest)"
+          hub_digest="$(docker buildx imagetools inspect "docker.io/${HUB_IMAGE}:${VERSION}" --format '{{ json .Manifest }}' | jq -r .digest)"
+          echo "GHCR ${ghcr_digest}, Docker Hub ${hub_digest}"
+          if [ "${ghcr_digest}" != "${hub_digest}" ]; then
+            echo "::warning::Docker Hub digest ${hub_digest} differs from GHCR ${ghcr_digest}"
+          fi
+
+      - name: Check out (Docker Hub overview)
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Update the Docker Hub overview from docs/DOCKERHUB.md
+        # Only the full description; the short description stays as set on Docker Hub. Needs a
+        # token with Read, Write, Delete scope; with a Read & Write token this step fails without
+        # failing the job (the overview can then be pasted by hand).
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ steps.hub.outputs.image }}
+          readme-filepath: docs/DOCKERHUB.md
+
   pypi:
-    name: Publish to PyPI
-    # Disabled by default. To enable:
-    #   1. On PyPI, add a "trusted publisher" for the project futureweb-intervals-mcp with
-    #      owner "futureweb", repository "intervals-mcp-server", workflow "release.yml"
-    #      and environment "pypi" (https://docs.pypi.org/trusted-publishers/).
-    #   2. In this repository create the GitHub environment "pypi" (Settings ->
-    #      Environments), ideally with required reviewers.
-    #   3. Replace the `if: false` below with `if: ${{ needs.version.outputs.prerelease == 'false' }}`
-    #      (pre-releases can be published too; PyPI marks them as such automatically).
-    if: false
-    needs: [version, github-release]
+    name: Publish to PyPI (trusted publishing)
+    # Trusted Publishing (OIDC): no API token is stored anywhere. PyPI side: publisher for the
+    # project futureweb-intervals-mcp, owner futureweb, repository intervals-mcp-server,
+    # workflow release.yml (environment pypi or any). Pre-releases (b/rc) are published too;
+    # PyPI marks them as pre-releases. Runs after the image, so nothing irreversible is
+    # published when an earlier job fails; a version on PyPI can never be replaced.
+    needs: [version, docker]
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/futureweb-intervals-mcp/
+      url: https://pypi.org/project/futureweb-intervals-mcp/${{ needs.version.outputs.version }}/
     permissions:
       id-token: write
     steps:
-      - name: Download distributions
+      - name: Download distributions (built and tested by the CI workflow)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI (trusted publishing)
+      - name: Check the distributions belong to the tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l dist/
+          test "$(find dist -type f | wc -l)" -eq 2
+          test -f "dist/futureweb_intervals_mcp-${VERSION}.tar.gz"
+          test -f "dist/futureweb_intervals_mcp-${VERSION}-py3-none-any.whl"
+
+      - name: Publish to PyPI
+        # Uploads PEP 740 attestations (Sigstore, bound to this workflow) with the files.
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist/
+          attestations: true
+          print-hash: true
+
+  github-release:
+    name: GitHub release
+    # After the image and PyPI: a release must not advertise packages that were not published.
+    needs: [version, docker, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download distributions (built by the CI workflow)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Download the Claude Desktop bundle (built and smoke-tested by the CI workflow)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mcpb
+          path: mcpb/
+
+      - name: Check the bundle belongs to the tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -l mcpb/
+          test -f "mcpb/futureweb-intervals-mcp-${VERSION}.mcpb"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          files: |
+            dist/*
+            mcpb/*.mcpb
+          fail_on_unmatched_files: true
+
+  mcp-registry:
+    name: Publish to the MCP Registry
+    # registry.modelcontextprotocol.io checks ownership of both packages in server.json: the
+    # "mcp-name:" line in the PyPI description and the io.modelcontextprotocol.server.name label
+    # of the GHCR image, read anonymously (the package must be public). GitHub OIDC grants the
+    # io.github.futureweb/* namespace, no secret is needed. server.json lists packages only.
+    needs: [version, docker, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install mcp-publisher (pinned, checksum verified)
+        run: scripts/install-mcp-publisher.sh "${RUNNER_TEMP}/mcp-publisher"
+
+      - name: Wait until PyPI serves the version and the GHCR image is public
+        run: |
+          for attempt in $(seq 1 20); do
+            if curl -sSf -o /dev/null "https://pypi.org/pypi/futureweb-intervals-mcp/${VERSION}/json"; then
+              break
+            fi
+            if [ "${attempt}" = 20 ]; then
+              echo "::error::PyPI does not serve futureweb-intervals-mcp ${VERSION} yet; re-run this job later"
+              exit 1
+            fi
+            sleep 15
+          done
+          repo="${IMAGE_NAME#ghcr.io/}"
+          token="$(curl -sSf "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r '.token // empty' || true)"
+          status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://ghcr.io/v2/${repo}/manifests/${VERSION}")"
+          if [ "${status}" != "200" ]; then
+            echo "::error::${IMAGE_NAME}:${VERSION} is not publicly readable (HTTP ${status}). The registry reads the image anonymously: make the GHCR package public (organization packages -> intervals-mcp-server -> Package settings -> Change visibility), then re-run this job."
+            exit 1
+          fi
+
+      - name: Log in with GitHub OIDC
+        run: '"${RUNNER_TEMP}/mcp-publisher/mcp-publisher" login github-oidc'
+
+      - name: Publish server.json
+        run: '"${RUNNER_TEMP}/mcp-publisher/mcp-publisher" publish server.json'
+
+      - name: Show the registry entry
+        run: |
+          name="$(jq -rn --arg n "${SERVER_NAME}" '$n | @uri')"
+          curl -sSf "https://registry.modelcontextprotocol.io/v0.1/servers/${name}/versions/${VERSION}" \
+            | jq '{name: .server.name, version: .server.version, packages: [.server.packages[].identifier], official: ._meta["io.modelcontextprotocol.registry/official"]}'

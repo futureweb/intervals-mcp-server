@@ -58,6 +58,14 @@ uv run --locked pytest
 
 CI runs the same three checks on Python 3.12 and 3.13; pylint is advisory. New tools must declare their permission class with `@tool("read" | "write" | "destructive" | "admin")`, be read-only unless they really write, carry a short docstring (at most 900 characters, first sentence: when to use the tool) and a described parameter for every argument (`Annotated[..., Field(description=...)]`, `Literal` enums for fixed values; details in `guides/methods/`), and come with tests that use synthetic fixtures only (never real athlete data, hostnames or keys).
 
+## Releases
+
+Releases are cut by the maintainers by pushing a version tag; the release workflow publishes to
+PyPI, GHCR, Docker Hub, the MCP Registry and attaches the Claude Desktop bundle. Setup, steps and
+what to do when a job fails: [RELEASING.md](RELEASING.md). A version is stored in `pyproject.toml`,
+`__version__`, `server.json` and `packaging/mcpb/manifest.json`;
+`uv run --no-project python scripts/check_release_metadata.py` checks that they agree.
+
 ## Pull request guidelines
 
 * Use concise commit messages.
