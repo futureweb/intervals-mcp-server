@@ -9,6 +9,79 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Fixed (review findings: writes and API)
+- `delete_events_by_date_range` works in two steps: new `categories` (default `WORKOUT`), `dry_run`
+  (default `true`: only lists what matches), `confirm_ids` (required with `dry_run=false`: the ids
+  from the preview the athlete confirmed) and `include_paired` (default `false`) parameters. Only
+  confirmed ids that still match are deleted, one `DELETE` per id (404 = already gone); events added
+  after the preview and confirmed ids that no longer match are reported, never deleted. At most 31
+  days and 100 ids, `end_date` not before `start_date`, only events that start in the range; plan
+  phases and fitness-model events cannot be range-deleted (class stays `destructive`).
+- Workouts are validated before they are written (`add_or_update_event`, `add_events_bulk`,
+  `create_library_workout`); with errors nothing is sent, warnings are listed in the answer. An
+  empty `workout_doc` (`{}`, no steps) is ignored and never wipes a planned workout. Text-only
+  workouts (strength, yoga) use the new `description` parameter of `add_or_update_event` or a
+  workout_doc with text steps only; on update a `description` (whatever it looks like, e.g. a bullet
+  list) or a workout_doc without timed steps replaces a structured (timed) workout only with
+  `replace_workout=true`. New errors:
+  open-ended (lap-press / free-ride without duration) steps, duration and distance on one step,
+  non-whole or non-positive durations, units that do not fit the target kind (HR in `%ftp` ...),
+  value plus range, implausible absolute paces (walking and hiking up to 40:00/km), step labels
+  with words that Intervals.icu would read as workout syntax (`2m`, `2-3m.`, `85%`, `Z2`, `Z2/Z3`,
+  `3x`, `ramp` unless the step is a ramp ...; surrounding punctuation does not hide them; line
+  breaks are never rendered), description or comment lines that would
+  become steps, repeats or warm-up/cool-down sections; the description is followed by a blank line. Bulk
+  entries get the same type checks (no crash on `"70"`, no per-character string steps), at most
+  100 entries, blank names and non-string colours are refused, `created_count` counts the events
+  the API returned.
+- `add_or_update_note` reads the event first and only updates notes (it never turns a workout into
+  a note); moving an event keeps its time of day; negative `moving_time`/`distance` and blank names
+  or messages are refused; an empty description or comment on update is ignored (new
+  `clear_description` for notes and activities, `clear_comments` for wellness empty them on
+  purpose; a clear flag together with new text is refused); dates must be `YYYY-MM-DD`; events and notes created without a date use today in the
+  athlete's time zone.
+- Sport inference matches whole words and no longer defaults to Ride: a workout or race whose name
+  does not name exactly one sport needs `workout_type`; notes, sick, holiday and injury days are
+  created without a sport; `TARGET` is no longer offered by `add_or_update_event` (it had no target
+  fields).
+- `update_sport_settings`: `threshold_pace` needs its unit (`"4:30/km"`, `"7:15/mi"`, `"1:45/100m"`,
+  `"4.17 m/s"`; a bare number is refused as ambiguous; 0.35-10 m/s), the answer shows pace and m/s, and
+  `recalcHrZones=false` is sent explicitly. `update_custom_item` refuses empty updates and merges
+  `content` into the current content; `delete_custom_item` reads the item first and names it.
+- `add_event_from_library` also copies the planned load (`icu_training_load`, `joules`) and says when
+  the library workout's steps are not in its text (file imports).
+- Overwriting write tools (`add_or_update_event`, `add_or_update_note`, `update_activity`,
+  `update_wellness`) carry `destructiveHint: true`; their class stays `write`.
+- Ids are confined to one URL path segment everywhere (`seg()` in every URL, and the tool guard
+  refuses `*_id` / `*_ids` arguments such as `a/b` or `i123/intervals`).
+- API client: error messages keep the status code and the reason Intervals.icu gives (API key
+  redacted), HTML error pages keep their status, empty transport errors name their type; GET is
+  retried after timeouts and dropped connections (POST/PUT/DELETE are not), and a write that failed
+  in transit says it may still have been applied.
+- One tool call makes at most 300 API requests and runs at most 120 s (`MCP_TOOL_MAX_REQUESTS`,
+  `MCP_TOOL_TIMEOUT_S`) and says when a limit cut its result; `compare_best_efforts` takes at most
+  10 durations.
+- Tool results are capped (`MCP_MAX_OUTPUT_CHARS`, default 100000) with a note instead of silent
+  truncation (JSON stays valid: the large lists are cut by the same fraction, chronological lists
+  keep their newest items, a paged list gets the matching `next_offset`, and `truncated` says what
+  was kept); `get_activity_streams` pages by size (default `max_points` 2000, at most 20000) and
+  its JSON output is one valid JSON object with `next_start_index`; `get_wellness_data` pages by
+  day with the `start_date` to continue.
+- "Today" and all default date ranges use the athlete's time zone (profile `timezone`, looked up
+  via `/profile` and cached for a day, or `ATHLETE_TIMEZONE`), not the server clock (UTC in Docker);
+  `tzdata` is a dependency so time zones also work on Windows.
+- Caches (athlete, sport settings, custom items, gear) expire (10 / 30 minutes), are keyed by API
+  key, drop after the writes that change them (`update_sport_settings` also refreshes the profile),
+  and never store a failed fetch; `get_training_zones` has `refresh`; gear and profile errors are
+  shown instead of "no gear" / "no settings".
+- API errors are no longer reported as missing data (`get_activity_report`,
+  `analyze_workout_execution`, `get_recovery_snapshot`, nutrition trends, `get_activity_intervals`);
+  `compare_best_efforts` marks failed cells and incomplete bests; `find_similar_intervals` and
+  `compare_workouts` say when the API result was cut at its limit, and a name search with dates
+  lists that range instead of the newest matches.
+- `get_weekly_summary` works with the athlete alias `0`; interval and stream labels use the custom
+  definitions of the activity's owner.
+
 ### Fixed (review findings: analytics)
 - `analyze_workout_execution` / `get_activity_report` / `get_activity_intervals` (plan vs
   execution): a planned step can span any number of consecutive intervals, so runs with device

@@ -8,7 +8,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.formatting import format_power_curves
 from intervals_mcp_server.utils.validation import resolve_athlete_id
@@ -184,7 +184,7 @@ async def get_athlete_power_curves(
         )
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/power-curves",
+        url=f"/athlete/{seg(athlete_id_to_use)}/power-curves",
         params=params,
         api_key=api_key,
     )

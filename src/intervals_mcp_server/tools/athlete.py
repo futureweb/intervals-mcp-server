@@ -4,16 +4,21 @@ Athlete profile, sport settings and training zone tools for Intervals.icu.
 The athlete object returned by ``/athlete/{id}`` contains account internals (e-mail,
 API key, OAuth scopes, notification switches). Only coaching-relevant fields are
 exposed here. Sport settings (FTP, LTHR, thresholds, zones, default gear) come from
-``/athlete/{id}/sport-settings``; both are cached per process and can be refreshed.
+``/athlete/{id}/sport-settings``; both are cached per process for ATHLETE_CACHE_TTL_S
+(changes made in the web app show up after that) and can be refreshed. The athlete
+profile's ``timezone`` defines "today" for all tools (utils.dates).
 """
 
 import json
+import re
 from typing import Any
 
 from intervals_mcp_server.api import client as api_client
+from intervals_mcp_server.api.client import seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.gear import get_gear_map
-from intervals_mcp_server.utils.dates import get_default_end_date, get_default_start_date
+from intervals_mcp_server.utils.cache import TTLCache, cache_key
+from intervals_mcp_server.utils.dates import get_default_end_date, get_default_start_date, set_timezone_resolver
 from intervals_mcp_server.utils.custom_fields import assigned_codes
 from intervals_mcp_server.utils.sports import family_types, format_pace, zone_ranges
 from intervals_mcp_server.utils.validation import resolve_athlete_id
@@ -23,8 +28,13 @@ from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
-_ATHLETE_CACHE: dict[str, dict[str, Any]] = {}
-_SPORT_SETTINGS_CACHE: dict[str, list[dict[str, Any]]] = {}
+ATHLETE_CACHE_TTL_S = 600
+_ATHLETE_CACHE: TTLCache[dict[str, Any]] = TTLCache(ATHLETE_CACHE_TTL_S)
+_SPORT_SETTINGS_CACHE: TTLCache[list[dict[str, Any]]] = TTLCache(ATHLETE_CACHE_TTL_S)
+# The athlete's time zone (rarely changes) and lookups that failed recently (not retried on
+# every tool call).
+_TIMEZONE_CACHE: TTLCache[str] = TTLCache(24 * 3600)
+_TIMEZONE_FAILURES: TTLCache[bool] = TTLCache(300)
 
 # Fields of the athlete object that are safe and useful for coaching.
 PROFILE_FIELDS = (
@@ -89,32 +99,92 @@ SPORT_SETTING_FIELDS = (
 )
 
 
+async def fetch_athlete(
+    athlete_id: str, api_key: str | None = None, *, refresh: bool = False
+) -> tuple[dict[str, Any], str | None]:
+    """The raw athlete object (cached) and the error message when it could not be loaded."""
+    key = cache_key(athlete_id, api_key)
+    cached = None if refresh else _ATHLETE_CACHE.get(key)
+    if cached is not None:
+        return cached, None
+    result = await api_client.make_intervals_request(url=f"/athlete/{seg(athlete_id)}", api_key=api_key)
+    if isinstance(result, dict) and "error" in result:
+        return {}, str(result.get("message", "Unknown error"))
+    if not isinstance(result, dict) or not result:
+        return {}, "unexpected empty response"
+    _ATHLETE_CACHE.set(key, result)
+    return result, None
+
+
 async def get_athlete_raw(
     athlete_id: str, api_key: str | None = None, *, refresh: bool = False
 ) -> dict[str, Any]:
     """Return (and cache) the raw athlete object; {} on error."""
-    if not refresh and athlete_id in _ATHLETE_CACHE:
-        return _ATHLETE_CACHE[athlete_id]
-    result = await api_client.make_intervals_request(url=f"/athlete/{athlete_id}", api_key=api_key)
-    if not isinstance(result, dict) or "error" in result:
-        return {}
-    _ATHLETE_CACHE[athlete_id] = result
-    return result
+    athlete, _ = await fetch_athlete(athlete_id, api_key, refresh=refresh)
+    return athlete
+
+
+async def athlete_timezone(athlete_id: str, api_key: str | None = None) -> str | None:
+    """IANA time zone of the athlete profile; None when unknown.
+
+    Cached for a day on its own (a sport-settings write does not drop it). Taken from an
+    already cached athlete object, otherwise from the lighter /profile endpoint.
+    """
+    key = cache_key(athlete_id, api_key)
+    cached = _TIMEZONE_CACHE.get(key)
+    if cached:
+        return cached
+    if _TIMEZONE_FAILURES.get(key):
+        return None
+    athlete = _ATHLETE_CACHE.get(key)
+    zone = athlete.get("timezone") if isinstance(athlete, dict) else None
+    if not zone:
+        result = await api_client.make_intervals_request(url=f"/athlete/{seg(athlete_id)}/profile", api_key=api_key)
+        profile = result.get("athlete") if isinstance(result, dict) and "error" not in result else None
+        zone = profile.get("timezone") if isinstance(profile, dict) else None
+    if not zone:
+        _TIMEZONE_FAILURES.set(key, True)
+        return None
+    _TIMEZONE_CACHE.set(key, str(zone))
+    return str(zone)
+
+
+set_timezone_resolver(athlete_timezone)
+
+
+async def canonical_athlete_id(athlete_id: str, api_key: str | None = None) -> str:
+    """The athlete's own id ("i123") for the alias "0" (the key's athlete); other ids unchanged."""
+    if str(athlete_id) != "0":
+        return str(athlete_id)
+    athlete = await get_athlete_raw(athlete_id, api_key)
+    return str(athlete.get("id") or athlete_id)
+
+
+async def fetch_sport_settings(
+    athlete_id: str, api_key: str | None = None, *, refresh: bool = False
+) -> tuple[list[dict[str, Any]], str | None]:
+    """The sport settings list (cached) and the error message when it could not be loaded."""
+    key = cache_key(athlete_id, api_key)
+    cached = None if refresh else _SPORT_SETTINGS_CACHE.get(key)
+    if cached is not None:
+        return cached, None
+    result = await api_client.make_intervals_request(
+        url=f"/athlete/{seg(athlete_id)}/sport-settings", api_key=api_key
+    )
+    if isinstance(result, dict) and "error" in result:
+        return [], str(result.get("message", "Unknown error"))
+    if not isinstance(result, list):
+        return [], "unexpected response"
+    settings = [item for item in result if isinstance(item, dict)]
+    _SPORT_SETTINGS_CACHE.set(key, settings)
+    return settings, None
 
 
 async def get_sport_settings_raw(
     athlete_id: str, api_key: str | None = None, *, refresh: bool = False
 ) -> list[dict[str, Any]]:
     """Return (and cache) the sport settings list; [] on error."""
-    if not refresh and athlete_id in _SPORT_SETTINGS_CACHE:
-        return _SPORT_SETTINGS_CACHE[athlete_id]
-    result = await api_client.make_intervals_request(
-        url=f"/athlete/{athlete_id}/sport-settings", api_key=api_key
-    )
-    if not isinstance(result, list):
-        return []
-    settings = [item for item in result if isinstance(item, dict)]
-    _SPORT_SETTINGS_CACHE[athlete_id] = settings
+    settings, _ = await fetch_sport_settings(athlete_id, api_key, refresh=refresh)
     return settings
 
 
@@ -129,7 +199,7 @@ async def get_latest_eftp(athlete_id: str, api_key: str | None = None) -> dict[s
         "fields": "id,sportInfo",
     }
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{athlete_id}/wellness", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params
     )
     if not isinstance(result, list):
         return {}
@@ -338,14 +408,15 @@ async def get_athlete_profile(  # pylint: disable=too-many-locals,too-many-branc
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         output_format: "text" (default) or "json"
-        refresh: Re-fetch instead of using the per-process cache (optional, default False)
+        refresh: Re-fetch instead of using the cache (optional, default False; the cache expires
+            after 10 minutes)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    athlete = await get_athlete_raw(athlete_id_to_use, api_key, refresh=refresh)
+    athlete, error = await fetch_athlete(athlete_id_to_use, api_key, refresh=refresh)
     if not athlete:
-        return f"Error fetching athlete profile for {athlete_id_to_use}."
+        return f"Error fetching athlete profile for {athlete_id_to_use}: {error}"
 
     profile = {key: athlete.get(key) for key in PROFILE_FIELDS if athlete.get(key) not in (None, "")}
     gear_rows = []
@@ -435,12 +506,15 @@ async def get_sport_settings(  # pylint: disable=too-many-arguments,too-many-pos
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
         sport_type: Only the setting that covers this activity type, e.g. "GravelRide" (optional)
         output_format: "text" (default) or "json"
-        refresh: Re-fetch instead of using the per-process cache (optional, default False)
+        refresh: Re-fetch instead of using the cache (optional, default False; the cache expires
+            after 10 minutes)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    settings = await get_sport_settings_raw(athlete_id_to_use, api_key, refresh=refresh)
+    settings, error = await fetch_sport_settings(athlete_id_to_use, api_key, refresh=refresh)
+    if error:
+        return f"Error fetching sport settings for athlete {athlete_id_to_use}: {error}"
     if not settings:
         return f"No sport settings found for athlete {athlete_id_to_use}."
     selected = _setting_for_sport(settings, sport_type)
@@ -467,6 +541,7 @@ async def get_training_zones(  # pylint: disable=too-many-arguments,too-many-pos
     sport_type: str | None = None,
     zone_type: str = "all",
     output_format: str = "text",
+    refresh: bool = False,
 ) -> str:
     """Get the training zones (power, heart rate, pace) of an athlete from Intervals.icu
 
@@ -480,6 +555,8 @@ async def get_training_zones(  # pylint: disable=too-many-arguments,too-many-pos
         sport_type: Only the setting that covers this activity type, e.g. "Run" (optional, default all)
         zone_type: "all" (default), "power", "hr" or "pace"
         output_format: "text" (default) or "json"
+        refresh: Re-fetch the sport settings instead of using the cache (optional, default False;
+            the cache expires after 10 minutes)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -487,7 +564,9 @@ async def get_training_zones(  # pylint: disable=too-many-arguments,too-many-pos
     kind = zone_type.strip().lower()
     if kind not in ("all", "power", "hr", "pace"):
         return "Error: zone_type must be one of all, power, hr, pace."
-    settings = await get_sport_settings_raw(athlete_id_to_use, api_key)
+    settings, error = await fetch_sport_settings(athlete_id_to_use, api_key, refresh=refresh)
+    if error:
+        return f"Error fetching sport settings for athlete {athlete_id_to_use}: {error}"
     selected = _setting_for_sport(settings, sport_type)
     if not selected:
         return f"No sport settings found for athlete {athlete_id_to_use} (sport_type={sport_type})."
@@ -531,8 +610,51 @@ _SETTING_LIMITS: dict[str, tuple[float, float, str]] = {
     "max_hr": (100, 230, "bpm"),
     "w_prime": (1000, 60000, "J"),
     "p_max": (300, 2500, "W"),
-    "threshold_pace": (0.5, 10.0, "m/s"),
+    "threshold_pace": (0.35, 10.0, "m/s"),  # 0.35 m/s = 4:46/100m (slow swim CSS)
 }
+
+# Distance in metres per pace unit ("4:30/km" = 1000 m in 270 s).
+_PACE_DISTANCES = {"/km": 1000.0, "/mi": 1609.344, "/100m": 100.0, "/100y": 91.44, "/500m": 500.0}
+_PACE_UNIT_SUFFIX = {"MINS_KM": "/km", "MINS_MILE": "/mi", "SECS_100M": "/100m", "SECS_100Y": "/100y", "SECS_500M": "/500m"}
+_PACE_RE = re.compile(r"(\d{1,2}):([0-5]\d)\s*(/km|/mi|/100m|/100y|/500m)?")
+_SPEED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*m/s")
+
+
+def parse_threshold_pace(value: Any, pace_units: Any) -> float | str:
+    """Threshold pace in m/s from "4:30/km", "7:15/mi", "1:45/100m", "4:30" (in the setting's
+    pace units) or "4.17 m/s"; an error string for a bare number, which is ambiguous (4.5 could
+    be 4:30/km or 4.5 m/s = 3:42/km)."""
+    text = str(value).strip().lower().replace(" ", "")
+    bare_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if bare_number or re.fullmatch(r"\d+(\.\d+)?", text):
+        return (
+            f"Error: threshold_pace {value!r} is ambiguous as a bare number; pass it with its unit, "
+            'e.g. "4:30/km", "7:15/mi", "1:45/100m" or "4.17 m/s".'
+        )
+    speed = _SPEED_RE.fullmatch(text)
+    if speed:
+        return float(speed.group(1))
+    pace = _PACE_RE.fullmatch(text)
+    if pace:
+        seconds = int(pace.group(1)) * 60 + int(pace.group(2))
+        suffix = pace.group(3) or _PACE_UNIT_SUFFIX.get(str(pace_units or "").upper())
+        if not suffix:
+            return 'Error: threshold_pace needs a unit, e.g. "4:30/km" (the sport setting has no pace units).'
+        if seconds <= 0:
+            return "Error: threshold_pace must be longer than 0:00."
+        return round(_PACE_DISTANCES[suffix] / seconds, 4)
+    return (
+        f"Error: threshold_pace {value!r} is not a pace; use m:ss with a unit, e.g. \"4:30/km\", "
+        '"7:15/mi", "1:45/100m", or a speed such as "4.17 m/s".'
+    )
+
+
+def _setting_value_text(name: str, value: Any, pace_units: Any) -> str:
+    if name == "threshold_pace" and isinstance(value, (int, float)) and value > 0:
+        suffix = _PACE_UNIT_SUFFIX.get(str(pace_units or "").upper(), "/km")
+        minutes, seconds = divmod(int(round(_PACE_DISTANCES[suffix] / value)), 60)
+        return f"{value:.2f} m/s ({minutes}:{seconds:02d}{suffix})"
+    return str(value)
 
 
 @tool("admin")
@@ -544,18 +666,18 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
     max_hr: int | None = None,
     w_prime: int | None = None,
     p_max: int | None = None,
-    threshold_pace: float | None = None,
+    threshold_pace: str | float | None = None,
     athlete_id: str | None = None,
     api_key: str | None = None,
 ) -> str:
     """ADMIN WRITE: change thresholds of the sport setting that covers a sport (FTP, LTHR, max HR ...)
 
-    Only the values passed are sent; zones are NOT recalculated (Intervals.icu keeps the
-    configured zone percentages/bpm, so check get_training_zones afterwards). Values are
-    sanity-checked (FTP 50-600 W, LTHR 80-220 and below max HR 100-230 bpm, W' 1000-60000 J,
-    Pmax 300-2500 W, threshold pace 0.5-10 m/s). Affects future analysis of every activity
-    of the sport group (e.g. Ride) and the training load of new activities. Use only on
-    explicit request of the athlete.
+    Only the values passed are sent; zones are NOT recalculated (the request asks Intervals.icu
+    explicitly not to recalculate HR zones; the configured zone percentages/bpm stay, so check
+    get_training_zones afterwards). Values are sanity-checked (FTP 50-600 W, LTHR 80-220 and
+    below max HR 100-230 bpm, W' 1000-60000 J, Pmax 300-2500 W, threshold pace 0.35-10 m/s).
+    Affects future analysis of every activity of the sport group (e.g. Ride) and the training
+    load of new activities. Use only on explicit request of the athlete.
 
     Args:
         sport_type: Activity type whose sport setting is changed, e.g. "Ride" or "Run"
@@ -565,7 +687,9 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
         max_hr: New maximum heart rate in bpm (optional)
         w_prime: New W' in joules (optional)
         p_max: New Pmax in watts (optional)
-        threshold_pace: New threshold pace in m/s (optional)
+        threshold_pace: New threshold pace WITH its unit (optional): "4:30/km", "7:15/mi",
+            "1:45/100m", "1:45/100y", "1:50/500m", "4:30" (in the setting's pace units) or a
+            speed "4.17 m/s". A bare number is refused because 4.5 could mean 4:30/km or 4.5 m/s.
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
     """
@@ -574,35 +698,58 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
         return error_msg
     changes: dict[str, float] = {}
     for name, value in (("ftp", ftp), ("indoor_ftp", indoor_ftp), ("lthr", lthr), ("max_hr", max_hr),
-                        ("w_prime", w_prime), ("p_max", p_max), ("threshold_pace", threshold_pace)):
+                        ("w_prime", w_prime), ("p_max", p_max)):
         if value is None:
             continue
         low, high, units = _SETTING_LIMITS[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
             return f"Error: {name} must be between {low:g} and {high:g} {units}."
         changes[name] = value
-    if not changes:
+    if threshold_pace is not None and str(threshold_pace).strip() == "":
+        threshold_pace = None
+    if not changes and threshold_pace is None:
         return "Error: pass at least one value to change (ftp, indoor_ftp, lthr, max_hr, w_prime, p_max, threshold_pace)."
-    settings = await get_sport_settings_raw(athlete_id_to_use, api_key, refresh=True)
+    settings, error = await fetch_sport_settings(athlete_id_to_use, api_key, refresh=True)
+    if error:
+        return f"Error fetching sport settings: {error}"
     matching = _setting_for_sport(settings, sport_type)
     if len(matching) != 1:
         known = sorted({str(t) for s in settings for t in (s.get("types") or [])})
         return f"Error: expected exactly one sport setting for '{sport_type}', found {len(matching)}. Known types: {', '.join(known)}."
     setting = matching[0]
+    pace_units = setting.get("pace_units")
+    if threshold_pace is not None:
+        speed = parse_threshold_pace(threshold_pace, pace_units)
+        if isinstance(speed, str):
+            return speed
+        low, high, units = _SETTING_LIMITS["threshold_pace"]
+        if not low <= speed <= high:
+            return f"Error: threshold_pace {threshold_pace!r} = {speed:.2f} m/s is outside {low:g}-{high:g} {units}."
+        changes["threshold_pace"] = speed
     new_lthr = changes.get("lthr", setting.get("lthr"))
     new_max = changes.get("max_hr", setting.get("max_hr"))
     if new_lthr is not None and new_max is not None and new_lthr >= new_max:
         return f"Error: LTHR ({new_lthr}) must be below max HR ({new_max})."
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/sport-settings/{setting.get('id')}", api_key=api_key, method="PUT", data=changes
+        url=f"/athlete/{seg(athlete_id_to_use)}/sport-settings/{seg(setting.get('id'))}",
+        api_key=api_key,
+        method="PUT",
+        params={"recalcHrZones": "false"},
+        data=changes,
     )
     if isinstance(result, dict) and "error" in result:
         return f"Error updating sport settings: {result.get('message', 'Unknown error')}"
-    _SPORT_SETTINGS_CACHE.pop(athlete_id_to_use, None)
+    # The athlete object embeds the sport settings too: drop both (all aliases and keys).
+    _SPORT_SETTINGS_CACHE.clear()
+    _ATHLETE_CACHE.clear()
     echoed = {k: (result.get(k) if isinstance(result, dict) else None) for k in changes}
     before = {k: setting.get(k) for k in changes}
     return (
         f"Updated sport setting {setting.get('id')} ({', '.join(str(t) for t in setting.get('types') or [])}): "
-        + "; ".join(f"{k} {before[k]} -> {echoed[k] if echoed[k] is not None else v}" for k, v in changes.items())
+        + "; ".join(
+            f"{k} {_setting_value_text(k, before[k], pace_units)} -> "
+            f"{_setting_value_text(k, echoed[k] if echoed[k] is not None else v, pace_units)}"
+            for k, v in changes.items()
+        )
         + ". Zones were not recalculated; verify them with get_training_zones."
     )

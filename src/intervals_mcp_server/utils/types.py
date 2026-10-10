@@ -412,6 +412,10 @@ class Step:  # pylint: disable=too-many-instance-attributes
         """Convert Step to string representation."""
         return self._to_str()
 
+    def _label(self) -> str:
+        """The step text on one line (a line break would start a new step in the workout text)."""
+        return " ".join(str(self.text).splitlines())
+
     def _to_str(self, nested: bool = False) -> str:  # pylint: disable=too-many-branches
         """Convert Step to string representation.
 
@@ -434,7 +438,7 @@ class Step:  # pylint: disable=too-many-instance-attributes
             if self.duration is not None or self.distance is not None:
                 val += "- "  # a step without duration or distance stays a plain text line
             if self.text is not None:
-                val += f"{self.text} "
+                val += f"{self._label()} "
             if self.duration is not None:
                 val += f"{self._format_duration()} "
             elif self.distance is not None:
@@ -460,7 +464,7 @@ class Step:  # pylint: disable=too-many-instance-attributes
             if self.cadence is not None:
                 val += f"{self.cadence} "
         if self.reps is not None and self.text is not None:
-            val += f"{self.text} "  # repeat header label: "10x Main"
+            val += f"{self._label()} "  # repeat header label: "10x Main"
         if self.reps is not None and self.steps is not None:
             for step in self.steps:
                 # Using _to_str instead of __str__ because we need the nested=True arg;
@@ -616,7 +620,8 @@ class WorkoutDoc:  # pylint: disable=too-many-instance-attributes
     def __str__(self) -> str:
         val = ""
         if self.description is not None:
-            val += f"{self.description}\n"
+            # A blank line keeps the description apart from the first step.
+            val += f"{self.description}\n\n"
         if self.steps is not None:
             for step in self.steps:
                 val += step.__str__() + "\n"

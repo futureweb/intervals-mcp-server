@@ -721,10 +721,12 @@ def test_update_custom_item(monkeypatch):
 
 def test_delete_custom_item(monkeypatch):
     """
-    Test delete_custom_item returns the API response.
+    Test delete_custom_item reads the item first and names it in the answer.
     """
 
-    async def fake_request(*_args, **_kwargs):
+    async def fake_request(*_args, **kwargs):
+        if kwargs.get("method", "GET") == "GET":
+            return {"id": 1, "name": "Old Chart", "type": "FITNESS_CHART"}
         return {}
 
     monkeypatch.setattr("intervals_mcp_server.api.client.make_intervals_request", fake_request)
@@ -732,7 +734,7 @@ def test_delete_custom_item(monkeypatch):
         "intervals_mcp_server.tools.custom_items.make_intervals_request", fake_request
     )
     result = asyncio.run(delete_custom_item(item_id=1, athlete_id="1"))
-    assert "Successfully deleted" in result
+    assert "Successfully deleted" in result and "'Old Chart' (FITNESS_CHART)" in result
 
 
 def test_create_custom_item_with_invalid_json_content(monkeypatch):

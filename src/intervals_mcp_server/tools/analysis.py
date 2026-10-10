@@ -12,7 +12,7 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -48,7 +48,7 @@ CORE_STREAMS = ("time", "watts", "heartrate", "cadence", "velocity_smooth", "dis
 
 
 async def _get_activity(activity_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
     if isinstance(result, dict) and "error" in result:
         return None, f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -62,7 +62,7 @@ async def _get_streams(
 ) -> tuple[list[dict[str, Any]], str | None]:
     params = {"types": ",".join(types)} if types else None
     result = await make_intervals_request(
-        url=f"/activity/{activity_id}/streams", api_key=api_key, params=params
+        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params=params
     )
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching activity streams: {result.get('message', 'Unknown error')}"
@@ -411,7 +411,7 @@ def _threshold_context(activity: dict[str, Any]) -> dict[str, Any]:
 
 async def _get_event(athlete_id: str, event_id: Any, api_key: str | None) -> dict[str, Any] | None:
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/events/{event_id}", api_key=api_key, params={"resolve": "true"}
+        url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", api_key=api_key, params={"resolve": "true"}
     )
     return result if isinstance(result, dict) and "error" not in result else None
 
@@ -431,7 +431,7 @@ async def _match_candidates(  # pylint: disable=too-many-locals
     except ValueError:
         return []
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/events", api_key=api_key,
         params={"oldest": start, "newest": end, "category": "WORKOUT"},
     )
     if not isinstance(result, list):
@@ -551,14 +551,19 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     if error or activity is None:
         return error or "Error"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    intervals_result = await make_intervals_request(url=f"/activity/{activity_id}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
     intervals: list[dict[str, Any]] = []
+    load_errors: list[str] = []  # API errors are reported, never shown as missing data (API-7)
     if isinstance(intervals_result, dict) and "error" not in intervals_result:
         intervals = [i for i in intervals_result.get("icu_intervals") or [] if isinstance(i, dict)]
+    elif isinstance(intervals_result, dict):
+        load_errors.append(f"intervals could not be loaded: {intervals_result.get('message', 'Unknown error')}")
 
     stream_defs = await _defs(ACTIVITY_STREAM, api_key, athlete_id)
     field_defs = await _defs(ACTIVITY_FIELD, api_key, athlete_id)
-    streams, _ = await _get_streams(activity_id, api_key, _stream_types_for_execution(activity, stream_defs))
+    streams, streams_error = await _get_streams(activity_id, api_key, _stream_types_for_execution(activity, stream_defs))
+    if streams_error and streams_error.startswith("Error"):
+        load_errors.append(streams_error)
 
     event: dict[str, Any] | None = None
     steps: Any = None
@@ -614,6 +619,8 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
         header += "\n" + ", ".join(extras)
     if device_lines and detail_level != "compact":
         header += "\nDevice/custom fields" + (" (assigned to the sport)" if assigned is not None else "") + ": " + "; ".join(device_lines)
+    if load_errors:
+        header += "\nINCOMPLETE DATA (API error, not missing data; retry later): " + "; ".join(load_errors)
 
     if output_format.strip().lower() == "json":
         payload = {
@@ -633,6 +640,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
             "extension": result.get("extension"),
             "pre_plan": result.get("pre_plan"),
             "hidden_streams": result.get("hidden_streams"),
+            "load_errors": load_errors,
         }
         return json.dumps(payload, ensure_ascii=False)
     return format_execution(result, header, pace_based, detail_level)

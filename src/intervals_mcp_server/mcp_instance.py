@@ -16,6 +16,7 @@ from mcp.types import ToolAnnotations
 from intervals_mcp_server.api.client import setup_api_client
 from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
+from intervals_mcp_server.tool_guard import guarded
 
 # Re-exported: the FASTMCP_* helpers live in server_setup so that --doctor can check them
 # without building the server.
@@ -104,9 +105,13 @@ PERMISSION_ANNOTATIONS: dict[str, dict[str, bool]] = {
     "destructive": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
     "admin": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
 }
+# Write tools that can REPLACE existing values (an update of an event, a wellness comment, an
+# activity name) are not purely additive: per the MCP spec they carry destructiveHint=true, so
+# clients ask before running them. Their permission class stays "write".
+OVERWRITE_ANNOTATIONS: dict[str, bool] = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False}
 
 
-def tool(permission: str = "read", **kwargs: Any) -> Callable[[F], F]:
+def tool(permission: str = "read", *, overwrites: bool = False, **kwargs: Any) -> Callable[[F], F]:
     """Register an MCP tool only when its permission class is enabled.
 
     Classes: "read" (never changes anything), "write" (creates or edits calendar
@@ -114,18 +119,24 @@ def tool(permission: str = "read", **kwargs: Any) -> Callable[[F], F]:
     "admin" (configuration and mass operations). The enabled classes come from the
     MCP_PERMISSIONS environment variable (default: read). A tool of a disabled class
     is not exposed to clients at all; the Python function stays importable.
+
+    ``overwrites=True`` marks a write tool that can replace existing values (destructiveHint).
+    Every tool is wrapped by tool_guard.guarded (id checks, athlete time zone, request budget
+    and deadline, output size cap), registered or not.
     """
     if permission not in PERMISSION_CLASSES:
         raise ValueError(f"Unknown permission class {permission!r}; use one of {PERMISSION_CLASSES}")
 
     def decorator(func: F) -> F:
         _TOOL_PERMISSIONS[func.__name__] = permission
+        wrapped = guarded(func)
         if permission in get_config().permissions:
             options = dict(kwargs)
-            options.setdefault("annotations", ToolAnnotations.model_validate(PERMISSION_ANNOTATIONS[permission]))
-            return cast(F, mcp.tool(**options)(func))
+            hints = OVERWRITE_ANNOTATIONS if overwrites else PERMISSION_ANNOTATIONS[permission]
+            options.setdefault("annotations", ToolAnnotations.model_validate(hints))
+            return cast(F, mcp.tool(**options)(wrapped))
         _DISABLED_TOOLS[func.__name__] = permission
-        return func
+        return wrapped
 
     return decorator
 

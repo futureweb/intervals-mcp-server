@@ -5,7 +5,7 @@ This module contains validation functions for input parameters.
 """
 
 import re
-from datetime import datetime
+from datetime import date
 
 from intervals_mcp_server.utils.dates import parse_date_range
 
@@ -40,11 +40,14 @@ def validate_date(date_str: str) -> str:
     Raises:
         ValueError: If the date string is not in YYYY-MM-DD format.
     """
+    # strptime would also accept "2026-1-5", which then reaches the API unpadded.
+    if not isinstance(date_str, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+        raise ValueError("Invalid date format. Please use YYYY-MM-DD.")
     try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-        return date_str
+        date.fromisoformat(date_str)
     except ValueError as exc:
         raise ValueError("Invalid date format. Please use YYYY-MM-DD.") from exc
+    return date_str
 
 
 def resolve_athlete_id(
@@ -70,12 +73,30 @@ def resolve_athlete_id(
     return athlete_id_to_use, None
 
 
+_TYPE_KEYWORDS = (
+    ("Ride", ("bike", "biking", "cycle", "cycling", "ride", "riding")),
+    ("Run", ("run", "running", "jog", "jogging", "marathon")),
+    ("Swim", ("swim", "swimming", "pool")),
+    ("Walk", ("walk", "walking", "hike", "hiking")),
+    ("Row", ("row", "rowing")),
+)
+
+
+def infer_activity_type(name: str | None) -> str | None:
+    """The sport named in an event name ("Easy run" -> Run), or None when no sport or more than
+    one is named. Whole words only, so "Arrow-straight tempo" is not a Row."""
+    words = set(re.findall(r"[a-z]+", (name or "").lower()))
+    found = [sport for sport, keywords in _TYPE_KEYWORDS if words & set(keywords)]
+    return found[0] if len(found) == 1 else None
+
+
 def resolve_activity_type(name: str | None, activity_type: str | None = None) -> str:
     """Determine the activity type based on the name and provided value.
 
     If an explicit *activity_type* is given it is returned as-is.  Otherwise the
-    *name* is searched for common keywords to infer the type, defaulting to
-    ``"Ride"`` when no match is found.
+    *name* is searched for common keywords (whole words) to infer the type, defaulting to
+    ``"Ride"`` when no match is found. Event creation uses infer_activity_type instead and
+    asks for the type rather than defaulting.
 
     Args:
         name: An optional activity/event name to infer the type from.
@@ -86,18 +107,7 @@ def resolve_activity_type(name: str | None, activity_type: str | None = None) ->
     """
     if activity_type:
         return activity_type
-    name_lower = name.lower() if name else ""
-    mapping = [
-        ("Ride", ["bike", "cycle", "cycling", "ride"]),
-        ("Run", ["run", "running", "jog", "jogging"]),
-        ("Swim", ["swim", "swimming", "pool"]),
-        ("Walk", ["walk", "walking", "hike", "hiking"]),
-        ("Row", ["row", "rowing"]),
-    ]
-    for workout, keywords in mapping:
-        if any(keyword in name_lower for keyword in keywords):
-            return workout
-    return "Ride"  # Default
+    return infer_activity_type(name) or "Ride"
 
 
 def resolve_date_params(

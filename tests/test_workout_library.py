@@ -232,7 +232,8 @@ def test_add_event_from_library_extra_fields_and_id_validation(monkeypatch):
         result = asyncio.run(
             add_event_from_library(workout_id=bad, date="2026-10-05", athlete_id="i1")
         )
-        assert "must be a numeric" in result
+        # "../events/1" and "1/2" are already refused by the tool guard (not one path segment).
+        assert result.startswith("Error: workout_id") and ("must be a numeric" in result or "not a valid identifier" in result)
     assert not calls
 
 
@@ -277,6 +278,7 @@ def test_add_event_from_library(monkeypatch):
         "type": "Ride",
         "description": "- 10m 55%",
         "moving_time": 5400,
+        "icu_training_load": 80,  # the planned load is copied too (WRT-12)
         "category": "WORKOUT",
         "start_date_local": "2026-10-05T00:00:00",
     }
@@ -324,7 +326,7 @@ def test_delete_library_workout_errors(monkeypatch):
     calls = _patch(monkeypatch, lambda url, method: {})
     for bad in ("", "12a", "../events/1", "1/2"):
         result = asyncio.run(delete_library_workout(workout_id=bad, athlete_id="i1"))
-        assert result == "Error: workout_id must be a numeric library workout ID."
+        assert result.startswith("Error: workout_id") and ("must be a numeric" in result or "not a valid identifier" in result)
     assert not calls
 
     result = asyncio.run(delete_library_workout(workout_id="7", athlete_id="i1"))

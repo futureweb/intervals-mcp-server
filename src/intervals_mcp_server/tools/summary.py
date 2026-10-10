@@ -13,7 +13,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -321,7 +321,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     defs = (await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)).get(ACTIVITY_FIELD, {})
     fields = BASE_FIELDS + "".join(f",{code}" for code in defs)
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key,
         params={"oldest": start_date, "newest": end, "fields": fields},
     )
     if isinstance(result, dict) and "error" in result:
@@ -334,7 +334,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         return f"No activities found for athlete {athlete_id_to_use} between {start_date} and {end}."
     gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
     wellness_result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/wellness", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id_to_use)}/wellness", api_key=api_key,
         params={"oldest": start_date, "newest": end, "fields": "id,ctl,atl,rampRate"},
     )
     wellness = [w for w in wellness_result if isinstance(w, dict)] if isinstance(wellness_result, list) else []

@@ -78,7 +78,7 @@ async def server_status(api_key: str | None = None, include_private: bool = Fals
         status["api"] = {"ok": False, "detail": "API_KEY is not set"}
         return status
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{config.athlete_id}/sport-settings", api_key=api_key
+        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings", api_key=api_key
     )
     if isinstance(result, dict) and "error" in result:
         status["api"] = {"ok": False, "detail": str(result.get("message"))}

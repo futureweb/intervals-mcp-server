@@ -24,10 +24,11 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
+from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.field_policy import aggregate_field, aggregation_policy
 from intervals_mcp_server.utils.load_metrics import (
@@ -93,8 +94,8 @@ NO_VERDICT = (
 
 
 def current_day() -> date:
-    """Today's date (one function for all load tools so tests can patch it)."""
-    return date.today()
+    """Today in the athlete's time zone (one function for all load tools so tests can patch it)."""
+    return athlete_today()
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +114,7 @@ async def fetch_activities(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Activities from start to end (local days, inclusive) with the given field selection."""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key,
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": fields},
     )
     error = _error(result, "activities")
@@ -127,7 +128,7 @@ async def fetch_wellness(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Wellness records from start to end with the given field selection."""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/wellness", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key,
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": fields},
     )
     error = _error(result, "wellness data")
@@ -143,7 +144,7 @@ async def fetch_events(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Calendar events from start to end (all categories)."""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/events", api_key=api_key,
         params={"oldest": start.isoformat(), "newest": end.isoformat()},
     )
     error = _error(result, "events")

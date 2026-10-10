@@ -9,8 +9,10 @@ This module contains read-only tools for a weekly training review:
 from datetime import date, datetime
 from typing import Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.tools.athlete import canonical_athlete_id
+from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -20,8 +22,8 @@ config = get_config()
 
 
 def _today() -> date:
-    """Return today's date (separate function so tests can patch it)."""
-    return date.today()
+    """Today in the athlete's time zone (separate function so tests can patch it)."""
+    return athlete_today()
 
 
 def _fmt_load(item: dict[str, Any]) -> str:
@@ -139,7 +141,7 @@ async def get_weekly_summary(
         return range_error
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/athlete-summary.json",
+        url=f"/athlete/{seg(athlete_id_to_use)}/athlete-summary.json",
         api_key=api_key,
         params={"start": start_date, "end": end_date},
     )
@@ -150,11 +152,13 @@ async def get_weekly_summary(
 
     # The endpoint may also return rows for other athletes (followed/coached) when called
     # with an API key; keep only the requested athlete (rows without athlete_id are kept).
+    # The alias "0" (the key's own athlete) is resolved to the real id the rows carry.
+    wanted = await canonical_athlete_id(athlete_id_to_use, api_key)
     rows = [
         w
         for w in result
         if isinstance(w, dict)
-        and (w.get("athlete_id") is None or str(w.get("athlete_id")) == str(athlete_id_to_use))
+        and (w.get("athlete_id") is None or str(w.get("athlete_id")) == wanted)
     ]
     if not rows:
         return f"No weekly summary data found for athlete {athlete_id_to_use} in the specified date range."
@@ -362,12 +366,12 @@ async def get_plan_compliance(
 
     params = {"oldest": start_date, "newest": end_date}
     events = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/events", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params=params
     )
     if isinstance(events, dict) and "error" in events:
         return f"Error fetching events: {events.get('message')}"
     activities = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/activities", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key, params=params
     )
     if isinstance(activities, dict) and "error" in activities:
         return f"Error fetching activities: {activities.get('message')}"

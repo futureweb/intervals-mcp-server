@@ -53,9 +53,11 @@ def _install_router(monkeypatch, *, activity=None, streams=None, intervals=None,
                     custom_items=None, wellness=None, calls=None):
     """Patch make_intervals_request everywhere with a router keyed on the URL."""
 
-    async def fake_request(url=None, **kwargs):
+    async def fake_request(url=None, **kwargs):  # pylint: disable=too-many-return-statements
         if calls is not None:
             calls.append((url, kwargs.get("params"), kwargs.get("method", "GET")))
+        if url and "/custom-item/" in url:
+            return {"id": int(url.rsplit("/", 1)[1]), "name": "Item", "type": "ACTIVITY_FIELD"}
         if url and "/custom-item" in url:
             return custom_items if custom_items is not None else []
         if url and "/streams" in url:
@@ -212,7 +214,7 @@ def test_get_activity_streams_pages_long_selections(monkeypatch):
     rows = [line for line in result.splitlines() if line[:1].isdigit()]
     assert len(rows) == 5
     assert "samples 0-4 of 12" in result
-    assert "Note: output cut to 5 of 12 samples (indices 0-4). Continue with start_index=5" in result
+    assert "Note: output cut to 5 of 12 samples (indices 0-4) by max_points=5. Continue with start_index=5" in result
 
 
 def test_get_activity_streams_json(monkeypatch):
@@ -402,9 +404,10 @@ def test_custom_item_index_is_cached_and_invalidated(monkeypatch):
     asyncio.run(custom_items_module.get_custom_item_index("i1", refresh=True))
     assert len(definition_calls()) == 2
 
-    asyncio.run(delete_custom_item(7, athlete_id="i1"))
+    asyncio.run(delete_custom_item(7, athlete_id="i1"))  # reads the item first (one more GET)
+    reads = len(definition_calls())
     asyncio.run(custom_items_module.get_custom_item_index("i1"))
-    assert len(definition_calls()) == 3
+    assert len(definition_calls()) == reads + 1
 
 
 def test_custom_item_index_does_not_cache_errors(monkeypatch):

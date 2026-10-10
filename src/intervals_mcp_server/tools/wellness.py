@@ -4,7 +4,10 @@ Wellness-related MCP tools for Intervals.icu.
 This module contains tools for retrieving and updating athlete wellness data.
 """
 
-from intervals_mcp_server.api.client import make_intervals_request
+from datetime import date as calendar_date, timedelta
+from typing import Any
+
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD, CustomFieldDefs
@@ -14,6 +17,7 @@ from intervals_mcp_server.utils.validation import (
     resolve_date_params,
     validate_date,
 )
+from intervals_mcp_server.tool_guard import output_budget
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -22,7 +26,7 @@ config = get_config()
 
 
 @tool("read")
-async def get_wellness_data(
+async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branches
     athlete_id: str | None = None,
     api_key: str | None = None,
     start_date: str | None = None,
@@ -43,17 +47,25 @@ async def get_wellness_data(
         start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
         end_date: End date in YYYY-MM-DD format (optional, defaults to today)
         include_all_fields: If True, include additional and custom fields beyond the standard set (optional, defaults to False)
+
+    Long ranges are paged by day: when the answer would get too large it stops with a note
+    giving the start_date to continue with.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
 
     start_date, end_date = resolve_date_params(start_date, end_date)
+    try:
+        validate_date(start_date)
+        validate_date(end_date)
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     params = {"oldest": start_date, "newest": end_date}
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/wellness", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/wellness", api_key=api_key, params=params
     )
 
     if isinstance(result, dict) and "error" in result:
@@ -69,31 +81,42 @@ async def get_wellness_data(
         index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
         field_definitions = index.get(INPUT_FIELD) or None
 
-    wellness_summary = "Wellness Data:\n\n"
-
+    entries: list[dict[str, Any]] = []
     if isinstance(result, dict):
         for date_str, data in result.items():
-            if isinstance(data, dict) and "date" not in data:
-                data["date"] = date_str
-            wellness_summary += (
-                format_wellness_entry(
-                    data,
-                    include_all_fields=include_all_fields,
-                    field_definitions=field_definitions,
-                )
-                + "\n\n"
-            )
+            if isinstance(data, dict):
+                if "date" not in data:
+                    data["date"] = date_str
+                entries.append(data)
     elif isinstance(result, list):
-        for entry in result:
-            if isinstance(entry, dict):
-                wellness_summary += (
-                    format_wellness_entry(
-                        entry,
-                        include_all_fields=include_all_fields,
-                        field_definitions=field_definitions,
-                    )
-                    + "\n\n"
-                )
+        entries = [entry for entry in result if isinstance(entry, dict)]
+    entries.sort(key=lambda e: str(e.get("id") or e.get("date") or ""))
+
+    # Page by day so the answer stays within the size of one tool result (a year with all
+    # fields is about 1 MB); the note says where to continue.
+    budget = output_budget()
+    wellness_summary = "Wellness Data:\n\n"
+    for position, entry in enumerate(entries):
+        block = (
+            format_wellness_entry(
+                entry,
+                include_all_fields=include_all_fields,
+                field_definitions=field_definitions,
+            )
+            + "\n\n"
+        )
+        if position and len(wellness_summary) + len(block) > budget:
+            last_day = str(entries[position - 1].get("id") or entries[position - 1].get("date") or "")[:10]
+            try:
+                next_day = (calendar_date.fromisoformat(last_day) + timedelta(days=1)).isoformat()
+            except ValueError:
+                next_day = str(entry.get("id") or entry.get("date") or "")[:10]
+            wellness_summary += (
+                f"Note: output stopped after {position} of {len(entries)} days (through {last_day}) to keep the "
+                f"response small. Continue with start_date={next_day} (end_date={end_date}).\n"
+            )
+            break
+        wellness_summary += block
 
     return wellness_summary
 
@@ -103,8 +126,8 @@ _SUBJECTIVE_SCALE_MIN = 1
 _SUBJECTIVE_SCALE_MAX = 4
 
 
-@tool("write")
-async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+@tool("write", overwrites=True)
+async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     date: str,
     soreness: int | None = None,
     fatigue: int | None = None,
@@ -115,6 +138,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
     comments: str | None = None,
     athlete_id: str | None = None,
     api_key: str | None = None,
+    clear_comments: bool = False,
 ) -> str:
     """WRITE: Update (modify) the subjective wellness fields of one day in Intervals.icu.
 
@@ -137,7 +161,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
 
     NOTE: comments REPLACES the day's existing comment, it does not append. To append,
     read the existing record first (get_wellness_data) and send the combined text.
-    An empty string clears the comment.
+    An empty string is ignored (it never wipes the comment); clear_comments=true empties it.
 
     Args:
         date: The day to update in YYYY-MM-DD format
@@ -150,6 +174,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
         comments: Free-text comment for the day; replaces any existing comment (optional)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
         api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+        clear_comments: Empty the day's comment (optional, default false)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -179,8 +204,12 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
                 f"and {_SUBJECTIVE_SCALE_MAX}."
             )
         body[name] = value
-    if comments is not None:
-        body["comments"] = comments
+    if clear_comments and comments is not None and comments.strip():
+        return "Error: pass either comments or clear_comments=true, not both."
+    if clear_comments:
+        body["comments"] = ""
+    elif comments is not None and comments.strip():
+        body["comments"] = comments  # a placeholder "" never wipes the comment
 
     if not body:
         return (
@@ -189,7 +218,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
         )
 
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id_to_use}/wellness/{date}",
+        url=f"/athlete/{seg(athlete_id_to_use)}/wellness/{seg(date)}",
         api_key=api_key,
         method="PUT",
         data=body,

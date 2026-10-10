@@ -7,7 +7,7 @@ the custom streams present (e.g. stamina, gear selection).
 
 import json
 
-from intervals_mcp_server.api.client import make_intervals_request
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_STREAM
@@ -82,14 +82,14 @@ async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positio
         stationary_speed_m_s: Speed below which a stretch is a pause candidate (optional; default
             0.3 m/s for foot sports, 0.5 m/s otherwise)
     """
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
     if not isinstance(activity, dict) or not activity:
         return f"No details found for activity {activity_id}."
 
-    streams_result = await make_intervals_request(url=f"/activity/{activity_id}/streams", api_key=api_key)
+    streams_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams", api_key=api_key)
     if isinstance(streams_result, dict) and "error" in streams_result:
         return f"Error fetching activity streams: {streams_result.get('message', 'Unknown error')}"
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []

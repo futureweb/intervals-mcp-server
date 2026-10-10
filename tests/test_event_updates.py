@@ -21,10 +21,13 @@ from intervals_mcp_server.tools.events import add_or_update_event, add_or_update
 from intervals_mcp_server.utils.types import Step, Value, ValueUnits, WorkoutDoc  # pylint: disable=wrong-import-position  # noqa: E402
 
 
-def _capture(monkeypatch) -> list[dict]:
+def _capture(monkeypatch, existing: dict | None = None) -> list[dict]:
+    """Record write requests; a GET (read before an update) answers with *existing*."""
     calls: list[dict] = []
 
     async def fake_request(*_args, **kwargs):
+        if kwargs.get("method", "GET") == "GET":
+            return existing if existing is not None else {"id": "e123"}
         calls.append({"url": kwargs.get("url"), "method": kwargs.get("method"), "data": kwargs.get("data")})
         return {"id": "e123"}
 
@@ -70,9 +73,10 @@ def test_create_defaults_and_validation(monkeypatch):
 
 
 def test_note_update_is_partial_and_create_has_defaults(monkeypatch):
-    calls = _capture(monkeypatch)
+    calls = _capture(monkeypatch, existing={"id": 88, "category": "NOTE"})
     asyncio.run(add_or_update_note(event_id="88", name="Travel day"))
-    assert calls[0] == {"url": "/athlete/i1/events/88", "method": "PUT", "data": {"category": "NOTE", "name": "Travel day"}}
+    # The category is not sent on update (it could turn another event into a note).
+    assert calls[0] == {"url": "/athlete/i1/events/88", "method": "PUT", "data": {"name": "Travel day"}}
     assert asyncio.run(add_or_update_note(description="no title")) == "Error: name is required when creating a note."
     asyncio.run(add_or_update_note(name="Rest", description="Legs heavy", start_date="2026-10-13"))
     assert calls[1]["data"] == {
