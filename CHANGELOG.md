@@ -41,13 +41,18 @@ All notable changes to this project are documented here. The format follows
 - `futureweb-intervals-mcp grants list|adopt-legacy --owner|remove <athlete>|remove --grant <id>|remove --legacy|prune --days N`
   (no tokens shown or decrypted; a running server picks up the change; run as root it keeps the
   owner of the state file) and `futureweb-intervals-mcp token-key [--file <path>]`; also as
-  `python -m intervals_mcp_server.auth`. At most `OAUTH_MAX_GRANTS_PER_ATHLETE` (5) grants per
-  athlete and 500 in total. A token opened with an older key is sealed again with the first key.
+  `python -m intervals_mcp_server.auth`. Run as root, the commands refuse a state directory of another
+  user (`--allow-root` overrides), never follow a link for the lock file and change owners only on
+  files they created, by descriptor. At most `OAUTH_MAX_GRANTS_PER_ATHLETE` (5) grants per athlete
+  and 500 in total; the owner's grants are never evicted. A token opened with an older key is sealed
+  again with the first key.
 - `OAUTH_ALLOWED_ATHLETES=*` is accepted in multi-user mode only with `OAUTH_ALLOW_ANY_ATHLETE=true`.
 - Request budgets for OAuth-token connections: `MCP_ATHLETE_DAILY_REQUESTS` (default 1000 per
   athlete and UTC day) and `MCP_APP_REQUESTS_PER_15MIN` (default 2000 for all athletes together),
-  with a fair share (`MCP_ATHLETE_SHARE_PERCENT`, default 50, per athlete; `MCP_OWNER_RESERVED_PERCENT`,
-  default 20, kept for the owner); retries count; the per-call budget applies on top.
+  with a fair share (`MCP_ATHLETE_SHARE_PERCENT`, default 25, per athlete; `0` still allows one
+  request per window; `MCP_OWNER_RESERVED_PERCENT`, default 20, kept for the owner; `100` blocks every
+  other athlete; `--doctor` warns about both edge values); retries count; the per-call budget applies
+  on top.
 - `get_server_status` shows the tenancy mode and, in multi-user mode, only the calling connection
   (athlete, credential kind, Intervals.icu scopes, requests today; friends do not see how the owner
   signs in). `--doctor` validates the multi-user settings (key, sign-in, TOTP, transport, budgets),

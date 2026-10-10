@@ -248,7 +248,7 @@ owner's client   <-- OAuth 2.1 -->  this server  <-- API_KEY (only for ATHLETE_I
 * **Lifecycle.** A token Intervals.icu rejects (401/403) gives a "disconnect and reconnect" message.
   Revoking a connection (`/revoke` when the client calls it on disconnect, refresh token reuse,
   retention, `grants remove`) deletes its stored token; so does the refresh token lifetime (grants
-  without a live refresh token are dropped). An athlete keeps at most `OAUTH_MAX_GRANTS_PER_ATHLETE`
+  without a live refresh token are dropped). An athlete other than the owner keeps at most `OAUTH_MAX_GRANTS_PER_ATHLETE`
   connections. A token opened with an older key of `OAUTH_TOKEN_KEY` is sealed again with the first
   key at its next use (`--doctor` counts the ones still waiting).
 
@@ -260,12 +260,12 @@ owner's client   <-- OAuth 2.1 -->  this server  <-- API_KEY (only for ATHLETE_I
 | `OAUTH_ALLOWED_ATHLETES` | The owner plus the friends. `*` (any Intervals.icu athlete) is only accepted together with `OAUTH_ALLOW_ANY_ATHLETE=true`: then anyone with an Intervals.icu account can store a token on your server and use the shared request budget. |
 | `OAUTH_TOTP_SECRET` | Required in the multi-user mode when `OAUTH_LOGIN` includes `password` or `apikey`. |
 | `OAUTH_TOKEN_RETENTION_DAYS` | Drop an athlete's connection and token after this many days without use (default `0` = only the refresh token lifetime, `OAUTH_REFRESH_TOKEN_TTL`, applies). |
-| `OAUTH_MAX_GRANTS_PER_ATHLETE` | Connections kept per athlete (default `5`; the least recently used are revoked). |
+| `OAUTH_MAX_GRANTS_PER_ATHLETE` | Connections kept per athlete (default `5`; the least recently used are revoked). The owner's connections are never evicted, neither by this cap nor by the total of 500. |
 | `INTERVALS_OAUTH_OFFER_CHATS` | `true` offers the "Activity comments" checkbox (Intervals.icu `CHATS`; default `false`). |
 | `INTERVALS_OAUTH_EXCLUDE_AREAS` | Further scope areas never requested. |
 | `MCP_ATHLETE_DAILY_REQUESTS` | Soft budget of Intervals.icu requests per athlete and UTC day (default `1000`, `0` = off). |
 | `MCP_APP_REQUESTS_PER_15MIN` | Budget of all OAuth-token connections together per 15 minutes (default `2000`, `0` = off). |
-| `MCP_ATHLETE_SHARE_PERCENT` / `MCP_OWNER_RESERVED_PERCENT` | Share of that budget one athlete may use (default `50`) and the share the other athletes leave to the owner (default `20`). |
+| `MCP_ATHLETE_SHARE_PERCENT` / `MCP_OWNER_RESERVED_PERCENT` | Share of that budget one athlete may use (default `25`; `0` still allows one request per window, `100` means no per-athlete limit) and the share the other athletes leave to the owner (default `20`; `100` blocks every athlete but the owner). `--doctor` warns about both edge values. The owner's API key is not counted; the reserve matters when the owner connects with an Intervals.icu token. |
 
 ```bash
 futureweb-intervals-mcp token-key --file /etc/intervals-mcp/token.key
@@ -291,6 +291,10 @@ API_KEY=...                   # the owner's key, used only for the owner's own c
 * In the multi-user mode the file is written as format 2, which older releases refuse to read
   instead of serving other athletes' connections with your API key. Back in the single-user mode,
   only your own connections are kept; the others and their tokens are removed at the next write.
+* Rolling back to an older release while in the single-user mode works (it reads the file), but it
+  drops the recorded athletes when it rewrites refresh tokens: connections created or refreshed
+  under the older release need `grants adopt-legacy --owner` again before the next switch to the
+  multi-user mode (until then they are refused, never served as the owner's).
 
 **Managing connections.**
 
@@ -305,8 +309,11 @@ futureweb-intervals-mcp grants prune --days 60 # athlete connections unused for 
 
 Run the commands **as the service user** with the server's environment (`OAUTH_STATE_FILE`,
 `ATHLETE_ID`, e.g. `sudo -u <user> env $(cat /etc/...env) futureweb-intervals-mcp grants list` or
-`docker exec` in the container); without it they look at `./oauth_state.json`. Run as root they keep
-the owner of the state file. They lock the state file (`<state file>.lock`); a running server
+`docker exec -u <uid>` in the container); without it they look at `./oauth_state.json`. As root they
+refuse to change a state directory that belongs to another user (that user could plant links for
+root to follow; `--allow-root` overrides). They never follow a link for the lock file, which must be
+a plain file owned by the server user, and give files they create the owner of the state file. They
+lock the state file (`<state file>.lock`); a running server
 notices the change and drops removed connections at its next request. Removing a friend completely:
 `grants remove <id>`, remove them from `OAUTH_ALLOWED_ATHLETES` and restart, and the friend revokes
 the app at Intervals.icu (the token stays valid there until then).
