@@ -6,6 +6,7 @@ All tools are read-only; they combine the activity, its intervals, its streams a
 paired) the planned workout, and compute statistics from recorded samples only.
 """
 
+import asyncio
 import difflib
 import json
 from datetime import date, timedelta
@@ -281,12 +282,17 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     steps (repeats expanded) are aligned with the actual intervals by order, duration (or
     distance) and target intensity (never by interval names); a step may also match any
     number of consecutive intervals of about the same intensity (an effort split by laps,
-    e.g. 1 km device auto-laps, or a stop). When a lap boundary is not the step boundary
-    (one step longer, the next shorter than planned by the same time), the boundary is set on
-    the plan timeline inside the lap and noted, instead of two opposite deviations.
-    Open-ended targets (top zone, a range with a start only) are lower bounds. Steps in the
-    recovery zone or between two clearly harder steps count as rest, easy aerobic steps as
-    work. Planned steps are capped at their planned duration: when an interval is longer than
+    e.g. 1 km device auto-laps, or a stop). Lap presses are kept as step boundaries. With
+    device auto-laps (most laps of one distance or duration) a step boundary inside a lap is
+    placed where the intensity changes, a step without a lap of its own between two matched
+    steps is found at its two intensity changes, and an overrun is reported as longer than
+    planned; a boundary the samples cannot place is kept and the durations there are not
+    judged. A caveat line and JSON alignment_confidence (high / medium / low) with notes say
+    how far the per-step results can be trusted. Open-ended targets (top zone, a %/W range
+    with a start only) are lower bounds. Steps in the recovery zone or between two clearly
+    harder steps count as rest (no length limit), easy aerobic steps as work. Steps without
+    duration (distance, lap button) restart the plan clock at their actual end. Planned
+    steps are capped at their planned duration: when an interval is longer than
     its step (beyond the tolerance), it is split logically (analysis only, nothing on
     Intervals.icu changes); the planned part is evaluated against the plan from the samples
     and the remainder is reported separately. For each step: planned vs actual (moving)
@@ -361,7 +367,8 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     doc = planned_workout_doc if isinstance(planned_workout_doc, dict) else ((event or {}).get("workout_doc") or {})
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
                "include_all_streams": detail_level == "full", "pace_units": doc.get("pace_units")}
-    result = analyze(planned, intervals, streams, tolerances=tolerances, context=context)
+    # CPU-bound (many laps): run off the event loop so other requests are not blocked
+    result = await asyncio.to_thread(analyze, planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
     assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))

@@ -375,37 +375,56 @@ def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int
     return float((sum(fourth_powers) / len(fourth_powers)) ** 0.25)
 
 
+NP_MAX_GRID_S = 200_000  # longer clocks (multi-day recordings) fall back to the recorded samples
+
+
 def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | None]:
     """Per sample: the 4th power of the 30 s rolling mean power ending at it (None without power).
 
-    The window is defined on the time stream and runs over the whole activity (partial at
-    its start), so the NP of a slice computed from these values includes the 30 s before
-    the slice. This is how Intervals.icu computes the NP of an interval, so NP values of
-    split or merged steps are comparable with the NP of the Intervals.icu intervals.
+    The window runs over the whole activity on a 1 s grid (partial at its start), recording
+    pauses counting as 0 W, so the NP of a slice computed from these values includes the
+    30 s before the slice and a pause does not restart the window. This is how Intervals.icu
+    computes the NP of an interval, so NP values of split or merged steps are comparable
+    with the NP of the Intervals.icu intervals.
     """
-    out: list[float | None] = []
+    out: list[float | None] = [None] * len(time)
+    points: list[tuple[int, int, float | None]] = []  # (sample index, second, watts)
+    for index, (moment, power) in enumerate(zip(time, watts, strict=False)):
+        if isinstance(moment, (int, float)) and not isinstance(moment, bool) and not is_missing(moment):
+            valid = isinstance(power, (int, float)) and not isinstance(power, bool) and not is_missing(power)
+            points.append((index, int(round(moment)), float(power) if valid else None))
+    if not points:
+        return out
+    origin, span = points[0][1], points[-1][1] - points[0][1] + 1
+    if span <= 0 or span > NP_MAX_GRID_S or any(b[1] <= a[1] for a, b in zip(points, points[1:], strict=False)):
+        return _rolling_fourth_powers_samples(points, out)
+    grid = [0.0] * span
+    for _, second, power in points:
+        grid[second - origin] = power or 0.0
+    rolling, total = [], 0.0
+    for second, power in enumerate(grid):
+        total += power
+        if second >= NP_WINDOW_S:
+            total -= grid[second - NP_WINDOW_S]
+        rolling.append(total / min(second + 1, NP_WINDOW_S))
+    for index, second, power in points:
+        out[index] = rolling[second - origin] ** 4 if power is not None else None
+    return out
+
+
+def _rolling_fourth_powers_samples(points: list[tuple[int, int, float | None]], out: list[float | None]) -> list[float | None]:
+    """Fallback without a regular clock: the rolling window over the recorded samples."""
     head, window_sum, count = 0, 0.0, 0
-    samples = [
-        (float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else None,
-         float(w) if isinstance(w, (int, float)) and not isinstance(w, bool) and not is_missing(w) else None)
-        for t, w in zip(time, watts, strict=False)
-    ]
-    for moment, power in samples:
-        if moment is None:
-            out.append(None)
-            continue
+    for position, (index, moment, power) in enumerate(points):
         if power is not None:
             window_sum += power
             count += 1
-        while head < len(out):
-            old_moment, old_power = samples[head]
-            if old_moment is not None and old_moment > moment - NP_WINDOW_S:
-                break
-            if old_moment is not None and old_power is not None:
-                window_sum -= old_power
+        while head < position and points[head][1] <= moment - NP_WINDOW_S:
+            if points[head][2] is not None:
+                window_sum -= points[head][2] or 0.0
                 count -= 1
             head += 1
-        out.append((window_sum / count) ** 4 if power is not None and count else None)
+        out[index] = (window_sum / count) ** 4 if power is not None and count else None
     return out
 
 

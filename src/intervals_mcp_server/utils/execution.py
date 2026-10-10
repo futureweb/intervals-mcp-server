@@ -34,11 +34,12 @@ from recorded samples only, time-weighted by the sample spacing.
 
 # pylint: disable=too-many-lines
 
+import statistics
 from dataclasses import dataclass
 from typing import Any
 
 from intervals_mcp_server.utils.custom_fields import is_missing
-from intervals_mcp_server.utils.sports import cadence_text, default_pace_units, format_pace, hms
+from intervals_mcp_server.utils.sports import cadence_text, default_pace_units, floor_watts, format_pace, hms
 from intervals_mcp_server.utils.streams import (
     NP_WINDOW_S,
     foreign_stream_reason,
@@ -53,7 +54,13 @@ EDGE_EXTRA_COST = 0.1  # an extra interval before the first / after the last pla
 EDGE_COST_PER_HOUR = 0.6  # ... plus this per hour of its moving time, so a long block is never cheap
 MERGE_PENALTY = 0.05  # once for a planned step matched with several consecutive intervals
 MAX_MERGE_WITHOUT_AMOUNT = 3  # a step without duration or distance absorbs at most this many intervals
-MAX_MERGE_PARTS = 250  # upper limit of intervals in one step (bounds the alignment's run time)
+MAX_MERGE_PARTS = 250  # intervals one step may span at least (more when its planned amount needs them)
+MAX_ALIGN_INTERVALS = 600  # more intervals are merged pairwise for the alignment (run time)
+AUTO_LAP_TOLERANCE = 0.03  # laps within +-3 % of the typical lap count as device auto-laps ...
+AUTO_LAP_MIN_SHARE = 0.6  # ... when they hold at least this share of the time (the last lap excluded)
+AUTO_LAP_MIN_LAPS = 4
+CHANGE_MIN_PCT = 3.0  # step targets closer than this are not told apart inside a lap
+MIN_BOUNDARY_SHIFT_S = 5.0
 MERGE_PART_MAX_COST = 0.3  # a merged interval may be at most this much further off target than the span
 TARGET_TOLERANCE_PCT = 5.0
 EXTENSION_MIN_SECS = 120  # additional training shorter than this is not reported separately
@@ -77,6 +84,7 @@ TIME_IN_TARGET_LOW_PCT = 50.0
 STREAM_KEYS = {"power": "watts", "hr": "heartrate", "pace": "velocity_smooth"}
 INTERVAL_KEYS = {"power": "average_watts", "hr": "average_heartrate", "pace": "average_speed"}
 DETAIL_LEVELS = ("compact", "standard", "full")
+UNVERIFIABLE_NOTE = "the step boundary lies inside a device auto-lap and the samples do not show where"
 DRIFT_CONVENTION = "positive = heart rate rose relative to power (Intervals.icu decoupling convention)"
 
 
@@ -193,12 +201,14 @@ def resolve_target(step: dict[str, Any], context: dict[str, Any]) -> dict[str, A
 
 
 def _zone_target(kind: str, bounds: Any, low: float, high: float | None, scale: float | None, units: str) -> dict[str, Any] | None:
-    """Target of a zone or zone range; a zone range given by its start only is open-ended."""
+    """Target of a zone or zone range; a zone given by its start only is that zone (open-ended
+    only for the top zone). Power zone watts are floored like the Intervals.icu zone table."""
     low_b, high_b = _zone_bounds(bounds, low, scale)
-    if high is None:
-        high_b = None
-    elif high != low:
+    if high is not None and high != low:
         _, high_b = _zone_bounds(bounds, high, scale)
+    if units == "W":
+        low_b = None if low_b is None else floor_watts(low_b) + (1 if low_b else 0)
+        high_b = None if high_b is None else floor_watts(high_b)
     return _target(kind, low_b, high_b, units)
 
 
@@ -329,12 +339,13 @@ def _estimated_duration(duration: float | None, distance: float | None, target: 
 def plan_steps(steps: list[Any], context: dict[str, Any]) -> list[dict[str, Any]]:
     """Flattened planned steps with resolved target, kind and planned timeline.
 
-    ``planned_start``/``planned_end`` are seconds on the plan clock; a distance step adds
-    its estimated duration (distance / target speed for pace targets, ``est_duration``) and
-    the clock is unknown (None) after a distance step without a pace target.
+    ``planned_start``/``planned_end`` are seconds on the plan clock; a step without duration
+    adds its estimated duration (distance / target speed for pace targets, ``est_duration``)
+    or nothing. The analysis restarts the clock at the actual end of every such step, so the
+    estimate never shifts the timeline of the following steps.
     """
     planned: list[dict[str, Any]] = []
-    clock: float | None = 0.0
+    clock = 0.0
     for index, (step, key) in enumerate(_flatten(steps), 1):
         target = resolve_target(step, context)
         duration = _num(step.get("duration"))
@@ -355,8 +366,7 @@ def plan_steps(steps: list[Any], context: dict[str, Any]) -> list[dict[str, Any]
             "_explicit": _explicit_kind(step) is not None,
             "_key": key,
         }
-        if clock is not None:
-            clock = clock + estimate if estimate is not None else (clock if not distance else None)
+        clock += estimate or 0.0
         entry["planned_end"] = clock
         planned.append(entry)
     recoveries = _recovery_between_efforts(planned, context)
@@ -565,6 +575,90 @@ def _spans(intervals: list[dict[str, Any]], profile: Profile) -> list[_Span]:
     return spans
 
 
+def lap_layout(spans: list[_Span]) -> dict[str, Any] | None:
+    """Device auto-laps: most laps (the activity's last lap excluded) share one distance or duration.
+
+    Returns {"by": "distance"|"time", "lap": typical value, "laps": count} or None when the
+    laps follow the workout (lap presses, a structured workout on the device, detected
+    efforts). Auto-lap boundaries say nothing about step boundaries.
+    """
+    full = spans[:-1]
+    total = sum(s.active for s in full)
+    if len(full) < AUTO_LAP_MIN_LAPS or total <= 0:
+        return None
+    for by in ("distance", "time"):
+        values = sorted(v for v in ((s.distance if by == "distance" else s.active) for s in full) if v and v > 0)
+        if len(values) < AUTO_LAP_MIN_LAPS:
+            continue
+        best_count, best_value, upper = 0, 0.0, 0
+        for lower, low in enumerate(values):  # largest cluster of values within a band of 2 x tolerance
+            while upper < len(values) and values[upper] <= low * (1 + 2 * AUTO_LAP_TOLERANCE):
+                upper += 1
+            if upper - lower > best_count:
+                best_count, best_value = upper - lower, values[(lower + upper - 1) // 2]
+        if best_count < AUTO_LAP_MIN_LAPS:
+            continue
+        layout = {"by": by, "lap": round(best_value, 1), "laps": best_count}
+        covered = sum(s.active for s in full if _is_auto_lap(s, layout))
+        if covered >= AUTO_LAP_MIN_SHARE * total:  # most of the time lies in laps of the typical length
+            return layout
+    return None
+
+
+def _is_auto_lap(span: _Span, layout: dict[str, Any] | None) -> bool:
+    """Whether an interval has the typical auto-lap length (a lap the device closed by itself)."""
+    if not layout:
+        return False
+    value = span.distance if layout["by"] == "distance" else span.active
+    return value is not None and value > 0 and abs(value - layout["lap"]) <= layout["lap"] * AUTO_LAP_TOLERANCE
+
+
+def _merge_spans(parts: list[_Span], index: int) -> _Span:
+    """One span covering consecutive spans (time-weighted interval averages)."""
+    first, last = parts[0], parts[-1]
+    interval: dict[str, Any] = {"type": first.interval.get("type"), "start_index": first.start, "end_index": last.end,
+                                "elapsed_time": sum(p.elapsed for p in parts), "moving_time": sum(p.active for p in parts)}
+    for key in INTERVAL_KEYS.values():
+        usable: list[tuple[float, float]] = []
+        for part in parts:
+            value, weight = _num(part.interval.get(key)), part.active or part.elapsed
+            if value is not None and weight:
+                usable.append((value, weight))
+        if usable:
+            interval[key] = sum(v * w for v, w in usable) / sum(w for _, w in usable)
+    distances = [p.distance for p in parts]
+    distance = None if any(d is None for d in distances) else sum(d or 0.0 for d in distances)
+    return _Span(index, first.start, last.end, interval["elapsed_time"], interval["moving_time"], interval, distance)
+
+
+def _coarsen(spans: list[_Span]) -> tuple[list[_Span], list[list[int]]]:
+    """Adjacent intervals merged pairwise until at most ``MAX_ALIGN_INTERVALS`` remain.
+
+    Bounds the alignment's run time for activities with very many (e.g. 100 m) laps; the
+    boundaries inside long steps are refined on the samples afterwards.
+    """
+    groups = [[s.index] for s in spans]
+    while len(groups) > MAX_ALIGN_INTERVALS:
+        merged: list[list[int]] = []
+        for pos in range(0, len(groups), 2):
+            pair = groups[pos:pos + 2]
+            left = spans[pair[0][-1]]
+            right = spans[pair[1][0]] if len(pair) == 2 else None
+            joinable = right is not None and (
+                (left.end is not None and right.start == left.end) or (left.start is None and right.start is None)
+            )
+            if joinable:
+                merged.append(pair[0] + pair[1])
+            else:
+                merged.extend(pair)
+        if len(merged) == len(groups):
+            break
+        groups = merged
+    if len(groups) == len(spans):
+        return spans, groups
+    return [_merge_spans([spans[i] for i in group], index) for index, group in enumerate(groups)], groups
+
+
 def _span_intensity(parts: list[_Span], kind: str, profile: Profile, cap_secs: float | None) -> float | None:
     """Time-weighted intensity of consecutive spans, on the first ``cap_secs`` moving seconds."""
     stream = STREAM_KEYS[kind]
@@ -617,16 +711,28 @@ def _planned_amount(step: dict[str, Any], has_distance: bool) -> tuple[str, floa
     return None
 
 
-def _match_options(  # pylint: disable=too-many-locals,too-many-branches
-    step: dict[str, Any], spans: list[_Span], j: int, profile: Profile, part_cost: Any
+@dataclass(frozen=True)
+class _MatchRules:
+    """Per-step limits of the alignment: how many intervals a step may span and whether it may
+    absorb surplus auto-laps before (``leading``) or after (``trailing``) its planned amount."""
+
+    max_parts: int = MAX_MERGE_PARTS
+    leading: bool = False
+    trailing: bool = False
+
+
+def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
+    step: dict[str, Any], spans: list[_Span], j: int, profile: Profile, part_cost: Any, rules: _MatchRules = _MatchRules()
 ) -> list[tuple[int, float]]:
     """(k, cost) for matching ``step`` with the k consecutive spans ending before index ``j``.
 
     A span of several intervals is only valid when neither its first nor its last interval
     is superfluous: the intervals without the first and the intervals without the last
-    must each stay short of the planned duration (or distance). Steps without either absorb
-    at most ``MAX_MERGE_WITHOUT_AMOUNT`` intervals. Every merged interval must be adjacent
-    to the next and about as close to the target as the whole span.
+    must each stay short of the planned duration (or distance). With device auto-laps a
+    step may in addition absorb surplus laps that fit its target (an overrun, reported as
+    longer than planned), except before the first and after the last step. Steps without
+    duration or distance absorb at most ``MAX_MERGE_WITHOUT_AMOUNT`` intervals. Every merged
+    interval must be adjacent to the next and about as close to the target as the whole span.
     """
     amount = _planned_amount(step, j > 0 and spans[j - 1].distance is not None)
     target = step.get("target")
@@ -638,7 +744,7 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches
     weighted, weights = 0.0, 0.0  # interval averages, for intervals without sample indices
     stream = STREAM_KEYS[target["kind"]] if target else ""
     use_stream = bool(target) and last is not None and last.end is not None and profile.has(stream)
-    for k in range(1, min(j, MAX_MERGE_PARTS) + 1):
+    for k in range(1, min(j, rules.max_parts) + 1):
         part = spans[j - k]
         if k > 1:
             following = spans[j - k + 1]
@@ -652,7 +758,9 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches
                 else:
                     without_first = covered_distance
                     without_last = covered_distance - (last.distance or 0.0) + (part.distance or 0.0)
-                if without_first >= amount[1] or without_last >= amount[1]:
+                if without_first >= amount[1] and not (rules.leading and target and part_cost(j - k) == 0.0):
+                    break
+                if without_last >= amount[1] and not (rules.trailing and target and part_cost(j - 1) == 0.0):
                     break
         covered_time += part.active
         covered_distance += part.distance or 0.0
@@ -681,6 +789,22 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches
     return options
 
 
+def _match_rules(planned: list[dict[str, Any]], spans: list[_Span], auto_laps: bool) -> list[_MatchRules]:
+    """Per planned step: interval limit (enough laps for three times the planned amount) and
+    whether surplus auto-laps may be absorbed (not before the first / after the last step)."""
+    lap_secs = statistics.median([s.active for s in spans if s.active > 0] or [1.0])
+    lap_metres = statistics.median([s.distance for s in spans if s.distance] or [0.0])
+    rules: list[_MatchRules] = []
+    for position, step in enumerate(planned):
+        secs = step.get("duration") or step.get("est_duration")
+        needed = 3 * secs / lap_secs if secs else 0.0
+        if not secs and step.get("distance") and lap_metres:
+            needed = 3 * step["distance"] / lap_metres
+        rules.append(_MatchRules(max_parts=max(MAX_MERGE_PARTS, int(needed) + 3),
+                                 leading=auto_laps and position > 0, trailing=auto_laps and position < len(planned) - 1))
+    return rules
+
+
 def align_spans(  # pylint: disable=too-many-locals,too-many-branches
     planned: list[dict[str, Any]], intervals: list[dict[str, Any]], profile: Profile | None = None
 ) -> list[tuple[int | None, list[int]]]:
@@ -690,7 +814,10 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches
     planned step without a matching interval, None an interval without a planned step.
     """
     profile = profile or Profile([])
-    spans = _spans(intervals, profile)
+    original = _spans(intervals, profile)
+    auto_laps = lap_layout(original) is not None
+    spans, groups = _coarsen(original)
+    rules = _match_rules(planned, spans, auto_laps)
     n, m = len(planned), len(spans)
     inf = float("inf")
     part_costs: dict[tuple[int, int], float] = {}
@@ -726,7 +853,7 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches
                 if score[i][j - 1] + extra < best:
                     best, move = score[i][j - 1] + extra, ("left", 0)
             if i > 0:
-                for k, match in _match_options(planned[i - 1], spans, j, profile, part_cost):
+                for k, match in _match_options(planned[i - 1], spans, j, profile, part_cost, rules[i - 1]):
                     if score[i - 1][j - k] == inf:
                         continue
                     cost = score[i - 1][j - k] + match
@@ -738,13 +865,13 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches
     while i > 0 or j > 0:
         step, k = trace[i][j]
         if step == "diag":
-            result.append((i - 1, list(range(j - k, j))))
+            result.append((i - 1, [index for group in groups[j - k:j] for index in group]))
             i, j = i - 1, j - k
         elif step == "up":
             result.append((i - 1, []))
             i -= 1
         else:
-            result.append((None, [j - 1]))
+            result.extend((None, [index]) for index in reversed(groups[j - 1]))
             j -= 1
     result.reverse()
     return result
@@ -773,39 +900,30 @@ def planned_step_map(  # pylint: disable=too-many-locals
     time when missing). A matched span (one or several consecutive intervals) longer than the
     planned duration plus the tolerance gets ``beyond_plan_s`` on each of its intervals, counted
     as in ``analyze``: after the last matched step as additional training after the plan,
-    earlier as extra time inside the plan. When the step or the next one spans several laps
-    (e.g. device auto-laps) and the next step is short, the lap boundary differs from the
-    step boundary: that time is carried over to the next step (``carried_to_next_s``)
-    instead. Nothing is changed on Intervals.icu.
+    earlier as extra time inside the plan. When the span ends with a device auto-lap that runs
+    into the next step, ``boundary_inside_auto_lap`` says so (the samples, not available here,
+    would be needed to place the boundary). Nothing is changed on Intervals.icu.
     """
     tol = tolerances or Tolerances()
     spans = _spans(intervals, Profile([]))
+    layout = lap_layout(spans)
     alignment = align_spans(planned, intervals)
     matched = [(p_idx, indices) for p_idx, indices in alignment if p_idx is not None and indices]
     last_matched = matched[-1][1][-1] if matched else None
     mapping: dict[int, dict[str, Any]] = {}
-    carried_in = 0.0
     for position, (p_idx, indices) in enumerate(alignment):
         if p_idx is None or not indices:
-            carried_in = 0.0
             continue
         step = planned[p_idx]
         duration = step.get("duration")
-        actual = sum(spans[i].active for i in indices) + carried_in
-        carried_in = 0.0
+        actual = sum(spans[i].active for i in indices)
+        nxt = alignment[position + 1] if position + 1 < len(alignment) else None
         entry: dict[str, Any] = {
             "index": step["index"], "kind": step["kind"], "duration": duration,
             "span_intervals": [i + 1 for i in indices], "span_actual_s": round(actual, 1),
-            "beyond_plan_s": None, "beyond_plan_counted_as": None, "carried_to_next_s": None,
+            "beyond_plan_s": None, "beyond_plan_counted_as": None,
+            "boundary_inside_auto_lap": bool(nxt and nxt[0] is not None and nxt[1] and _is_auto_lap(spans[indices[-1]], layout)),
         }
-        nxt = alignment[position + 1] if position + 1 < len(alignment) else None
-        if duration and actual > duration + tol.duration_allowance(duration) and nxt and nxt[0] is not None and nxt[1]:
-            next_duration = planned[nxt[0]].get("duration")
-            next_actual = sum(spans[i].active for i in nxt[1])
-            if next_duration and next_actual < next_duration and (len(indices) > 1 or len(nxt[1]) > 1):
-                carried_in = min(actual - duration, next_duration - next_actual)
-                entry["carried_to_next_s"] = round(carried_in, 1)
-                actual -= carried_in
         if duration and actual > duration + tol.duration_allowance(duration):
             entry["beyond_plan_s"] = round(actual - duration, 1)
             entry["beyond_plan_counted_as"] = (
@@ -841,8 +959,6 @@ def planned_step_text(step: dict[str, Any] | None, position: str = "extra_inside
     if not step:
         return UNPLANNED_TEXT.get(position, "no planned step (extra)")
     text = f"plan step {step['index']} {step['kind']} {hms(step.get('duration'))}"
-    if step.get("carried_to_next_s"):
-        text += f", last {hms(step['carried_to_next_s'])} counted to the next step (lap and step boundaries differ)"
     if step.get("beyond_plan_s"):
         span = step.get("span_intervals") or []
         merged = f" (intervals {span[0]}-{span[-1]})" if len(span) > 1 else ""
@@ -850,6 +966,8 @@ def planned_step_text(step: dict[str, Any] | None, position: str = "extra_inside
             f", actual {hms(step.get('span_actual_s'))}{merged}: first {hms(step.get('duration'))} inside the plan, "
             f"{hms(step['beyond_plan_s'])} beyond the plan ({step.get('beyond_plan_counted_as')})"
         )
+    if step.get("boundary_inside_auto_lap"):
+        text += " (device auto-lap: the step boundary lies inside the last lap)"
     return text
 
 
@@ -1123,20 +1241,24 @@ def _distance_text(metres: float | None) -> str:
     return f"{metres / 1000:.2f} km" if metres >= 1000 else f"{metres:.0f} m"
 
 
-def _step_deviations(row: dict[str, Any], step: dict[str, Any], tol: Tolerances, span_active: float, planned_s: float | None) -> None:
+def _step_deviations(  # pylint: disable=too-many-locals
+    row: dict[str, Any], step: dict[str, Any], tol: Tolerances, span_active: float, planned_s: float | None
+) -> None:
     """Fill row["deviations"]: duration, intensity, time in target, pauses and start shift."""
     kind = step.get("kind")
     metrics = row["metrics"]
     overrun = row.get("overrun")
+    unverifiable = bool(row.get("boundary_unverifiable"))
+    note = f" ({UNVERIFIABLE_NOTE})" if unverifiable else ""
     if overrun and overrun["counted_as"].startswith("extra"):
-        severity = "info" if kind == "warmup" else "deviation"
-        row["deviations"].append(_deviation(severity, f"{hms(overrun['moving_time_s'])} longer than planned; the remainder is reported separately"))
+        severity = "info" if kind == "warmup" or unverifiable else "deviation"
+        row["deviations"].append(_deviation(severity, f"{hms(overrun['moving_time_s'])} longer than planned; the remainder is reported separately{note}"))
     elif not overrun and planned_s and span_active < planned_s - tol.duration_allowance(planned_s):
         if step.get("duration"):
             text = f"{hms(planned_s - span_active)} shorter than planned"
         else:
             text = f"{_distance_text(-(row.get('distance_diff_m') or 0))} shorter than planned"
-        row["deviations"].append(_deviation("deviation", text))
+        row["deviations"].append(_deviation("info" if unverifiable else "deviation", text + note))
     adh = row.get("adherence") or {}
     if adh.get("status") in ("above", "below"):
         severity = "deviation" if kind in ("work", "rest") else "info"
@@ -1150,10 +1272,11 @@ def _step_deviations(row: dict[str, Any], step: dict[str, Any], tol: Tolerances,
     if shift is not None and abs(shift) > tol.start_shift_s:
         row["deviations"].append(_deviation("info", f"started {hms(abs(shift))} {'later' if shift > 0 else 'earlier'} than the plan timeline"))
     for carried in row.get("carried_over") or []:
-        if carried["seconds"] > 0:
-            part = "last" if carried["from"] == "previous" else "first"
+        if carried.get("received_from"):
+            part = "last" if carried["received_from"] == "previous" else "first"
             row["deviations"].append(_deviation(
-                "info", f"includes the {part} {hms(carried['seconds'])} of the {carried['from']} step's lap (lap and step boundaries differ)"
+                "info", f"includes the {part} {hms(carried['seconds'])} of the {carried['received_from']} step's auto-lap "
+                        "(step boundary set where the intensity changes)"
             ))
 
 
@@ -1173,89 +1296,205 @@ def _planned_secs(step: dict[str, Any], profile: Profile, start: int, end: int) 
     return step.get("est_duration")
 
 
-def _segment_cost(step: dict[str, Any], profile: Profile, start: int, end: int) -> float | None:
-    """Intensity cost of the samples [start, end) against a step's target; None without target or data."""
-    target = step.get("target")
-    if not target:
-        return None
-    value = profile.mean(STREAM_KEYS[target["kind"]], start, end)
-    return None if value is None else _intensity_cost(value, target)
+def _change_point(values: list[Any], start: int, mid_a: float, mid_b: float) -> int:
+    """Index c (``start`` <= c <= ``start + len(values)``) that best splits ``values`` into a part
+    around ``mid_a`` followed by a part around ``mid_b`` (least squares, missing samples skipped)."""
+    best, best_cut, total = 0.0, start, 0.0
+    for offset, raw in enumerate(values):
+        value = _num(raw)
+        if value is not None:
+            total += (value - mid_a) ** 2 - (value - mid_b) ** 2
+        if total < best:
+            best, best_cut = total, start + offset + 1
+    return best_cut
 
 
-def _receives(receiver: dict[str, Any], giver: dict[str, Any], profile: Profile, start: int, end: int) -> bool:
-    """Whether the samples [start, end) of the giver's lap fit the receiving step at least as well."""
-    to_receiver, to_giver = _segment_cost(receiver, profile, start, end), _segment_cost(giver, profile, start, end)
-    if to_receiver is None or to_giver is None:
-        return True  # without targets the plan timeline decides
-    return to_receiver <= to_giver + 1e-9
+def _refine_boundary(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-branches
+    steps: tuple[dict[str, Any], dict[str, Any]], segs: tuple[dict[str, Any], dict[str, Any]], profile: Profile
+) -> str:
+    """Place the boundary between two adjacent steps at the intensity change inside an auto-lap.
 
-
-def _worth_moving(short: float, long: float, moved: float, allow_short: float, allow_long: float) -> bool:
-    """Whether moving ``moved`` seconds puts right a step flagged as too short or too long."""
-    return short > allow_short or long - moved <= allow_long < long
-
-
-def _carry_over(  # pylint: disable=too-many-locals
-    steps: tuple[dict[str, Any], dict[str, Any]], segs: tuple[dict[str, Any], dict[str, Any]], profile: Profile, tol: Tolerances
-) -> None:
-    """Move the boundary between two adjacent matched steps off the lap boundary.
-
-    When the first step is longer than planned and the second shorter (or vice versa), the
-    part of the lap that belongs to the other step is carried over, so a lap boundary that
-    does not coincide with the step boundary (e.g. device auto-laps) does not produce two
-    opposite deviations. Only done when keeping the lap boundary would flag a step that the
-    moved time puts right, and when the moved samples fit the receiving step's target at
-    least as well as the giving step's.
+    Only when the lap that ends at the current boundary is a device auto-lap (so the lap
+    boundary says nothing about the step boundary), both steps have targets of the same
+    kind with clearly different levels, and the stream exists. The cut is the least-squares
+    change point between the two target levels inside the laps next to the boundary, and
+    is only taken when the moved samples are closer to the receiving step's target. Lap
+    presses (partial laps), steps without a target and missing streams keep the lap boundary.
+    Returns "lap" (a lap press: kept), "moved", "confirmed" (the change is at the lap
+    boundary) or "unverifiable" (an auto-lap boundary the samples cannot place: kept, and the
+    duration of both steps is not judged as a deviation).
     """
     (step_a, step_b), (seg_a, seg_b) = steps, segs
-    plan_a = _planned_secs(step_a, profile, seg_a["start"], seg_a["end"])
-    plan_b = _planned_secs(step_b, profile, seg_b["start"], seg_b["end"])
-    if not plan_a or not plan_b:
-        return
-    act_a, act_b = profile.active(seg_a["start"], seg_a["end"]), profile.active(seg_b["start"], seg_b["end"])
-    allow_a, allow_b = tol.duration_allowance(plan_a), tol.duration_allowance(plan_b)
-    if act_a > plan_a and act_b < plan_b:  # the tail of step a's lap belongs to step b
-        moved = min(act_a - plan_a, plan_b - act_b)
-        if not _worth_moving(plan_b - act_b, act_a - plan_a, moved, allow_b, allow_a):
-            return
-        cut = profile.cap_by_time(seg_a["start"], seg_a["end"], act_a - moved)
-        if seg_a["start"] < cut < seg_a["end"] and _receives(step_b, step_a, profile, cut, seg_a["end"]):
-            seconds = round(profile.active(cut, seg_a["end"]), 1)
-            seg_a["carried"].append({"from": "next", "seconds": -seconds})
-            seg_b["carried"].append({"from": "previous", "seconds": seconds})
-            seg_a["end"] = seg_b["start"] = cut
-    elif act_a < plan_a and act_b > plan_b:  # the head of step b's lap belongs to step a
-        moved = min(plan_a - act_a, act_b - plan_b)
-        if not _worth_moving(plan_a - act_a, act_b - plan_b, moved, allow_a, allow_b):
-            return
-        cut = profile.cap_by_time(seg_b["start"], seg_b["end"], moved)
-        if seg_b["start"] < cut < seg_b["end"] and _receives(step_a, step_b, profile, seg_b["start"], cut):
-            seconds = round(profile.active(seg_b["start"], cut), 1)
-            seg_a["carried"].append({"from": "next", "seconds": seconds})
-            seg_b["carried"].append({"from": "previous", "seconds": -seconds})
-            seg_a["end"] = seg_b["start"] = cut
+    if not seg_a["auto_end"]:
+        return "lap"
+    target_a, target_b = step_a.get("target"), step_b.get("target")
+    if not target_a or not target_b or target_a["kind"] != target_b["kind"]:
+        return "unverifiable"
+    stream = STREAM_KEYS[target_a["kind"]]
+    mid_a, mid_b = _target_mid(target_a), _target_mid(target_b)
+    if not profile.has(stream) or abs(mid_a - mid_b) < CHANGE_MIN_PCT / 100 * max(mid_a, mid_b):
+        return "unverifiable"
+    laps_a, laps_b = seg_a["laps"], seg_b["laps"]
+    back, ahead = len(laps_a) - 1, 0  # start with the laps next to the boundary, widen while the cut hits an edge
+    while True:
+        low = max(seg_a["start"] + 1, laps_a[back][0])
+        high = min(seg_b["end"] - 1, laps_b[ahead][1])
+        if high <= low:
+            return "unverifiable"
+        cut = min(max(_change_point(profile.values(stream, low, high), low, mid_a, mid_b), low), high)
+        if cut >= high and ahead + 1 < len(laps_b):
+            ahead += 1
+        elif cut <= low and back > 0:
+            back -= 1
+        else:
+            break
+    boundary = seg_a["end"]
+    if cut - seg_a["start"] < MIN_BOUNDARY_SHIFT_S or seg_b["end"] - cut < MIN_BOUNDARY_SHIFT_S:
+        return "unverifiable"  # nothing of one step would remain: no clear change inside the laps
+    first, second = sorted((cut, boundary))
+    seconds = round(profile.active(first, second), 1)
+    if seconds < MIN_BOUNDARY_SHIFT_S:
+        return "confirmed"
+    mean = profile.mean(stream, first, second)
+    receiver, giver = (mid_b, mid_a) if cut < boundary else (mid_a, mid_b)
+    if mean is None or abs(mean - receiver) >= abs(mean - giver):
+        return "unverifiable"
+    if cut < boundary:
+        seg_a["carried"].append({"given_to": "next", "seconds": seconds})
+        seg_b["carried"].append({"received_from": "previous", "seconds": seconds})
+    else:
+        seg_a["carried"].append({"received_from": "next", "seconds": seconds})
+        seg_b["carried"].append({"given_to": "previous", "seconds": seconds})
+    seg_a["end"] = seg_b["start"] = cut
+    return "moved"
 
 
-def _step_segments(
-    planned: list[dict[str, Any]], alignment: list[tuple[int | None, list[int]]], spans: list[_Span], profile: Profile, tol: Tolerances
-) -> dict[int, dict[str, Any]]:
-    """Sample range of every matched step (by alignment position), boundaries carried over between adjacent steps."""
+def _change_points_3(
+    values: list[Any], start: int, mids: tuple[float, float, float], first_range: tuple[int, int], length_range: tuple[int, int]
+) -> tuple[int, int] | None:
+    """Indices (c1, c2) that best split ``values`` into parts around the three levels ``mids``
+    (least squares, missing samples skipped), with c1 in ``first_range`` and c2 - c1 in
+    ``length_range`` (absolute indices / samples); None when no split fits the ranges."""
+    sums: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
+    for raw in values:
+        value = _num(raw)
+        prev = sums[-1]
+        if value is None:
+            sums.append(prev)
+        else:
+            sums.append((prev[0] + (value - mids[0]) ** 2, prev[1] + (value - mids[1]) ** 2, prev[2] + (value - mids[2]) ** 2))
+    best_total, best_cuts = float("inf"), None
+    for first in range(max(first_range[0] - start, 1), min(first_range[1] - start, len(values) - 1) + 1):
+        lead = sums[first][0] - sums[first][1]
+        for second in range(first + max(length_range[0], 1), min(first + length_range[1], len(values) - 1) + 1):
+            total = lead + sums[second][1] - sums[second][2]
+            if total < best_total:
+                best_total, best_cuts = total, (start + first, start + second)
+    return best_cuts
+
+
+def _carve_step(  # pylint: disable=too-many-locals,too-many-return-statements
+    steps: tuple[dict[str, Any], dict[str, Any], dict[str, Any]], segs: tuple[dict[str, Any], dict[str, Any]], profile: Profile
+) -> dict[str, Any] | None:
+    """Find a planned step without an interval of its own between two adjacent matched steps.
+
+    With device auto-laps a step shorter than a lap (e.g. a 2 min jog between efforts) has no
+    lap of its own. When all three steps have targets of the same kind with clearly different
+    levels, the two change points inside the laps around the boundary give its samples. The
+    step is only placed when its samples are closer to its own target than to its neighbours'.
+    """
+    seg_a, seg_b = segs
+    targets: list[dict[str, Any]] = [step["target"] for step in steps if step.get("target")]
+    if not seg_a["auto_end"] or len(targets) != 3 or len({t["kind"] for t in targets}) != 1:
+        return None
+    stream = STREAM_KEYS[targets[0]["kind"]]
+    mids = (_target_mid(targets[0]), _target_mid(targets[1]), _target_mid(targets[2]))
+    if not profile.has(stream) or min(abs(mids[1] - mids[0]), abs(mids[1] - mids[2])) < CHANGE_MIN_PCT / 100 * max(mids):
+        return None
+    # The plan bounds the search (the first step ends within half to one and a half of its
+    # planned duration, the missing step lasts half to one and a half of its own); the
+    # intensity changes decide where.
+    plan_a = steps[0].get("duration") or steps[0].get("est_duration")
+    plan_m = steps[1].get("duration") or steps[1].get("est_duration")
+    if not plan_a or not plan_m:
+        return None
+    first_range = (seg_a["start"] + int(plan_a * 0.5), seg_a["start"] + int(plan_a * 1.5))
+    length_range = (int(plan_m * 0.5), int(plan_m * 1.5) + 1)
+    low = max(seg_a["start"] + 1, min(seg_a["laps"][-1][0], first_range[0]))
+    high = seg_b["end"] - 1
+    found = _change_points_3(profile.values(stream, low, high), low, mids, first_range, length_range)
+    if found is None:
+        return None
+    first, second = found
+    if min(second - first, first - seg_a["start"], seg_b["end"] - second) < MIN_BOUNDARY_SHIFT_S:
+        return None
+    mean = profile.mean(stream, first, second)
+    if mean is None or abs(mean - mids[1]) >= min(abs(mean - mids[0]), abs(mean - mids[2])):
+        return None
+    parts = [i for i, lap in zip(seg_a["indices"] + seg_b["indices"], seg_a["laps"] + seg_b["laps"], strict=True)
+             if lap[0] < second and lap[1] > first]
+    seg_a["end"], seg_b["start"] = first, second
+    return {"start": first, "end": second, "carried": [], "laps": [], "indices": parts, "auto_end": False, "carved": True}
+
+
+def _step_segments(  # pylint: disable=too-many-locals,too-many-branches
+    planned: list[dict[str, Any]], alignment: list[tuple[int | None, list[int]]], spans: list[_Span], profile: Profile,
+    layout: dict[str, Any] | None,
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    """Sample range of every matched step (by alignment position) and boundary statistics.
+
+    With device auto-laps, the boundary between adjacent steps is placed at the intensity
+    change inside the lap (``_refine_boundary``) and a planned step without a lap of its own
+    between two matched steps is placed at the two intensity changes (``_carve_step``); an
+    unmatched auto-lap straddling two steps is split between them at the intensity change
+    (its position is listed in ``absorbed_positions``). Otherwise the lap boundaries are kept.
+    """
     segs: dict[int, dict[str, Any]] = {}
+    stats: dict[str, Any] = {"auto_lap_boundaries": 0, "moved": 0, "unverifiable": 0, "carved": 0, "absorbed_positions": []}
     if not profile.n:
-        return segs
+        return segs, stats
     for position, (p_idx, indices) in enumerate(alignment):
         if p_idx is None or not indices:
             continue
         first, last = spans[indices[0]], spans[indices[-1]]
         if first.start is not None and last.end is not None:
-            segs[position] = {"start": first.start, "end": last.end, "carried": []}
-    for position, seg in sorted(segs.items()):
-        following = segs.get(position + 1)
-        if following is None or seg["end"] != following["start"]:
-            continue  # a missed step or an extra interval lies between: keep the lap boundary
-        steps = (planned[alignment[position][0]], planned[alignment[position + 1][0]])  # type: ignore[index]
-        _carry_over(steps, (seg, following), profile, tol)
-    return segs
+            laps = [(spans[i].start or first.start, spans[i].end or last.end) for i in indices]
+            segs[position] = {"start": first.start, "end": last.end, "carried": [], "laps": laps, "indices": list(indices),
+                              "auto_end": _is_auto_lap(last, layout)}
+    if layout is None:
+        return segs, stats
+    positions = sorted(segs)
+    for position, later in zip(positions, positions[1:], strict=False):
+        seg, following = segs[position], segs[later]
+        between = alignment[position + 1:later]
+        step_a, step_b = planned[alignment[position][0]], planned[alignment[later][0]]  # type: ignore[index]
+        if len(between) == 1 and between[0][0] is not None:  # a planned step without an interval of its own
+            if seg["end"] == following["start"] and seg["auto_end"]:
+                stats["auto_lap_boundaries"] += 1
+                carved = _carve_step((step_a, planned[between[0][0]], step_b), (seg, following), profile)
+                if carved is not None:
+                    segs[position + 1] = carved
+                    stats["carved"] += 1
+            continue
+        if len(between) == 1 and len(between[0][1]) == 1:  # an unmatched auto-lap straddling two steps
+            straddling = spans[between[0][1][0]]
+            if not (_is_auto_lap(straddling, layout) and seg["end"] == straddling.start and straddling.end == following["start"]):
+                continue
+            seg.update(end=straddling.end, auto_end=True)
+            seg["laps"].append((straddling.start, straddling.end))
+            seg["indices"].append(straddling.index)
+            stats["absorbed_positions"].append(position + 1)
+        elif between or seg["end"] != following["start"]:
+            continue  # missed steps or extra intervals lie between: keep the lap boundaries
+        status = _refine_boundary((step_a, step_b), (seg, following), profile)
+        if status != "lap":
+            stats["auto_lap_boundaries"] += 1
+        if status == "moved":
+            stats["moved"] += 1
+        if status == "unverifiable":
+            stats["unverifiable"] += 1
+            seg["unverifiable_end"] = following["unverifiable_start"] = True
+    return segs, stats
 
 
 def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
@@ -1307,6 +1546,8 @@ def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
                metrics=metrics, adherence=adherence(target, metrics, tol.target_pct))
     if seg["carried"]:
         row["carried_over"] = seg["carried"]
+    if seg.get("unverifiable_start") or seg.get("unverifiable_end"):
+        row["boundary_unverifiable"] = [side for side, key in (("start", "unverifiable_start"), ("end", "unverifiable_end")) if seg.get(key)]
     if step.get("duration"):
         row["duration_diff_s"] = round(span_active - step["duration"], 1)
     elif step.get("distance"):
@@ -1456,8 +1697,10 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
         "unmatched_intervals": sum(1 for r in rows if not r.get("planned") and r.get("metrics")),
         "merged_steps": sum(1 for r in matched_rows if r.get("merged")),
         "split_steps": sum(1 for r in matched_rows if r.get("overrun")),
-        "boundaries_off_lap": sum(1 for r in matched_rows for c in r.get("carried_over") or [] if c["seconds"] > 0),
+        "boundaries_off_lap": sum(1 for r in matched_rows for c in r.get("carried_over") or [] if c.get("received_from")),
         "planned_total_s": sum(s.get("duration") or s.get("est_duration") or 0 for s in planned) or None,
+        "planned_total_estimated": any(not s.get("duration") and s.get("est_duration") for s in planned),
+        "planned_distance_without_duration_m": sum(s.get("distance") or 0 for s in planned if not s.get("duration") and not s.get("est_duration")) or None,
         "actual_total_s": sum(_num(i.get("elapsed_time")) or 0 for i in intervals) or None,
         "plan_start_s": start,
         "plan_end_s": end,
@@ -1465,6 +1708,9 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
         "plan_part_moving_s": round(sum(r["metrics"].get("moving_time_s") or 0 for r in matched_rows), 1) or None,
         "extra_time_inside_plan_s": round(sum(o.get("moving_time_s") or 0 for o in inside), 1),
         "extension_s": (extension or {}).get("duration_s", 0) or 0,
+        "last_step_beyond_plan_s": next(
+            (r["overrun"].get("moving_time_s") for r in matched_rows if (r.get("overrun") or {}).get("counted_as", "").startswith("additional")), None
+        ),
         "extended_beyond_plan": bool(extension),
         "pre_plan_s": (pre_plan or {}).get("duration_s", 0) or 0,
         "total_work_kj": round(total_kj, 1) if total_kj else None,
@@ -1482,7 +1728,37 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
     }
 
 
-def analyze(  # pylint: disable=too-many-locals,too-many-statements
+def _alignment_confidence(rows: list[dict[str, Any]], layout: dict[str, Any] | None, stats: dict[str, Any]) -> dict[str, Any]:
+    """How far the per-step results can be trusted.
+
+    "high": the laps follow the plan (lap presses, a workout on the device, detected
+    efforts; with auto-laps in between, all step boundaries fell on laps ended by the
+    athlete or the device workout). "medium": step boundaries inside device auto-laps
+    were placed at intensity changes. "low": with auto-laps, boundaries that the samples
+    cannot place or planned steps that were not found.
+    """
+    notes: list[str] = []
+    if layout is None or not (stats["auto_lap_boundaries"] or any(not r.get("metrics") for r in rows if r.get("planned"))):
+        return {"auto_laps": None if layout is None else {"by": layout["by"], "lap": layout["lap"], "laps": layout["laps"]},
+                "alignment_confidence": "high", "alignment_notes": notes}
+    if stats["moved"]:
+        notes.append(f"{stats['moved']} step boundary(ies) set inside auto-laps")
+    if stats["carved"]:
+        notes.append(f"{stats['carved']} step(s) without a lap of their own placed at intensity changes")
+    if stats["unverifiable"]:
+        notes.append(f"{stats['unverifiable']} step boundary(ies) inside auto-laps not visible in the samples (durations there not judged)")
+    missing = sum(1 for r in rows if r.get("planned") and not r.get("metrics"))
+    if missing:
+        notes.append(f"{missing} planned step(s) not found (shorter than an auto-lap or not executed)")
+    if layout["by"] == "distance":
+        lap = f"{layout['lap'] / 1000:.2f} km" if layout["lap"] >= 500 else f"{layout['lap']:.0f} m"
+    else:
+        lap = hms(layout["lap"])
+    return {"auto_laps": {"by": layout["by"], "lap": layout["lap"], "laps": layout["laps"], "text": lap},
+            "alignment_confidence": "low" if stats["unverifiable"] or missing else "medium", "alignment_notes": notes}
+
+
+def analyze(  # pylint: disable=too-many-locals,too-many-statements,too-many-branches
     planned: list[dict[str, Any]],
     intervals: list[dict[str, Any]],
     streams: list[dict[str, Any]],
@@ -1512,14 +1788,12 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
         return result
     spans = _spans(intervals, profile)
     alignment = align_spans(planned, intervals, profile)
-    segments = _step_segments(planned, alignment, spans, profile, tol)
+    layout = lap_layout(spans)
+    segments, boundary_stats = _step_segments(planned, alignment, spans, profile, layout)
     matched = [(p, idx) for p, idx in alignment if p is not None and idx]
     first_matched = matched[0][1][0] if matched else None
     last_matched = matched[-1][1][-1] if matched else None
-    anchor = None
-    first_planned_start = planned[matched[0][0]].get("planned_start") if matched else None  # type: ignore[index]
-    if matched and spans[matched[0][1][0]].start is not None and profile.n and first_planned_start is not None:
-        anchor = profile.at(spans[matched[0][1][0]].start or 0) - first_planned_start
+    anchor: float | None = None  # actual time minus plan clock; restarted after steps without duration
     rows: list[dict[str, Any]] = []
     pre_spans: list[_Span] = []
     post_spans: list[_Span] = []
@@ -1527,6 +1801,8 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
     for position, (p_idx, indices) in enumerate(alignment):
         following = next((spans[idx[0]] for _, idx in alignment[position + 1:] if idx), None)
         if p_idx is None:
+            if position in boundary_stats["absorbed_positions"]:
+                continue  # an auto-lap split between the steps around it
             span = spans[indices[0]]
             if first_matched is None or span.index < first_matched:
                 pre_spans.append(span)
@@ -1536,12 +1812,22 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
                 rows.append(_unplanned_row(span, profile, ftp, hidden, following.start if following else None))
             continue
         step = planned[p_idx]
-        if not indices:
+        seg = segments.get(position)
+        if not indices and not (seg and seg.get("carved")):
             rows.append({"planned": step, "interval_index": None, "deviations": [_deviation("deviation", "not executed / no matching interval")]})
+            if not step.get("duration"):
+                anchor = None  # the plan clock is lost until the next matched step
             continue
-        is_last = indices[-1] == last_matched
-        row = _step_row(step, [spans[i] for i in indices], profile, tol, seg=segments.get(position), is_last=is_last,
-                        anchor=anchor, ftp=ftp, hidden=hidden)
+        is_last = bool(indices) and indices[-1] == last_matched
+        if anchor is None and seg is not None:
+            anchor = profile.at(seg["start"]) - step["planned_start"]
+        row = _step_row(step, [spans[i] for i in (seg["indices"] if seg else indices)], profile, tol, seg=seg,
+                        is_last=is_last, anchor=anchor, ftp=ftp, hidden=hidden)
+        if seg is not None and seg.get("carved"):
+            row["carved"] = True
+            row["deviations"].insert(0, _deviation("info", "no lap of its own: placed where the intensity changes inside the auto-laps"))
+        if seg is not None and not step.get("duration"):
+            anchor = profile.at(seg["end"]) - step["planned_end"]  # restart the plan clock at the actual end
         if step.get("kind") == "work" and row.get("end_index") is not None:
             _hr_recovery(profile, row["metrics"], row["end_index"])
         if is_last:
@@ -1554,6 +1840,7 @@ def analyze(  # pylint: disable=too-many-locals,too-many-statements
         if profile.elapsed(0, start_index) >= EXTENSION_MIN_SECS:
             pre_plan = _block(profile, 0, start_index, pre_spans, ftp, hidden)
     summary = _summary(planned, intervals, rows, profile, extension, pre_plan, tol)
+    summary.update(_alignment_confidence(rows, layout, boundary_stats))
     return {
         "rows": rows, "summary": summary, "extension": extension, "pre_plan": pre_plan, "hidden_streams": hidden_map,
         "activity_type": ctx.get("activity_type"), "pace_units": pace_units,
@@ -1749,8 +2036,13 @@ def _block_lines(  # pylint: disable=too-many-arguments,too-many-positional-argu
 
 
 def _summary_lines(summary: dict[str, Any]) -> list[str]:
+    total = ("≈" if summary.get("planned_total_estimated") else "") + hms(summary["planned_total_s"])
+    if summary.get("planned_distance_without_duration_m"):
+        total += f" + {_distance_text(summary['planned_distance_without_duration_m'])}"
+    if summary.get("planned_total_estimated"):
+        total += " (distance steps estimated at the target pace)"
     lines = [
-        f"Plan: {summary['planned_steps']} steps, {hms(summary['planned_total_s'])} planned | "
+        f"Plan: {summary['planned_steps']} steps, {total} planned | "
         f"Actual: {summary['actual_intervals']} intervals, {hms(summary['actual_total_s'])} in total | "
         f"matched {summary['matched']}, planned without match {summary['unmatched_planned']}, "
         f"extra intervals inside the plan {summary['unmatched_intervals']} | work steps in target: {summary['work_steps_in_range'] or 'n/a'}"
@@ -1766,13 +2058,25 @@ def _summary_lines(summary: dict[str, Any]) -> list[str]:
     if summary.get("merged_steps"):
         quality.append(f"steps matched to several intervals {summary['merged_steps']}")
     if summary.get("boundaries_off_lap"):
-        quality.append(f"step boundaries set on the plan timeline inside a lap {summary['boundaries_off_lap']}")
+        quality.append(f"step boundaries set at intensity changes inside auto-laps {summary['boundaries_off_lap']}")
     lines.append("Execution: " + ", ".join(quality))
+    if summary.get("alignment_confidence") in ("medium", "low"):
+        caveat = (
+            f"Caveat ({summary['alignment_confidence']} confidence): the laps look like device auto-laps (every "
+            f"{summary['auto_laps']['text']}), not step laps; step boundaries inside laps were placed where the intensity changes, "
+            "so per-step results are approximate"
+        )
+        lines.append(caveat + "".join(f"; {note}" for note in summary.get("alignment_notes") or []) + ".")
     if summary.get("extended_beyond_plan"):
         share = f", {summary['extension_work_share_pct']:.0f}% of the activity's work in kJ" if summary.get("extension_work_share_pct") is not None else ""
         lines.append(
             f"The activity was extended beyond the plan: plan part {hms(summary.get('plan_part_actual_s'))}, "
             f"additional training {hms(summary['extension_s'])}{share} (reported separately below, not counted against the plan)."
+        )
+    if not summary.get("extended_beyond_plan") and summary.get("last_step_beyond_plan_s"):
+        lines.append(
+            f"The last step ran {hms(summary['last_step_beyond_plan_s'])} beyond its planned duration "
+            f"(less than {hms(EXTENSION_MIN_SECS)}, not reported as a separate block)."
         )
     if summary.get("pre_plan_s"):
         lines.append(f"Riding before the first planned step: {hms(summary['pre_plan_s'])} (reported separately below).")

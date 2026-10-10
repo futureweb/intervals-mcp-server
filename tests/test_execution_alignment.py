@@ -100,26 +100,40 @@ def test_long_unmatched_block_before_the_plan_is_not_cheap():
     assert result["summary"]["matched"] == 3 and result["pre_plan"] is None
 
 
-def test_lap_boundary_inside_a_step_carries_time_over_instead_of_paired_deviations():
-    """ANA-2: laps of 6:30 with a plan of 10 + 20 min: the 3 min after the 10th minute belong to the
-    second step; no '+3:00 extra time inside the plan' / '3:00 shorter than planned' pair."""
+def test_auto_lap_boundary_is_set_at_the_intensity_change():
+    """ANA-2 / R26-1: with 1 km auto-laps the step boundary lies inside a lap; it is placed where the
+    pace changes (evidence), not on the plan clock, so no pair of opposite deviations appears."""
+    plan = [{"duration": 600, "warmup": True, "_pace": {"start": 2.32, "end": 2.52}},
+            {"duration": 1200, "_pace": {"start": 2.62, "end": 2.82}}]
+    streams, intervals = build_run([2.42] * 600 + [2.72] * 1200)
+    planned = plan_steps(plan, {"threshold_pace": 3.2258})
+    result = analyze(planned, intervals, streams, context={"threshold_pace": 3.2258, "activity_type": "Run"})
+    warmup, easy = result["rows"]
+    assert warmup["metrics"]["moving_time_s"] == 600 and "overrun" not in warmup
+    assert easy["metrics"]["moving_time_s"] == 1200 and easy["carried_over"][0]["received_from"] == "previous"
+    assert result["summary"]["steps_with_deviations"] == 0 and result["summary"]["boundaries_off_lap"] == 1
+    assert result["summary"]["alignment_confidence"] == "medium" and result["summary"]["auto_laps"]["by"] == "distance"
+    text = format_execution(result, "", True)
+    assert "includes the last" in text and "of the previous step's auto-lap (step boundary set where the intensity changes)" in text
+    assert "Caveat (medium confidence): the laps look like device auto-laps (every 1.00 km)" in text
+
+
+def test_auto_lap_boundary_without_evidence_is_kept_and_not_judged():
+    """R26-1: when the samples do not show the change (same pace in both steps), the lap boundary is
+    kept, nothing is moved, and the resulting durations are not reported as clear deviations."""
     plan = [{"duration": 600, "warmup": True, "_pace": {"start": 2.32, "end": 2.52}},
             {"duration": 1200, "_pace": {"start": 2.45, "end": 2.65}}]
     streams, intervals = build_run([2.5] * 1800, lap_m=975)
     planned = plan_steps(plan, {"threshold_pace": 3.2258})
     result = analyze(planned, intervals, streams, context={"threshold_pace": 3.2258, "activity_type": "Run"})
     warmup, easy = result["rows"]
-    assert warmup["metrics"]["moving_time_s"] == 600 and "overrun" not in warmup
-    assert easy["metrics"]["moving_time_s"] == 1200
-    assert easy["carried_over"] == [{"from": "previous", "seconds": 180.0}]
-    assert result["summary"]["steps_with_deviations"] == 0 and result["summary"]["extra_time_inside_plan_s"] == 0
-    assert result["summary"]["boundaries_off_lap"] == 1
-    text = format_execution(result, "", True)
-    assert "includes the last 3:00 of the previous step's lap (lap and step boundaries differ)" in text
-    assert "shorter than planned" not in text
-    # Interval listing without streams: the time is carried over, not reported as beyond the plan.
+    assert warmup["interval_indices"] == [0, 1] and "carried_over" not in easy
+    assert result["summary"]["steps_with_deviations"] == 0 and result["summary"]["alignment_confidence"] == "low"
+    assert any("not visible in the samples" in note for note in result["summary"]["alignment_notes"])
+    assert any(d["severity"] == "info" and "inside a device auto-lap" in d["text"] for d in easy["deviations"])
+    # Interval listing without streams: no guess, but the auto-lap is named.
     mapping = planned_step_map(planned, intervals)
-    assert mapping[0]["carried_to_next_s"] == 180.0 and mapping[0]["beyond_plan_s"] is None
+    assert mapping[0]["boundary_inside_auto_lap"] is True and mapping[0]["beyond_plan_s"] == 180.0
 
 
 def test_real_overrun_with_step_laps_is_still_flagged():
@@ -140,7 +154,7 @@ def test_real_overrun_with_step_laps_is_still_flagged():
 def test_open_ended_targets_are_lower_bounds():
     """ANA-3: top zone and start-only targets have no upper limit."""
     z7 = resolve_target({"power": {"value": 7, "units": "power_zone"}}, ZONE_CONTEXT)
-    assert z7["low"] == 351.0 and z7["high"] is None
+    assert z7["low"] == 352 and z7["high"] is None  # watts floored like the Intervals.icu zone table
     sprint = adherence(z7, {"avg_watts": 1.8 * 234})
     assert sprint["status"] == "in range" and sprint["offset_from_range_pct"] == 0.0 and sprint["open_ended"] is True
     assert _time_in_target([1.8 * 234] * 30, z7) == 100.0
@@ -149,7 +163,10 @@ def test_open_ended_targets_are_lower_bounds():
     assert z67["high"] is None and adherence(z67, {"avg_watts": 400})["status"] == "in range"
     start_only = resolve_target({"power": {"start": 120, "units": "%ftp"}}, ZONE_CONTEXT)
     assert start_only["low"] == 280.8 and start_only["high"] is None
-    assert resolve_target({"power": {"start": 6, "units": "power_zone"}}, ZONE_CONTEXT)["high"] is None
+    # R26-11: a zone given by its start only is that zone; only the top zone is open-ended
+    z1 = resolve_target({"power": {"start": 1, "units": "power_zone"}}, ZONE_CONTEXT)
+    assert (z1["low"], z1["high"]) == (0, 128)
+    assert resolve_target({"power": {"start": 7, "units": "power_zone"}}, ZONE_CONTEXT)["high"] is None
     pace_z7 = resolve_target({"pace": {"value": 7, "units": "pace_zone"}}, ZONE_CONTEXT)
     assert pace_z7["high"] is None and adherence(pace_z7, {"avg_speed_m_s": 5.2})["status"] == "in range"
     # single values stay point targets
@@ -165,7 +182,7 @@ def test_open_ended_targets_are_lower_bounds():
     sprint_row = result["rows"][1]
     assert sprint_row["adherence"]["status"] == "in range" and not sprint_row["deviations"]
     text = format_execution(result, "")
-    assert "work 0:20 @ 351 W or more" in text and "% of the lower bound" in text
+    assert "work 0:20 @ 352 W or more" in text and "% of the lower bound" in text
 
 
 def test_easy_run_step_is_work_and_recoveries_between_efforts_are_rest():

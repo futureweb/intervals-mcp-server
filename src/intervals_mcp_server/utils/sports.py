@@ -172,7 +172,7 @@ def _numeric(values: Any) -> list[float]:
     return [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
 
 
-def _floor_watts(watts: float) -> int:
+def floor_watts(watts: float) -> int:
     """Whole watts rounded down, robust against float noise (70 % of 300 W is 210, not 209)."""
     return math.floor(watts + 1e-9)
 
@@ -204,8 +204,8 @@ def zone_ranges(  # pylint: disable=too-many-arguments,too-many-positional-argum
         }
         if kind == "power" and isinstance(ftp, (int, float)) and ftp:
             # Intervals.icu floors the watt bounds: Z1 <= floor(55 % FTP), Z2 from that + 1 ...
-            row["min_watts"] = _floor_watts(lower / 100 * ftp) + (1 if lower else 0)
-            row["max_watts"] = _floor_watts(upper / 100 * ftp) if upper < 999 else None
+            row["min_watts"] = floor_watts(lower / 100 * ftp) + (1 if lower else 0)
+            row["max_watts"] = floor_watts(upper / 100 * ftp) if upper < 999 else None
         if kind == "pace" and isinstance(threshold_pace, (int, float)) and threshold_pace:
             low_speed = lower / 100 * threshold_pace
             high_speed = upper / 100 * threshold_pace if upper < 999 else None
