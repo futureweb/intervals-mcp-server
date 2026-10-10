@@ -1071,3 +1071,68 @@ def test_refused_token_requests_inside_a_state_change_are_oauth_errors(tmp_path)
     stolen = RefreshToken(token=first.refresh_token, client_id="c2", scopes=["mcp"], expires_at=None)
     with pytest.raises(TokenError):
         asyncio.run(provider.exchange_refresh_token(other, stolen, ["mcp"]))
+
+
+def test_grace_answer_waits_for_the_write_of_the_rotation(tmp_path, monkeypatch):
+    """R24-13: a concurrent retry gets the cached answer only once its write is on disk; when that
+    write fails, the retry rotates the restored token itself and holds tokens that exist."""
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+    original = provider._write_state
+    calls: list[int] = []
+
+    def first_write_fails(data: dict[str, Any]) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.2)
+            raise OSError(28, "No space left on device")
+        original(data)
+
+    monkeypatch.setattr(provider, "_write_state", first_write_fails)
+
+    async def run() -> tuple[Any, Any]:
+        loaded = await provider.load_refresh_token(registered, first.refresh_token)
+        assert loaded is not None
+
+        async def retry() -> Any:
+            await asyncio.sleep(0.05)  # while the first rotation is being written
+            again = await provider.load_refresh_token(registered, first.refresh_token)
+            assert again is not None
+            return await provider.exchange_refresh_token(registered, again, again.scopes)
+
+        return await asyncio.gather(
+            provider.exchange_refresh_token(registered, loaded, loaded.scopes), retry(), return_exceptions=True
+        )
+
+    failed, retried = asyncio.run(run())
+    assert isinstance(failed, OSError)
+    assert not isinstance(retried, BaseException)
+    assert auth._digest(retried.refresh_token) in provider._tokens.refresh
+    assert asyncio.run(provider.load_access_token(retried.access_token)) is not None
+    saved = json.loads(provider.config.state_file.read_text())
+    assert list(saved["refresh_tokens"]) == [auth._digest(retried.refresh_token)]
+
+
+def test_grace_answer_after_a_committed_rotation(tmp_path):
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+    rotated = refresh_with(provider, registered, first.refresh_token)
+    assert all(entry.committed for entry in provider._tokens.rotated.values())
+    assert refresh_with(provider, registered, first.refresh_token).refresh_token == rotated.refresh_token
+
+
+def test_pending_flood_inside_the_athletes_48_evicts_only_the_attacker(tmp_path):
+    """R24-14: an attacker sharing the athlete's /48 (ISP /56s) fills the table with its own /64s;
+    the busiest address inside the busiest /48 loses entries, not the athlete."""
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    victim = authorize_as(provider, registered, "2001:db8:aaaa:1::7")
+    for i in range(auth.MAX_PENDING_LOGINS + 50):
+        authorize_as(provider, registered, f"2001:db8:aaaa:{0x100 + i % 25:x}::1")  # 25 /64s in the same /48
+    assert provider.pending_login(victim) is not None
+    assert len(provider._pending) <= auth.MAX_PENDING_LOGINS

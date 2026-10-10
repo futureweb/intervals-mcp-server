@@ -608,6 +608,9 @@ class _RotatedToken:
     rotated_at: float
     successor: str = ""
     response: OAuthToken | None = None
+    # Set once the state file holding the successor was written: the answer is only
+    # handed out again after that (a failed write undoes the rotation).
+    committed: bool = False
 
 
 class _AlreadyRotated(Exception):
@@ -1006,6 +1009,9 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 if isinstance(exc, OSError):
                     logger.error("Could not write OAUTH_STATE_FILE %s: %s", self._config.state_file, _one_line(exc))
                 raise
+            # Every successor in memory is on disk now (bodies only run under this lock).
+            for rotated in self._tokens.rotated.values():
+                rotated.committed = True
 
     # ----- helpers -------------------------------------------------------- #
 
@@ -1076,6 +1082,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             return None
         if (
             rotated.record.client_id != client.client_id
+            or not rotated.committed
             or not self._in_grace(rotated)
             or rotated.response is None
             or rotated.successor not in self._tokens.refresh
@@ -1101,11 +1108,12 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     def _evict_for_key(table: dict[str, Any], key: str, per_key: int, total: int) -> None:
         """Make room in *table* (insertion ordered) for one more entry of *key*.
 
-        A key may hold at most *per_key* entries (its oldest is dropped); when the table is
-        full, the oldest entry of the busiest network goes (IPv6 grouped by /48), so one
-        address or one network cannot push out another address's sign-in. Without a known
-        address (``unknown``: an app built without the middleware) only the global limit
-        applies.
+        A key may hold at most *per_key* entries (its oldest is dropped). When the table is
+        full, the busiest network (IPv6 grouped by /48) is chosen, and within it the busiest
+        address (IPv6 /64) loses its oldest entry: many /64s of one /48 cannot push out
+        another network's sign-in, and an attacker sharing the athlete's /48 only evicts its
+        own entries. Without a known address (``unknown``: an app built without the
+        middleware) only the global limit applies.
         """
         if key == "unknown":
             per_key = total
@@ -1113,12 +1121,13 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         while len(mine) >= per_key:
             del table[mine.pop(0)]
         while len(table) >= total:
-            counts: dict[str, int] = {}
+            groups: dict[str, dict[str, int]] = {}
             for entry in table.values():
-                group = _eviction_group(entry.key)
-                counts[group] = counts.get(group, 0) + 1
-            busiest = max(counts, key=lambda k: counts[k])
-            del table[next(k for k, entry in table.items() if _eviction_group(entry.key) == busiest)]
+                keys = groups.setdefault(_eviction_group(entry.key), {})
+                keys[entry.key] = keys.get(entry.key, 0) + 1
+            group = max(groups, key=lambda g: sum(groups[g].values()))
+            busiest = max(groups[group], key=lambda k: groups[group][k])
+            del table[next(k for k, entry in table.items() if entry.key == busiest)]
 
     def _purge_pending(self) -> None:
         now = self._clock()
@@ -1307,6 +1316,12 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         the same answer again within the grace period instead of a second chain.
         """
         digest = _digest(refresh_token.token)
+        pending = self._tokens.rotated.get(digest)
+        if pending is not None and not pending.committed:
+            # A concurrent request is still writing this rotation: wait for it, so the same
+            # answer is only given once it is on disk (a failed write undoes the rotation).
+            async with self._state_lock:
+                pass
         answer = self._grace_answer(digest, client)
         if answer is not None:
             return answer

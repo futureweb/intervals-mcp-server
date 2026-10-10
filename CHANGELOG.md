@@ -27,9 +27,10 @@ First public beta of the Futureweb fork. Based on upstream
   registrations per client address and hour, and a client in the middle of its consent is no
   longer evicted from the 50-client table.
 - Pending sign-ins and Intervals.icu sign-ins in progress are capped per client address (IPv4
-  address or IPv6 /64, 20 each), and a full table drops entries of the busiest network first
-  (IPv6 per /48); a flood of `/authorize` requests from one address or network can no longer
-  push out the athlete's own pending sign-in.
+  address or IPv6 /64, 20 each), and a full table drops the oldest entry of the busiest address
+  inside the busiest network (IPv6 per /48); a flood of `/authorize` requests from one address or
+  network (also one sharing the athlete's /48) can no longer push out the athlete's own pending
+  sign-in.
 - Client metadata documents: bounded cache (256 documents, rejected ones evicted first), one
   shared fetch per document, at most 10 fetches per minute for unknown client ids (pinned ids,
   ids accepted before and ids holding a refresh token - loaded from the state file at startup -
@@ -45,8 +46,8 @@ First public beta of the Futureweb fork. Based on upstream
   parameter once (RFC 6749); a `multipart/form-data` body, which the SDK would have parsed,
   could otherwise skip the client assertion check.
 - Refresh tokens: a rotated refresh token presented again within `OAUTH_REFRESH_REUSE_GRACE`
-  seconds (default 120) gets the same answer again (retry after a lost response, concurrent
-  refreshes), so a grant never forks into parallel chains; presented later it revokes the whole
+  seconds (default 120) gets the same answer again once that answer is stored (retry after a
+  lost response, concurrent refreshes), so a grant never forks into parallel chains; presented later it revokes the whole
   grant (RFC 9700 reuse detection; `OAUTH_REFRESH_REUSE_REVOKE=false` only refuses the request).
   A client whose metadata document declares `private_key_jwt` (ChatGPT) must send its client
   assertion with every token request (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified

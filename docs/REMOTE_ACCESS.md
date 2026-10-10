@@ -88,7 +88,7 @@ instead) use the API-key or password sign-in: no app is needed for those.
 | `API_KEY` | The Intervals.icu API key of the deployment; also the secret of the `apikey` sign-in. |
 | `OAUTH_TOTP_SECRET` | Optional second factor for `password` and `apikey` (create with `python -m intervals_mcp_server.auth totp-secret`). |
 | `OAUTH_CLIENT_HOSTS` | Where client metadata documents are accepted, comma-separated: a host (every path on it), `host/path` (exactly that document URL) or `host/path/` (every path below it). Default `chatgpt.com,claude.ai,claude.com`; `none` disables them. Client ids with a query string, percent-encoding, `.`/`..` or empty path segments are never accepted, and a document's redirect URIs must stay on its own host, another listed host or loopback. Documents of unknown client ids are fetched at most 10 times per minute in total; pinned ids (`host/path`), ids accepted before and ids holding a refresh token (read from the state file at startup) are never held back by that budget. Stricter (only ChatGPT's document, which also stops random client ids from causing any fetch): `chatgpt.com/oauth/client.json`. |
-| `OAUTH_REDIRECT_HOSTS` | Redirect URIs allowed for dynamically registered clients: a host, an exact `host/path`, or a `host/path/` prefix. Same default; `*` allows any https host. Redirect URIs with a query string are refused; loopback http is always allowed. Stricter: `claude.ai/api/mcp/auth_callback,claude.com/api/mcp/auth_callback,chatgpt.com/connector_platform_oauth_redirect,chatgpt.com/connector/oauth/`. |
+| `OAUTH_REDIRECT_HOSTS` | Redirect URIs allowed for dynamically registered clients: a host, an exact `host/path`, or a `host/path/` prefix (the trailing `/` makes it a prefix: `chatgpt.com/connector/oauth` without it would refuse ChatGPT's per-connection `.../connector/oauth/<id>` redirect URIs). Same default; `*` allows any https host. Redirect URIs with a query string are refused; loopback http is always allowed. Stricter: `claude.ai/api/mcp/auth_callback,claude.com/api/mcp/auth_callback,chatgpt.com/connector_platform_oauth_redirect,chatgpt.com/connector/oauth/`. |
 | `OAUTH_DYNAMIC_REGISTRATION` | `true` (default) or `false`. At most 10 registrations per client address and hour; 50 clients are kept (idle ones are evicted first). |
 | `OAUTH_PRIVATE_KEY_JWT` | Advertise and verify `private_key_jwt` for metadata-document clients, default `true`. |
 | `OAUTH_REQUIRE_PRIVATE_KEY_JWT` | Default `true`: a token request without a client assertion is refused (`invalid_client`) when the client's metadata document declares `token_endpoint_auth_method: private_key_jwt` (ChatGPT does, and signs its code and refresh requests). `false` accepts such clients without an assertion again (PKCE still protects the code). |
@@ -220,9 +220,10 @@ Claude: Settings → Connectors → *Add custom connector* with the same URL; th
    (unless `OAUTH_REFRESH_REUSE_REVOKE=false`).
 
 Sign-in links live 10 minutes, codes 5 minutes; both are single use. Each client address
-may have at most 20 pending sign-ins, and a full table (500) drops entries of the busiest
-network first (IPv6 counted per /48), so a flood of `/authorize` requests from one address or
-network cannot push out your own; an attacker with hundreds of separate networks still can.
+may have at most 20 pending sign-ins, and a full table (500) drops the oldest entry of the
+busiest address inside the busiest network (IPv6 counted per /48), so a flood of `/authorize`
+requests from one address or network - also one sharing your /48 - cannot push out your own;
+an attacker with hundreds of separate networks still can.
 
 ## Operations
 
