@@ -149,12 +149,12 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 
 | Tool | What it does |
 | --- | --- |
-| `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call |
-| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule) |
+| `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call; names the usual wellness fields today's record does not have yet (not yet available, not normal) |
+| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days, today's not-yet-available wellness fields and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule) |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per moving hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name (device-file zeros treated as placeholders); per sport family, and within it per duration and intensity, with sample sizes, logging coverage and Spearman correlations from 8 sessions; no targets |
-| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field); subjective scores |
+| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet (night/morning values apart from day totals); subjective scores |
 
 **Athlete, gear, calendar and workouts**
 

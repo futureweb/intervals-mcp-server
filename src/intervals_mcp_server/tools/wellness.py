@@ -11,11 +11,18 @@ from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD, CustomFieldDefs
+from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.formatting import format_wellness_entry
 from intervals_mcp_server.utils.validation import (
     resolve_athlete_id,
     resolve_date_params,
     validate_date,
+)
+from intervals_mcp_server.utils.wellness_completeness import (
+    completeness_line,
+    completeness_start,
+    has_missing_custom_fields,
+    today_completeness,
 )
 from intervals_mcp_server.tool_guard import output_budget
 
@@ -23,6 +30,8 @@ from intervals_mcp_server.tool_guard import output_budget
 from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
+
+COMPLETENESS_NAMES = 15  # names per group in the line on today's missing usual fields
 
 
 @tool("read")
@@ -40,6 +49,10 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     additional or custom fields configured by the user in Intervals.icu; custom
     wellness fields are labelled with their display name and units from the
     athlete's custom item definitions.
+
+    When the range includes today, a line names the usual fields (present on 80 % of the 14
+    previous days) that today's record does not have yet, night/morning values apart from day
+    totals: not yet available, not normal.
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
@@ -62,7 +75,11 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     except ValueError as exc:
         return f"Error: {exc}"
 
-    params = {"oldest": start_date, "newest": end_date}
+    # Today's completeness needs the 14 days before today: widen the same request.
+    today = athlete_today()
+    check_today = start_date <= today.isoformat() <= end_date
+    oldest = min(start_date, completeness_start(today).isoformat()) if check_today else start_date
+    params = {"oldest": oldest, "newest": end_date}
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/wellness", api_key=api_key, params=params
@@ -71,46 +88,60 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching wellness data: {result.get('message')}"
 
-    if not result:
-        return (
-            f"No wellness data found for athlete {athlete_id_to_use} in the specified date range."
-        )
-
-    field_definitions: CustomFieldDefs | None = None
-    if include_all_fields:
-        index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
-        field_definitions = index.get(INPUT_FIELD) or None
-
-    entries: list[dict[str, Any]] = []
+    fetched: list[dict[str, Any]] = []
     if isinstance(result, dict):
         for date_str, data in result.items():
             if isinstance(data, dict):
                 if "date" not in data:
                     data["date"] = date_str
-                entries.append(data)
+                fetched.append(data)
     elif isinstance(result, list):
-        entries = [entry for entry in result if isinstance(entry, dict)]
-    entries.sort(key=lambda e: str(e.get("id") or e.get("date") or ""))
+        fetched = [entry for entry in result if isinstance(entry, dict)]
+
+    def day_of(entry: dict[str, Any]) -> str:
+        return str(entry.get("id") or entry.get("date") or "")
+
+    # Only the days the completeness check added before start_date are left out.
+    entries = sorted((e for e in fetched if not oldest <= day_of(e)[:10] < start_date), key=day_of)
+
+    field_definitions: CustomFieldDefs | None = None
+    if include_all_fields and entries:
+        index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
+        field_definitions = index.get(INPUT_FIELD) or None
+
+    completeness = today_completeness(fetched, today, field_definitions) if check_today else None
+    if not (include_all_fields and entries) and has_missing_custom_fields(completeness):
+        # Display names of the missing custom fields (the definitions are cached per athlete).
+        index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
+        completeness = today_completeness(fetched, today, index.get(INPUT_FIELD))
+    today_line = completeness_line(completeness, COMPLETENESS_NAMES, " (all: get_recovery_snapshot detail_level=full)")
+
+    if not entries:
+        return (
+            f"No wellness data found for athlete {athlete_id_to_use} in the specified date range."
+            + (f"\n\n{today_line}" if today_line else "")
+        )
 
     # Page by day so the answer stays within the size of one tool result (a year with all
     # fields is about 1 MB); the note says where to continue.
     budget = output_budget()
-    wellness_summary = "Wellness Data:\n\n"
+    wellness_summary = "Wellness Data:\n\n" + (f"{today_line}\n\n" if today_line else "")
     for position, entry in enumerate(entries):
         block = (
             format_wellness_entry(
                 entry,
                 include_all_fields=include_all_fields,
                 field_definitions=field_definitions,
+                header=False,
             )
             + "\n\n"
         )
         if position and len(wellness_summary) + len(block) > budget:
-            last_day = str(entries[position - 1].get("id") or entries[position - 1].get("date") or "")[:10]
+            last_day = day_of(entries[position - 1])[:10]
             try:
                 next_day = (calendar_date.fromisoformat(last_day) + timedelta(days=1)).isoformat()
             except ValueError:
-                next_day = str(entry.get("id") or entry.get("date") or "")[:10]
+                next_day = day_of(entry)[:10]
             wellness_summary += (
                 f"Note: output stopped after {position} of {len(entries)} days (through {last_day}) to keep the "
                 f"response small. Continue with start_date={next_day} (end_date={end_date}).\n"

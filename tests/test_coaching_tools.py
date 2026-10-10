@@ -450,6 +450,7 @@ def test_analyze_climbs_tool(monkeypatch):
 def test_get_recovery_snapshot(monkeypatch):
     """The snapshot lists native and custom values per day, baselines, activities and planned events."""
     _install_router(monkeypatch)
+    monkeypatch.setattr("intervals_mcp_server.tools.wellness_insights.get_default_end_date", lambda: "2026-10-09")
     result = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=2))
     assert "Recovery snapshot for athlete i1: 2026-10-09 and 2 day(s) before" in result
     assert "2026-10-09 (today, preliminary) | updated 2026-10-09T07:00:00+00:00 | locked no" in result
@@ -466,6 +467,12 @@ def test_get_recovery_snapshot(monkeypatch):
     assert "Workout (Ride) '2x5 min Threshold' (event 5), planned 29:00, planned load 40, done: i1" in result
     payload = json.loads(asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1, output_format="json")))
     assert payload["days"][-1]["preliminary"] is True
+    # A past day is not labelled as today (the athlete's today decides, not date_str).
+    monkeypatch.setattr("intervals_mcp_server.tools.wellness_insights.get_default_end_date", lambda: "2026-10-10")
+    past = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1))
+    assert "(today, preliminary)" not in past and "2026-10-09 | updated 2026-10-09T07:00" in past
+    assert json.loads(asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1, output_format="json")))[
+        "days"][-1]["preliminary"] is False
     assert payload["days"][-1]["custom"]["GarminSleepDeepMinutes"] == 85.0
     assert payload["baselines"][0]["metric"] == "hrv"
     assert asyncio.run(get_recovery_snapshot(days_back=99)).startswith("Error: days_back")

@@ -6,8 +6,10 @@ monotony, strain, CTL/ATL/form), the intensity distribution of the last 7 and 28
 recovery markers against the athlete's own 42-day baselines (numbers only), durability, the
 most notable sessions and the plan of the next days in about 2-3k characters. It reuses the
 metric modules of get_training_load, get_intensity_distribution and get_durability and needs
-three API calls. The idea of one pre-computed coaching context comes from the coach report
-by morritter in upstream pull request mvilanova/intervals-mcp-server#150.
+at most four API calls (for today: activities, wellness, events and the last 14 wellness
+records with all fields for the completeness of today's record). The idea of one pre-computed
+coaching context comes from the coach report by morritter in upstream pull request
+mvilanova/intervals-mcp-server#150.
 """
 
 import json
@@ -16,6 +18,7 @@ import statistics
 from datetime import date, timedelta
 from typing import Any
 
+from intervals_mcp_server.tools.custom_items import cached_custom_item_index
 from intervals_mcp_server.tools.durability import sample_note
 from intervals_mcp_server.tools.intensity import HARD_RULE_SHORT, dist_text, sport_split_text
 from intervals_mcp_server.tools.training_load import (
@@ -33,6 +36,7 @@ from intervals_mcp_server.tools.training_load import (
     load_end_for,
     past_end,
 )
+from intervals_mcp_server.utils.custom_fields import INPUT_FIELD
 from intervals_mcp_server.utils.durability import decoupling_summary, efficiency_summary
 from intervals_mcp_server.utils.intensity import THRESHOLD_MODES, analyze_period
 from intervals_mcp_server.utils.load_metrics import (
@@ -49,6 +53,7 @@ from intervals_mcp_server.utils.load_metrics import (
     wellness_by_day,
     weekly_rows,
 )
+from intervals_mcp_server.utils.wellness_completeness import completeness_line, completeness_start, today_completeness
 from intervals_mcp_server.utils.wellness_stats import compute_metric_trend
 
 # Import mcp instance from shared module for tool registration
@@ -59,6 +64,7 @@ BASELINE_DAYS = 42
 RECOVERY_METRICS = (("hrv", "HRV", "ms"), ("restingHR", "resting HR", "bpm"), ("sleepSecs", "sleep", "h"))
 PLAN_DAYS = 7
 RACE_LOOKAHEAD_DAYS = 42
+COMPLETENESS_NAMES = 6  # names per group of today's missing usual fields in the text (JSON lists all)
 
 
 RECENT_DAYS = 7
@@ -206,8 +212,11 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         f"{HARD_RULE_SHORT.replace('hard session', 'hard')}.",
         f"Recovery markers (z vs the week-to-week spread of the prior 90 d; |z| up to about 2 is normal week-to-week variation): "
         f"{_recovery_text(payload['recovery'])}",
-        f"Durability 28 d: {_durability_text(payload['durability'], payload['efficiency'])}",
     ]
+    today_line = completeness_line(payload["today_completeness"], COMPLETENESS_NAMES, " (see get_recovery_snapshot)")
+    if today_line:
+        lines.append(today_line)
+    lines.append(f"Durability 28 d: {_durability_text(payload['durability'], payload['efficiency'])}")
     if detail_level != "compact":
         if sports["by_sport"]:
             lines.append("By sport (7 d / 28 d load, ratio): " + "; ".join(
@@ -282,10 +291,12 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     (coupled daily means), the zone basis, the threshold_as mode and the hard-session rule;
     when the intensity totals combine power and HR zones a caveat gives the per-sport split.
     Small samples are flagged (durability: qualifying share, fewer than 8 sessions, mixed
-    indoor/outdoor or gear); missing values are never counted as 0. Recommended first call
-    for a weekly analysis. No verdict or diagnosis. The single tools give the details:
-    get_training_load, get_intensity_distribution, get_durability, get_recovery_snapshot,
-    get_load_projection. Three API calls. After morritter's coach report (upstream PR #150).
+    indoor/outdoor or gear); missing values are never counted as 0. For today a line (JSON
+    today_completeness) names the usual wellness fields not yet in today's record: not yet
+    available, not normal. Recommended first call for a weekly analysis. No verdict or
+    diagnosis. The single tools give the details: get_training_load, get_intensity_distribution,
+    get_durability, get_recovery_snapshot, get_load_projection. At most four API calls. After
+    morritter's coach report (upstream PR #150).
 
     Args:
         end_date: Last day YYYY-MM-DD (optional, default today; not in the future)
@@ -320,10 +331,17 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     if error:
         return error
     events: list[dict[str, Any]] = []
+    completeness: dict[str, Any] | None = None
     if end == today:
         events, error = await fetch_events(athlete_id_to_use, api_key, today, today + timedelta(days=RACE_LOOKAHEAD_DAYS))
         if error:
             return error
+        # All fields of the last 14 days; custom display names only from cached definitions (no request).
+        recent, recent_error = await fetch_wellness(athlete_id_to_use, api_key, completeness_start(today), today, None)
+        completeness = (
+            {"date": today.isoformat(), "error": recent_error} if recent_error
+            else today_completeness(recent, today, (cached_custom_item_index(athlete_id_to_use, api_key) or {}).get(INPUT_FIELD))
+        )
 
     load_end, note = load_end_for(end_date, end, activities)
     wellness = wellness_by_day(wellness_list)
@@ -350,6 +368,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
         "intensity": {"last_7": intensity_7["total"], "last_28": intensity_28["total"], "drift": intensity_28["drift"],
                       "by_sport_28": intensity_28["by_sport"]},
         "recovery": _recovery(wellness_list, end),
+        "today_completeness": completeness,
         "durability": durability,
         "efficiency": efficiency_summary(activities, window_start, load_end),
         "top_sessions": top_sessions(between(activities, load_end - timedelta(days=6), load_end)),

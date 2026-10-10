@@ -73,7 +73,17 @@ async def get_custom_item_index(
     (units_source 'inferred'); operator-configured display units (CUSTOM_UNITS_OVERRIDES) are
     applied on top.
     """
-    index = index_custom_items(await get_custom_items_raw(athlete_id, api_key, refresh=refresh))
+    return _index(await get_custom_items_raw(athlete_id, api_key, refresh=refresh))
+
+
+def cached_custom_item_index(athlete_id: str, api_key: str | None = None) -> CustomItemIndex | None:
+    """The definitions as get_custom_item_index returns them if they are cached, else None (no request)."""
+    items = _CUSTOM_ITEMS_CACHE.get(cache_key(athlete_id, api_key))
+    return None if items is None else _index(items)
+
+
+def _index(items: list[dict[str, Any]]) -> CustomItemIndex:
+    index = index_custom_items(items)
     return apply_units_overrides(infer_temperature_units(index), get_config().custom_units_overrides)
 
 
