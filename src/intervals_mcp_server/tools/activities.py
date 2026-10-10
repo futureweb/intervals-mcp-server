@@ -7,7 +7,9 @@ This module contains tools for retrieving and managing athlete activities.
 # pylint: disable=too-many-lines
 
 import json
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -58,6 +60,17 @@ from intervals_mcp_server.utils.streams import (
     resolve_sample_range,
     stream_label,
     stream_length,
+)
+from intervals_mcp_server.utils.params import (
+    ActivityId,
+    AthleteId,
+    DetailLevel,
+    EndDate,
+    GearId,
+    OutputFormat,
+    SportTypes,
+    StartDate,
+    lower_choice,
 )
 from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_date_params
 from intervals_mcp_server.tool_guard import output_budget
@@ -513,39 +526,39 @@ async def _fetch_streams(
 
 @tool("read")
 async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches,too-many-positional-arguments,too-many-locals
-    athlete_id: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    limit: int = 10,
-    include_unnamed: bool = False,
-    sport_types: str | None = None,
-    gear_id: str | None = None,
-    sort_by: str = "date_desc",
-    offset: int = 0,
-    detail_level: str = "summary",
-    output_format: str = "text",
-    power_meter: str | None = None,
+    athlete_id: AthleteId = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before today")] = None,
+    end_date: EndDate = None,
+    limit: Annotated[int, Field(description="Activities per page")] = 10,
+    include_unnamed: Annotated[bool, Field(description="Also list activities without a name")] = False,
+    sport_types: SportTypes = None,
+    gear_id: GearId = None,
+    sort_by: Annotated[
+        Literal["date_desc", "date_asc", "distance", "moving_time", "load"],
+        BeforeValidator(lower_choice),
+        Field(description="Newest or oldest first, or largest distance, moving time or load first"),
+    ] = "date_desc",
+    offset: Annotated[int, Field(description="Matching activities to skip (pagination)")] = 0,
+    detail_level: Annotated[
+        Literal["summary", "compact"],
+        BeforeValidator(lower_choice),
+        Field(description="summary = text block per activity; compact = one line each"),
+    ] = "summary",
+    output_format: Annotated[
+        OutputFormat, Field(description="text, or json (records with units, local and UTC start, paging)")
+    ] = "text",
+    power_meter: Annotated[str | None, Field(
+        description="Only activities whose power meter name contains this text, e.g. Rally; others excluded"
+    )] = None,
 ) -> str:
-    """Get a list of activities for an athlete from Intervals.icu
+    """Use to find activities and their ids in a date range (default the last 30 days up to today, 10 per page), e.g. all rides on one bike over a season.
 
-    Supports filtering by sport type and gear, sorting, pagination and compact or JSON
-    output for large date ranges (e.g. comparing all rides on one bike over a season).
-    Without the optional filters the classic summary listing is returned.
-
-    Args:
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
-        end_date: End date in YYYY-MM-DD format (optional, defaults to today)
-        limit: Maximum number of activities to return per page (optional, defaults to 10)
-        include_unnamed: Whether to include unnamed activities (optional, defaults to False)
-        sport_types: Comma-separated activity types to keep, e.g. "Ride,GravelRide" (optional)
-        gear_id: Only activities done on this gear, e.g. "b12472159" (optional; see get_gear_list)
-        sort_by: "date_desc" (default), "date_asc", "distance", "moving_time" or "load"
-        offset: Number of matching activities to skip for pagination (optional, default 0)
-        detail_level: "summary" (default, full text block per activity) or "compact" (one line each)
-        output_format: "text" (default) or "json" (records with explicit units, local and UTC start)
-        power_meter: Only activities whose power meter name (from the device file) contains this
-            text, e.g. "Rally" or "Shimano"; activities without power meter data are excluded (optional)
+    Returns one summary block per activity (Intervals.icu load, power, HR, feel/RPE, gear), one
+    line each with detail_level=compact, or JSON records with units and local/UTC start. Filters:
+    sport types, gear, power meter name. Any filter, sort, offset, compact or json gives a paged
+    listing with the total and the next offset. Unnamed activities are hidden unless
+    include_unnamed; nothing outside the date range is listed. Read-only. One activity in depth:
+    get_activity_report. Method: intervals://methods/activity-data (get_guide).
     """
     # Resolve athlete ID and date parameters
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
@@ -619,34 +632,27 @@ async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-
 
 @tool("read")
 async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
-    activity_id: str,
-    include_custom_fields: bool = True,
-    include_all_fields: bool = False,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    activity_id: ActivityId,
+    include_custom_fields: Annotated[bool, Field(description="List the athlete's custom activity fields that have a value")] = True,
+    include_all_fields: Annotated[bool, Field(
+        description="Also list every other non-empty payload field (same as detail_level=full)"
+    )] = False,
+    output_format: Annotated[OutputFormat, Field(
+        description="text, or json (raw activity, start times, gear name, thresholds, custom fields with status)"
+    )] = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = ~8 lines: key numbers, thresholds, sport-assigned custom fields, data quality; "
+        "standard = full summary; full adds every other payload field"
+    )] = "standard",
 ) -> str:
-    """Get detailed information for a specific activity from Intervals.icu
+    """Use when one activity's full summary, thresholds or device custom fields are needed beyond get_activity_report.
 
-    Besides the standard summary the result lists every custom activity field the
-    athlete has defined on Intervals.icu that has a value on this activity, with
-    display name, technical code, value and units (for select fields also the option
-    label). This covers metrics that devices write into custom fields, for example
-    aerobic/anaerobic training effect, training load, EPOC, recovery time, VO2max,
-    performance condition, stamina at start/end, sweat loss and any other field the
-    athlete has configured. The fields are read dynamically from the athlete's custom
-    item definitions; nothing is hard-coded. 'no value' means null/NaN on Intervals.icu.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        include_custom_fields: Include the custom activity fields section (optional, default True)
-        include_all_fields: Also list every other non-empty field of the raw activity payload
-            that is not part of the standard summary, e.g. time in zones, running dynamics,
-            power meter details, available stream types (optional, default False)
-        output_format: "text" (default) or "json" (raw activity, explicit start times, gear name,
-            thresholds snapshot and every custom field with value/units/status)
-        detail_level: "compact" (key numbers, thresholds, custom fields assigned to the sport, data
-            quality; ~8 lines), "standard" (default, the full summary) or "full" (standard plus every
-            other payload field, same as include_all_fields=True)
+    Returns the summary (time, distance, Intervals.icu load, power, HR, cadence, feel/RPE, FTP and
+    thresholds used, device and power meter), fueling, weather, W′ balance and source, plus every
+    custom activity field with a value (device metrics such as training effect, recovery time,
+    stamina, sweat loss), read from the athlete's own definitions with name, code, value and
+    units; 'no value' = null/NaN on Intervals.icu. full adds time in zones, running dynamics and
+    other raw fields. Read-only. Method: intervals://methods/activity-data (get_guide).
     """
     if detail_level not in DETAIL_LEVELS_3:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
@@ -853,52 +859,35 @@ def _plan_mapping_lines(intervals: list[dict[str, Any]], mapping: dict[int, dict
 
 @tool("read")
 async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
-    activity_id: str,
-    stream_types: str | None = None,
-    include_custom_fields: bool = True,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    include_planned_types: bool = False,
-    planned_workout_doc: dict[str, Any] | None = None,
+    activity_id: ActivityId,
+    stream_types: Annotated[str | None, Field(
+        description="Comma-separated streams to evaluate per interval, e.g. Stamina,secondary_power; "
+        "custom = custom streams + secondary_power; all = every stream"
+    )] = None,
+    include_custom_fields: Annotated[bool, Field(description="List the athlete's custom interval fields per interval")] = True,
+    output_format: Annotated[OutputFormat, Field(
+        description="text, or json (raw intervals and groups with custom fields, stream statistics, planned step)"
+    )] = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = one line per interval; standard = full block per interval; full adds every "
+        "custom stream when stream_types is empty"
+    )] = "standard",
+    include_planned_types: Annotated[bool, Field(
+        description="Show the planned step matched to each interval (paired event or planned_workout_doc)"
+    )] = False,
+    planned_workout_doc: Annotated[dict[str, Any] | None, Field(
+        description='Workout document {"steps": [...]} to match against; implies include_planned_types'
+    )] = None,
 ) -> str:
-    """Get interval data for a specific activity from Intervals.icu
+    """Use for per-interval numbers of one activity (laps or detected efforts): power, HR, cadence, speed, intensity, custom interval fields and groups.
 
-    This endpoint returns detailed metrics for each interval in an activity, including power, heart rate,
-    cadence, speed, and environmental data. It also includes grouped intervals if applicable.
-    Cadence follows the sport (one extra call for the activity): foot sports show steps per
-    minute (2 x the per-leg value Intervals.icu stores, which is labelled as stored), other
-    sports rpm; running dynamics are only shown for foot sports. Missing temperatures are n/a.
-
-    Custom interval fields defined by the athlete are listed per interval with display
-    name, technical code, value and units. With stream_types the raw samples of the given
-    streams between each interval's start_index and end_index are evaluated (start, end,
-    min, max, mean, delta and the number of non-null samples), which yields per-interval
-    values for any stream Intervals.icu does not summarise itself: custom streams such as
-    stamina (delta = stamina drop during the interval), performance condition or grade
-    adjusted speed, a second power meter (secondary_power), gear selection and so on.
-    Groups are evaluated over all their member intervals. Statistics are computed from
-    the recorded samples only; missing samples are never interpolated.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        stream_types: Comma-separated stream types to evaluate per interval, e.g.
-            "Stamina,PotentialStamina,secondary_power"; "custom" = every custom stream of the
-            activity plus secondary_power; "all" = every stream. Use list_activity_streams to
-            see what is available. (optional, default: no stream metrics)
-        include_custom_fields: List custom interval fields per interval (optional, default True)
-        output_format: "text" (default) or "json" (raw intervals and groups plus custom fields
-            and per-interval stream statistics)
-        detail_level: "compact" (one line per interval with the key numbers; custom streams as
-            start→end), "standard" (default, the full block per interval) or "full" (standard plus
-            every custom stream when stream_types is not given)
-        include_planned_types: Also show the planned step (type) matched to each interval from the
-            paired event or planned_workout_doc; the Intervals.icu WORK/RECOVERY type is kept as
-            stored. An interval longer than its planned step (plus the tolerance of
-            analyze_workout_execution) shows the planned duration and the time beyond the plan
-            on its line and in JSON (planned_step.beyond_plan_s) (optional, default False; one or
-            two extra API calls)
-        planned_workout_doc: Workout document with "steps" to match against (optional; implies
-            include_planned_types)
+    Cadence follows the sport: steps per minute on foot (2 x the stored per-leg value), rpm
+    otherwise. stream_types adds start/end/min/max/mean/delta of any stream per interval from the
+    recorded samples, e.g. stamina drop or a second power meter (list_activity_streams shows what
+    exists). include_planned_types shows the planned step matched to each interval and the time
+    beyond the plan; the Intervals.icu type is kept. Without intervals use analyze_climbs.
+    Read-only; 2 API calls, +1 for streams, +1 for a paired event. Methods:
+    intervals://methods/activity-data, intervals://methods/execution (get_guide).
     """
     if detail_level not in DETAIL_LEVELS_3:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS_3)}."
@@ -1112,58 +1101,46 @@ def _render_stream_rows(  # pylint: disable=too-many-arguments,too-many-position
 
 @tool("read")
 async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    activity_id: str,
-    stream_types: str | None = None,
-    output_format: str = "summary",
-    start_index: int | None = None,
-    end_index: int | None = None,
-    start_time: int | None = None,
-    end_time: int | None = None,
-    downsample: int = 1,
-    max_points: int = DEFAULT_STREAM_POINTS,
+    activity_id: ActivityId,
+    stream_types: Annotated[str | None, Field(
+        description="Comma-separated stream types (standard or custom codes) or all; default "
+        "time,watts,heartrate,cadence,altitude,distance,velocity_smooth"
+    )] = None,
+    output_format: Annotated[
+        Literal["summary", "full", "json"],
+        BeforeValidator(lower_choice),
+        Field(description="summary = per-stream units, statistics, preview; full = CSV row per sample; "
+              "json = one object with arrays and next_start_index"),
+    ] = "summary",
+    start_index: Annotated[int | None, Field(
+        description="First sample index (full/json); same indices as get_activity_intervals"
+    )] = None,
+    end_index: Annotated[int | None, Field(description="Sample index to stop before (exclusive; full/json)")] = None,
+    start_time: Annotated[int | None, Field(description="Only samples with time >= this, seconds since start (full/json)")] = None,
+    end_time: Annotated[int | None, Field(description="Only samples with time < this, seconds since start (full/json)")] = None,
+    downsample: Annotated[int, Field(description="Keep every n-th sample in full/json (skipped, never averaged)")] = 1,
+    max_points: Annotated[int, Field(
+        description="Max samples in full/json, at most 20000; longer output is cut with a continue hint"
+    )] = DEFAULT_STREAM_POINTS,
 ) -> str:
-    """Get time-series (stream) data for a specific activity from Intervals.icu
+    """Use for the raw time-series samples of one activity (power, HR, cadence, altitude or any custom stream such as Stamina) when summaries are not enough.
 
-    Any stream the activity has can be requested by its technical type: the standard
-    streams (time, watts, heartrate, cadence, altitude, distance, velocity_smooth, temp,
-    torque, left_right_balance, hrv, respiration, secondary_power, ...) and every custom
-    stream the athlete has defined, addressed by its code (for example Stamina,
-    PotentialStamina, GarminGASpeed, FrontGear, RearGear ...). Use list_activity_streams
-    to discover what an activity offers. All streams of an activity are sample-aligned:
-    index i of every stream belongs to the same recorded sample and time[i] is its offset
-    in seconds from the activity start. Recording pauses appear as jumps in time, so use
-    the time column, not the index, as the timestamp.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        stream_types: Comma-separated stream types to retrieve, or "all" for every stream of
-            the activity (optional, defaults to time,watts,heartrate,cadence,altitude,distance,velocity_smooth)
-        output_format: "summary" (default) = per-stream metadata, statistics and a short preview;
-            "full" = CSV table with one row per sample (index, time, one column per stream,
-            empty cell = no value); "json" = ONE JSON object with the same selection as arrays
-            (null = no value), the sample range, next_start_index and a note.
-            The time stream is always included in full/json output.
-        start_index: First sample index of the full/json output (optional, default 0; matches
-            start_index of get_activity_intervals)
-        end_index: Sample index to stop before in full/json output (optional, default = end;
-            matches end_index of get_activity_intervals, which is exclusive)
-        start_time: Only samples with time >= start_time seconds (optional, full/json)
-        end_time: Only samples with time < end_time seconds (optional, full/json)
-        downsample: Keep every n-th recorded sample in full/json output (optional, default 1 =
-            full sample resolution; samples are skipped, never averaged)
-        max_points: Maximum number of samples in full/json output (optional, default 2000,
-            at most 20000). Longer selections, and selections too large for one tool result
-            (many streams), are cut and the response says how to continue (page with
-            start_index, or raise downsample / select fewer streams).
+    Default output is a per-stream summary (units, statistics, first/last values); full gives a
+    CSV table, json one object with arrays (empty/null = no value). Default streams: time, watts,
+    heartrate, cadence, altitude, distance, velocity_smooth; "all" = every stream. full/json return
+    at most max_points samples (default 2000) and say where to continue; slice by index or time,
+    downsample keeps every n-th sample. time = seconds since start, pauses appear as jumps.
+    Read-only. Discover streams with list_activity_streams. Method:
+    intervals://methods/activity-data (get_guide).
     """
-    output_format = (output_format or "summary").strip().lower()
-    if output_format not in STREAM_OUTPUT_FORMATS:
+    fmt = (output_format or "summary").strip().lower()
+    if fmt not in STREAM_OUTPUT_FORMATS:
         return f"Error: output_format must be one of {', '.join(STREAM_OUTPUT_FORMATS)}."
     if downsample < 1 or max_points < 1:
         return "Error: downsample and max_points must be positive integers."
     max_points = min(max_points, MAX_STREAM_POINTS)
 
-    params = _stream_request_params(stream_types, ensure_time=output_format != "summary")
+    params = _stream_request_params(stream_types, ensure_time=fmt != "summary")
     streams, error = await _fetch_streams(activity_id, params)
     if error:
         return error
@@ -1175,14 +1152,14 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
         owner = activity.get("icu_athlete_id") if activity else None
     stream_defs = await _custom_defs(ACTIVITY_STREAM, owner)
 
-    if output_format == "summary":
+    if fmt == "summary":
         return format_streams_summary(activity_id, streams, stream_defs)
 
     return _render_stream_rows(
         activity_id,
         streams,
         stream_defs,
-        output_format,
+        fmt,
         (start_index, end_index, start_time, end_time),
         downsample,
         max_points,
@@ -1234,22 +1211,18 @@ def _format_stream_listing(
 
 @tool("read")
 async def list_activity_streams(
-    activity_id: str,
-    include_stats: bool = False,
+    activity_id: ActivityId,
+    include_stats: Annotated[bool, Field(
+        description="Also download the streams for sample counts and start/end/min/max/mean per stream"
+    )] = False,
 ) -> str:
-    """List every data stream available for an activity on Intervals.icu
+    """Use before get_activity_streams or get_activity_intervals(stream_types=...) to see which data streams one activity has.
 
-    Returns the standard streams and the custom streams (defined by the athlete, for
-    example streams a device records such as stamina, potential stamina, performance
-    condition, grade adjusted speed, gear selection, battery ...) present on the activity,
-    with display name, units and description. Use the listed stream types with
-    get_activity_streams (full sample data) or get_activity_intervals(stream_types=...)
-    (per-interval statistics).
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        include_stats: Also download the streams and report sample count, non-null count and
-            start/end/min/max/mean per stream (optional, default False)
+    Lists the standard streams and the athlete's custom streams present on the activity (e.g.
+    stamina, potential stamina, performance condition, grade adjusted speed, gear selection,
+    battery) with type code, display name, units and description, plus the power fields of the
+    file. include_stats downloads the streams and adds per-stream sample counts and
+    start/end/min/max/mean. Read-only. Method: intervals://methods/activity-data (get_guide).
     """
     result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
 
@@ -1279,12 +1252,8 @@ async def list_activity_streams(
 
 
 @tool("read")
-async def get_activity_messages(activity_id: str) -> str:
-    """Get messages (notes/comments) for a specific activity from Intervals.icu
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-    """
+async def get_activity_messages(activity_id: ActivityId) -> str:
+    """Use to read the notes and comments on one activity: author, time, type and text of each message (read-only)."""
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}/messages",
     )
@@ -1310,14 +1279,13 @@ async def get_activity_messages(activity_id: str) -> str:
 
 @tool("write")
 async def add_activity_message(
-    activity_id: str,
-    content: str,
+    activity_id: ActivityId,
+    content: Annotated[str, Field(description="Message text to post; must not be blank")],
 ) -> str:
-    """Add a message (note/comment) to an activity on Intervals.icu
+    """Use only when the athlete asks to post a note or comment on an activity.
 
-    Args:
-        activity_id: The Intervals.icu activity ID
-        content: The message text to add
+    Adds one message to its thread on Intervals.icu (nothing is replaced; blank text is refused)
+    and returns the message id. Read the thread with get_activity_messages.
     """
     if not (content or "").strip():
         return "Error: content must not be blank; nothing was posted."
@@ -1342,28 +1310,28 @@ async def add_activity_message(
 
 @tool("write", overwrites=True)
 async def update_activity(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    activity_id: str,
-    rpe: int | None = None,
-    feel: int | None = None,
-    name: str | None = None,
-    description: str | None = None,
-    clear_description: bool = False,
+    activity_id: ActivityId,
+    rpe: Annotated[int | None, Field(
+        description="Perceived exertion, integer 1-10 (1 = very easy, 10 = maximal); stored as icu_rpe",
+        json_schema_extra={"minimum": 1, "maximum": 10}
+    )] = None,
+    feel: Annotated[int | None, Field(
+        description="How the athlete felt, integer 1-5: 1 = Strong, 2 = Good, 3 = Normal, 4 = Poor, 5 = Weak",
+        json_schema_extra={"minimum": 1, "maximum": 5}
+    )] = None,
+    name: Annotated[str | None, Field(description="New name; replaces the current one, must not be blank")] = None,
+    description: Annotated[str | None, Field(
+        description="New description; REPLACES the current text (an empty string is ignored)"
+    )] = None,
+    clear_description: Annotated[bool, Field(description="Empty the description on purpose")] = False,
 ) -> str:
-    """WRITE TOOL: modifies an existing activity in Intervals.icu (PUT /activity/{id}).
+    """Use only when the athlete asks to rate, rename or describe an activity: writes RPE, feel, name or description of one activity to Intervals.icu.
 
-    Only the fields that are passed are sent; all other activity values stay untouched.
-    name and description REPLACE the current text (read it first with get_activity_details to
-    extend it); an empty description is ignored, clear_description=true empties it on purpose.
-    At least one of rpe, feel, name or description must be provided.
-    Activities imported from Strava cannot be updated via the API; the API returns an error.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        rpe: Rate of perceived exertion, integer 1-10 (sent as `icu_rpe`; 1 = very easy, 10 = maximal)
-        feel: How the athlete felt, integer 1-5 (1 = Strong, 2 = Good, 3 = Normal, 4 = Poor, 5 = Weak)
-        name: New activity name
-        description: New activity description (an empty string is ignored)
-        clear_description: Empty the activity description (optional, default false)
+    Only the given fields are sent (PUT /activity/{id}); every other value stays. name and
+    description REPLACE the current text, so read it first with get_activity_details to extend
+    it; an empty description is ignored, clear_description empties it. At least one field is
+    required. Activities imported from Strava cannot be updated (the API returns an error).
+    Returns the stored values and the activity summary. Notes go to add_activity_message.
     """
     if rpe is not None and (isinstance(rpe, bool) or not 1 <= rpe <= 10):
         return "Error: rpe must be an integer between 1 and 10."

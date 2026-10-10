@@ -17,11 +17,14 @@ GEAR_CACHE_TTL_S and derive the `{id: name}` lookup from it. A failed fetch is n
 cached. Call `get_gear_list(refresh=True)` to bust the cache.
 """
 
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.cache import TTLCache, cache_key
+from intervals_mcp_server.utils.params import AthleteId
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -165,17 +168,14 @@ async def resolve_gear_for_activities(
 
 @tool("read")
 async def get_gear_list(  # pylint: disable=too-many-locals
-    athlete_id: str | None = None,
-    refresh: bool = False,
+    athlete_id: AthleteId = None,
+    refresh: Annotated[bool, Field(description="Re-fetch instead of using the 30-minute cache")] = False,
 ) -> str:
-    """Get the gear catalog (bikes, shoes, etc.) for an athlete from Intervals.icu.
+    """Use to find gear ids and get an overview of the athlete's bikes, shoes and components (read-only).
 
-    Returns one line per gear item with id, type, name, and basic stats.
-    The catalog is cached for 30 minutes; pass refresh=True to re-fetch.
-
-    Args:
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        refresh: If True, bypass the cache and re-fetch from the API (default False)
+    One row per item: id, type, name, default-for, activity count, distance in km and retired
+    flag. Details of one item (components, reminders, filters): get_gear_details; activities on
+    a gear: get_activities(gear_id=...).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -220,23 +220,18 @@ def _gear_stats_line(item: dict[str, Any]) -> str:
 
 @tool("read")
 async def get_gear_details(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-    gear_id: str,
-    athlete_id: str | None = None,
-    refresh: bool = False,
+    gear_id: Annotated[str, Field(description='Gear id from get_gear_list, e.g. "b12472159" (bike) or "30303" (component)')],
+    athlete_id: AthleteId = None,
+    refresh: Annotated[bool, Field(description="Re-fetch the gear catalog instead of using the 30-minute cache")] = False,
 ) -> str:
-    """Get details of one gear item (bike, shoes, component) from Intervals.icu
+    """Use for the details of one gear item (bike, shoes, component; read-only).
 
-    Shows distance, time and activity count, purchase date, retirement, notes, the activity
-    type filters that assign activities to it automatically, reminders, and for a bike the
-    list of its components (frame, power meter, chain, tyres ...) with their own mileage.
-    Which power meter recorded a given activity is NOT derived from gear: use
-    get_activity_details (power meter and serial come from the device file) for that.
-    To list the activities done on this gear use get_activities(gear_id=...).
-
-    Args:
-        gear_id: The gear ID, e.g. "b12472159" for a bike or "30303" for a component
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        refresh: Re-fetch the gear catalog instead of using the cache (optional, default False)
+    Distance, time and activity count, purchase and retirement dates, notes, the bike a
+    component belongs to, the activity type filters that assign activities automatically,
+    maintenance reminders with their usage, and for a bike its components (frame, power meter,
+    chain, tyres ...) with their own mileage. Which power meter recorded an activity is not
+    derived from gear: get_activity_details shows the power meter and serial from the device
+    file. Activities on this gear: get_activities(gear_id=...).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:

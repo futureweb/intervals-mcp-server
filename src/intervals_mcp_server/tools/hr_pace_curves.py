@@ -6,12 +6,15 @@ per duration) and pace curves (best time per distance). Together they are useful
 track progress, e.g. the same pace at a lower heart rate.
 """
 
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.power_curves import _validate_dates
 from intervals_mcp_server.utils.formatting import format_hr_curves, format_pace_curves
+from intervals_mcp_server.utils.params import AthleteId
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -34,6 +37,16 @@ SWIM_TYPES: tuple[str, ...] = ("Swim", "OpenWaterSwim")
 
 # Tolerance in metres when matching requested distances to curve distances
 _DISTANCE_TOLERANCE = 1.0
+
+CurveIds = Annotated[
+    list[str] | None,
+    Field(
+        description='Curve ids as a JSON array of strings, e.g. ["90d", "1y"], "s0" this season, "s1" last season, '
+        '"r.2026-01-01.2026-03-01" a range; default ["90d"]'
+    ),
+]
+RangeStart = Annotated[str | None, Field(description="First day YYYY-MM-DD of an extra custom-range curve; needs end_date")]
+RangeEnd = Annotated[str | None, Field(description="Last day YYYY-MM-DD of the custom-range curve, after start_date")]
 
 
 def _build_curve_ids(
@@ -155,26 +168,21 @@ async def _fetch_curves(
 
 @tool("read")
 async def get_hr_curves(
-    activity_type: str = "Run",
-    durations: list[int] | None = None,
-    curves: list[str] | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    athlete_id: str | None = None,
+    activity_type: Annotated[str, Field(description="Activity type of the curves, e.g. Run, Ride, Swim")] = "Run",
+    durations: Annotated[
+        list[int] | None,
+        Field(description="Durations in seconds as a JSON array of integers, e.g. [60, 300, 1200]; default 5 s to 60 min"),
+    ] = None,
+    curves: CurveIds = None,
+    start_date: RangeStart = None,
+    end_date: RangeEnd = None,
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Get heart rate curves for an athlete from Intervals.icu.
+    """Use for the highest average heart rate an athlete sustained per duration over one or more periods (e.g. comparing periods; with get_pace_curves the same pace at a lower HR).
 
-    Returns the best (highest) average heart rate in bpm sustained for selected durations
-    across one or more time periods. Read-only.
-
-    Args:
-        activity_type: Activity type (e.g. "Run", "Ride", "Swim"). Default is "Run".
-        durations: Durations in seconds to include. Default is [5, 15, 30, 60, 300, 600, 1200, 1800, 3600]
-        curves: Curve identifiers, e.g. ["90d", "1y"], ["s0"] (this season), ["s1"] (last season)
-            or ["r.2026-01-01.2026-03-01"] (custom range). Default is ["90d"].
-        start_date: Start date (YYYY-MM-DD) for an additional custom range curve. Must be used with end_date.
-        end_date: End date (YYYY-MM-DD) for an additional custom range curve. Must be used with start_date.
-        athlete_id: Intervals.icu athlete ID (optional, uses ATHLETE_ID from .env if not provided)
+    Returns bpm per duration for each curve (default the last 90 days) with the activity that
+    set it; durations without data are listed as not available. Read-only, one API call.
+    Power: get_athlete_power_curves. Method: intervals://methods/comparisons (get_guide).
     """
     date_error = _validate_dates(start_date, end_date)
     if date_error:
@@ -198,30 +206,24 @@ async def get_hr_curves(
 
 @tool("read")
 async def get_pace_curves(
-    activity_type: str = "Run",
-    distances: list[float] | None = None,
-    curves: list[str] | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    gap: bool = False,
-    athlete_id: str | None = None,
+    activity_type: Annotated[str, Field(description="Activity type of the curves, e.g. Run, TrailRun, Swim")] = "Run",
+    distances: Annotated[
+        list[float] | None,
+        Field(description="Distances in metres as a JSON array of numbers, e.g. [1000, 5000, 21097.5]; default 400 m to marathon, swims 50-400 m"),
+    ] = None,
+    curves: CurveIds = None,
+    start_date: RangeStart = None,
+    end_date: RangeEnd = None,
+    gap: Annotated[bool, Field(description="Gradient-adjusted pace (GAP) instead of raw pace")] = False,
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Get pace curves for an athlete from Intervals.icu.
+    """Use for an athlete's best times per distance over one or more periods: PBs, comparing periods, progress in running or swimming.
 
-    Returns the best time and pace for selected distances across one or more time periods.
-    Pace is shown as min/km (min/100m for swims). Read-only.
-
-    Args:
-        activity_type: Activity type (e.g. "Run", "Swim", "TrailRun"). Default is "Run".
-        distances: Distances in metres to include. Default for runs is
-            [400, 800, 1000, 3000, 5000, 10000, 21097.5, 42195]; for swims [50, 100, 200, 300, 400].
-            Distances not present in the curve are listed as not available.
-        curves: Curve identifiers, e.g. ["90d", "1y"], ["s0"] (this season), ["s1"] (last season)
-            or ["r.2026-01-01.2026-03-01"] (custom range). Default is ["90d"].
-        start_date: Start date (YYYY-MM-DD) for an additional custom range curve. Must be used with end_date.
-        end_date: End date (YYYY-MM-DD) for an additional custom range curve. Must be used with start_date.
-        gap: Use gradient adjusted pace (GAP) instead of raw pace (default False).
-        athlete_id: Intervals.icu athlete ID (optional, uses ATHLETE_ID from .env if not provided)
+    Returns the best time and pace (min/km; min/100 m for Swim and OpenWaterSwim) per
+    distance for each curve (default the last 90 days) with the activity that set it;
+    optionally gradient-adjusted pace. Distances not on the curve are listed as not
+    available. Read-only, one API call. HR side: get_hr_curves. Method:
+    intervals://methods/comparisons (get_guide).
     """
     date_error = _validate_dates(start_date, end_date)
     if date_error:

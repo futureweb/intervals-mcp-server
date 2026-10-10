@@ -5,7 +5,9 @@ This module contains tools for retrieving and updating athlete wellness data.
 """
 
 from datetime import date as calendar_date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -13,6 +15,7 @@ from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.formatting import format_wellness_entry
+from intervals_mcp_server.utils.params import AthleteId, EndDate, StartDate
 from intervals_mcp_server.utils.validation import (
     resolve_athlete_id,
     resolve_date_params,
@@ -36,31 +39,23 @@ COMPLETENESS_NAMES = 15  # names per group in the line on today's missing usual 
 
 @tool("read")
 async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branches
-    athlete_id: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    include_all_fields: bool = False,
+    athlete_id: AthleteId = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before today")] = None,
+    end_date: EndDate = None,
+    include_all_fields: Annotated[
+        bool, Field(description="Also list every other field, custom wellness fields with name and units")
+    ] = False,
 ) -> str:
-    """Get wellness data for an athlete from Intervals.icu.
+    """Use for the raw daily wellness records of a date range (default the last 30 days; read-only).
 
-    By default returns standard wellness fields (training metrics, vitals, sleep,
-    subjective scores, etc.). Set include_all_fields=True to also include any
-    additional or custom fields configured by the user in Intervals.icu; custom
-    wellness fields are labelled with their display name and units from the
-    athlete's custom item definitions.
-
-    When the range includes today, a line names the usual fields (present on 80 % of the 14
-    previous days) that today's record does not have yet, night/morning values apart from day
-    totals: not yet available, not normal.
-
-    Args:
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        start_date: Start date in YYYY-MM-DD format (optional, defaults to 30 days ago)
-        end_date: End date in YYYY-MM-DD format (optional, defaults to today)
-        include_all_fields: If True, include additional and custom fields beyond the standard set (optional, defaults to False)
-
-    Long ranges are paged by day: when the answer would get too large it stops with a note
-    giving the start_date to continue with.
+    Per day as stored: CTL/ATL and eFTP per sport, vitals (weight, resting HR, HRV, SpO2 ...),
+    sleep, subjective scores, nutrition, steps and comments; include_all_fields adds every other
+    field, custom wellness fields labelled with name and units. When the range includes today, a
+    line names the usual fields not yet in today's record, grouped by when they usually arrive:
+    not yet available, not normal. Long ranges are paged by day: a note gives the start_date to
+    continue with. Baselines and trends: get_recovery_snapshot, get_wellness_trends,
+    get_nutrition_summary.
+    Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -150,58 +145,35 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     return wellness_summary
 
 
-# Subjective scales accepted by Intervals.icu (all 1-4, see update_wellness docstring).
+# Subjective scales accepted by Intervals.icu (all 1-4, see the update_wellness parameters).
 _SUBJECTIVE_SCALE_MIN = 1
 _SUBJECTIVE_SCALE_MAX = 4
 
 
 @tool("write", overwrites=True)
 async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    date: str,
-    soreness: int | None = None,
-    fatigue: int | None = None,
-    stress: int | None = None,
-    mood: int | None = None,
-    motivation: int | None = None,
-    injury: int | None = None,
-    comments: str | None = None,
-    athlete_id: str | None = None,
-    clear_comments: bool = False,
+    date: Annotated[str, Field(description="Day to update, YYYY-MM-DD")],
+    soreness: Annotated[int | None, Field(description="Soreness 1-4: 1=Low, 2=Avg, 3=High, 4=Extreme", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    fatigue: Annotated[int | None, Field(description="Fatigue 1-4: 1=Low, 2=Avg, 3=High, 4=Extreme", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    stress: Annotated[int | None, Field(description="Stress 1-4: 1=Low, 2=Avg, 3=High, 4=Extreme", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    mood: Annotated[int | None, Field(description="Mood 1-4: 1=Great, 2=Good, 3=OK, 4=Grumpy", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    motivation: Annotated[int | None, Field(description="Motivation 1-4: 1=Extreme, 2=High, 3=Avg, 4=Low", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    injury: Annotated[int | None, Field(description="Injury 1-4: 1=None, 2=Niggle, 3=Poor, 4=Injured", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
+    comments: Annotated[
+        str | None, Field(description="Free text; REPLACES the day's comment (no append); empty text is ignored")
+    ] = None,
+    athlete_id: AthleteId = None,
+    clear_comments: Annotated[bool, Field(description="Empty the day's comment (not together with comments)")] = False,
 ) -> str:
-    """WRITE: Update (modify) the subjective wellness fields of one day in Intervals.icu.
+    """Use only when the athlete asks to record or change subjective wellness scores or the comment of one day.
 
-    This tool MODIFIES data in Intervals.icu. Only the fields you pass are sent and
-    changed; all other values of that day (weight, HRV, sleep, resting HR, etc., which
-    are usually synced from devices) are left untouched. At least one field is required.
-    If no wellness record exists for the date, it is created.
-
-    Scales (integers 1-4, as in the Intervals.icu wellness dialog):
-        soreness:   1=Low, 2=Avg, 3=High, 4=Extreme
-        fatigue:    1=Low, 2=Avg, 3=High, 4=Extreme
-        stress:     1=Low, 2=Avg, 3=High, 4=Extreme
-        mood:       1=Great, 2=Good, 3=OK, 4=Grumpy
-        motivation: 1=Extreme, 2=High, 3=Avg, 4=Low
-        injury:     1=None, 2=Niggle, 3=Poor, 4=Injured
-
-    A scale value cannot be cleared again through the API once it is set (null is
-    ignored and 0 is rejected); use the Intervals.icu web app for that. Double-check
-    the values before writing.
-
-    NOTE: comments REPLACES the day's existing comment, it does not append. To append,
-    read the existing record first (get_wellness_data) and send the combined text.
-    An empty string is ignored (it never wipes the comment); clear_comments=true empties it.
-
-    Args:
-        date: The day to update in YYYY-MM-DD format
-        soreness: Muscle soreness, 1-4 (optional)
-        fatigue: Fatigue, 1-4 (optional)
-        stress: Stress, 1-4 (optional)
-        mood: Mood, 1-4 (optional)
-        motivation: Motivation, 1-4 (optional)
-        injury: Injury level, 1-4 (optional)
-        comments: Free-text comment for the day; replaces any existing comment (optional)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        clear_comments: Empty the day's comment (optional, default false)
+    Writes the wellness record of that day in Intervals.icu (created if missing): only the fields
+    passed are changed; device values (weight, HRV, sleep, resting HR ...) stay untouched. At
+    least one field is required. Scales are integers 1-4 as in the Intervals.icu wellness dialog
+    (labels per parameter). A scale value once set cannot be cleared through the API (null is
+    ignored, 0 rejected): use the web app, so double-check before writing. comments replaces the
+    existing comment: to append, read it with get_wellness_data and send the combined text.
+    Returns the updated record.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:

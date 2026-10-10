@@ -10,7 +10,9 @@ import asyncio
 import difflib
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -36,6 +38,14 @@ from intervals_mcp_server.utils.power_compare import (
 )
 from intervals_mcp_server.utils.sports import format_start_times, hms, is_indoor, start_times
 from intervals_mcp_server.utils.streams import find_stream
+from intervals_mcp_server.utils.params import (
+    ActivityId,
+    AthleteId,
+    DetailLevel,
+    EndDate,
+    OptionalActivityId,
+    OutputFormat,
+)
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -277,50 +287,37 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
 
 @tool("read")
 async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    activity_id: str | None = None,
-    primary: str = "watts",
-    secondary: str = "secondary_power",
-    start_index: int | None = None,
-    end_index: int | None = None,
-    output_format: str = "text",
-    activity_ids: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    limit: int = 10,
-    detail_level: str = "standard",
-    athlete_id: str | None = None,
+    activity_id: Annotated[OptionalActivityId, Field(
+        description="One ride, e.g. i123456789; omit (or give activity_ids) to compare several rides"
+    )] = None,
+    primary: Annotated[str, Field(description="Stream type of the reference power source")] = "watts",
+    secondary: Annotated[str, Field(description="Stream type of the compared power source")] = "secondary_power",
+    start_index: Annotated[int | None, Field(description="First sample index to compare (one ride only)")] = None,
+    end_index: Annotated[int | None, Field(description="Sample index to stop before (exclusive; one ride only)")] = None,
+    output_format: OutputFormat = "text",
+    activity_ids: Annotated[str | None, Field(
+        description="Comma-separated activity ids to compare as several rides (duplicates ignored, cut to limit)"
+    )] = None,
+    start_date: Annotated[str | None, Field(
+        description="Several rides: first day YYYY-MM-DD; default 179 days before end_date (180 days)"
+    )] = None,
+    end_date: Annotated[EndDate, Field(description="Several rides: last day YYYY-MM-DD; default today")] = None,
+    limit: Annotated[int, Field(description="Several rides: at most this many, newest first, 1-20")] = 10,
+    detail_level: Annotated[DetailLevel, Field(
+        description="Several rides: compact = summary only; standard adds one line per ride; full adds power "
+        "bins and device data per ride"
+    )] = "standard",
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Compare two power streams of an activity sample by sample (e.g. head unit vs. second power meter)
+    """Use to compare two power meters recorded on the same ride (watts vs secondary_power by default), on one ride or across several rides.
 
-    Compares the primary power stream with a second one recorded on the same activity
-    (Intervals.icu stores a second power meter as stream type "secondary_power", shown as
-    "Power2" in power_field_names). Reports the overall offset in W and %, the offset per
-    power band, stable 30 s / 60 s windows only, drift over the ride quarters, a lag estimate,
-    best efforts per duration from each stream and how many samples were excluded as
-    coasting, missing or outliers. No calibration is performed and nothing is written; which
-    physical sensor each stream belongs to must be taken from the device data shown in the
-    header (power meter name/serial), not assumed.
-
-    Without activity_id (or with activity_ids) several rides are compared: the rides of the
-    date range (default 180 days) that carry the second stream, each analysed on its own and
-    summarised per bike and power meter identity with n, median, between-ride SD and range of
-    the offset (overall, per power band, stable windows), drift, lag and outliers. No
-    correction factor is derived.
-
-    Args:
-        activity_id: The Intervals.icu activity ID (one ride)
-        primary: Stream type of the primary power source (default "watts")
-        secondary: Stream type of the second power source (default "secondary_power")
-        start_index: First sample index to compare (one ride only)
-        end_index: Sample index to stop before (one ride only)
-        output_format: "text" (default) or "json"
-        activity_ids: Comma-separated activity IDs to compare as several rides (optional)
-        start_date: Several rides from YYYY-MM-DD (optional, default 180 days before end_date)
-        end_date: Several rides until YYYY-MM-DD (optional, default today)
-        limit: Several rides: at most this many, newest first, 1-20 (default 10)
-        detail_level: Several rides: "compact" (summary only), "standard" (default, plus one line
-            per ride) or "full" (plus bins and device data per ride)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+    One ride (activity_id): offset in W and % (secondary - primary), per power band, in stable 30/60
+    s windows, drift over the ride quarters, lag, best efforts of each stream and the samples
+    excluded as coasting, missing or outliers. Several rides (no activity_id, or activity_ids): the
+    rides that carry the second stream (default 180 days to end_date, newest first, limit 10, max
+    20), each compared on its own and summarised per bike and power meter with median,
+    between-ride SD and range. No calibration and no correction factor; sensors are named only
+    from the file's device data. Read-only. Method: intervals://methods/power-meters (get_guide).
     """
     if not activity_id or activity_ids:
         if start_index is not None or end_index is not None:
@@ -475,70 +472,41 @@ def _stream_types_for_execution(activity: dict[str, Any], stream_defs: dict[str,
 
 @tool("read")
 async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
-    activity_id: str,
-    event_id: str | None = None,
-    planned_workout_doc: dict[str, Any] | None = None,
-    suggest_matches: bool = True,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    duration_tolerance_pct: float | None = None,
-    start_tolerance_s: float | None = None,
-    pause_tolerance_s: float | None = None,
+    activity_id: ActivityId,
+    event_id: Annotated[str | None, Field(
+        description="Planned workout event to compare against; default the event paired with the activity"
+    )] = None,
+    planned_workout_doc: Annotated[dict[str, Any] | None, Field(
+        description='Workout document {"steps": [...]} (format of add_or_update_event), e.g. when the event was deleted'
+    )] = None,
+    suggest_matches: Annotated[bool, Field(
+        description="Unpaired activity without plan: list candidate events of the same days (read-only)"
+    )] = True,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = one line per step plus summary; standard; full adds counter and other-sport "
+        "custom streams"
+    )] = "standard",
+    duration_tolerance_pct: Annotated[float | None, Field(
+        description="Step length deviation in % of the step (at least 30 s) before it is split or flagged; default 10"
+    )] = None,
+    start_tolerance_s: Annotated[float | None, Field(
+        description="Flag steps starting further than this from the plan timeline, seconds; default 120"
+    )] = None,
+    pause_tolerance_s: Annotated[float | None, Field(
+        description="Recording pause per step that is not flagged, seconds; default 60"
+    )] = None,
 ) -> str:
-    """Compare a planned workout with how it was actually executed (or analyse the intervals alone)
+    """Use to check how a planned workout was executed, or without a plan to evaluate each detected interval of one activity.
 
-    Uses, in this order, the given planned_workout_doc, the given event_id, or the event
-    paired with the activity, together with the intervals Intervals.icu detected. Planned
-    steps (repeats expanded) are aligned with the actual intervals by order, duration (or
-    distance) and target intensity (never by interval names); a step may also match any
-    number of consecutive intervals of about the same intensity (an effort split by laps,
-    e.g. 1 km device auto-laps, or a stop). Lap presses are kept as step boundaries. With
-    device auto-laps (most laps of one distance or duration) a step boundary inside a lap is
-    placed where the intensity changes, a step without a lap of its own between two matched
-    steps is found at its two intensity changes, and an overrun is reported as longer than
-    planned; a boundary the samples cannot place is kept and the durations there are not
-    judged. A caveat line and JSON alignment_confidence (high / medium / low) with notes say
-    how far the per-step results can be trusted. Open-ended targets (top zone, a %/W range
-    with a start only) are lower bounds. Steps in the recovery zone or between two clearly
-    harder steps count as rest (no length limit), easy aerobic steps as work. Steps without
-    duration (distance, lap button) restart the plan clock at their actual end. Planned
-    steps are capped at their planned duration: when an interval is longer than
-    its step (beyond the tolerance), it is split logically (analysis only, nothing on
-    Intervals.icu changes); the planned part is evaluated against the plan from the samples
-    and the remainder is reported separately. For each step: planned vs actual (moving)
-    duration, the target range (resolved to W, bpm or pace), the actual average, below/in/
-    above target with the offset from the exact range, time within the target range (±5%),
-    HR start/end, the HR drop in the first minute after work steps, cadence, power/speed
-    fade, Pw:HR drift for work steps of 10 min or more (Intervals.icu decoupling sign:
-    positive = HR rose relative to power), the change of every custom stream
-    (e.g. stamina; clock counters and other-sport streams are left out) and notes on clear
-    deviations (short, too long, off target, paused, shifted). The Intervals.icu interval
-    type is kept and shown next to the planned step type when they differ. Everything after
-    the end of the last planned step (e.g. a cool-down continued for the ride home, extra
-    sprints) is reported as additional training with its own metrics, kJ share, estimated
-    load and the extra efforts it contains, and is not counted against the plan; riding
-    before the first step is reported the same way. Without a plan the same metrics are
-    reported per detected interval; for an unpaired activity up to three planned workouts
-    of the same days are suggested (read-only, nothing is paired or changed). The content
-    of a deleted event is never reconstructed; pass planned_workout_doc instead.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        event_id: Planned workout (event) to compare against (optional; default: the event
-            paired with the activity, if any)
-        planned_workout_doc: Workout document with "steps" (same format as add_or_update_event)
-            to compare against, e.g. when the calendar event no longer exists (optional)
-        suggest_matches: For unpaired activities without a plan, list candidate events of the
-            same days as a read-only suggestion (optional, default True)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (one line per step plus the summary), "standard" (default) or
-            "full" (also counter and other-sport custom streams)
-        duration_tolerance_pct: How much longer/shorter (in % of the step, at least 30 s) a step
-            may be before it is split or flagged as short (optional, default 10)
-        start_tolerance_s: Steps starting more than this many seconds away from the plan
-            timeline are flagged (optional, default 120)
-        pause_tolerance_s: Recording pauses inside a step up to this many seconds are not
-            flagged (optional, default 60); durations are always compared on moving time
+    The plan comes from planned_workout_doc, event_id or the event paired with the activity.
+    Planned steps (repeats expanded) are aligned with the intervals by order, duration or distance
+    and target intensity, never by names; laps that split one effort are merged. Per step: planned
+    vs actual moving time, target (W, bpm or pace) vs actual, time in target, HR response, cadence,
+    fade, Pw:HR drift (work steps of 10 min or more) and custom stream changes, with deviation notes
+    and an alignment confidence. Time past a step's plan and training after the plan are reported
+    apart. Unpaired: up to three candidate events, nothing is paired. Read-only. Method:
+    intervals://methods/execution (get_guide).
     """
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):

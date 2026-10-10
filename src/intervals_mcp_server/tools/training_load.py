@@ -22,7 +22,9 @@ with the intensity, durability and coach context tools.
 
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -69,6 +71,7 @@ from intervals_mcp_server.utils.plan_simulation import (
     solve_target,
     state_at_start,
 )
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, OutputFormat
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -390,42 +393,25 @@ def _load_text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: di
 
 @tool("read")
 async def get_training_load(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    end_date: str | None = None,
-    acute_days: int = 7,
-    chronic_days: int = 28,
-    weeks: int = 4,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD; default today; not in the future")] = None,
+    acute_days: Annotated[int, Field(description="Acute window in days, 3-28")] = 7,
+    chronic_days: Annotated[int, Field(description="Chronic window in days, 14-120, longer than acute_days")] = 28,
+    weeks: Annotated[int, Field(description="ISO weeks in the weekly table, 1-26")] = 4,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = windows, ratio, monotony, fitness, top 3 sports; standard adds all sports, ISO weeks, "
+        "device loads; full adds daily loads and definitions"
+    )] = "standard",
 ) -> str:
-    """Acute and chronic training load, acute:chronic ratio, monotony, strain and deload weeks (read-only)
+    """Use for acute and chronic training load in detail: acute (default 7 d) and chronic (28 d) Intervals.icu load, acute:chronic ratio (coupled daily means), Foster monotony and strain, deload-like weeks, per sport family with the primary sport, ISO weeks, and CTL/ATL/form/ramp at the end date (read-only).
 
-    From the Intervals.icu training load of every activity (rest days count as 0): the acute
-    (default 7 days) and chronic (default 28 days) load with sessions and days, the
-    acute:chronic ratio (daily means, coupled: the acute window is part of the chronic one),
-    Foster's monotony (mean / SD of the last 7 daily loads, rest days included; undefined
-    when the SD is 0) and strain (7-day load x monotony), and the 7-day load as a percentage
-    of the chronic weekly mean (deload-like at <= 80 %). The same per sport family, with the
-    primary sport (highest 7-day load) and its own monotony, because a steady low load from
-    cross-training raises the total monotony. ISO weeks with load per sport, rest days,
-    weekly monotony and strain and the share of the trailing weekly mean. CTL, ATL, form and
-    ramp from Intervals.icu at the end date for context (today's values are recomputed
-    without planned workouts that are not done yet). Device loads (custom fields such as a
-    Garmin training load) are summed separately on their own scale. Reference ranges (ACWR
-    0.8-1.3, monotony 2.0) are shown with their sources as context only; small samples are
-    flagged; no verdict is made. With the default end date and no activity recorded today
-    yet, the windows end yesterday. Metric set after morritter's upstream PR #150.
-
-    Args:
-        end_date: Last day YYYY-MM-DD (optional, default today; not in the future, see get_load_projection)
-        acute_days: Acute window in days, 3-28 (optional, default 7)
-        chronic_days: Chronic window in days, 14-120 and longer than acute_days (optional, default 28)
-        weeks: Number of ISO weeks in the weekly table, 1-26 (optional, default 4)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (windows, ratio, monotony, fitness, top sports), "standard" (default, plus
-            all sports, the weekly table and device loads) or "full" (plus the daily loads and definitions;
-            JSON includes the daily loads only at full)
+    Rest days count as 0; sessions without a load are counted, not added. Device loads (custom
+    fields such as a Garmin training load) are listed apart on their own scale, never added. With
+    the default end date and nothing recorded today yet, the windows end yesterday. Reference
+    ranges (ACWR 0.8-1.3, monotony 2.0) are shown with sources as context; small samples are
+    flagged; no verdict. Overview: get_coach_context; planned load: get_load_projection.
+    Method: intervals://methods/load (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:
@@ -1026,45 +1012,42 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
 
 @tool("read")
 async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-statements,too-many-branches
-    end_date: str | None = None,
-    ctl_days: int = CTL_DAYS,
-    atl_days: int = ATL_DAYS,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    scenario: dict[str, Any] | list[dict[str, Any]] | str | None = None,
-    target_date: str | None = None,
-    target_form: str | list[float] | None = None,
-    taper_days: int = 7,
+    end_date: Annotated[str | None, Field(
+        description="Last day YYYY-MM-DD, max 180 days ahead; default 28 days ahead, extended to the target and "
+        "scenario"
+    )] = None,
+    ctl_days: Annotated[int, Field(description="CTL time constant in days; atl_days < ctl_days <= 365")] = CTL_DAYS,
+    atl_days: Annotated[int, Field(description="ATL time constant in days, at least 1")] = ATL_DAYS,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = start, end, lowest form, races, target; standard adds ISO weeks and plan checks; full "
+        "adds days (JSON: days always, with a scenario only at full)"
+    )] = "standard",
+    scenario: Annotated[dict[str, Any] | list[dict[str, Any]] | str | None, Field(
+        description='What-if plan not in the calendar, object or JSON text: {"calendar": "add"|"replace"|"none", '
+        '"sessions": [{"date", "load" or "duration_min"+"intensity_factor"}], "weekly": [{"start", "weeks", "load" or '
+        '"hours"+"intensity_factor", "sessions" or "days"}]}; a list = sessions. Full format: intervals://methods/load'
+    )] = None,
+    target_date: Annotated[str | None, Field(
+        description="Target day YYYY-MM-DD after today; default the next RACE_A event"
+    )] = None,
+    target_form: Annotated[str | list[float] | None, Field(
+        description='Form range at the start of the target day: "5,15" (CTL - ATL) or "5%,20%" (of CTL); starts the '
+        "search for the load before it"
+    )] = None,
+    taper_days: Annotated[int, Field(description="Days before the target varied by the search, 1-42")] = 7,
 ) -> str:
-    """Project CTL, ATL and form over the planned workouts, or simulate a what-if plan (read-only, nothing is written)
+    """Use for future fitness: CTL, ATL and form projected over the planned workouts in the calendar, or a what-if scenario (sessions or weekly templates not in the calendar) against the calendar plan (read-only, nothing is written).
 
-    Exponential model from the Intervals.icu CTL/ATL at the end of yesterday (time constants 42/7 d): today's completed
-    load, then the planned load of the WORKOUT events (workouts without one are reported). Reports end values, lowest
-    form, highest ramp, ISO weeks (load per sport, sessions, hours, longest session, rest days, monotony, CTL/ATL/form/
-    ramp), all end of day; race days at the start of the day; Intervals.icu's projection, a model check and weeks
-    outside commonly cited ranges (ramp 5-8 CTL/week, monotony > 2.0, < 1 rest day; with sources). `scenario` simulates
-    sessions NOT in the calendar and
-    compares with the calendar plan. A target day (target_date or the next RACE_A) gets CTL/form at the start of the
-    day; with `target_form`, a grid search over the load of the last `taper_days` days. Arithmetic, no verdict.
-
-    Args:
-        end_date: Last day YYYY-MM-DD (optional; default 28 days ahead, extended to the target and scenario; max 180 days)
-        ctl_days: CTL time constant in days (optional, default 42)
-        atl_days: ATL time constant in days (optional, default 7)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact", "standard" (default, plus weeks and checks) or "full" (plus days; JSON has the days
-            always, with a scenario only at full)
-        scenario: Optional object (or JSON text): {"calendar": "add" (default) | "replace" (drop planned workouts from
-            the first to the last scenario day) | "none", "sessions": [{"date": "YYYY-MM-DD", "load": 120} or
-            {"date": ..., "duration_min": 240, "intensity_factor": 0.7} (load estimated as hours x IF^2 x 100), optional
-            "sport", "name"], "weekly": [{"start": "YYYY-MM-DD" (default next Monday), "weeks": 4, "load": 550 or
-            [500, 550, 600, 400] or "hours" + "intensity_factor", "sessions": 5 or "days": ["Tue", "Thu", "Sat"],
-            optional "long_session_share": 0.4, "long_day": "Sat", "sport": "Ride"}]}; a plain list = sessions
-        target_date: Target day YYYY-MM-DD (optional; default the next RACE_A event)
-        target_form: Form range at the target, "5,15" (CTL - ATL) or "5%,20%" (of CTL) (optional)
-        taper_days: Days before the target varied by the search, 1-42 (optional, default 7)
+    Starts from Intervals.icu's CTL/ATL at the end of yesterday plus today's completed load;
+    planned workouts without a load are reported, not guessed. Returns end values, lowest form,
+    highest ramp, ISO weeks with plan statistics, race days, Intervals.icu's own projection, a
+    model check and weeks outside commonly cited ranges (ramp 5-8 CTL/week, monotony 2.0, no rest
+    day). With target_date, target_form or a scenario: the target day (default the next RACE_A)
+    at the start of the day; target_form adds a search for the load of the last taper_days that
+    reaches it. Arithmetic, not a forecast; no verdict. Method and scenario format:
+    intervals://methods/load (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:

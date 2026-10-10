@@ -10,7 +10,9 @@ upstream pull request mvilanova/intervals-mcp-server#150 and are computed in
 """
 
 import json
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field
 
 from intervals_mcp_server.tools.training_load import (
     LOAD_FIELDS,
@@ -32,6 +34,15 @@ from intervals_mcp_server.utils.intensity import (
     ZONE_BASES,
     analyze_period,
     mapping_text,
+)
+from intervals_mcp_server.utils.params import (
+    AthleteId,
+    DetailLevel,
+    EndDate,
+    OutputFormat,
+    SportTypes,
+    ThresholdAs,
+    lower_choice,
 )
 
 # Import mcp instance from shared module for tool registration
@@ -150,45 +161,32 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
 
 @tool("read")
 async def get_intensity_distribution(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    start_date: str | None = None,
-    end_date: str | None = None,
-    zone_basis: str = "auto",
-    sport_types: str | None = None,
-    threshold_as: str = "moderate",
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    start_date: Annotated[str | None, Field(
+        description="First day YYYY-MM-DD; default 27 days before end_date (4 weeks); max 366 days"
+    )] = None,
+    end_date: EndDate = None,
+    zone_basis: Annotated[
+        Literal["auto", "power", "hr", "pace"],
+        BeforeValidator(lower_choice),
+        Field(description="auto = power for cycling, else HR, then pace, then power; or one basis for all"),
+    ] = "auto",
+    sport_types: SportTypes = None,
+    threshold_as: ThresholdAs = "moderate",
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = period, sports, drift; standard adds ISO weeks, zone mapping and rules; full adds "
+        "every session"
+    )] = "standard",
 ) -> str:
-    """Three-zone training intensity distribution with polarization index and hard days (read-only)
+    """Use for the training intensity distribution of a period (default the last 4 weeks, read-only): Intervals.icu's time in zones of each activity mapped to the three-zone model (Z1 below the first threshold, Z2 between, Z3 above the second).
 
-    Sums the time in zones Intervals.icu stores per activity and maps it to the three-zone
-    model (Z1 below the first threshold, Z2 between the thresholds, Z3 above the second).
-    The mapping depends on the zone basis and the number of zones of the athlete's model:
-    power 7 zones Z1-Z2 | Z3-Z4 | Z5-Z7 (threshold work in Z4 at 91-105 % FTP is middle-zone work
-    as in Seiler's model; threshold_as="high" counts it as high), HR and pace 7 zones
-    Z1-Z2 | Z3-Z4 | Z5a-Z5c, 5 zones Z1-Z2 | Z3 | Z4-Z5, 3 zones
-    as they are; other zone counts are left out and reported. zone_basis "auto" uses power
-    for cycling and heart rate (then pace, then power) for other sports. Reports for the
-    period, per sport family and per ISO week: the shares of Z1/Z2/Z3, hours, the
-    polarization index after Treff et al. 2019 (Front Physiol 10:707; undefined when Z3 < 1 %
-    or Z1 = 0, Z2 = 0 replaced by 0.01), the class (Base, Polarized, Pyramidal, Threshold,
-    HIT) with the zone order, and hard sessions and days (at least 10 min in Z3, or IF >= 0.85
-    on a session of at least 20 min). The drift compares the first and second half of the
-    period. Activities without zone data are never counted as easy time; the coverage says
-    how many sessions and how much moving time have zones. Metric set after morritter's
-    upstream PR #150; statistics only, no verdict.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 27 days before end_date = 4 weeks)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        zone_basis: "auto" (default), "power", "hr" or "pace"
-        sport_types: Comma-separated activity types to include, e.g. "Ride,GravelRide" (optional, default all)
-        threshold_as: How power zone Z4 (91-105 % FTP, threshold work) is counted: "moderate"
-            (default, three-zone Z2) or "high" (three-zone Z3)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (period, sports, drift), "standard" (default, plus ISO weeks, zone mapping
-            and rules) or "full" (plus every session; JSON includes the sessions only at full)
+    Returns Z1/Z2/Z3 shares and hours, the polarization index (Treff et al. 2019), the class
+    (Base, Polarized, Pyramidal, Threshold, HIT) and hard sessions and days for the period, per
+    sport family and per ISO week, and the drift between the two halves. The mapping depends on
+    the zone basis and the zone count of the athlete's model. Activities without zone data are
+    never counted as easy; the coverage is reported. Statistics only, no verdict. Overview:
+    get_coach_context. Method: intervals://methods/intensity (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:

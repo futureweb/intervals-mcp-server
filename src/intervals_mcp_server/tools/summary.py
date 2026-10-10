@@ -11,7 +11,9 @@ totals (e.g. a device training load, kept apart from the Intervals.icu load) and
 import json
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -21,6 +23,7 @@ from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, is_missing
 from intervals_mcp_server.utils.field_policy import aggregate_custom_fields, format_aggregate, format_pair, pair_changes
 from intervals_mcp_server.utils.dates import get_default_end_date
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OutputFormat, SportTypes, lower_choice
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
@@ -250,55 +253,34 @@ def _format_group(  # pylint: disable=too-many-locals,too-many-branches
 
 @tool("read")
 async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    start_date: str,
-    end_date: str | None = None,
-    group_by: str = "week",
-    sport_types: str | None = None,
-    include_gear: bool = True,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    start_date: Annotated[str, Field(description="First day YYYY-MM-DD")],
+    end_date: EndDate = None,
+    group_by: Annotated[
+        Literal["week", "month", "sport", "gear", "total"],
+        BeforeValidator(lower_choice),
+        Field(description="week = ISO weeks from Monday; month; sport = activity type; gear; total = one group"),
+    ] = "week",
+    sport_types: SportTypes = None,
+    include_gear: Annotated[bool, Field(description="Per-gear split inside each group (text, standard and full)")] = True,
+    athlete_id: AthleteId = None,
+    output_format: Annotated[OutputFormat, Field(
+        description="text (readable) or json (all fields, independent of detail_level)"
+    )] = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = totals, loads, fitness, sessions per sport, device loads; standard adds zones, gear, "
+        "feel/RPE, custom fields; full adds the aggregation reason per custom field"
+    )] = "standard",
 ) -> str:
-    """Training totals for a period grouped by week, month, sport, gear or in total (read-only)
+    """Use for training totals of a period grouped by ISO week, month, sport (activity type), gear or in total, including custom activity fields (read-only).
 
-    Per group: sessions, moving and elapsed time, distance, elevation gain, the
-    Intervals.icu training load (per activity the power load, else HR, else pace) with the
-    sums per method over the activities that have it (overlapping, as an activity with power
-    also has an HR load), the time-weighted intensity,
-    CTL/ATL/form/ramp at the end of the group's calendar period (week, month; capped at the
-    end date), time in power zones (sweet spot listed apart, it overlaps Z3/Z4) and HR
-    zones, per-sport and per-gear splits, feel distribution and mean RPE,
-    number of sessions of 3 h or more, the longest session, trainer sessions, and the
-    numeric custom activity fields aggregated by a generic policy derived from their
-    units, meaning and definition: additive values (kcal, ml, distance, time) are summed,
-    device training loads / EPOC are summed but labelled as a device scale separate from
-    the Intervals.icu load, estimates and states (VO2max, performance condition, recovery
-    time, detected thresholds) get latest value, change and range, and per-activity values
-    (percentages such as stamina, scores, training effects, running dynamics, temperatures,
-    heart rate) get mean, median, min and max - they are never summed, even when the field
-    definition says SUM. Fields without units or a recognisable meaning get no aggregate.
-    Sport settings (field assignments) decide where a value counts: on a sport that lists the
-    field it counts; on a sport whose list excludes the field it is ignored (e.g. running
-    dynamics stored as 0 on rides); a sport without any field list (e.g. gravel rides without
-    own settings) follows the lists of its sport family (Ride), and there only real non-zero
-    values count, reported as "from sports without field assignment", while a stored 0 is a
-    placeholder and ignored. For estimates a
-    stored 0 means "no value" and is left out. Paired "... at start" / "... at end" fields (e.g. stamina)
-    also get the typical start-to-end change. CUSTOM_AGGREGATE_OVERRIDES ("Code=sum|device_load_sum|trend|mean|none")
-    overrides the policy per field. For a quick per-week view see also get_weekly_summary.
-
-    Args:
-        start_date: Start date YYYY-MM-DD
-        end_date: End date YYYY-MM-DD (optional, default today)
-        group_by: "week" (default, ISO weeks starting Monday), "month", "sport", "gear" or "total"
-        sport_types: Comma-separated activity types to include, e.g. "Ride,GravelRide" (optional)
-        include_gear: Show the per-gear split inside each group (optional, default True)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (totals, loads, fitness, sessions per sport and device loads per
-            group), "standard" (default, everything above plus zones, gear, feel/RPE and custom
-            field aggregates) or "full" (standard plus the aggregation reason per custom field and
-            the fields without a meaningful aggregate)
+    Per group and in total: sessions, moving/elapsed time, distance, elevation, Intervals.icu load
+    with the power/HR/pace load sums, time-weighted intensity, CTL/ATL/form/ramp at the end of the
+    group's week or month, time in power (sweet spot apart) and HR zones, sport and gear splits,
+    feel and RPE, sessions of 3 h or more, the longest session, trainer sessions. Numeric custom
+    fields are aggregated by units and meaning: additive values summed, device loads summed apart
+    from the Intervals.icu load, estimates as latest value and change, per-activity values as
+    mean/median/range. Missing values are skipped, never counted as 0. Per-week view in one
+    call: get_weekly_summary. Method: intervals://methods/summary (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:

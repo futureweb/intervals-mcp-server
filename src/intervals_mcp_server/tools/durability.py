@@ -11,7 +11,9 @@ heartbeat of single work intervals per power band. One API call (the activity li
 """
 
 import json
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field
 
 from intervals_mcp_server.tools.training_load import (
     DURABILITY_FIELDS,
@@ -36,6 +38,15 @@ from intervals_mcp_server.utils.durability import (
     TREND_BAND_PP,
     decoupling_summary,
     efficiency_summary,
+)
+from intervals_mcp_server.utils.params import (
+    AthleteId,
+    DetailLevel,
+    EndDate,
+    Environment,
+    OutputFormat,
+    SportTypes,
+    lower_choice,
 )
 from intervals_mcp_server.utils.sports import SPORT_FAMILIES
 
@@ -146,58 +157,42 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:
 
 @tool("read")
 async def get_durability(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    min_minutes: float = 60,
-    max_vi: float = MAX_VI,
-    max_temp_c: float | None = MAX_TEMP_C,
-    drift_threshold_pct: float = DRIFT_THRESHOLD_PCT,
-    recent_days: int = 7,
-    environment: str | None = None,
-    temperature_source: str = "device",
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    start_date: Annotated[str | None, Field(
+        description="First day YYYY-MM-DD; default 41 days before end_date (6 weeks); max 366 days"
+    )] = None,
+    end_date: EndDate = None,
+    sport_types: Annotated[SportTypes, Field(
+        description='Comma-separated activity types, e.g. "Ride,VirtualRide"; default every cycling and running type'
+    )] = None,
+    min_minutes: Annotated[float, Field(description="Minimum moving time in minutes, above 0")] = 60,
+    max_vi: Annotated[float, Field(description="Maximum variability index (steadiness), at least 1")] = MAX_VI,
+    max_temp_c: Annotated[float | None, Field(
+        description="Maximum average temperature in °C; null = no limit; a missing temperature passes"
+    )] = MAX_TEMP_C,
+    drift_threshold_pct: Annotated[float, Field(description="Decoupling in % above which sessions are counted")] = DRIFT_THRESHOLD_PCT,
+    recent_days: Annotated[int, Field(description="Recent window in days compared with the whole period")] = 7,
+    environment: Environment = None,
+    temperature_source: Annotated[
+        Literal["device", "weather", "feels_like"],
+        BeforeValidator(lower_choice),
+        Field(description="Temperature for max_temp_c: device sensor, Intervals.icu weather or its feels-like"),
+    ] = "device",
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = per-sport summary; standard adds the qualifying sessions and the reference; full "
+        "adds the excluded sessions"
+    )] = "standard",
 ) -> str:
-    """Aerobic durability: decoupling of steady long sessions and efficiency factor trend (read-only)
+    """Use for aerobic durability: Intervals.icu's aerobic decoupling (power:HR, or pace:HR for runs without power; drift between the halves in %) of steady long cycling and running sessions and the efficiency factor trend (read-only, default the last 6 weeks).
 
-    Uses the aerobic decoupling Intervals.icu computes per activity (power:HR, or pace:HR for
-    runs without power: the drift between the first and second half, in %) for cycling and
-    running sessions that pass a quality filter: at least min_minutes moving, moving time at
-    least 85 % of elapsed time (no long stops), heart rate present, rides with power and a
-    variability index up to max_vi (steady), average temperature up to max_temp_c (device
-    sensor, or the activity's weather / feels-like with temperature_source; missing, e.g.
-    indoors, passes; sessions list device and weather temperature) and optionally only indoor or outdoor sessions. Excluded sessions
-    are counted per reason. Per sport family: median, range and quartiles, how many sessions
-    are above drift_threshold_pct (5 % is commonly cited, Friel / Allen & Coggan), and the
-    median of the last recent_days against the window median with a +/- 1 percentage point
-    stability band (needs 2 recent and 3 window sessions). Per sport the qualifying share
-    (e.g. 6 of 19 sessions) is shown; fewer than 8 qualifying sessions are flagged as a small
-    sample, not reliable, and a mix of indoor/outdoor sessions, several bikes/shoes or power
-    meters among them is pointed out. Also the efficiency factor (normalized power / average HR) of steady
-    sessions with power of at least 20 min: window mean versus recent mean (+/- 2 % band);
-    EF depends on the power meter, so several bikes are pointed out. For interval-level
-    watts per heartbeat per power band and per bike use get_power_hr_efficiency. Filter and
-    trend after morritter's upstream PR #150; statistics only, no verdict.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 41 days before end_date = 6 weeks)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated activity types, e.g. "Ride,VirtualRide" (optional, default every cycling
-            and running type)
-        min_minutes: Minimum moving time in minutes (optional, default 60)
-        max_vi: Maximum variability index (optional, default 1.20)
-        max_temp_c: Maximum average temperature in °C, null for no limit (optional, default 25)
-        drift_threshold_pct: Decoupling threshold in % for the count above it (optional, default 5)
-        recent_days: Recent window compared with the whole period (optional, default 7)
-        environment: "indoor" or "outdoor" (optional, default both)
-        temperature_source: Temperature for max_temp_c: "device" (sensor, default; reads body and sun heat as well),
-            "weather" (Intervals.icu weather along the track) or "feels_like" (optional)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (per sport summary), "standard" (default, plus the qualifying sessions and the
-            reference) or "full" (plus the excluded sessions; JSON includes session lists only at standard and full)
+    Sessions pass a quality filter (min_minutes moving, few stops, HR, rides with power,
+    variability index up to max_vi, temperature up to max_temp_c, optionally indoor or outdoor
+    only); excluded ones are counted per reason. Per sport family: median, range, quartiles,
+    sessions above drift_threshold_pct (5 % commonly cited) and the last recent_days against the
+    window. Fewer than 8 qualifying sessions are flagged as a small sample; mixed indoor/outdoor,
+    bikes/shoes or power meters are noted. Statistics only, no verdict. Per interval and bike:
+    get_power_hr_efficiency. Method: intervals://methods/durability (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:
@@ -205,8 +200,8 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
     env = (environment or "").strip().lower() or None
     if env not in (None, "indoor", "outdoor"):
         return "Error: environment must be 'indoor' or 'outdoor'."
-    temperature_source = (temperature_source or "device").strip().lower()
-    if temperature_source not in TEMPERATURE_SOURCES:
+    temp_source = (temperature_source or "device").strip().lower()
+    if temp_source not in TEMPERATURE_SOURCES:
         return f"Error: temperature_source must be one of {', '.join(TEMPERATURE_SOURCES)}."
     if min_minutes <= 0 or max_vi < 1 or recent_days < 1 or drift_threshold_pct <= 0:
         return "Error: min_minutes, recent_days and drift_threshold_pct must be positive and max_vi at least 1."
@@ -222,11 +217,11 @@ async def get_durability(  # pylint: disable=too-many-arguments,too-many-positio
     families = FAMILIES if not wanted else tuple(
         family for family, types in SPORT_FAMILIES.items() if any(t.lower() in wanted for t in types)
     ) or FAMILIES
-    filters = {"min_minutes": min_minutes, "max_vi": max_vi, "max_temp_c": max_temp_c, "temperature_source": temperature_source, "environment": env,
+    filters = {"min_minutes": min_minutes, "max_vi": max_vi, "max_temp_c": max_temp_c, "temperature_source": temp_source, "environment": env,
                "drift_threshold_pct": drift_threshold_pct, "recent_days": recent_days, "sport_types": sport_types}
     decoupling = decoupling_summary(
         activities, start, end, recent_days=recent_days, threshold_pct=drift_threshold_pct, families=families,
-        min_moving_s=min_minutes * 60, max_vi=max_vi, max_temp_c=max_temp_c, environment=env, temperature_source=temperature_source,
+        min_moving_s=min_minutes * 60, max_vi=max_vi, max_temp_c=max_temp_c, environment=env, temperature_source=temp_source,
     )
     efficiency = efficiency_summary(activities, start, end, recent_days=recent_days, families=families, max_vi=max_vi, environment=env)
     payload: dict[str, Any] = {

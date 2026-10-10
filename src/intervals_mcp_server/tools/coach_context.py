@@ -16,7 +16,9 @@ import json
 import math
 import statistics
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.tools.custom_items import cached_custom_item_index
 from intervals_mcp_server.tools.durability import sample_note
@@ -53,6 +55,7 @@ from intervals_mcp_server.utils.load_metrics import (
     wellness_by_day,
     weekly_rows,
 )
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, OutputFormat, ThresholdAs
 from intervals_mcp_server.utils.wellness_completeness import completeness_line, completeness_start, today_completeness
 from intervals_mcp_server.utils.wellness_stats import compute_metric_trend
 
@@ -268,43 +271,27 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
 
 @tool("read")
 async def get_coach_context(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    end_date: str | None = None,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    threshold_as: str = "moderate",
+    end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD; default today; not in the future")] = None,
+    athlete_id: AthleteId = None,
+    output_format: Annotated[OutputFormat, Field(
+        description="text (readable) or json (the full structure, independent of detail_level)"
+    )] = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = load, fitness, intensity, recovery, durability, method; standard adds sports, drift, "
+        "top sessions, plan, coverage; full adds 4 ISO weeks and references"
+    )] = "standard",
+    threshold_as: ThresholdAs = "moderate",
 ) -> str:
-    """Compact coaching context for a weekly review in one call (read-only, about 2-3k characters)
+    """Use first for a weekly or general training review: load, intensity, recovery, durability and plan for one end date in one compact call (read-only, about 2-3k characters).
 
-    Combines for the end date (default today): training load (7- and 28-day Intervals.icu
-    load, acute:chronic ratio, Foster monotony and strain, the 7-day load as a share of the
-    28-day weekly mean, per sport with the primary sport) and CTL/ATL/form/ramp; the
-    three-zone intensity distribution of the last 7 and 28 days with polarization index,
-    class, hard sessions/days and the drift between the two halves of the 28 days; recovery
-    markers as numbers only (7-day mean of HRV, resting HR and sleep against the 42 days
-    before those 7 days, with n, difference and a z-score against the week-to-week spread
-    of 7-day means over the 90 days before; |z| up to about 2 is normal variation); durability (median aerobic decoupling
-    of steady sessions and efficiency factor over 28 days); the top sessions of the last 7
-    days; the planned workouts of the next 7 days and the next race (when the end date is
-    today); and the data coverage. A method line states the windows, the ACWR method
-    (coupled daily means), the zone basis, the threshold_as mode and the hard-session rule;
-    when the intensity totals combine power and HR zones a caveat gives the per-sport split.
-    Small samples are flagged (durability: qualifying share, fewer than 8 sessions, mixed
-    indoor/outdoor or gear); missing values are never counted as 0. For today a line (JSON
-    today_completeness) names the usual wellness fields not yet in today's record: not yet
-    available, not normal. Recommended first call for a weekly analysis. No verdict or
-    diagnosis. The single tools give the details: get_training_load, get_intensity_distribution,
-    get_durability, get_recovery_snapshot, get_load_projection. At most four API calls. After
-    morritter's coach report (upstream PR #150).
-
-    Args:
-        end_date: Last day YYYY-MM-DD (optional, default today; not in the future)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json" (the full structure)
-        detail_level: "compact" (load, fitness, intensity, recovery, durability, method), "standard" (default,
-            plus sports, drift, top sessions, plan and coverage) or "full" (plus the last 4 ISO weeks and references)
-        threshold_as: How power zone Z4 (threshold work) counts in the intensity distribution: "moderate"
-            (default) or "high", as in get_intensity_distribution
+    Combines 7/28-day Intervals.icu load with acute:chronic ratio, monotony, strain and
+    CTL/ATL/form; the three-zone intensity of 7 and 28 days; recovery markers (HRV, resting HR,
+    sleep) against personal baselines with a z-score (numbers only); durability; top sessions;
+    and, when the end date is today, planned workouts of the next 7 days and the next race. For
+    today it names wellness fields not yet recorded (not yet available, not normal). A method
+    line states windows and rules; small samples are flagged; missing values are never 0; no
+    verdict. Details: get_training_load, get_intensity_distribution, get_durability,
+    get_recovery_snapshot, get_load_projection. Method: intervals://methods/load (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:

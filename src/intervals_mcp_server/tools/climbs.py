@@ -6,11 +6,15 @@ the custom streams present (e.g. stamina, gear selection).
 """
 
 import json
+from typing import Annotated
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_STREAM
+from intervals_mcp_server.utils.params import ActivityId, OutputFormat
 from intervals_mcp_server.utils.segments import detect_segments, format_segments, segments_to_json
 from intervals_mcp_server.utils.sports import format_start_times, start_times
 
@@ -22,63 +26,38 @@ config = get_config()
 
 @tool("read")
 async def analyze_climbs(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    activity_id: str,
-    min_climb_gain_m: float = 30.0,
-    min_descent_loss_m: float = 30.0,
-    min_grade_pct: float = 2.0,
-    pause_min_secs: int = 60,
-    extra_stream_types: str | None = None,
-    max_segments: int = 40,
-    output_format: str = "text",
-    show_raw_grade: bool = False,
-    grade_window_m: float | None = None,
-    min_grade_distance_m: float | None = None,
-    stationary_speed_m_s: float | None = None,
+    activity_id: ActivityId,
+    min_climb_gain_m: Annotated[float, Field(description="Minimum elevation gain of a climb, metres")] = 30.0,
+    min_descent_loss_m: Annotated[float, Field(description="Minimum elevation loss of a descent, metres")] = 30.0,
+    min_grade_pct: Annotated[float, Field(description="Minimum average grade of climbs and descents, %")] = 2.0,
+    pause_min_secs: Annotated[int, Field(description="Minimum length of a reported stationary period, seconds")] = 60,
+    extra_stream_types: Annotated[str | None, Field(
+        description="Comma-separated standard streams to evaluate per segment besides the custom ones, e.g. "
+        "temp,respiration,left_right_balance"
+    )] = None,
+    max_segments: Annotated[int, Field(description="Segments listed in text output")] = 40,
+    output_format: OutputFormat = "text",
+    show_raw_grade: Annotated[bool, Field(
+        description="Also report the grade of the unsmoothed altitude (windows of at least min_grade_distance_m)"
+    )] = False,
+    grade_window_m: Annotated[float | None, Field(
+        description="Distance window of the steepest grade, metres; default 50 on foot, 100 otherwise"
+    )] = None,
+    min_grade_distance_m: Annotated[float | None, Field(
+        description="No grade below this horizontal distance, metres; default 30 on foot, 50 otherwise"
+    )] = None,
+    stationary_speed_m_s: Annotated[float | None, Field(
+        description="Pause candidate below this speed, m/s; default 0.3 on foot, 0.5 otherwise"
+    )] = None,
 ) -> str:
-    """Detect climbs, descents and pauses of an activity from its streams and evaluate each segment
+    """Use for activities without useful intervals (tours, mountain hikes, trail runs) to split the recording into climbs, descents, sections in between and pauses.
 
-    For activities without defined intervals (tours, mountain hikes, trail runs) this
-    splits the recording into climbs (sustained ascent of at least min_climb_gain_m with an
-    average grade of at least min_grade_pct), descents and the sections in between, using
-    the corrected altitude when available, smoothed against GPS/barometer noise. Per segment:
-    start/end time and sample indices, duration and moving time, distance, elevation
-    gain/loss, average grade and the steepest grade over a distance window (smoothed;
-    optionally also the raw grade), VAM and speed on moving time, average and normalized
-    power, max power, average/max HR, cadence (non-zero samples), and the start/end/min/max/
-    mean/delta of every custom stream (clock counters and other-sport streams left out) plus
-    any extra standard streams requested. Defaults depend on the sport (hike / walk / run vs
-    bike): no grade is computed over tiny horizontal distances, grades above a plausible limit
-    are flagged as data-quality problems (GPS distance too short on slow, steep terrain) and
-    excluded from the steepest climb. Every segment gets a grade confidence (high / medium /
-    low with reasons: horizontal distance relative to min_grade_distance_m, GPS speed, pauses
-    and recording stops, implausible grades), counted in the summary; below the minimum
-    horizontal distance the grade - raw included - is "not determinable", and the raw maximum
-    uses windows of at least that distance. Pause candidates (speed below the stationary speed) are
-    classified: real pauses and recording stops count as pause time, very slow movement with
-    vertical or horizontal progress (scrambling) is kept as moving time. A device moving-time
-    counter stream is shown for comparison but not treated as truth. The sum of the climbs'
-    gain is not the activity's total elevation gain (Intervals.icu computes that separately).
-    Thresholds are explicit parameters, nothing is interpolated, and device sitting/standing
-    or similar classifications are not used.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        min_climb_gain_m: Minimum elevation gain for a climb in metres (optional, default 30)
-        min_descent_loss_m: Minimum elevation loss for a descent in metres (optional, default 30)
-        min_grade_pct: Minimum average grade in percent for climbs/descents (optional, default 2)
-        pause_min_secs: Minimum length of a stationary period to report (optional, default 60)
-        extra_stream_types: Comma-separated standard stream types to evaluate per segment in
-            addition to the custom streams, e.g. "temp,respiration,left_right_balance" (optional)
-        max_segments: Maximum number of segments to print in text output (optional, default 40)
-        output_format: "text" (default) or "json"
-        show_raw_grade: Also report the grade from the unsmoothed altitude over short windows (at
-            least min_grade_distance_m; optional, default False)
-        grade_window_m: Distance window of the steepest grade in metres (optional; default 50 for
-            foot sports, 100 otherwise)
-        min_grade_distance_m: No grade below this horizontal distance in metres (optional; default
-            30 for foot sports, 50 otherwise)
-        stationary_speed_m_s: Speed below which a stretch is a pause candidate (optional; default
-            0.3 m/s for foot sports, 0.5 m/s otherwise)
+    Per segment: time and sample indices, moving time, distance, gain/loss, average and steepest
+    grade, VAM, speed, power, NP, HR, cadence and start/end/min/max/mean/delta of every custom
+    stream. Defaults follow the sport (foot vs bike); implausible grades are flagged and each
+    segment gets a grade confidence. Slow scrambling counts as moving, real pauses as pause. Climb
+    gains are not the activity's total elevation gain. Text lists up to max_segments segments.
+    Read-only, 2 API calls (activity, all streams). Method: intervals://methods/climbs (get_guide).
     """
     result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:

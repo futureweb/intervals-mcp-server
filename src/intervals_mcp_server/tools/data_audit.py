@@ -11,7 +11,9 @@ request with a field selection. The pure logic lives in ``utils.provenance``.
 
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -20,6 +22,7 @@ from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.training_load import filter_types, resolve_period, wanted_types
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, CustomFieldDefs
 from intervals_mcp_server.utils.load_metrics import num, parse_day
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OptionalActivityId, OutputFormat, SportTypes
 from intervals_mcp_server.utils.provenance import (
     AUDIT_LIST_FIELDS,
     BASELINE_DAYS,
@@ -321,29 +324,28 @@ def _coverage_text(payload: dict[str, Any], detail_level: str) -> str:
 
 @tool("read")
 async def get_activity_data_audit(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    activity_id: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    activity_id: Annotated[OptionalActivityId, Field(
+        description="Activity to audit, e.g. i123456789; omit for the coverage of a period"
+    )] = None,
+    start_date: Annotated[str | None, Field(
+        description="Period: first day YYYY-MM-DD; default 27 days before end_date; max 366 days"
+    )] = None,
+    end_date: Annotated[EndDate, Field(description="Period: last day YYYY-MM-DD; default today")] = None,
+    sport_types: SportTypes = None,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = no stream download, shorter lists; full = every stream, gap and field"
+    )] = "standard",
 ) -> str:
-    """Data audit of one activity or data coverage of a period (read-only)
+    """Use to check where an activity's data came from and what is missing, or without activity_id how complete the data of a period is.
 
-    With activity_id: source (Garmin sync, upload, Strava stub), upload/analysis times, filtered
-    duplicates, recording stops, FIT laps vs intervals and edits, sensor identity, streams vs
-    those usual for the sport with coverage, custom fields with value / zero placeholder / none,
-    fields the Garmin Intervals Bridge could fill. Without activity_id: per sport how many
-    activities have power, HR, GPS, weather, custom streams and fields. Facts, no verdict.
-
-    Args:
-        activity_id: Activity; omit for the period coverage
-        start_date: YYYY-MM-DD (default end_date - 27 days)
-        end_date: YYYY-MM-DD (default today)
-        sport_types: e.g. "Ride,GravelRide"
-        output_format: "text" or "json"
-        detail_level: "compact" (no streams), "standard" or "full"
+    One activity: source (sync, upload, Strava stub), upload and analysis times, filtered
+    duplicates, recording stops, FIT laps vs intervals and edits, sensors, streams vs those usual
+    for the sport with coverage, custom fields with value / zero placeholder / none, fields the
+    Garmin Intervals Bridge could fill. Period (default 28 days to end_date): per sport how many
+    activities have power, HR, GPS, weather, custom streams and fields. Facts and counts, no
+    verdict; read-only, 1-3 API requests. Method: intervals://methods/activity-data (get_guide).
     """
     if detail_level not in DETAIL_LEVELS:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."

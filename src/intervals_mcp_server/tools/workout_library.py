@@ -7,10 +7,13 @@ workout on the calendar.
 """
 
 import json
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.params import AthleteId, OutputFormat
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import (
@@ -105,15 +108,10 @@ async def _fetch_folders(
 
 @tool("read")
 async def get_workout_library(
-    folder: str | None = None,
-    athlete_id: str | None = None,
+    folder: Annotated[str | None, Field(description="Only this folder or plan: name (case-insensitive) or id")] = None,
+    athlete_id: AthleteId = None,
 ) -> str:
-    """List the athlete's workout library (folders/plans and their workouts) from Intervals.icu.
-
-    Args:
-        folder: Optional folder or plan filter, either the folder name (case-insensitive) or its id
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-    """
+    """Use to list the athlete's workout library: folders and plans with their workouts and ids (read-only). One workout in detail: get_library_workout."""
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
@@ -190,30 +188,18 @@ async def _resolve_folder_id(
 
 @tool("write")
 async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
-    name: str,
-    sport_type: str,
-    folder: str | None = None,
-    description: str | None = None,
-    workout_doc: WorkoutDoc | None = None,
-    moving_time: int | None = None,
-    distance: int | None = None,
-    athlete_id: str | None = None,
+    name: Annotated[str, Field(description='Workout name, e.g. "Sweet Spot 3x10"')],
+    sport_type: Annotated[str, Field(description="Sport, e.g. Ride, Run, Swim, Walk, Row, WeightTraining")],
+    folder: Annotated[str | None, Field(description="Folder or plan by name (case-insensitive) or id; optional if the library has exactly one folder")] = None,
+    description: Annotated[str | None, Field(description="Workout text in Intervals.icu syntax or free text; ignored when workout_doc has steps")] = None,
+    workout_doc: Annotated[WorkoutDoc | None, Field(description="Structured steps, rendered into the text. Format: intervals://workout-syntax")] = None,
+    moving_time: Annotated[int | None, Field(description="Planned moving time in seconds")] = None,
+    distance: Annotated[int | None, Field(description="Planned distance in metres")] = None,
+    athlete_id: AthleteId = None,
 ) -> str:
-    """WRITES to Intervals.icu: create a new workout template in the athlete's workout library.
+    """Use only when the athlete asks to save a workout template in the workout library. Writes to Intervals.icu.
 
-    Args:
-        name: Name of the workout (e.g. "Sweet Spot 3x10")
-        sport_type: Sport type (e.g. Ride, Run, Swim, Walk, Row, WeightTraining)
-        folder: Folder or plan to put the workout in, by name (case-insensitive) or id. Optional if
-            the library has exactly one folder; the call fails if there is no folder.
-        description: Workout text in Intervals.icu workout syntax (e.g. "- 10m 55%\\n3x\\n- 10m 90%\\n- 5m 55%")
-            or free text. Ignored if workout_doc has steps.
-        workout_doc: Structured steps (same format and checks as in add_or_update_event). Rendered
-            into the description text; an empty workout_doc ({} or no steps) is ignored, so the
-            description is used. With validation errors nothing is created.
-        moving_time: Expected total moving time in seconds (optional)
-        distance: Expected total distance in meters (optional)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+    The workout_doc is validated like add_or_update_event (with errors nothing is created) and rendered into the workout text; an empty workout_doc is ignored and description is used. Format: intervals://workout-syntax (get_guide). Schedule it with add_event_from_library.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -264,22 +250,13 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
 
 @tool("write")
 async def add_event_from_library(  # pylint: disable=too-many-return-statements
-    workout_id: str,
-    date: str,
-    athlete_id: str | None = None,
+    workout_id: Annotated[str, Field(description="Library workout id (get_workout_library); small numbers such as 1 are normal")],
+    date: Annotated[str, Field(description="Day YYYY-MM-DD")],
+    athlete_id: AthleteId = None,
 ) -> str:
-    """WRITES to Intervals.icu: schedule a workout from the workout library on the calendar.
+    """Use only when the athlete asks to schedule a workout from the library on a day. Writes a new WORKOUT event to Intervals.icu.
 
-    Creates a new calendar event (category WORKOUT) on the given date by copying the library
-    workout's name, description (steps), type, duration, distance, tags and planned load.
-    A workout imported from a file (.zwo, .mrc, .erg, .fit) whose description holds no workout
-    steps is created without steps; the answer says so.
-
-    Args:
-        workout_id: The id of the library workout (see get_workout_library). Library ids are
-            numbered per athlete, so small values such as 1 are normal.
-        date: Date in YYYY-MM-DD format
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+    Copies the library workout's name, steps, type, duration, distance, tags and planned load. A workout imported from a file (.zwo, .mrc, .erg, .fit) without workout steps in its text is created without steps; the answer says so.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -331,19 +308,12 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
 
 @tool("destructive")
 async def delete_library_workout(
-    workout_id: str,
-    athlete_id: str | None = None,
+    workout_id: Annotated[str, Field(description="Library workout id (get_workout_library); small numbers such as 1 are normal")],
+    athlete_id: AthleteId = None,
 ) -> str:
-    """DELETES from Intervals.icu: permanently remove a workout from the workout library.
+    """Use only when the athlete explicitly asks to delete a workout from the library.
 
-    This cannot be undone. Calendar events that were created from the workout are not
-    affected. Only the given workout is deleted (other workouts added together with it to
-    a plan are kept).
-
-    Args:
-        workout_id: The id of the library workout (see get_workout_library). Library ids are
-            numbered per athlete, so small values such as 1 are normal.
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+    DELETES it from Intervals.icu permanently (cannot be undone). Calendar events created from it are not affected; other workouts of the same plan are kept.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -366,20 +336,11 @@ async def delete_library_workout(
 
 @tool("read")
 async def get_library_workout(
-    workout_id: str,
-    athlete_id: str | None = None,
-    output_format: str = "text",
+    workout_id: Annotated[str, Field(description="Library workout id (get_workout_library); small numbers such as 1 are normal")],
+    athlete_id: AthleteId = None,
+    output_format: Annotated[OutputFormat, Field(description="text or json (complete workout incl. workout_doc)")] = "text",
 ) -> str:
-    """Get one workout template from the athlete's library (steps, planned time, load, targets)
-
-    Use get_workout_library to find the id. The workout text is rendered from the structured
-    steps so it can be reused with add_or_update_event or validate_workout.
-
-    Args:
-        workout_id: The library workout id
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        output_format: "text" (default) or "json" (the complete workout including workout_doc)
-    """
+    """Use to read one library workout (steps, planned time, load, targets), e.g. to reuse it with add_or_update_event or validate_workout. Ids: get_workout_library."""
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg

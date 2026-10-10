@@ -7,7 +7,9 @@ Custom item definitions come from the per-process cache. The logic lives in ``ut
 """
 
 import json
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -31,6 +33,7 @@ from intervals_mcp_server.utils.fueling import (
     period_fueling,
     row_text,
 )
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, OptionalActivityId, OutputFormat, SportTypes
 from intervals_mcp_server.utils.sports import format_local_start, hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
@@ -159,31 +162,33 @@ def _period_text(payload: dict[str, Any], detail_level: str) -> str:
 
 @tool("read")
 async def get_fueling_analysis(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    activity_id: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    min_minutes: float = 90,
-    athlete_id: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    activity_id: Annotated[OptionalActivityId, Field(
+        description="One activity, e.g. i123456789; omit for the period mode"
+    )] = None,
+    start_date: Annotated[str | None, Field(
+        description="First day YYYY-MM-DD (period mode); default 89 days before end_date; max 366 days"
+    )] = None,
+    end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD (period mode); default today")] = None,
+    sport_types: Annotated[SportTypes, Field(
+        description='Comma-separated activity types (period mode), e.g. "Ride,GravelRide"'
+    )] = None,
+    min_minutes: Annotated[float, Field(description="Minimum moving time in minutes (period mode), not negative")] = 90,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="period: compact = per sport family; standard adds duration/IF buckets, correlations, 15 "
+        "sessions; full lists all sessions. One activity: compact omits notes"
+    )] = "standard",
 ) -> str:
-    """Fueling of one activity or of the long sessions of a period (read-only)
+    """Use for carbohydrate, fluid and sodium intake of one activity (activity_id) or of the long sessions of a period (default the last 90 days, sessions of at least min_minutes; read-only).
 
-    Carbs used (Intervals.icu estimate) and ingested (logged total) in g and g/h, ingested share
-    of used, kcal, kJ and, where custom fields exist (found by units and name), fluid intake,
-    sodium and sweat loss per hour. Period mode: sessions of at least min_minutes, g/h per sport
-    family, duration and intensity with sample sizes. Used vs ingested is no 1:1 energy deficit
-    (body stores contribute). No targets.
-
-    Args:
-        activity_id: One activity; omit for the period mode
-        start_date: YYYY-MM-DD (default end_date - 89 days)
-        end_date: YYYY-MM-DD (default today)
-        sport_types: e.g. "Ride,GravelRide"
-        min_minutes: Minimum moving time, period mode (default 90)
-        output_format: "text" or "json"
-        detail_level: "compact", "standard" or "full"
+    Carbs used (Intervals.icu estimate) and ingested (logged total) in g and g/h, the ingested
+    share of used, kcal and kJ, and fluid intake, sodium and sweat loss per hour where custom
+    fields exist (found by units and name). One activity also gets the intake per hour from a
+    custom intake stream, if there is one. Period: statistics per sport family, by duration and
+    by intensity, Spearman correlations from 8 sessions, with sample sizes. Not logged is never
+    0; used minus ingested is no 1:1 energy deficit; no targets.
+    Method: intervals://methods/fueling (get_guide).
     """
     if detail_level not in DETAIL_LEVELS:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."
