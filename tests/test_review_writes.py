@@ -96,14 +96,50 @@ def test_range_delete_is_a_preview_of_planned_workouts_by_default(monkeypatch):
     assert not _writes(calls)
 
 
-def test_range_delete_deletes_exactly_the_listed_ids(monkeypatch):
+def test_range_delete_needs_the_confirmed_ids(monkeypatch):
     calls = _router(monkeypatch, _calendar)
+    for confirm in (None, "", " , ", "1,abc"):
+        result = asyncio.run(delete_events_by_date_range("2026-10-12", "2026-10-13", dry_run=False, confirm_ids=confirm))
+        assert result.startswith("Error:") and "Nothing was deleted" in result
+    assert not calls
+
+
+def test_range_delete_deletes_only_confirmed_ids_that_still_match(monkeypatch):
+    """R25-2/R25-3: an event added after the preview is never deleted; per-id DELETE."""
+    calendar = list(CALENDAR)
+
+    def responder(_url, method, params, _data):
+        if method == "GET":
+            wanted = set((params or {}).get("category", "").split(","))
+            return [e for e in calendar if e["category"] in wanted]
+        return {}
+
+    calls = _router(monkeypatch, responder)
+    preview = json.loads(asyncio.run(delete_events_by_date_range("2026-10-12", "2026-10-13", categories="WORKOUT,NOTE")))
+    assert [e["id"] for e in preview["events"]] == [1, 3] and 'confirm_ids="1,3"' in preview["message"]
+    calendar.append({"id": 17, "start_date_local": "2026-10-13T00:00:00", "category": "WORKOUT", "name": "Added after the preview"})
     payload = json.loads(asyncio.run(delete_events_by_date_range(
-        "2026-10-12", "2026-10-13", categories="workout,note", dry_run=False, include_paired=True)))
-    writes = _writes(calls)
-    assert len(writes) == 1 and writes[0]["method"] == "PUT" and writes[0]["url"] == "/athlete/i1/events/bulk-delete"
-    assert writes[0]["data"] == [{"id": 1}, {"id": 3}, {"id": 5}]  # the race and the sick day stay
-    assert payload["deleted_count"] == 1 and [e["id"] for e in payload["events"]] == [1, 3, 5]
+        "2026-10-12", "2026-10-13", categories="WORKOUT,NOTE", dry_run=False, confirm_ids="1,3,99")))
+    assert [(c["method"], c["url"]) for c in _writes(calls)] == [
+        ("DELETE", "/athlete/i1/events/1"), ("DELETE", "/athlete/i1/events/3")]
+    assert [e["id"] for e in payload["deleted"]] == [1, 3]
+    assert [e["id"] for e in payload["not_confirmed"]] == [17] and payload["no_longer_matching"] == ["99"]
+    assert "1 matching event(s) were not confirmed and were kept" in payload["message"]
+
+
+def test_range_delete_reports_each_id(monkeypatch):
+    def responder(url, method, params, _data):
+        if method == "GET":
+            return [e for e in CALENDAR if e["category"] in set(params["category"].split(","))]
+        if url.endswith("/1"):
+            return {"error": True, "status_code": 404, "message": "404 Not Found"}
+        return {"error": True, "status_code": 500, "message": "500 Internal Server Error"}
+
+    _router(monkeypatch, responder)
+    payload = json.loads(asyncio.run(delete_events_by_date_range(
+        "2026-10-12", "2026-10-13", categories="WORKOUT,NOTE", dry_run=False, confirm_ids="1,3")))
+    assert [e["id"] for e in payload["already_gone"]] == [1] and payload["deleted"] == []
+    assert payload["failed"][0]["id"] == 3 and "500" in payload["failed"][0]["error"]
 
 
 @pytest.mark.parametrize(
@@ -135,10 +171,39 @@ def test_blank_workout_doc_never_wipes_the_planned_workout(monkeypatch, doc):
     assert _writes(calls) == [{"url": "/athlete/i1/events/5", "method": "PUT", "params": None, "data": {"name": "Renamed"}}]
 
 
-def test_text_only_workout_doc_is_refused_on_update(monkeypatch):
+STRUCTURED = {"id": 5, "category": "WORKOUT", "workout_doc": {"steps": [{"duration": 600, "power": {"value": 60}}]}}
+TEXT_ONLY = {"id": 5, "category": "WORKOUT", "type": "WeightTraining", "description": "Squats 5x5",
+             "workout_doc": {"steps": [{"text": "Squats 5x5"}]}}
+
+
+def test_text_never_silently_replaces_a_structured_workout(monkeypatch):
+    calls = _router(monkeypatch, lambda url, method, p, d: STRUCTURED if method == "GET" else {"id": 5})
+    for kwargs in ({"workout_doc": WorkoutDoc.from_dict({"description": "Moved to Thursday"})}, {"description": "Moved to Thursday"}):
+        result = asyncio.run(add_or_update_event(event_id="5", **kwargs))
+        assert "holds a structured workout" in result and result.endswith("Nothing was changed.")
+    assert not _writes(calls)
+    asyncio.run(add_or_update_event(event_id="5", description="Easy spin instead", replace_workout=True))
+    assert _writes(calls)[0]["data"] == {"description": "Easy spin instead"}
+
+
+def test_text_only_workouts_can_be_created_and_edited(monkeypatch):
+    """R25-4: strength / yoga sessions are plain text."""
+    calls = _router(monkeypatch, lambda url, method, p, d: TEXT_ONLY if method == "GET" else {"id": 5})
+    asyncio.run(add_or_update_event(name="Strength", workout_type="WeightTraining", description="Squats 5x5\nDeadlifts 3x5", start_date="2026-10-12"))
+    asyncio.run(add_or_update_event(event_id="5", description="Squats 5x5\nPlank 3x60s"))
+    exercises = {"steps": [{"text": "Squats"}, {"text": "Deadlifts"}, {"text": "Plank"}]}
+    asyncio.run(add_or_update_event(event_id="5", workout_doc=WorkoutDoc.from_dict(exercises)))
+    writes = _writes(calls)
+    assert writes[0]["data"]["description"] == "Squats 5x5\nDeadlifts 3x5" and writes[0]["data"]["type"] == "WeightTraining"
+    assert writes[1]["data"] == {"description": "Squats 5x5\nPlank 3x60s"}
+    assert "Squats" in writes[2]["data"]["description"] and "Plank" in writes[2]["data"]["description"]
+    assert "either workout_doc or description" in asyncio.run(add_or_update_event(
+        event_id="5", description="x", workout_doc=WorkoutDoc.from_dict({"steps": [{"duration": 60, "power": {"value": 60, "units": "%ftp"}}]})))
+
+
+def test_blank_description_is_not_sent(monkeypatch):
     calls = _router(monkeypatch)
-    result = asyncio.run(add_or_update_event(event_id="5", workout_doc=WorkoutDoc.from_dict({"description": "Moved to Thursday"})))
-    assert result.startswith("Error: workout_doc has no steps") and result.endswith("Nothing was written.")
+    assert asyncio.run(add_or_update_event(event_id="5", description="  ")).startswith("Error: nothing to update")
     assert not _writes(calls)
 
 
@@ -397,3 +462,53 @@ def test_blank_names_and_messages_are_refused(monkeypatch):
     assert "must not be blank" in asyncio.run(add_activity_message("i5", "   "))
     assert asyncio.run(add_or_update_note(event_id="6", name=" ")) == "Error: name must not be blank."
     assert not calls
+
+
+# ------------------------------------------------------------------ R25-5 / R25-6 / R25-7 / R25-10
+@pytest.mark.parametrize("step", [
+    {"text": "Einfahren Rampe", "duration": 600, "power": {"value": 60, "units": "%ftp"}},
+    {"text": "Ramp warm-up", "ramp": True, "duration": 600, "power": {"start": 50, "end": 75, "units": "%ftp"}},
+    {"text": "30/30s on", "duration": 30, "power": {"value": 120, "units": "%ftp"}},
+    {"text": "Hike up", "duration": 3600, "pace": {"value": 1320, "units": "MINS_KM"}},
+])
+def test_former_false_refusals_are_accepted(step):
+    assert not validate_workout_doc({"steps": [step]}, "Ride")["errors"]
+
+
+def test_slow_swim_threshold_is_accepted():
+    assert parse_threshold_pace("3:30/100m", "SECS_100M") == pytest.approx(0.4762, abs=1e-4)
+
+
+def test_write_answers_show_validation_warnings(monkeypatch):
+    _router(monkeypatch)
+    doc = {"steps": [{"duration": 600, "warmup": True, "power": {"value": 60, "units": "%ftp"}},
+                     {"reps": 2, "warmup": True, "steps": [{"duration": 60, "power": {"value": 90, "units": "%ftp"}}]}]}
+    result = asyncio.run(add_or_update_event(name="Run", workout_type="Run", workout_doc=WorkoutDoc.from_dict(doc), start_date="2026-10-12"))
+    assert result.startswith("Successfully created") and "Validation warnings:" in result
+    assert "warmup/cooldown on a repeat block is ignored" in result and "power target on a Run" in result
+    assert "no cool-down step" not in result  # routine hints are not repeated
+
+
+def test_blank_text_on_update_never_wipes(monkeypatch):
+    calls = _router(monkeypatch, lambda url, method, p, d: {"id": 7, "category": "NOTE"} if method == "GET" else {"id": 7})
+    assert asyncio.run(add_or_update_note(event_id="7", description="")).startswith("Error: nothing to update")
+    assert "at least one of" in asyncio.run(update_activity("i5", description=""))
+    assert not _writes(calls)
+    asyncio.run(add_or_update_note(event_id="7", clear_description=True))
+    asyncio.run(update_activity("i5", clear_description=True))
+    assert [c["data"] for c in _writes(calls)] == [{"description": ""}, {"description": ""}]
+
+
+@pytest.mark.parametrize("doc,problem", [
+    ({"description": "Main set\n3x", "steps": [{"duration": 60, "power": {"value": 60, "units": "%ftp"}}]}, "workout_doc.description"),
+    ({"description": "- 10m 50%", "steps": [{"duration": 60, "power": {"value": 60, "units": "%ftp"}}]}, "workout_doc.description"),
+    ({"steps": [{"text": "Warmup"}, {"duration": 600, "power": {"value": 60, "units": "%ftp"}}]}, "warm-up/cool-down section"),
+    ({"steps": [{"text": "- extra"}, {"duration": 600, "power": {"value": 60, "units": "%ftp"}}]}, "would be read by Intervals.icu as a step"),
+])
+def test_description_and_comment_lines_are_checked_for_structure(doc, problem):
+    assert any(problem in e for e in validate_workout_doc(doc, "Ride")["errors"])
+
+
+def test_description_is_kept_apart_from_the_steps():
+    text = str(WorkoutDoc.from_dict({"description": "Threshold day", "steps": [{"duration": 600, "power": {"value": 90, "units": "%ftp"}}]}))
+    assert text.startswith("Threshold day\n\n- 10m 90% ftp")

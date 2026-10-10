@@ -281,9 +281,9 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `OAUTH_PASSWORD_HASH` / `OAUTH_USERNAME` | – / `athlete` | Password sign-in (hash: `python -m intervals_mcp_server.auth hash-password`) |
 | `OAUTH_STATE_FILE` | `./oauth_state.json` | Registered clients and refresh token digests |
 | `INTERVALS_API_BASE_URL` | `https://intervals.icu/api/v1` | API base URL |
-| `ATHLETE_TIMEZONE` | athlete profile | Time zone for "today" and default date ranges, e.g. `Europe/Vienna`; `server` uses the server clock. Unset: the `timezone` of the Intervals.icu athlete profile |
+| `ATHLETE_TIMEZONE` | athlete profile | Time zone for "today" and default date ranges, e.g. `Europe/Vienna`; `server` uses the server clock. Unset: the `timezone` of the Intervals.icu athlete profile (looked up once a day) |
 | `MCP_TOOL_MAX_REQUESTS` / `MCP_TOOL_TIMEOUT_S` | `300` / `120` | Limits of one tool call (Intervals.icu requests, seconds); a tool that hits them stops and says its result is incomplete |
-| `MCP_MAX_OUTPUT_CHARS` | `100000` | Largest tool result; longer text is cut with a note on how to get the rest, too large JSON is replaced by an error object |
+| `MCP_MAX_OUTPUT_CHARS` | `100000` | Largest tool result; longer text is cut with a note on how to get the rest, in JSON the largest lists are cut (`truncated` says what was kept) |
 
 Further OAuth options (client and redirect host allowlists, token lifetimes, rate limit) are
 listed in [docs/REMOTE_ACCESS.md](docs/REMOTE_ACCESS.md).
@@ -304,9 +304,10 @@ other tools are hidden from it and refused if called.
 Write tools that can replace existing values (`add_or_update_event`, `add_or_update_note`,
 `update_activity`, `update_wellness`) carry the MCP hint `destructiveHint: true`, so clients ask
 before running them; their class stays `write`. Nothing is created, paired, renamed or deleted
-automatically: `delete_events_by_date_range` only lists what it would delete unless it is called
-with `dry_run=false`, and touches only the named categories (default planned workouts), at most
-31 days, never workouts already paired with an activity unless asked.
+automatically: `delete_events_by_date_range` first only lists what matches; it deletes only with
+`dry_run=false` and the confirmed ids from that list (`confirm_ids`), touches only the named
+categories (default planned workouts), at most 31 days, never workouts already paired with an
+activity unless asked. Empty values from a client never wipe existing text or workouts.
 
 - Credentials never appear in logs or tool output; the Intervals.icu sign-in token is used for
   the identity check only and never stored.

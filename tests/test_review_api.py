@@ -200,10 +200,14 @@ def test_today_follows_the_athlete_profile_time_zone(monkeypatch):
     monkeypatch.delenv("ATHLETE_TIMEZONE", raising=False)
     athlete_module._ATHLETE_CACHE.clear()
     athlete_module._TIMEZONE_FAILURES.clear()
+    athlete_module._TIMEZONE_CACHE.clear()
     zones = {"i1": "Pacific/Kiritimati", "i2": "Pacific/Pago_Pago"}  # UTC+14 and UTC-11: always different days
+    urls = []
 
     async def fake_request(url=None, **_kwargs):
-        return {"id": url.rsplit("/", 1)[1], "timezone": zones[url.rsplit("/", 1)[1]]}
+        urls.append(url)
+        athlete = url.split("/")[2]
+        return {"athlete": {"id": athlete, "timezone": zones[athlete]}, "customItems": []}
 
     monkeypatch.setattr(api_client, "make_intervals_request", fake_request)
 
@@ -215,6 +219,10 @@ def test_today_follows_the_athlete_profile_time_zone(monkeypatch):
     assert east == datetime.now(ZoneInfo("Pacific/Kiritimati")).date().isoformat()
     assert west == datetime.now(ZoneInfo("Pacific/Pago_Pago")).date().isoformat()
     assert east != west
+    # The light /profile endpoint is used, once per athlete; a cleared athlete cache keeps the zone.
+    athlete_module._ATHLETE_CACHE.clear()
+    asyncio.run(guarded(athlete_id="i1"))
+    assert urls == ["/athlete/i1/profile", "/athlete/i2/profile"]
 
 
 def test_unknown_time_zone_falls_back_to_the_server_clock(monkeypatch):
@@ -434,9 +442,15 @@ def test_global_output_cap_never_cuts_silently():
     text = "line\n" * 50_000
     capped = tool_guard.cap_output(text, limit=10_000)
     assert len(capped) <= 10_000 and "[Output truncated: showing the first" in capped
-    payload = json.dumps({"rows": ["x" * 100] * 500})
-    replaced = json.loads(tool_guard.cap_output(payload, limit=10_000))
-    assert replaced["error"] == "output_too_large" and replaced["chars"] == len(payload)
+    payload = json.dumps({"athlete": "i1", "rows": [{"id": i, "text": "x" * 100} for i in range(500)]})
+    cut = tool_guard.cap_output(payload, limit=10_000)
+    shrunk = json.loads(cut)  # still valid JSON, the list is cut and says so
+    assert len(cut) <= 10_000 and shrunk["athlete"] == "i1" and shrunk["rows"][0]["id"] == 0
+    assert shrunk["truncated"] == [{"path": "rows", "kept": len(shrunk["rows"]), "total": 500}]
+    assert "detail_level" in shrunk["truncated_note"] and "offset" in shrunk["truncated_note"]
+    blob = json.dumps({"blob": "z" * 50_000})
+    replaced = json.loads(tool_guard.cap_output(blob, limit=10_000))
+    assert replaced["error"] == "output_too_large" and replaced["chars"] == len(blob)
     assert tool_guard.cap_output("small", limit=10_000) == "small"
 
 
