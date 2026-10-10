@@ -95,6 +95,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, ValidationError
 
 from intervals_mcp_server.auth_clients import ClientMetadataResolver, Fetcher, is_metadata_client_id
+from intervals_mcp_server.auth_clients import log_safe as _for_log
 from intervals_mcp_server.auth_totp import generate_secret, match_counter, normalize_secret, provisioning_uri
 
 __all__ = [
@@ -138,6 +139,9 @@ LOGIN_REQUEST_TTL = 10 * 60
 PBKDF2_ITERATIONS = 600_000
 MAX_CLIENTS = 50
 MAX_PENDING_LOGINS = 500
+MAX_CLIENT_NAME_CHARS = 100
+MAX_REDIRECT_URIS = 10
+MAX_CLIENT_METADATA_BYTES = 8 * 1024
 
 _STATE_VERSION = 1
 _HASH_PREFIX = "pbkdf2_sha256"
@@ -530,6 +534,21 @@ def _digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _check_registration_size(client_info: OAuthClientInformationFull, redirect_count: int) -> None:
+    """Bound what an unauthenticated /register request can store and log."""
+    name = client_info.client_name or ""
+    if len(name) > MAX_CLIENT_NAME_CHARS or not name.isprintable():
+        raise RegistrationError(
+            "invalid_client_metadata", f"client_name must be at most {MAX_CLIENT_NAME_CHARS} printable characters"
+        )
+    if redirect_count > MAX_REDIRECT_URIS:
+        raise RegistrationError("invalid_redirect_uri", f"at most {MAX_REDIRECT_URIS} redirect_uris are allowed")
+    if len(client_info.model_dump_json(exclude_none=True)) > MAX_CLIENT_METADATA_BYTES:
+        raise RegistrationError(
+            "invalid_client_metadata", f"client metadata must not exceed {MAX_CLIENT_METADATA_BYTES} bytes"
+        )
+
+
 def _redirect_uri_allowed(uri: str, hosts: frozenset[str] | None = None) -> bool:
     """https on an allowed host (``None`` = any host), or http on loopback."""
     parts = urlsplit(uri)
@@ -541,13 +560,30 @@ def _redirect_uri_allowed(uri: str, hosts: frozenset[str] | None = None) -> bool
 
 
 def granted_classes(scopes: list[str] | None) -> set[str] | None:
-    """Permission classes granted by token *scopes*; None = no per-token restriction.
+    """Permission classes granted by token *scopes*; None = no token, so no per-token restriction.
 
-    Tokens issued before permission scopes existed only carry ``mcp`` and keep the
-    server-wide permissions (``MCP_PERMISSIONS``).
+    A token without any ``intervals:*`` scope only gets ``read``: every token this server
+    issues names its classes, so a bare ``mcp`` token can only come from narrowing scopes
+    and must never widen the grant to the server-wide permissions.
     """
-    classes = {s[len(PERMISSION_SCOPE_PREFIX):] for s in scopes or [] if s.startswith(PERMISSION_SCOPE_PREFIX)}
-    return classes or None
+    if scopes is None:
+        return None
+    classes = {s[len(PERMISSION_SCOPE_PREFIX):] for s in scopes if s.startswith(PERMISSION_SCOPE_PREFIX)}
+    return classes or {"read"}
+
+
+def _refresh_scopes(granted: list[str], requested: list[str] | None) -> list[str]:
+    """Scopes for a refreshed token: the requested subset, but never fewer permission scopes than ``read``.
+
+    The SDK accepts any subset of the refresh token's scopes. Dropping every ``intervals:*``
+    scope keeps the grant's own permission scopes instead of producing a bare ``mcp`` token.
+    """
+    if not requested:
+        return list(granted)
+    narrowed = [scope for scope in granted if scope in requested]
+    if not any(scope.startswith(PERMISSION_SCOPE_PREFIX) for scope in narrowed):
+        narrowed += [scope for scope in granted if scope.startswith(PERMISSION_SCOPE_PREFIX)]
+    return narrowed or list(granted)
 
 
 IntervalsTokenExchange = Callable[[str], Awaitable[dict[str, Any]]]
@@ -732,7 +768,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         idle = [c for c in by_age if c.client_id not in active]
         victim = (idle or by_age)[0]
         if victim.client_id is not None:
-            logger.info("Evicting registered OAuth client %s to make room", victim.client_id)
+            logger.info("Evicting registered OAuth client %s to make room", _for_log(victim.client_id))
             del self._clients[victim.client_id]
 
     def _redirect(self, pending: _PendingLogin, **params: str | None) -> str:
@@ -772,13 +808,14 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 )
         if client_info.client_id is None:
             raise RegistrationError("invalid_client_metadata", "client_id is missing")
+        _check_registration_size(client_info, len(uris))
         self._evict_clients()
         self._clients[client_info.client_id] = client_info
         self._save_state()
         logger.info(
             "Registered OAuth client %s (%s, auth=%s)",
-            client_info.client_id,
-            client_info.client_name or "unnamed",
+            _for_log(client_info.client_id),
+            _for_log(client_info.client_name or "unnamed"),
             client_info.token_endpoint_auth_method,
         )
 
@@ -800,7 +837,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             redirect_host=urlsplit(str(params.redirect_uri)).hostname or "",
             offered=requested or self._config.permission_classes,
         )
-        logger.info("Authorization requested by client %s", client.client_id)
+        logger.info("Authorization requested by client %s", _for_log(client.client_id))
         return f"{self.login_url}?request={request_id}"
 
     async def load_authorization_code(
@@ -810,7 +847,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self._purge_expired_tokens()
         used = self._tokens.used_codes.pop(authorization_code, None)
         if used is not None:
-            logger.warning("Authorization code reused by client %s; revoking grant", client.client_id)
+            logger.warning("Authorization code reused by client %s; revoking grant", _for_log(client.client_id))
             self._revoke_grant(used[1])
             return None
         code = self._tokens.codes.get(authorization_code)
@@ -827,7 +864,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             raise TokenError("invalid_grant", "authorization code is not valid")
         grant_id = secrets.token_urlsafe(16)
         self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
-        logger.info("Issued tokens to client %s", client.client_id)
+        logger.info("Issued tokens to client %s", _for_log(client.client_id))
         return self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
 
     async def load_refresh_token(
@@ -852,8 +889,8 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         record = self._tokens.refresh.pop(_digest(refresh_token.token), None)
         if record is None or record.client_id != client.client_id:
             raise TokenError("invalid_grant", "refresh token is not valid")
-        logger.info("Refreshed tokens for client %s", client.client_id)
-        return self._issue_tokens(record.client_id, scopes or record.scopes, record.grant_id, record.resource)
+        logger.info("Refreshed tokens for client %s", _for_log(client.client_id))
+        return self._issue_tokens(record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource)
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         """Return the access token metadata used by the bearer middleware (audience-checked)."""
@@ -877,7 +914,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         record = bucket.get(_digest(token.token))
         if record is None:
             return
-        logger.info("Revoked tokens of client %s", record.client_id)
+        logger.info("Revoked tokens of client %s", _for_log(record.client_id))
         self._revoke_grant(record.grant_id)
 
     # ----- consent / sign-in support -------------------------------------- #
@@ -943,14 +980,14 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             resource=params.resource,
         )
         logger.info(
-            "Sign-in succeeded; issuing authorization code to client %s (%s)", pending.client_id, ", ".join(classes)
+            "Sign-in succeeded; issuing authorization code to client %s (%s)", _for_log(pending.client_id), ", ".join(classes)
         )
         return self._redirect(pending, code=code)
 
     def deny_login(self, request_id: str) -> str:
         """Consume the pending request and return the access_denied redirect URL."""
         pending = self._pending.pop(request_id)
-        logger.info("Authorization denied for client %s", pending.client_id)
+        logger.info("Authorization denied for client %s", _for_log(pending.client_id))
         return self._redirect(pending, error="access_denied", error_description="The athlete denied the request")
 
     # ----- sign-in with Intervals.icu -------------------------------------- #

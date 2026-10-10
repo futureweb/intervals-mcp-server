@@ -254,6 +254,15 @@ def main() -> None:
     # Validate ATHLETE_ID when server starts (not at import time to allow tests)
     validate_athlete_id(config.athlete_id)
 
+    # Plain log lines: the SDK installs rich's handler, whose rendering time grows with the
+    # square of an unbroken string's length and runs on the event loop.
+    logging.basicConfig(
+        level=mcp.settings.log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()],
+        force=True,
+    )
+
     # Setup transport and start server
     selected_transport = setup_transport()
     start_server(mcp, selected_transport, provider=oauth_provider)

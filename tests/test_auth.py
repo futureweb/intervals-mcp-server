@@ -681,3 +681,103 @@ def test_codes_and_login_requests_expire(oauth_env):
     assert asyncio.run(provider.load_authorization_code(registered, code)) is not None
     now[0] += 301
     assert asyncio.run(provider.load_authorization_code(registered, code)) is None
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: scope narrowing on refresh, registration limits, log values
+# --------------------------------------------------------------------------- #
+
+
+def obtain_granted_tokens(client: TestClient, grants: list[str]) -> tuple[str, dict[str, Any]]:
+    """Like obtain_tokens, but tick the given permission classes on the consent page."""
+    client_id = register(client)["client_id"]
+    verifier, challenge = pkce_pair()
+    request_id = start_authorization(client, client_id, challenge)
+    redirect = client.post(
+        "/oauth/login",
+        data={"request": request_id, "username": "athlete", "password": PASSWORD, "grant": grants},
+    )
+    assert redirect.status_code == 302, redirect.text
+    query = parse_qs(urlsplit(redirect.headers["location"]).query)
+    tokens = exchange_code(client, client_id, query["code"][0], verifier)
+    assert tokens.status_code == 200, tokens.text
+    return client_id, tokens.json()
+
+
+def refresh(client: TestClient, client_id: str, refresh_token: str, scope: str | None = None) -> dict[str, Any]:
+    """Run the refresh grant, optionally narrowing the scope."""
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id}
+    if scope is not None:
+        data["scope"] = scope
+    response = client.post("/token", data=data)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_refresh_with_bare_mcp_scope_keeps_the_granted_permissions(oauth_env):
+    """Narrowing to ``mcp`` on refresh must not turn a read-only grant into MCP_PERMISSIONS."""
+    client = build_app({**oauth_env, "MCP_PERMISSIONS": "read,write,destructive"})[1]
+    client_id, tokens = obtain_granted_tokens(client, [])
+    scopes = client.get("/whoami", headers=bearer(tokens["access_token"])).json()["scopes"]
+    assert sorted(scopes) == ["intervals:read", "mcp"]
+
+    narrowed = refresh(client, client_id, tokens["refresh_token"], scope="mcp")
+    assert sorted(client.get("/whoami", headers=bearer(narrowed["access_token"])).json()["scopes"]) == [
+        "intervals:read",
+        "mcp",
+    ]
+    again = refresh(client, client_id, narrowed["refresh_token"])
+    assert sorted(client.get("/whoami", headers=bearer(again["access_token"])).json()["scopes"]) == [
+        "intervals:read",
+        "mcp",
+    ]
+
+
+def test_refresh_can_still_narrow_permission_scopes(oauth_env):
+    """A client may drop write on refresh; it can never add a class it was not granted."""
+    client = build_app({**oauth_env, "MCP_PERMISSIONS": "read,write"})[1]
+    client_id, tokens = obtain_granted_tokens(client, ["write"])
+    assert "intervals:write" in client.get("/whoami", headers=bearer(tokens["access_token"])).json()["scopes"]
+    narrowed = refresh(client, client_id, tokens["refresh_token"], scope="mcp intervals:read")
+    assert sorted(client.get("/whoami", headers=bearer(narrowed["access_token"])).json()["scopes"]) == [
+        "intervals:read",
+        "mcp",
+    ]
+    widened = client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": narrowed["refresh_token"],
+            "client_id": client_id,
+            "scope": "mcp intervals:read intervals:write",
+        },
+    )
+    assert widened.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"client_name": "A" * 101},
+        {"client_name": "ChatGPT\nforged log line"},
+        {"redirect_uris": [REDIRECT_URI] * 11},
+        {"contacts": ["x" * 9000 + "@example.com"]},
+    ],
+    ids=["long-name", "control-chars", "many-redirects", "oversized"],
+)
+def test_registration_rejects_oversized_or_unprintable_metadata(client, extra):
+    """/register is unauthenticated: names, redirect lists and total size are bounded."""
+    response = client.post("/register", json={**CHATGPT_REGISTRATION, **extra})
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] in ("invalid_client_metadata", "invalid_redirect_uri")
+    assert register(client)["client_name"] == "ChatGPT"
+
+
+def test_log_safe_clips_and_escapes():
+    """Client-supplied values are escaped and clipped before they reach a log line."""
+    from intervals_mcp_server.auth_clients import log_safe  # pylint: disable=import-outside-toplevel
+
+    assert log_safe("ChatGPT") == "ChatGPT"
+    assert log_safe("a\nb") == "a\\nb"
+    clipped = log_safe("x" * 1000)
+    assert clipped.startswith("x" * 120) and clipped.endswith("(+880 chars)") and len(clipped) < 140

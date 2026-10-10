@@ -39,6 +39,7 @@ __all__ = [
     "ClientAssertionVerifier",
     "ClientMetadataResolver",
     "is_metadata_client_id",
+    "log_safe",
 ]
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,17 @@ MAX_ASSERTION_LIFETIME = 600
 CLOCK_SKEW = 30
 ASSERTION_ALGORITHMS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384"]
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+MAX_LOGGED_CHARS = 120
 
 Fetcher = Callable[[str], Awaitable[tuple[int, dict[str, str], bytes]]]
+
+
+def log_safe(value: object, limit: int = MAX_LOGGED_CHARS) -> str:
+    """A client-supplied value made safe for a log line: escaped and clipped."""
+    text = str(value)
+    if not text.isprintable():
+        text = text.encode("unicode_escape").decode("ascii")
+    return text if len(text) <= limit else f"{text[:limit]}…(+{len(text) - limit} chars)"
 
 
 def is_metadata_client_id(client_id: str) -> bool:
@@ -170,13 +180,13 @@ class ClientMetadataResolver:
         try:
             status, headers, body = await self._fetch(url)
         except (httpx.HTTPError, OSError) as exc:
-            logger.warning("Client metadata document %s could not be fetched: %s", url, type(exc).__name__)
+            logger.warning("Client metadata document %s could not be fetched: %s", log_safe(url), type(exc).__name__)
             return _CachedDocument(None, self._clock() + NEGATIVE_CACHE_SECONDS)
         problem, client, jwks_uri = self._validate(url, status, body)
         if problem:
-            logger.warning("Client metadata document %s rejected: %s", url, problem)
+            logger.warning("Client metadata document %s rejected: %s", log_safe(url), log_safe(problem))
             return _CachedDocument(None, self._clock() + NEGATIVE_CACHE_SECONDS)
-        logger.info("Client metadata document %s accepted (%s)", url, client.client_name if client else "")
+        logger.info("Client metadata document %s accepted (%s)", log_safe(url), log_safe(client.client_name if client else ""))
         return _CachedDocument(client, self._clock() + _cache_seconds(headers), jwks_uri)
 
     def _validate(  # pylint: disable=too-many-return-statements
