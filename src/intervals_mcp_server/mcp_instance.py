@@ -22,6 +22,7 @@ from mcp.types import GetPromptResult, Icon, TextContent, ToolAnnotations
 from mcp.types import Tool as MCPTool
 from pydantic import AnyUrl
 
+from intervals_mcp_server import __version__
 from intervals_mcp_server.api.client import setup_api_client
 from intervals_mcp_server.auth import (
     CredentialError,
@@ -229,6 +230,8 @@ mcp: IntervalsFastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
     "intervals-icu", instructions=SERVER_INSTRUCTIONS, website_url=WEBSITE_URL, icons=server_icons(os.environ),
     lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
 )
+# serverInfo.version: this package's version (the SDK would report its own version otherwise).
+mcp._mcp_server.version = __version__  # pylint: disable=protected-access
 mcp.toolset = get_config().toolset
 install_icon_routes(mcp)
 if oauth_provider is not None:
