@@ -18,7 +18,8 @@ Usage:
     from environment variables (optionally via a .env file) and communicates with the Intervals.icu API.
 
     To run the server:
-        $ python src/intervals_mcp_server/server.py
+        $ futureweb-intervals-mcp            (console script, see intervals_mcp_server.cli)
+        $ python src/intervals_mcp_server/server.py   (same, kept for existing setups)
 
     MCP tools provided:
         - get_activities
@@ -49,19 +50,32 @@ Usage:
     See the README for more details on configuration and usage.
 """
 
-import logging
+if __name__ == "__main__":
+    # Run as a script: let the CLI handle the flags and report configuration errors in one
+    # line before the server modules (OAuth state, FastMCP settings) are imported.
+    from intervals_mcp_server.cli import main as _cli_main
+
+    raise SystemExit(_cli_main())
+
+# pylint: disable=wrong-import-position
+import logging  # noqa: E402
 
 # Import API client and configuration
-from intervals_mcp_server.api.client import (
+from intervals_mcp_server.api.client import (  # noqa: E402
     httpx_client,  # Re-export for backward compatibility with tests
     make_intervals_request,
 )
-from intervals_mcp_server.config import get_config
-from intervals_mcp_server.mcp_instance import mcp, oauth_provider
+from intervals_mcp_server.config import get_config  # noqa: E402
+from intervals_mcp_server.mcp_instance import mcp, oauth_provider  # noqa: E402
 
 # Import types and validation
-from intervals_mcp_server.server_setup import setup_transport, start_server
-from intervals_mcp_server.utils.validation import validate_athlete_id
+from intervals_mcp_server.server_setup import (  # noqa: E402
+    NETWORK_TRANSPORTS,
+    configure_logging,
+    setup_transport,
+    start_server,
+)
+from intervals_mcp_server.utils.validation import validate_athlete_id  # noqa: E402
 
 # Configure logging
 logging.basicConfig(
@@ -156,11 +170,7 @@ from intervals_mcp_server.tools.workout_check import (  # pylint: disable=wrong-
     preview_workout,
     validate_workout,
 )
-from intervals_mcp_server.tools.status import (  # pylint: disable=wrong-import-position  # noqa: E402
-    format_status,
-    get_server_status,
-    server_status,
-)
+from intervals_mcp_server.tools.status import get_server_status  # pylint: disable=wrong-import-position  # noqa: E402
 
 # Re-export make_intervals_request and httpx_client for backward compatibility
 # pylint: disable=duplicate-code  # This __all__ list is intentionally similar to tools/__init__.py
@@ -231,34 +241,23 @@ __all__ = [
 ]
 
 
-def _cli() -> bool:
-    """Handle --version / --doctor; returns True when the process should exit."""
-    import asyncio  # pylint: disable=import-outside-toplevel
-    import sys  # pylint: disable=import-outside-toplevel
-
-    from intervals_mcp_server import __version__  # pylint: disable=import-outside-toplevel
-
-    if "--version" in sys.argv:
-        print(__version__)
-        return True
-    if "--doctor" in sys.argv:
-        print(format_status(asyncio.run(server_status())))
-        return True
-    return False
-
-
-def main() -> None:
-    """Console entry point: handle CLI flags, validate the configuration and start the server."""
-    if _cli():
-        raise SystemExit(0)
+def run() -> None:
+    """Validate the configuration and start the server (flags are handled by :mod:`intervals_mcp_server.cli`)."""
     # Validate ATHLETE_ID when server starts (not at import time to allow tests)
     validate_athlete_id(config.athlete_id)
+    configure_logging(mcp.settings.log_level)
 
     # Setup transport and start server
     selected_transport = setup_transport()
+    if selected_transport in NETWORK_TRANSPORTS:
+        missing = [name for name, value in (("API_KEY", config.api_key), ("ATHLETE_ID", config.athlete_id)) if not value]
+        if missing:
+            logger.warning("%s not set: every tool call needs it as an argument and will fail otherwise", " and ".join(missing))
     start_server(mcp, selected_transport, provider=oauth_provider)
 
 
-# Run the server
-if __name__ == "__main__":
-    main()
+def main() -> None:
+    """Entry point kept for existing callers: same as the ``futureweb-intervals-mcp`` command."""
+    from intervals_mcp_server.cli import main as cli_main  # pylint: disable=import-outside-toplevel
+
+    raise SystemExit(cli_main())

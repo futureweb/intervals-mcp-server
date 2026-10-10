@@ -5,102 +5,32 @@ This module provides a shared FastMCP instance that can be imported by both
 the server module and tool modules without creating cyclic imports.
 """
 
-import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any, TypeVar, cast
-from urllib.parse import urlsplit
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from intervals_mcp_server.api.client import setup_api_client
 from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 
-# FastMCP passes explicit defaults (e.g. host="127.0.0.1", port=8000) to its
-# settings model, which take precedence over FASTMCP_* environment variables.
-# We therefore read the documented variables ourselves and pass them explicitly.
-_ENV_STRING_SETTINGS = {
-    "FASTMCP_HOST": "host",
-    "FASTMCP_LOG_LEVEL": "log_level",
-    "FASTMCP_MOUNT_PATH": "mount_path",
-    "FASTMCP_SSE_PATH": "sse_path",
-    "FASTMCP_MESSAGE_PATH": "message_path",
-    "FASTMCP_STREAMABLE_HTTP_PATH": "streamable_http_path",
-}
+# Re-exported: the FASTMCP_* helpers live in server_setup so that --doctor can check them
+# without building the server.
+from intervals_mcp_server.server_setup import fastmcp_settings_from_env, transport_security_from_env
 
-
-_LOCAL_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-_LOCAL_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
-
-
-def _env_list(env: Mapping[str, str], name: str) -> list[str]:
-    return [item.strip() for item in env.get(name, "").split(",") if item.strip()]
-
-
-def transport_security_from_env(environ: Mapping[str, str] | None = None) -> TransportSecuritySettings | None:
-    """Host/Origin allowlist for the HTTP transports (DNS rebinding protection).
-
-    The MCP SDK enables DNS rebinding protection for servers bound to localhost and then
-    accepts only localhost Host headers, which breaks a reverse proxy that preserves the
-    public Host header. The public host is allowed automatically from ``MCP_PUBLIC_URL``;
-    further hosts and origins come from ``FASTMCP_ALLOWED_HOSTS`` / ``FASTMCP_ALLOWED_ORIGINS``
-    (comma-separated, ``host`` or ``host:*``; ``FASTMCP_ALLOWED_HOSTS=*`` turns the check off).
-    Returns None (SDK default) when nothing is configured.
-    """
-    env = os.environ if environ is None else environ
-    hosts = _env_list(env, "FASTMCP_ALLOWED_HOSTS")
-    origins = _env_list(env, "FASTMCP_ALLOWED_ORIGINS")
-    public = env.get("MCP_PUBLIC_URL", "").strip()
-    if public:
-        parts = urlsplit(public)
-        if parts.netloc:
-            hosts.append(parts.netloc)
-            origins.append(f"{parts.scheme}://{parts.netloc}")
-    if not hosts and not origins:
-        return None
-    if "*" in hosts:
-        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=list(dict.fromkeys(_LOCAL_HOSTS + hosts)),
-        allowed_origins=list(dict.fromkeys(_LOCAL_ORIGINS + origins)),
-    )
-
-
-def fastmcp_settings_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Build FastMCP keyword arguments from FASTMCP_* environment variables.
-
-    Only variables that are set (and non-empty) are returned, so FastMCP's own
-    defaults still apply otherwise.
-
-    Raises:
-        ValueError: If FASTMCP_PORT is set but is not a valid integer.
-    """
-    env = os.environ if environ is None else environ
-    settings: dict[str, Any] = {}
-
-    for var, key in _ENV_STRING_SETTINGS.items():
-        value = env.get(var, "").strip()
-        if value:
-            settings[key] = value.upper() if key == "log_level" else value
-
-    port = env.get("FASTMCP_PORT", "").strip()
-    if port:
-        try:
-            settings["port"] = int(port)
-        except ValueError as exc:
-            raise ValueError(f"FASTMCP_PORT must be an integer, got {port!r}") from exc
-
-    security = transport_security_from_env(env)
-    if security is not None:
-        settings["transport_security"] = security
-
-    return settings
-
+__all__ = [
+    "IntervalsFastMCP",
+    "disabled_tools",
+    "fastmcp_settings_from_env",
+    "mcp",
+    "oauth_provider",
+    "tool",
+    "tool_permissions",
+    "transport_security_from_env",
+]
 
 class IntervalsFastMCP(FastMCP[Any]):
     """FastMCP that honours the permission scopes of an OAuth access token.

@@ -15,6 +15,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from intervals_mcp_server import auth
+from tests.oauth_helpers import submit_consent
 from intervals_mcp_server.auth import (
     SingleUserOAuthProvider,
     auth_settings,
@@ -131,7 +132,7 @@ def test_api_key_sign_in_flow(tmp_path):
     page = client.get("/oauth/login", params={"request": request_id}).text
     assert 'name="api_key"' in page and "Sign in with API key" in page
     assert 'name="password"' not in page and 'name="totp"' not in page and API_KEY not in page
-    response = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": API_KEY, "grant": ["read", "write"]})
+    response = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": API_KEY, "grant": ["read", "write"]})
     assert response.status_code == 302 and response.headers["location"].startswith(REDIRECT)
     token = client.post("/token", data={"grant_type": "authorization_code", "code": query(response)["code"],
                                         "redirect_uri": REDIRECT, "client_id": client_id, "code_verifier": verifier})
@@ -142,16 +143,16 @@ def test_wrong_api_key_is_rejected_and_rate_limited(tmp_path):
     _, client = make_client(make_env(tmp_path, OAUTH_LOGIN_RATE_LIMIT="3"))
     _, _, request_id = start(client)
     for _ in range(3):
-        response = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": "nope"})
+        response = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": "nope"})
         assert response.status_code == 401 and "Invalid credentials." in response.text
-    blocked = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": API_KEY})
+    blocked = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": API_KEY})
     assert blocked.status_code == 429
 
 
 def test_password_action_refused_when_only_api_key_is_enabled(tmp_path):
     _, client = make_client(make_env(tmp_path, OAUTH_PASSWORD_HASH=auth.hash_password("pw", 1), OAUTH_LOGIN="apikey"))
     _, _, request_id = start(client)
-    response = client.post("/oauth/login", data={"request": request_id, "action": "password", "username": "athlete", "password": "pw"})
+    response = submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": "pw"})
     assert response.status_code == 400
 
 
@@ -190,15 +191,15 @@ def test_sign_in_with_second_factor_and_replay_protection(tmp_path):
     _, _, request_id = start(client)
     page = client.get("/oauth/login", params={"request": request_id}).text
     assert 'name="totp"' in page and "Authenticator code" in page
-    missing = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": API_KEY})
+    missing = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": API_KEY})
     assert missing.status_code == 401 and "authenticator code" in missing.text
-    wrong_key = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": "x", "totp": totp(secret, clock.now)})
+    wrong_key = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": "x", "totp": totp(secret, clock.now)})
     assert wrong_key.status_code == 401
     clock.now += 30  # the previous code was consumed by the failed attempt's check; use the next step
-    ok = client.post("/oauth/login", data={"request": request_id, "action": "apikey", "api_key": API_KEY, "totp": totp(secret, clock.now)})
+    ok = submit_consent(client, {"request": request_id, "action": "apikey", "api_key": API_KEY, "totp": totp(secret, clock.now)})
     assert ok.status_code == 302
     _, _, second_request = start(client)
-    replay = client.post("/oauth/login", data={"request": second_request, "action": "apikey", "api_key": API_KEY, "totp": totp(secret, clock.now)})
+    replay = submit_consent(client, {"request": second_request, "action": "apikey", "api_key": API_KEY, "totp": totp(secret, clock.now)})
     assert replay.status_code == 401
 
 
@@ -208,8 +209,8 @@ def test_password_sign_in_also_needs_the_code(tmp_path):
     env = make_env(tmp_path, OAUTH_LOGIN="password", OAUTH_PASSWORD="pw", OAUTH_TOTP_SECRET=secret)
     _, client = make_client(env, clock)
     _, _, request_id = start(client)
-    assert client.post("/oauth/login", data={"request": request_id, "action": "password", "username": "athlete", "password": "pw"}).status_code == 401
-    ok = client.post("/oauth/login", data={"request": request_id, "action": "password", "username": "athlete", "password": "pw", "totp": totp(secret, clock.now)})
+    assert submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": "pw"}).status_code == 401
+    ok = submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": "pw", "totp": totp(secret, clock.now)})
     assert ok.status_code == 302
 
 

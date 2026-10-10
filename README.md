@@ -211,6 +211,9 @@ final versions, beta tags such as `1.0.0b1` explicitly):
 docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:1.0.0b1
 ```
 
+With `MCP_AUTH=oauth` mount a volume on `/data` (the image keeps `OAUTH_STATE_FILE` there), e.g.
+`-v intervals-mcp:/data`; otherwise every re-created container disconnects all clients.
+
 ## Connect an AI client
 
 ### Claude Desktop and Claude Code (local, stdio)
