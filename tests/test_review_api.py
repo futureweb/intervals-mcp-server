@@ -183,7 +183,7 @@ def test_seg_confines_an_internal_id_to_one_segment(monkeypatch):
     url = f"/athlete/i1/events/{api_client.seg('a/b')}"
     assert url == "/athlete/i1/events/a%2Fb"
     assert "Invalid identifier" in _request(url, api_key=KEY, method="DELETE")["message"] and not sent
-    assert api_client.seg("i194378945") == "i194378945" and api_client.seg(12) == "12"
+    assert api_client.seg("i900000001") == "i900000001" and api_client.seg(12) == "12"
 
 
 def test_every_value_in_an_api_path_goes_through_seg():
@@ -302,8 +302,8 @@ def test_weekly_summary_with_the_alias_zero(monkeypatch):
 
     async def fake_request(url=None, **_kwargs):
         if url == "/athlete/0":
-            return {"id": "i219504"}
-        return [{"athlete_id": "i219504", "date": "2026-10-05", "count": 3, "time": 3600},
+            return {"id": "i765432"}
+        return [{"athlete_id": "i765432", "date": "2026-10-05", "count": 3, "time": 3600},
                 {"athlete_id": "i777", "date": "2026-10-05", "count": 9}]
 
     monkeypatch.setattr("intervals_mcp_server.tools.training_review.make_intervals_request", fake_request)

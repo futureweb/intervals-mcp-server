@@ -102,9 +102,9 @@ def _plain(value: Any) -> str:
 
 
 def canonical_athlete_id(value: Any) -> str:
-    """The form Intervals.icu paths accept: ``219504``, ``I219504`` and ``i219504`` become ``i219504``.
+    """The form Intervals.icu paths accept: ``765432``, ``I765432`` and ``i765432`` become ``i765432``.
 
-    (``/athlete/219504/...`` answers 404; the ``i`` prefix is required.) Other values are
+    (``/athlete/765432/...`` answers 404; the ``i`` prefix is required.) Other values are
     returned stripped and unchanged.
     """
     plain = _plain(value)
