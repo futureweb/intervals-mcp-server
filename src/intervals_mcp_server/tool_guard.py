@@ -73,8 +73,74 @@ def identifier_error(arguments: dict[str, Any]) -> str | None:
     return None
 
 
+_PAGING_HINT = (
+    "Get the rest with a narrower request: detail_level=\"standard\" or \"compact\" where the tool has it, "
+    "a shorter date range, limit/offset paging, start_index for streams, or the text output."
+)
+
+
+def _lists(value: Any, path: str = "", depth: int = 0) -> list[tuple[str, list[Any]]]:
+    """(path, list) of every list with more than one item, up to four levels deep."""
+    found: list[tuple[str, list[Any]]] = []
+    if depth > 4:
+        return found
+    if isinstance(value, list):
+        if len(value) > 1:
+            found.append((path or "$", value))
+        for index, item in enumerate(value[:50]):
+            found.extend(_lists(item, f"{path}[{index}]", depth + 1))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(_lists(item, f"{path}.{key}" if path else str(key), depth + 1))
+    return found
+
+
+def _shrink_json(payload: Any, limit: int) -> str | None:
+    """Valid JSON within limit by cutting the largest lists (with a "truncated" note), or None."""
+    root = payload if isinstance(payload, dict) else {"items": payload}
+    truncated: list[dict[str, Any]] = []
+    root["truncated"] = truncated
+    root["truncated_note"] = (
+        "Lists were cut to fit the size limit of one tool result (see truncated: kept items are the first ones). "
+        + _PAGING_HINT
+    )
+
+    def size() -> int:
+        return len(json.dumps(root, ensure_ascii=False))
+
+    for _ in range(8):
+        if size() <= limit:
+            break
+        candidates = sorted(_lists(root), key=lambda item: len(json.dumps(item[1], ensure_ascii=False)), reverse=True)
+        candidates = [c for c in candidates if c[0] != "truncated"]
+        if not candidates:
+            break
+        path, items = candidates[0]
+        original = list(items)
+        entry = {"path": path, "kept": len(original), "total": len(original)}
+        truncated.append(entry)  # counted in the size while searching
+        low, high = 1, len(original) - 1  # keep as many leading items as fit
+        while low < high:
+            middle = (low + high + 1) // 2
+            items[:] = original[:middle]
+            if size() <= limit:
+                low = middle
+            else:
+                high = middle - 1
+        items[:] = original[:low]
+        entry["kept"] = low
+    if size() > limit:
+        return None
+    return json.dumps(root, ensure_ascii=False)
+
+
 def cap_output(result: Any, limit: int | None = None) -> Any:
-    """Keep a tool result below the size limit, never silently."""
+    """Keep a tool result below the size limit, never silently.
+
+    Text is cut at a line boundary with a note. JSON stays valid JSON: the largest lists are
+    cut (first items kept) and a "truncated" entry says which and how many; only when that
+    cannot help is the result replaced by an error object with the paging hints.
+    """
     if not isinstance(result, str):
         return result
     limit = limit or max_output_chars()
@@ -83,20 +149,19 @@ def cap_output(result: Any, limit: int | None = None) -> Any:
     stripped = result.lstrip()
     if stripped[:1] in ("{", "["):
         try:
-            json.loads(stripped)
+            payload = json.loads(stripped)
         except ValueError:
             pass
         else:
+            shrunk = _shrink_json(payload, limit - 500)
+            if shrunk is not None:
+                return shrunk
             return json.dumps(
                 {
                     "error": "output_too_large",
                     "chars": len(result),
                     "limit": limit,
-                    "message": (
-                        f"The JSON result has {len(result)} characters, more than the limit of {limit}. "
-                        "Ask for less: a shorter date range, fewer items (limit/offset), the tool's "
-                        "paging parameters (e.g. start_index for streams) or the text output."
-                    ),
+                    "message": f"The JSON result has {len(result)} characters, more than the limit of {limit}. " + _PAGING_HINT,
                 }
             )
     note_room = 400
@@ -106,8 +171,8 @@ def cap_output(result: Any, limit: int | None = None) -> Any:
     return (
         result[:cut]
         + f"\n\n[Output truncated: showing the first {cut} of {len(result)} characters (limit {limit}). "
-        "Get the rest with a narrower request: a shorter date range, fewer items (limit/offset) or the "
-        "tool's paging parameters (e.g. start_index for streams, start_date for wellness).]"
+        + _PAGING_HINT
+        + "]"
     )
 
 

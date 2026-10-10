@@ -337,12 +337,12 @@ def unsafe_path_reason(url: str) -> str | None:
     return None
 
 
-def scrub_secrets(value: Any) -> Any:
+def redact_secret_fields(value: Any) -> Any:
     """Recursively drop secret fields from API data before it reaches a tool."""
     if isinstance(value, dict):
-        return {k: scrub_secrets(v) for k, v in value.items() if k not in SECRET_FIELDS}
+        return {k: redact_secret_fields(v) for k, v in value.items() if k not in SECRET_FIELDS}
     if isinstance(value, list):
-        return [scrub_secrets(v) for v in value]
+        return [redact_secret_fields(v) for v in value]
     return value
 
 
@@ -366,7 +366,7 @@ def _parse_response(
         logger.error("Invalid JSON in response from: %s", full_url)
         return {"error": True, "status_code": status, "message": f"Invalid JSON in response (HTTP {status})"}
     response.raise_for_status()
-    return scrub_secrets(response_data)
+    return redact_secret_fields(response_data)
 
 
 def _transport_error(error: Exception, method: str) -> tuple[str, bool]:
@@ -377,9 +377,10 @@ def _transport_error(error: Exception, method: str) -> tuple[str, bool]:
     not_sent = isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
     maybe_applied = method != "GET" and not not_sent
     if maybe_applied:
+        consequence = "nothing is created twice" if method == "POST" else "you know what is left"
         text += (
             ". The request may still have reached Intervals.icu and been applied; check the current "
-            "state (e.g. get_events or the activity) before retrying, so nothing is created twice."
+            f"state (e.g. get_events or the activity) before retrying, so {consequence}."
         )
     return text, maybe_applied
 
