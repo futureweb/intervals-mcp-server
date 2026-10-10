@@ -7,7 +7,6 @@ workout on the calendar.
 """
 
 import json
-import re
 from typing import Any
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
@@ -19,7 +18,7 @@ from intervals_mcp_server.utils.validation import (
     resolve_athlete_id,
     validate_date,
 )
-from intervals_mcp_server.utils.workout_validation import workout_text_for_write, write_refusal
+from intervals_mcp_server.utils.workout_validation import has_step_lines, warnings_note, workout_text_for_write, write_refusal
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -192,7 +191,7 @@ async def _resolve_folder_id(
 
 
 @tool("write")
-async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+async def create_library_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
     name: str,
     sport_type: str,
     folder: str | None = None,
@@ -230,9 +229,12 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
             return f"Error: {key} must not be negative."
     workout_type = resolve_activity_type(name, sport_type)
     # A doc with steps wins; a blank doc ({} / {"steps": []}) falls back to the description.
-    text, problem = workout_text_for_write(workout_doc, workout_type, allow_text_only=description is None)
-    if problem:
-        return write_refusal(problem)
+    workout = workout_text_for_write(workout_doc, workout_type)
+    if workout.problem:
+        return write_refusal(workout.problem)
+    text = workout.text
+    if text is not None and workout.text_only and description is not None and description.strip():
+        return "Error: pass the text either as description or as workout_doc, not both. Nothing was written."
 
     folder_id, error = await _resolve_folder_id(athlete_id_to_use, api_key, folder)
     if error:
@@ -261,13 +263,8 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     if isinstance(result, dict) and "error" in result:
         return f"Error creating library workout: {result.get('message', 'Unknown error')}"
     if isinstance(result, dict) and result.get("id") is not None:
-        return f"Successfully created library workout id: {result.get('id')} in folder {folder_id}"
+        return f"Successfully created library workout id: {result.get('id')} in folder {folder_id}" + warnings_note(workout.warnings)
     return f"No library workout created for athlete {athlete_id_to_use}."
-
-
-def _has_step_lines(text: str) -> bool:
-    """True when workout text contains at least one step line ("- 10m 55%") or repeat ("3x")."""
-    return re.search(r"^\s*(?:-|\d+\s*x\b)", text, re.MULTILINE | re.IGNORECASE) is not None
 
 
 @tool("write")
@@ -328,7 +325,7 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
     if isinstance(result, dict) and result.get("id") is not None:
         note = ""
         steps = (workout.get("workout_doc") or {}).get("steps") if isinstance(workout.get("workout_doc"), dict) else None
-        if steps and not _has_step_lines(str(workout.get("description") or "")):
+        if steps and not has_step_lines(str(workout.get("description") or "")):
             note = (
                 " Note: the library workout's structure is not in its description text (e.g. imported from a "
                 "file), so the event was created WITHOUT steps; check it with get_event_by_id."

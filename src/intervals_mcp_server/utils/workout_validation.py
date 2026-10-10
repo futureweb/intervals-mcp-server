@@ -6,7 +6,7 @@ target units per sport, ramps and ranges, warm-up/cool-down, and the total durat
 """
 
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -22,11 +22,12 @@ PACE_UNITS = {"%pace", "pace_zone", "MINS_KM", "MINS_MILE", "SECS_100M", "SECS_1
 CADENCE_UNITS = {"cadence", "rpm"}
 # Units each target kind may use: an HR target in %ftp would be written as a power target.
 UNITS_BY_KIND = {"power": POWER_UNITS, "hr": HR_UNITS, "pace": PACE_UNITS, "cadence": CADENCE_UNITS}
-# Plausible absolute paces in seconds per unit distance (2:30-20:00/km, 0:50-6:00/100m ...);
+# Plausible absolute paces in seconds per unit distance (2:20-40:00/km, 0:50-6:00/100m ...);
 # outside these the units are almost certainly wrong (e.g. 1.75 SECS_100M = 0:02/100m).
+# The slow ends include walking and hiking (40:00/km).
 ABSOLUTE_PACE_SECONDS = {
-    "MINS_KM": (150, 1200),
-    "MINS_MILE": (240, 1930),
+    "MINS_KM": (140, 2400),
+    "MINS_MILE": (210, 3860),
     "SECS_100M": (50, 360),
     "SECS_100Y": (45, 330),
     "SECS_500M": (75, 300),
@@ -47,31 +48,67 @@ PLAUSIBLE = {
 }
 DURATION_TOLERANCE_S = 60
 
-# Step labels are written BEFORE the duration ("- Sprint 40mtr Z5 HR"), unescaped: anything
-# Intervals.icu reads as workout syntax would change the step. Labels must stay plain words.
-_LABEL_SYNTAX = (
-    (re.compile(r"[\r\n]"), "a line break (starts a new step)"),
-    (re.compile(r"\d+\s*x(?![a-z])", re.I), "a repeat count such as 3x"),
-    (re.compile(r"\d+(?:\.\d+)?\s*(?:h|hr|hrs|m|min|mins|s|sec|secs)(?![a-z])", re.I), "a duration such as 2m or 30s"),
-    (re.compile(r"\d+(?:\.\d+)?\s*(?:km|mi|mtr|y|yd|yds)(?![a-z])", re.I), "a distance such as 400mtr"),
-    (re.compile(r"\d+(?:\.\d+)?\s*%"), "a % target"),
-    (re.compile(r"\d+\s*w(?![a-z])", re.I), "a power target in watts"),
-    (re.compile(r"\d+\s*(?:rpm|bpm|spm)(?![a-z])", re.I), "a cadence or heart rate"),
-    (re.compile(r"(?<![a-z0-9])z\d", re.I), "a zone such as Z2"),
-    (re.compile(r"\d+:\d\d"), "a pace or time such as 4:30"),
-    (re.compile(r"(?<![a-z])(?:ramp|freeride|free ride|maxeffort|max effort|hidepower|intensity=)", re.I),
-     "a workout keyword (ramp, freeride, max effort, hidepower, intensity=)"),
+# Step labels are written BEFORE the duration ("- Sprint 40mtr Z5 HR"), unescaped: a word of the
+# label that Intervals.icu reads as workout syntax would change the step. The checks work on
+# whitespace-separated words, so "30/30s" or "Rampe" stay plain labels while "2m" or "Z2" do not.
+_TOKEN_SYNTAX = (
+    (re.compile(r"\d+x(?:\d.*)?", re.I), "a repeat count such as 3x"),
+    (re.compile(r"(?:\d+(?:\.\d+)?(?:h|hr|hrs|m|min|mins|s|sec|secs))+", re.I), "a duration such as 2m or 30s"),
+    (re.compile(r"\d+(?:\.\d+)?(?:km|mi|mtr|y|yd|yds)", re.I), "a distance such as 400mtr"),
+    (re.compile(r"\d+(?:-\d+)?w", re.I), "a power target in watts"),
+    (re.compile(r"\d+(?:-\d+)?(?:rpm|bpm|spm)", re.I), "a cadence or heart rate"),
+    (re.compile(r"z\d(?:-z?\d)?", re.I), "a zone such as Z2"),
+    (re.compile(r"\d+:\d\d(?:-\d+:\d\d)?(?:/\w+)?", re.I), "a pace or time such as 4:30"),
+    (re.compile(r"intensity=.*", re.I), "the keyword intensity="),
 )
+_TEXT_SYNTAX = (
+    (re.compile(r"[\r\n]"), "a line break (starts a new step)"),
+    (re.compile(r"\d+(?:\.\d+)?\s*%"), "a % target"),
+)
+# Keywords, unless the step carries the same flag anyway ("Ramp warm-up" on a ramp step).
+_KEYWORDS = {"ramp": "ramp", "freeride": "freeride", "free ride": "freeride", "maxeffort": "maxeffort",
+             "max effort": "maxeffort", "hidepower": "hidepower"}
+_KEYWORD_RE = re.compile(r"(?<![a-z])(ramp|freeride|free ride|maxeffort|max effort|hidepower)(?![a-z])", re.I)
+# A text-only line that Intervals.icu reads as structure: a step ("- ..."), a repeat ("3x"),
+# or a section header that turns the following steps into warm-up / cool-down.
+_STRUCTURE_LINE = re.compile(r"\s*(?:-|\d+\s*x\b|(?:warm\s*-?\s*up|cool\s*-?\s*down)\s*:?\s*$)", re.I)
 
 
-def label_problem(text: Any) -> str | None:
-    """Why a step label would be read as workout syntax, or None when it is a plain label."""
+def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> str | None:
+    """Why a step label would be read as workout syntax, or None when it is a plain label.
+
+    flags: keywords the step already carries (ramp, freeride, maxeffort, hidepower); the same
+    word in the label then changes nothing.
+    """
     if not isinstance(text, str):
         return "must be a string"
-    for pattern, meaning in _LABEL_SYNTAX:
+    for pattern, meaning in _TEXT_SYNTAX:
         found = pattern.search(text)
         if found:
             return f"contains {found.group(0).strip() or found.group(0)!r}, which Intervals.icu would read as {meaning}"
+    for word in text.split():
+        token = word.strip(",;()[]{}!?\"'")
+        for pattern, meaning in _TOKEN_SYNTAX:
+            if token and pattern.fullmatch(token):
+                return f"contains {token!r}, which Intervals.icu would read as {meaning}"
+    for found in _KEYWORD_RE.finditer(text):
+        if _KEYWORDS[found.group(1).lower()] not in flags:
+            return (
+                f"contains {found.group(1)!r}, which Intervals.icu would read as a workout keyword "
+                "(ramp, freeride, max effort, hidepower)"
+            )
+    return None
+
+
+def structure_line_problem(text: Any) -> str | None:
+    """Why a text-only line (comment step, description line) would be read as structure."""
+    if isinstance(text, str):
+        for line in text.splitlines() or [text]:
+            if _STRUCTURE_LINE.match(line):
+                return (
+                    f"line {line.strip()!r} would be read by Intervals.icu as a step, a repeat or a warm-up/"
+                    "cool-down section; put structure into steps"
+                )
     return None
 
 
@@ -122,7 +159,11 @@ def _check_value(kind: str, value: Any, path: str, errors: list[str], warnings: 
 def _check_label(step: dict[str, Any], path: str, errors: list[str]) -> None:
     if step.get("text") is None:
         return
-    problem = label_problem(step["text"])
+    flags = {key for key in ("ramp", "freeride", "maxeffort", "hidepower") if step.get(key)}
+    problem = label_problem(step["text"], flags)
+    timed = any(step.get(k) is not None for k in ("duration", "distance", "reps", "steps"))
+    if problem is None and not timed:
+        problem = structure_line_problem(step["text"])  # a comment line on its own
     if problem:
         errors.append(
             f"{path}: text {step['text']!r} {problem}; keep labels to plain words and put durations, "
@@ -227,6 +268,9 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
     if not isinstance(steps, list) or not steps:
         errors.append("workout_doc.steps must be a non-empty list")
         steps = []
+    description_problem = structure_line_problem(doc.get("description"))
+    if description_problem:
+        errors.append(f"workout_doc.description: {description_problem}")
     totals: dict[str, Any] = {"duration": 0.0, "distance": 0.0, "open": 0, "work": 0, "steps": 0}
     for index, step in enumerate(steps, 1):
         if not isinstance(step, dict):
@@ -324,41 +368,73 @@ def is_blank_workout_doc(workout_doc: Any) -> bool:
     return not data.get("steps") and not (isinstance(description, str) and description.strip())
 
 
-def workout_text_for_write(  # pylint: disable=too-many-return-statements
-    workout_doc: Any, workout_type: str | None, *, allow_text_only: bool = False
-) -> tuple[str | None, str | None]:
-    """The workout text to send for a workout_doc that is about to be WRITTEN: (text, problem).
+class WorkoutText(NamedTuple):
+    """Result of workout_text_for_write."""
 
-    - A blank doc (None, {}, {"steps": []}) gives (None, None): treated as not given, so an
-      update never wipes the planned workout with an empty description.
-    - A doc without steps but with a description is refused unless allow_text_only (on create
-      it is the event's text; on update it would replace the structured workout with prose).
+    text: str | None  # the description to send; None = leave the description alone
+    problem: str | None  # why nothing may be written
+    warnings: list[str]  # validation warnings worth showing with the result
+    text_only: bool  # no step with a duration or distance (strength, yoga, notes ...)
+
+
+# Hints every workout without warm-up/cool-down would get; not repeated after a write.
+_ROUTINE_WARNINGS = ("no warm-up step", "no cool-down step", "is not a common Intervals.icu activity type")
+
+
+def has_step_lines(text: str) -> bool:
+    """True when workout text contains at least one step line ("- 10m 55%") or repeat ("3x")."""
+    return re.search(r"^\s*(?:-|\d+\s*x\b)", text or "", re.MULTILINE | re.IGNORECASE) is not None
+
+
+def is_structured_workout(event: Any) -> bool:
+    """True when an event/workout from the API holds a structured workout (a timed step)."""
+    doc = event.get("workout_doc") if isinstance(event, dict) else None
+    steps = doc.get("steps") if isinstance(doc, dict) else None
+
+    def timed(items: Any) -> bool:
+        return isinstance(items, list) and any(
+            isinstance(step, dict) and (step.get("duration") or step.get("distance") or timed(step.get("steps")))
+            for step in items
+        )
+
+    return timed(steps)
+
+
+def workout_text_for_write(  # pylint: disable=too-many-return-statements
+    workout_doc: Any, workout_type: str | None
+) -> WorkoutText:
+    """The workout text to send for a workout_doc that is about to be WRITTEN.
+
+    - A blank doc (None, {}, {"steps": []}) gives text None: treated as not given, so an update
+      never wipes the planned workout with an empty description.
+    - A doc with only a description, or with only text steps (an exercise list), gives that text
+      with text_only=True; the caller decides whether it may replace an existing workout.
     - Any validation error (validate_workout_doc) refuses the write.
 
     The problem is a plain sentence; the tools add "Error:" and "Nothing was written.".
     """
     if is_blank_workout_doc(workout_doc):
-        return None, None
+        return WorkoutText(None, None, [], False)
     data = _doc_dict(workout_doc)
     if not isinstance(data, dict):
-        return None, "workout_doc must be an object with a 'steps' list"
+        return WorkoutText(None, "workout_doc must be an object with a 'steps' list", [], False)
     if not data.get("steps"):
-        if allow_text_only:
-            return str(data.get("description")).strip(), None
-        return None, (
-            "workout_doc has no steps (only a description); writing it would replace the planned workout "
-            "with text only. Pass the steps, or leave workout_doc out to keep the existing workout"
-        )
+        return WorkoutText(str(data.get("description")).strip(), None, [], True)
     result = validate_workout_doc(data, workout_type or "")
     if result["errors"]:
-        return None, "workout_doc is not valid: " + "; ".join(result["errors"])
+        return WorkoutText(None, "workout_doc is not valid: " + "; ".join(result["errors"]), [], False)
+    warnings = [w for w in result["warnings"] if not any(r in w for r in _ROUTINE_WARNINGS)]
     totals = result["totals"]
-    if not totals.get("duration_s") and not totals.get("distance_m"):
-        return None, "workout_doc has no step with a duration or distance"
+    text_only = not totals.get("duration_s") and not totals.get("distance_m")
     text = str(workout_doc) if isinstance(workout_doc, WorkoutDoc) else str(WorkoutDoc.from_dict(data))
-    return text, None
+    return WorkoutText(text, None, warnings, text_only)
 
 
 def write_refusal(problem: str) -> str:
     """Tool answer for a workout that is not written."""
     return f"Error: {problem}. Nothing was written."
+
+
+def warnings_note(warnings: list[str]) -> str:
+    """Suffix for a successful write that had validation warnings."""
+    return (" Validation warnings: " + "; ".join(warnings) + ".") if warnings else ""

@@ -620,7 +620,8 @@ class WorkoutDoc:  # pylint: disable=too-many-instance-attributes
     def __str__(self) -> str:
         val = ""
         if self.description is not None:
-            val += f"{self.description}\n"
+            # A blank line keeps the description apart from the first step.
+            val += f"{self.description}\n\n"
         if self.steps is not None:
             for step in self.steps:
                 val += step.__str__() + "\n"
