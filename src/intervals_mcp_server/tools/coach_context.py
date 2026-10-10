@@ -274,12 +274,12 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD; default today; not in the future")] = None,
     athlete_id: AthleteId = None,
     output_format: Annotated[OutputFormat, Field(
-        description="text (readable) or json (the full structure, independent of detail_level)"
+        description="text (readable) or json (the parts of an explicit detail_level, else the full structure)"
     )] = "text",
-    detail_level: Annotated[DetailLevel, Field(
-        description="compact = load, fitness, intensity, recovery, durability, method; standard adds sports, drift, "
-        "top sessions, plan, coverage; full adds 4 ISO weeks and references"
-    )] = "standard",
+    detail_level: Annotated[DetailLevel | None, Field(
+        description="compact = load, fitness, intensity, recovery, durability, method; standard (text default) adds "
+        "sports, drift, top sessions, plan, coverage; full adds 4 ISO weeks and references"
+    )] = None,
     threshold_as: ThresholdAs = "moderate",
 ) -> str:
     """Use first for a weekly or general training review: load, intensity, recovery, durability and plan for one end date in one compact call (read-only, about 2-3k characters).
@@ -293,7 +293,8 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     verdict. Details: get_training_load, get_intensity_distribution, get_durability,
     get_recovery_snapshot, get_load_projection. Method: intervals://methods/load (get_guide).
     """
-    athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
+    level = detail_level or "standard"
+    athlete_id_to_use, error_msg = resolve_request(athlete_id, level)
     if error_msg:
         return error_msg
     threshold_mode = (threshold_as or "moderate").strip().lower()
@@ -368,5 +369,29 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
         },
     }
     if output_format.strip().lower() == "json":
-        return json.dumps(payload, ensure_ascii=False)
-    return _text(payload, detail_level)
+        # Without an explicit detail_level the JSON keeps its full structure (as before stage 3B).
+        return json.dumps(payload if detail_level is None else _json_payload(payload, level), ensure_ascii=False)
+    return _text(payload, level)
+
+
+# Parts of the payload the text shows only from "standard" on (compact leaves them out).
+_STANDARD_PARTS = ("sports", "top_sessions", "plan", "coverage")
+
+
+def _json_payload(payload: dict[str, Any], detail_level: str) -> dict[str, Any]:
+    """The JSON answer with the same parts as the text of *detail_level*: compact = load, fitness,
+    intensity of 7 and 28 days, recovery, today's completeness, durability, method; standard adds
+    sports, intensity drift, top sessions, plan and coverage; full adds the ISO weeks and references."""
+    out = {**payload, "detail_level": detail_level}
+    if detail_level == "full":
+        out["references"] = {
+            "acwr": REFERENCES["acwr"]["source"], "monotony": REFERENCES["monotony"]["source"],
+            "polarization_index": "Treff et al. 2019, Front Physiol 10:707",
+        }
+        return out
+    out.pop("weeks", None)
+    if detail_level == "compact":
+        for key in _STANDARD_PARTS:
+            out.pop(key, None)
+        out["intensity"] = {key: value for key, value in payload["intensity"].items() if key != "drift"}
+    return out

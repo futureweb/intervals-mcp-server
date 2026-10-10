@@ -269,7 +269,8 @@ def efficiency_summary(  # pylint: disable=too-many-locals
         window_mean = statistics.fmean(window) if window else None
         recent_mean = statistics.fmean(recent) if recent else None
         entry: dict[str, Any] = {
-            "n": len(window), "mean": rnd(window_mean, 3), "recent_n": len(recent), "recent_mean": rnd(recent_mean, 3),
+            "n": len(window), "mean": rnd(window_mean, 3), "recent_days": recent_days, "recent_n": len(recent),
+            "recent_mean": rnd(recent_mean, 3),
             "change_pct": None, "direction": None, "gear_ids": len({g for _, _, g in values if g}),
             "small_sample": len(window) < SMALL_SAMPLE,
         }

@@ -155,6 +155,39 @@ def _summarize(  # pylint: disable=too-many-locals
     }
 
 
+_COMPACT_KEYS = (
+    "sessions", "moving_time_s", "elapsed_time_s", "distance_m", "elevation_gain_m", "training_load", "power_load",
+    "hr_load", "pace_load", "intensity_time_weighted_pct",
+)
+
+
+def _without_reason(aggregate: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in aggregate.items() if key != "reason"}
+
+
+def _summary_json(s: dict[str, Any], detail_level: str, include_gear: bool) -> dict[str, Any]:
+    """One group's summary with the same parts as the text of *detail_level*.
+
+    compact: totals, loads, sessions and time per sport, device loads; standard adds zones, gear
+    (include_gear), feel/RPE, long sessions and the custom fields with an aggregate; full adds the
+    custom fields without one and the aggregation reason of every custom field.
+    """
+    if detail_level == "compact":
+        out = {key: s[key] for key in _COMPACT_KEYS}
+        out["by_sport"] = {sport: {"sessions": int(v["sessions"]), "moving_time_s": v["moving_time"]} for sport, v in s["by_sport"].items()}
+        out["device_loads"] = {
+            code: _without_reason(agg) for code, agg in s["custom_fields"].items() if agg["policy"] == "device_load_sum"
+        }
+        return out
+    out = {key: value for key, value in s.items() if key != "by_gear" or include_gear}
+    if detail_level == "standard":
+        out["custom_fields"] = {code: _without_reason(agg) for code, agg in s["custom_fields"].items() if agg["policy"] != "none"}
+        skipped = [code for code, agg in s["custom_fields"].items() if agg["policy"] == "none"]
+        if skipped:
+            out["custom_fields_without_aggregate"] = skipped
+    return out
+
+
 def _group_end(group_by: str, items: list[dict[str, Any]], end: str) -> str:
     """Last calendar day of a group (Sunday of the ISO week, last day of the month, else the
     period end), capped at the period end."""
@@ -252,7 +285,7 @@ def _format_group(  # pylint: disable=too-many-locals,too-many-branches
 
 
 @tool("read")
-async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
     start_date: Annotated[str, Field(description="First day YYYY-MM-DD")],
     end_date: EndDate = None,
     group_by: Annotated[
@@ -264,12 +297,12 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     include_gear: Annotated[bool, Field(description="Per-gear split inside each group (text, standard and full)")] = True,
     athlete_id: AthleteId = None,
     output_format: Annotated[OutputFormat, Field(
-        description="text (readable) or json (all fields, independent of detail_level)"
+        description="text (readable) or json (the parts of an explicit detail_level, else all fields)"
     )] = "text",
-    detail_level: Annotated[DetailLevel, Field(
-        description="compact = totals, loads, fitness, sessions per sport, device loads; standard adds zones, gear, "
-        "feel/RPE, custom fields; full adds the aggregation reason per custom field"
-    )] = "standard",
+    detail_level: Annotated[DetailLevel | None, Field(
+        description="compact = totals, loads, fitness, sessions per sport, device loads; standard (text default) adds "
+        "zones, gear, feel/RPE, custom fields; full adds the aggregation reason per custom field"
+    )] = None,
 ) -> str:
     """Use for training totals of a period grouped by ISO week, month, sport (activity type), gear or in total, including custom activity fields (read-only).
 
@@ -285,7 +318,8 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    if detail_level not in ("compact", "standard", "full"):
+    level = detail_level or "standard"
+    if level not in ("compact", "standard", "full"):
         return "Error: detail_level must be one of compact, standard, full."
     if group_by not in GROUPINGS:
         return f"Error: group_by must be one of {', '.join(GROUPINGS)}."
@@ -330,13 +364,16 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     overall = _summarize(activities, defs, gear_map, assigned_by_type)
 
     if output_format.strip().lower() == "json":
-        return json.dumps(
-            {"start": start_date, "end": end, "group_by": group_by, "groups": rows, "overall": overall,
-             "fitness_at_end": _fitness_at(wellness, end), "generated": datetime.now().isoformat(timespec="minutes")},
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {"start": start_date, "end": end, "group_by": group_by, "groups": rows, "overall": overall}
+        if detail_level is not None:  # without it the JSON keeps all fields (as before stage 3B)
+            payload.update(
+                detail_level=level, overall=_summary_json(overall, level, include_gear),
+                groups=[{**row, "summary": _summary_json(row["summary"], level, include_gear)} for row in rows],
+            )
+        payload.update(fitness_at_end=_fitness_at(wellness, end), generated=datetime.now().isoformat(timespec="minutes"))
+        return json.dumps(payload, ensure_ascii=False)
     text = f"Training summary for athlete {athlete_id_to_use}, {start_date} to {end}, grouped by {group_by}:\n\n"
-    text += "\n\n".join(_format_group(r["group"], r["summary"], r["fitness_at_end"], include_gear, detail_level) for r in rows)
+    text += "\n\n".join(_format_group(r["group"], r["summary"], r["fitness_at_end"], include_gear, level) for r in rows)
     if len(rows) > 1:
-        text += "\n\n" + _format_group("TOTAL", overall, _fitness_at(wellness, end), include_gear, detail_level)
+        text += "\n\n" + _format_group("TOTAL", overall, _fitness_at(wellness, end), include_gear, level)
     return text

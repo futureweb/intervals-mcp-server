@@ -188,7 +188,7 @@ def test_text_never_silently_replaces_a_structured_workout(monkeypatch):
 
 def test_text_only_workouts_can_be_created_and_edited(monkeypatch):
     """R25-4: strength / yoga sessions are plain text."""
-    calls = _router(monkeypatch, lambda url, method, p, d: TEXT_ONLY if method == "GET" else {"id": 5})
+    calls = _router(monkeypatch, lambda url, method, p, d: ([] if p else TEXT_ONLY) if method == "GET" else {"id": 5})
     asyncio.run(add_or_update_event(name="Strength", workout_type="WeightTraining", description="Squats 5x5\nDeadlifts 3x5", start_date="2026-10-12"))
     asyncio.run(add_or_update_event(event_id="5", description="Squats 5x5\nPlank 3x60s"))
     exercises = {"steps": [{"text": "Squats"}, {"text": "Deadlifts"}, {"text": "Plank"}]}
@@ -298,7 +298,7 @@ def test_bulk_float_durations_are_whole_seconds(monkeypatch):
     calls = _router(monkeypatch, lambda url, method, p, d: [{"id": 1}])
     asyncio.run(add_events_bulk([{"name": "A", "start_date": "2026-10-12", "workout_type": "Ride",
                                   "workout_doc": {"steps": [{"duration": 4000.0, "power": {"value": "70", "units": "%ftp"}}]}}]))
-    assert "- 1h6m40s 70% ftp" in calls[0]["data"][0]["description"]
+    assert "- 1h6m40s 70% ftp" in _writes(calls)[0]["data"][0]["description"]
 
 
 # ------------------------------------------------------------------ WRT-9 / WRT-16 / API-3
@@ -398,7 +398,7 @@ def test_overwriting_write_tools_are_marked_destructive_for_clients():
 def test_library_event_copies_load_and_flags_missing_steps(monkeypatch):
     workout = {"id": 5, "name": "Over-unders", "type": "Ride", "description": "Classic over-unders from Zwift.",
                "icu_training_load": 72, "joules": 600000, "workout_doc": {"steps": [{"duration": 60}]}}
-    calls = _router(monkeypatch, lambda url, method, p, d: workout if method == "GET" else {"id": 9})
+    calls = _router(monkeypatch, lambda url, method, p, d: ([] if p else workout) if method == "GET" else {"id": 9})
     result = asyncio.run(add_event_from_library(workout_id="5", date="2026-10-12"))
     data = _writes(calls)[0]["data"]
     assert data["icu_training_load"] == 72 and data["joules"] == 600000

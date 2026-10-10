@@ -26,6 +26,8 @@ def _capture_event_payload(monkeypatch) -> dict:
     captured: dict = {}
 
     async def fake_request(*_args, **kwargs):
+        if kwargs.get("method", "GET") == "GET":  # duplicate check (a day's events) and read-back
+            return [] if kwargs.get("params") else {"id": "e123"}
         captured["data"] = kwargs.get("data")
         captured["method"] = kwargs.get("method")
         captured["url"] = kwargs.get("url")

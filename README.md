@@ -131,19 +131,19 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 
 | Tool | What it does |
 | --- | --- |
-| `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output |
+| `get_activities` | List with sport, gear and power meter filters, sorting, paging, compact or JSON output; without `start_date` the 30 days before `end_date` (or today) |
 | `get_activity_details` | Summary, thresholds used (FTP, eFTP, LTHR, zones), device and power meter, running dynamics, every custom field with units, fueling, weather, W′ balance and source/freshness |
 | `get_activity_intervals` | Intervals and groups, custom interval fields, per-interval statistics of any stream, optionally the planned step type next to the Intervals.icu type |
 | `list_activity_streams`, `get_activity_streams` | Discover and fetch any stream: summary, CSV or JSON, slicing, downsampling, paging (2000 samples per page by default) |
-| `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description |
+| `get_activity_messages`, `add_activity_message` ✎, `update_activity` ✎ | Notes and comments, RPE, feel, name, description (`dry_run` shows the exact request) |
 
 **Performance over time**
 
 | Tool | What it does |
 | --- | --- |
-| `compare_best_efforts` | Best efforts across activities (ids, date range, sport, gear) side by side |
+| `compare_best_efforts` | Best efforts across activities (ids, date range, sport, gear) side by side; ids are de-duplicated and capped to the limit before any request |
 | `find_similar_intervals` | Activities with comparable intervals, from a reference activity or a given length and intensity; same sport family by default, ranked by comparability, with gear and power meter context; with a reference the 365 days before it by default (window shown, `start_date` for any range) |
-| `compare_workouts` | Repeated workouts over time, comparing only comparable work intervals (reference activity, sport family, length, intensity, reps, FTP range); surges kept apart, time-weighted means, power, HR, cadence and whole-activity RPE trends, gear and power meter flags |
+| `compare_workouts` | Repeated workouts over time, comparing only comparable work intervals (reference activity, sport family, length, intensity, reps, FTP range); the reference activity is always fetched and always the pattern, with a name search the 365 days before it are listed; surges kept apart, time-weighted means, power, HR, cadence and whole-activity RPE trends, gear and power meter flags |
 | `get_power_hr_efficiency` | Watts per heartbeat per power band and bike over time, with minimum sample sizes and filters for gear, indoor/outdoor and interval position |
 | `get_fatigue_resistance` | Best power fresh vs after the athlete's kJ thresholds; without configured thresholds it explains the setting and suggests values instead of showing pseudo results |
 | `get_long_ride_fatigue_profile` | HR, W/bpm, cadence and Garmin stamina at matched power in steady segments before vs after work thresholds (default 750 / 1,500 kJ, or kJ/kg), for given rides or the long rides of a period; prior work at every threshold and climb (kJ, kJ/kg, kJ and time above FTP, efforts above FTP), climbs after N hours with stamina at start and end, median and range across rides, method stated, small samples flagged |
@@ -153,7 +153,7 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 | `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out; heat filter on the device sensor or the activity's weather / feels-like temperature (`temperature_source`), sessions list both temperatures |
 | `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned. What-if simulation (`scenario`): sessions or weekly templates that are not in the calendar (load given or estimated as hours x IF² x 100), added to or replacing the plan, compared with the calendar plan; form at a target day or the next RACE_A and a grid search for the load of the last days that reaches a given form range; per-week plan statistics (ramp, monotony, longest session, rest days) with commonly cited ranges and sources. Nothing is written |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
-| `get_training_summary` | Totals per week, month, sport or gear with the Intervals.icu load (power, else HR, else pace per activity) and the overlapping per-method sums, time in power zones (sweet spot apart) and HR zones, CTL/ATL at the end of each week or month; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change) |
+| `get_training_summary` | Totals per week, month, sport or gear with the Intervals.icu load (power, else HR, else pace per activity) and the overlapping per-method sums, time in power zones (sweet spot apart) and HR zones, CTL/ATL at the end of each week or month; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change); an explicit `detail_level` also selects the JSON parts (without it the JSON is complete) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
 
 **Wellness and recovery**
@@ -161,29 +161,29 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 | Tool | What it does |
 | --- | --- |
 | `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call; names the usual wellness fields today's record does not have yet (not yet available, not normal) |
-| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days, today's not-yet-available wellness fields and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule) |
+| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days, today's not-yet-available wellness fields and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule); an explicit `detail_level` also selects the JSON parts (without it the JSON is complete) |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per moving hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name (device-file zeros treated as placeholders); per sport family, and within it per duration and intensity, with sample sizes, logging coverage and Spearman correlations from 8 sessions; no targets |
-| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet (night/morning values, daily metrics such as VO2max or endurance score, and day totals apart); subjective scores |
+| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field; without `start_date` the 30 days before `end_date` or today), with a line naming the usual fields today's record does not have yet (night/morning values, daily metrics such as VO2max or endurance score, and day totals apart); subjective scores (`dry_run` shows the exact request) |
 
 **Athlete, gear, calendar and workouts**
 
 | Tool | What it does |
 | --- | --- |
 | `get_athlete_profile`, `get_sport_settings`, `get_training_zones` | Profile, per-sport thresholds, zones with absolute ranges |
-| `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace (pace with its unit, e.g. `4:30/km`) |
+| `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace (pace with its unit, e.g. `4:30/km`); `dry_run` shows the request with the current values |
 | `get_gear_list`, `get_gear_details` | Bikes, shoes and components with mileage and maintenance reminders |
 | `get_events`, `get_event_by_id`, `get_training_plan` | Calendar with the full workout document; plan phases, weekly targets, races |
 | `validate_workout`, `preview_workout` | Check and render a workout document before writing it |
-| `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes (workouts are validated before they are written; the range delete previews by default) |
-| `get_workout_library`, `get_library_workout`, `create_library_workout` ✎, `add_event_from_library` ✎, `delete_library_workout` ✖ | Workout library |
+| `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes: workouts are validated before they are written, `dry_run` returns the exact request, a new event is refused when that day already has the same one (`allow_duplicate`), the answer reads back what Intervals.icu stored and parsed (steps parsed vs sent, parse warnings); deletions name what was deleted; the range delete previews by default |
+| `get_workout_library`, `get_library_workout`, `create_library_workout` ✎, `add_event_from_library` ✎, `delete_library_workout` ✖ | Workout library (dry run, duplicate check when scheduling, read-back, deletions name what was deleted) |
 
 **Custom items and server**
 
 | Tool | What it does |
 | --- | --- |
-| `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions |
+| `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions (`create_custom_item` and `update_custom_item` with `dry_run`; update: the content after the merge) |
 | `get_server_status` | Version, enabled permissions, tool set, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
 | `get_guide` | Usage guide, workout syntax and method guides (the resources below) for clients that only call tools |
 
@@ -358,6 +358,22 @@ automatically: `delete_events_by_date_range` first only lists what matches; it d
 `dry_run=false` and the confirmed ids from that list (`confirm_ids`), touches only the named
 categories (default planned workouts), at most 31 days, never workouts already paired with an
 activity unless asked. Empty values from a client never wipe existing text or workouts.
+
+Every write is predictable and verifiable (details: write safety in `intervals://guide`):
+
+- `dry_run=true` on every create/update tool (including `create_custom_item`) returns the exact
+  request (method, path, body after all defaults and merges, as compact JSON) and the validation
+  result; no write request is sent (the server refuses every non-GET request during a dry run).
+- Creating an event (single, bulk or from the library) first reads the events of its date (one
+  request over the date range) and refuses a duplicate (same category and sport with the same name,
+  or the same non-trivial workout or text) unless `allow_duplicate=true`; a brick day or an AM/PM
+  pair with different names is not a duplicate. The bulk tool decides per entry, lists the refused
+  ones and creates planned double sessions (same name, different content).
+- After every event or library workout write the answer reads back what Intervals.icu stored and
+  parsed: date, name, category, sport, duration, load, steps parsed vs sent and parse warnings
+  (notes: date, name, category, text length).
+- `delete_event`, `delete_library_workout` and `delete_custom_item` read the object first and name
+  what was deleted; a missing id deletes nothing.
 
 - Credentials never appear in logs or tool output; the Intervals.icu sign-in token is used for
   the identity check only and never stored.

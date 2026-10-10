@@ -65,6 +65,68 @@ Method details: `intervals://methods/<topic>` or `get_guide(topic)`; workout for
   athlete confirmed. Writes need MCP_PERMISSIONS=write and the athlete's explicit request;
   deletions preview first (`delete_events_by_date_range` with `dry_run=true`).
 
+### Write safety
+Every write is predictable and verifiable:
+
+- **Only on request.** Write tools run only when the athlete explicitly asks. Nothing is created,
+  renamed, paired or deleted automatically; existing events are only changed through their
+  `event_id`.
+- **Dry run.** Every create/update tool has `dry_run` (default false): `add_or_update_event`,
+  `add_or_update_note`, `add_events_bulk`, `add_event_from_library`, `create_library_workout`,
+  `create_custom_item`, `update_activity`, `update_wellness`, `update_custom_item`,
+  `update_sport_settings`, `add_activity_message`. A dry run runs every check of the real call
+  (validation, the reads it needs such as the duplicate check, the current event or the custom
+  item content to merge) and returns compact JSON: `{"dry_run":true,"request":{"method","path",
+  "params","body"},"validation":{"ok":true,"warnings":[...]}, ...}`. `body` is exactly what would
+  be sent, after all defaults and merges. No write request is made: during a dry run the server
+  refuses every request other than GET. A refusal (invalid workout, duplicate, nothing to change)
+  is returned exactly as the real call would return it. Show the request, then call again without
+  `dry_run`.
+- **Validation before writes.** Workouts are checked like `validate_workout`; with an error
+  nothing is written. Text never silently replaces a structured workout (`replace_workout=true`);
+  empty texts never wipe a description or comment (`clear_description` / `clear_comments` do).
+- **Duplicate check before creating events** (`add_or_update_event` and `add_or_update_note`
+  without `event_id`, `add_events_bulk`, `add_event_from_library`): the events of the days are
+  read with one GET over the date range, and a create is refused when that day already has an
+  event of the same category and the same sport (when both have one) with
+  - the same name (case- and whitespace-insensitive), or
+  - the same non-trivial content: workout text with at least two step lines or a repeat (its step
+    and repeat lines are compared, so another introduction does not hide the same workout), or at
+    least two lines of plain text (notes, exercise lists). A single generic line such as
+    `- 45m Z2 HR` or "Rest day" is never compared, so an AM and a PM easy run with different
+    names are both created, and so are a ride and a run of a brick day.
+
+  The answer names the existing event (id, name): change it with `event_id`, or pass
+  `allow_duplicate=true` only when the athlete wants a second one. `add_events_bulk` decides per
+  entry: an entry duplicating an existing event, or repeating an earlier entry of the same list
+  exactly (same day, category, sport, name and content), is listed under `refused` and nothing is
+  written for it; two entries with the same day, sport and name but different content are planned
+  double sessions and are both created (the second with a warning). If the events cannot be read,
+  nothing is written: try again in a moment.
+- **Read-back.** After every successful event or library workout write the tool reads the stored
+  object and reports what Intervals.icu stored and parsed: date (and time when it is not
+  midnight), name, category, sport, planned duration and load, the timed steps it parsed from the
+  workout text against the steps sent, and parse warnings: steps dropped, merged or added, repeat
+  counts changed, a step's duration or distance changed, a target missing or in other units (an
+  absolute pace sent as `MINS_KM` and stored as `secs/km` is the same unit; the paces are compared
+  in seconds with 2 s tolerance), no planned duration, a field stored with another value (e.g. a
+  planned moving time replaced by the steps' total). Notes, holidays, sick and injured days are
+  read back with date, category, name and text length only. The text answer has one "Read-back:"
+  paragraph (at most about 600 characters). `add_events_bulk` answers compact JSON: per created
+  entry status, id, date, name and short warnings from the read-back (one GET over the dates of
+  the created events); `detail_level="full"` adds what was stored. If the read-back fails, the
+  write succeeded but is not verified: check it with `get_event_by_id` / `get_library_workout`.
+- **Deletions echo what was deleted.** `delete_event`, `delete_library_workout` and
+  `delete_custom_item` read the object first and name it (event: id, date, category, sport, name
+  and whether it was paired with an activity). A missing id deletes nothing and says "not found".
+  `delete_events_by_date_range` previews by default and deletes only the `confirm_ids` from that
+  preview.
+- **Requests per write.** Creating one event with `add_or_update_event`, `add_or_update_note` or
+  `add_event_from_library`: +1 GET (duplicate check) and +1 GET (read-back); updating an event:
+  +1 GET (read-back); `add_events_bulk`: +1 GET (duplicate check over the date range) and +1 GET
+  (read-back); `create_library_workout`: +1 GET (read-back); `delete_event`: +1 GET before the
+  DELETE. `allow_duplicate=true` skips the duplicate check. A dry run makes the reads only.
+
 ## Conventions
 - Dates are YYYY-MM-DD in the athlete's time zone; `athlete_id` defaults to the configured athlete.
 - Times are local (time zone name when stored, else the UTC offset) and UTC.

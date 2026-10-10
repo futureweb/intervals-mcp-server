@@ -357,6 +357,12 @@ def _filter_text(sport_types: str | None, gear_id: str | None, start_date: str |
     return ", ".join(parts)
 
 
+async def _reference_activity(api: _Api, activity_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    """The reference activity fetched by id: (activity, None), (None, error) or (None, None) when missing."""
+    fetched, error = await _activities_by_ids(api, [activity_id])
+    return (fetched[0] if fetched else None), error
+
+
 def _reference_window(reference: dict[str, Any] | None, start_date: str | None) -> tuple[str | None, str | None]:
     """(effective start date, note) of a search anchored on a reference activity.
 
@@ -649,13 +655,16 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
     if date_error:
         return date_error
     capped = min(max(limit, 1), MAX_COMPARE_ACTIVITIES)
+    # Explicit ids: duplicates dropped and cut to the limit BEFORE any request.
+    ids, dropped, duplicates = cap_ids(activity_ids, capped) if activity_ids else ([], [], 0)
 
     api = _Api()
     activities, error, source = await _collect_activities(
-        api, athlete_id_to_use, activity_ids=activity_ids, start_date=start_date, end_date=end_date
+        api, athlete_id_to_use, activity_ids=",".join(ids) or None, start_date=start_date, end_date=end_date
     )
     if error:
         return error
+    source += ids_note(dropped, duplicates, capped)
     selected = _select_activities(
         activities, sport_types=sport_types, gear_id=gear_id, start_date=start_date, end_date=end_date, limit=capped
     )
@@ -1367,6 +1376,18 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
 
     api = _Api()
     fetch_limit = min(capped * 4, MAX_SEARCH_RESULTS)
+    reference: dict[str, Any] | None = None
+    window_note = None
+    if reference_activity_id and not activity_ids:
+        # The reference is fetched by id, so it is the pattern even when it is older than the newest
+        # `limit` activities or outside the listed range.
+        reference, error = await _reference_activity(api, reference_activity_id)
+        if reference is None:
+            return error or f"Reference activity {reference_activity_id} not found."
+        if query:
+            # A name search is anchored on the reference like find_similar_intervals: without start_date it
+            # covers REFERENCE_LOOKBACK_DAYS before it, and that whole window is listed (not only 90 days).
+            start_date, window_note = _reference_window(reference, start_date)
     name_search = bool(query) and not activity_ids and not (start_date or end_date)
     activities, error, source = await _collect_activities(
         api, athlete_id_to_use, activity_ids=activity_ids, query=query, start_date=start_date,
@@ -1374,18 +1395,15 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     )
     if error:
         return error
-    reference: dict[str, Any] | None = None
-    if reference_activity_id:
+    if reference_activity_id and reference is None:  # activity_ids: the reference is one of them or fetched
         reference = next((a for a in activities if str(a.get("id")) == str(reference_activity_id)), None)
         if reference is None:
-            fetched, error = await _activities_by_ids(api, [reference_activity_id])
-            if error or not fetched:
+            reference, error = await _reference_activity(api, reference_activity_id)
+            if reference is None:
                 return error or f"Reference activity {reference_activity_id} not found."
-            reference = fetched[0]
-    window_note = None
-    if query and not activity_ids and reference is not None:
-        # A name search is not limited in time: anchor it on the reference like find_similar_intervals.
-        start_date, window_note = _reference_window(reference, start_date)
+    if reference is not None:
+        # The fetched reference replaces its (shorter) list entry, or is added when the list does not have it.
+        activities = [a for a in activities if str(a.get("id")) != str(reference.get("id"))] + [reference]
     newest = _select_activities(activities, start_date=start_date, end_date=end_date, limit=1)
     anchor = reference or (newest[0] if newest else None)
     if sport_types and sport_types.strip().lower() == "all":
@@ -1399,10 +1417,12 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
     )
     if ftp_bounds:
         selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
-    if reference is not None and not any(str(a.get("id")) == str(reference.get("id")) for a in selected):
-        selected.append(reference)
-        selected.sort(key=lambda a: str(a.get("start_date_local") or ""), reverse=True)
-    selected = selected[:capped]
+    if reference is not None:
+        # The reference always takes one of the `limit` places (the oldest other activity makes room).
+        others = [a for a in selected if str(a.get("id")) != str(reference.get("id"))]
+        selected = sorted(others[: capped - 1] + [reference], key=lambda a: str(a.get("start_date_local") or ""), reverse=True)
+    else:
+        selected = selected[:capped]
     filters_text = _filter_text(sport_types if sport_types else None, gear_id, start_date, end_date)
     if sport_filter and not sport_types and anchor is not None:
         filters_text = ", ".join(p for p in (filters_text, f"sport family {sport_family(anchor.get('type'))} (default)") if p)
@@ -1421,9 +1441,10 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         if error:
             return error
         rows.append(_workout_row(activity, intervals, gear_map, split_filters))
-    ref_row = next((r for r in rows if reference is not None and str(r["id"]) == str(reference.get("id"))), None) or next(
-        (r for r in reversed(rows) if r["main_set"].get("count")), rows[-1]
-    )
+    if reference is not None:
+        ref_row = next(r for r in rows if str(r["id"]) == str(reference.get("id")))
+    else:
+        ref_row = next((r for r in reversed(rows) if r["main_set"].get("count")), rows[-1])
     pattern = pattern_of(ref_row["main_set"])
     for row in rows:
         reason = matches_pattern(row["main_set"], pattern) if pattern else "no reference pattern"
@@ -1456,7 +1477,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         return json.dumps(payload, ensure_ascii=False)
     pattern_text = (
         f"{pattern['count']} x {hms(pattern['secs'])}" + (f" @ {pattern['pct_ftp']:.0f}% FTP" if pattern.get("pct_ftp") is not None else "")
-        if pattern else "n/a"
+        if pattern else "n/a (no main set of WORK intervals found)"
     )
     lines = [
         f"Workout comparison for athlete {athlete_id_to_use} (source {source}{'; ' + filters_text if filters_text else ''}; "

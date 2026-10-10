@@ -143,16 +143,26 @@ def parse_date_range(
     """
     Parse and validate a date range, providing defaults if needed.
 
+    The default start lies ``default_start_days_ago`` days before the end date or today,
+    whichever is earlier, so a past end_date without a start_date never gives a start after
+    the end (a future end_date keeps the start relative to today).
+
     Args:
         start_date: Start date in YYYY-MM-DD format (optional).
         end_date: End date in YYYY-MM-DD format (optional).
-        default_start_days_ago: Number of days ago for default start date. Defaults to 30.
+        default_start_days_ago: Number of days before the end (or today) for the default start. Defaults to 30.
 
     Returns:
         Tuple of (start_date, end_date) as strings in YYYY-MM-DD format.
     """
-    if not start_date:
-        start_date = get_default_start_date(default_start_days_ago)
     if not end_date:
         end_date = get_default_end_date()
+    if not start_date:
+        start_date = get_default_start_date(default_start_days_ago)
+        try:
+            end_day = date.fromisoformat(end_date)
+        except ValueError:
+            end_day = None  # an invalid end date is reported by the tool's own date check
+        if end_day is not None and end_day < athlete_today():
+            start_date = (end_day - timedelta(days=default_start_days_ago)).isoformat()
     return start_date, end_date

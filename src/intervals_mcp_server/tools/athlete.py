@@ -22,7 +22,8 @@ from intervals_mcp_server.tools.gear import get_gear_map
 from intervals_mcp_server.utils.cache import TTLCache, cache_key
 from intervals_mcp_server.utils.dates import get_default_end_date, get_default_start_date, set_timezone_resolver
 from intervals_mcp_server.utils.custom_fields import assigned_codes
-from intervals_mcp_server.utils.params import AthleteId, OutputFormat, lower_choice
+from intervals_mcp_server.utils.write_safety import dry_run_answer
+from intervals_mcp_server.utils.params import AthleteId, DryRun, OutputFormat, lower_choice
 from intervals_mcp_server.utils.sports import family_types, format_pace, zone_ranges
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
@@ -656,6 +657,7 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
         Field(description='With its unit: "4:30/km", "7:15/mi", "1:45/100m", "1:45/100y", "1:50/500m", "4:30" (the setting\'s pace units) or "4.17 m/s"; a bare number is refused; 0.35-10 m/s'),
     ] = None,
     athlete_id: AthleteId = None,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to change a threshold (FTP, indoor FTP, LTHR, max HR, W', Pmax, threshold pace) of the sport setting that covers one activity type.
 
@@ -664,7 +666,7 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
     zones; the configured percentages and bpm stay): check get_training_zones afterwards. Values
     are range-checked and LTHR must stay below max HR. Changes the future analysis of every
     activity of the sport group (e.g. Ride) and the training load of new activities. Returns the
-    old and new values.
+    old and new values (dry_run: the request and the current values).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -703,8 +705,15 @@ async def update_sport_settings(  # pylint: disable=too-many-arguments,too-many-
     new_max = changes.get("max_hr", setting.get("max_hr"))
     if new_lthr is not None and new_max is not None and new_lthr >= new_max:
         return f"Error: LTHR ({new_lthr}) must be below max HR ({new_max})."
+    url = f"/athlete/{seg(athlete_id_to_use)}/sport-settings/{seg(setting.get('id'))}"
+    if dry_run:
+        return dry_run_answer(
+            "PUT", url, changes, params={"recalcHrZones": "false"},
+            extra={"sport_setting": {"id": setting.get("id"), "types": setting.get("types"),
+                                     "current": {k: setting.get(k) for k in changes}}},
+        )
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/sport-settings/{seg(setting.get('id'))}",
+        url=url,
         method="PUT",
         params={"recalcHrZones": "false"},
         data=changes,

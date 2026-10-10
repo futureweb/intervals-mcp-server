@@ -10,9 +10,12 @@ outermost tool call only:
 - limits the number of API requests and the duration of the call (api.client.call_limits)
   and says so in the result when a limit stopped requests;
 - caps the size of the result: text is cut at a line boundary with a note on how to get the
-  rest, JSON that does not fit is replaced by a JSON error object (never cut into invalid JSON).
+  rest, JSON that does not fit is replaced by a JSON error object (never cut into invalid JSON);
+- runs a tool called with ``dry_run=true`` with read-only requests: the API client refuses
+  anything but GET (api.client.read_only_requests), so a dry run can never write.
 
-Nested calls (a tool calling another tool function) pass straight through.
+Nested calls (a tool calling another tool function) pass straight through, except that a nested
+dry run is read-only as well.
 """
 
 import functools
@@ -21,11 +24,12 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
-from intervals_mcp_server.api.client import call_limits, unsafe_segment_reason
+from intervals_mcp_server.api.client import call_limits, read_only_requests, unsafe_segment_reason
 from intervals_mcp_server.utils.dates import activate_athlete_timezone, reset_athlete_timezone
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -272,18 +276,28 @@ def _limit_note(result: Any, hit: str) -> Any:
     return f"{result}\n\n{text}"
 
 
+def _is_dry_run(signature: inspect.Signature, arguments: Mapping[str, Any]) -> bool:
+    """True when the tool has a dry_run parameter and this call runs it (passed or by default)."""
+    parameter = signature.parameters.get("dry_run")
+    if parameter is None:
+        return False
+    value = arguments.get("dry_run", parameter.default)
+    return value is not inspect.Parameter.empty and bool(value)
+
+
 def guarded(func: F) -> F:
     """Wrap a tool coroutine function with the checks described in the module docstring."""
     signature = inspect.signature(func)
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if _IN_TOOL.get():
-            return await func(*args, **kwargs)
         try:
             bound = signature.bind_partial(*args, **kwargs)
         except TypeError:
             return await func(*args, **kwargs)  # let the function raise its own argument error
+        if _IN_TOOL.get():  # a nested call: only the dry-run guard applies
+            with read_only_requests() if _is_dry_run(signature, bound.arguments) else nullcontext():
+                return await func(*args, **kwargs)
         error = identifier_error(dict(bound.arguments))
         if error:
             return error
@@ -291,13 +305,15 @@ def guarded(func: F) -> F:
 
         athlete = bound.arguments.get("athlete_id") or get_config().athlete_id
         marker = _IN_TOOL.set(True)
+        writes = read_only_requests() if _is_dry_run(signature, bound.arguments) else nullcontext()
         try:
             with call_limits() as limits:
-                zone_token = await activate_athlete_timezone(str(athlete) if athlete else None)
-                try:
-                    result = await func(*args, **kwargs)
-                finally:
-                    reset_athlete_timezone(zone_token)
+                with writes:
+                    zone_token = await activate_athlete_timezone(str(athlete) if athlete else None)
+                    try:
+                        result = await func(*args, **kwargs)
+                    finally:
+                        reset_athlete_timezone(zone_token)
                 if limits.hit:
                     result = _limit_note(result, limits.hit)
         finally:

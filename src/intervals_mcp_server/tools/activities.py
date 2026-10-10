@@ -65,6 +65,7 @@ from intervals_mcp_server.utils.params import (
     ActivityId,
     AthleteId,
     DetailLevel,
+    DryRun,
     EndDate,
     GearId,
     OutputFormat,
@@ -74,6 +75,7 @@ from intervals_mcp_server.utils.params import (
     stream_output_choice,
 )
 from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_date_params
+from intervals_mcp_server.utils.write_safety import dry_run_answer
 from intervals_mcp_server.tool_guard import output_budget
 
 # Import mcp instance from shared module for tool registration
@@ -528,7 +530,7 @@ async def _fetch_streams(
 @tool("read")
 async def get_activities(  # pylint: disable=too-many-arguments,too-many-return-statements,too-many-branches,too-many-positional-arguments,too-many-locals
     athlete_id: AthleteId = None,
-    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before today")] = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before the earlier of end_date and today")] = None,
     end_date: EndDate = None,
     limit: Annotated[int, Field(description="Activities per page")] = 10,
     include_unnamed: Annotated[bool, Field(description="Also list activities without a name")] = False,
@@ -1282,16 +1284,20 @@ async def get_activity_messages(activity_id: ActivityId) -> str:
 async def add_activity_message(
     activity_id: ActivityId,
     content: Annotated[str, Field(description="Message text to post; must not be blank")],
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to post a note or comment on an activity.
 
     Adds one message to its thread on Intervals.icu (nothing is replaced; blank text is refused)
-    and returns the message id. Read the thread with get_activity_messages.
+    and returns the message id (dry_run shows the request). Read the thread with get_activity_messages.
     """
     if not (content or "").strip():
         return "Error: content must not be blank; nothing was posted."
+    url = f"/activity/{seg(activity_id)}/messages"
+    if dry_run:
+        return dry_run_answer("POST", url, {"content": content})
     result = await make_intervals_request(
-        url=f"/activity/{seg(activity_id)}/messages",
+        url=url,
         method="POST",
         data={"content": content},
     )
@@ -1310,7 +1316,7 @@ async def add_activity_message(
 
 
 @tool("write", overwrites=True)
-async def update_activity(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+async def update_activity(  # pylint: disable=too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-return-statements
     activity_id: ActivityId,
     rpe: Annotated[int | None, Field(
         description="Perceived exertion, integer 1-10 (1 = very easy, 10 = maximal); stored as icu_rpe",
@@ -1325,14 +1331,16 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
         description="New description; REPLACES the current text (an empty string is ignored)"
     )] = None,
     clear_description: Annotated[bool, Field(description="Empty the description on purpose")] = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to rate, rename or describe an activity: writes RPE, feel, name or description of one activity to Intervals.icu.
 
     Only the given fields are sent (PUT /activity/{id}); every other value stays. name and
     description REPLACE the current text, so read it first with get_activity_details to extend
     it; an empty description is ignored, clear_description empties it. At least one field is
-    required. Activities imported from Strava cannot be updated (the API returns an error).
-    Returns the stored values and the activity summary. Notes go to add_activity_message.
+    required; dry_run shows the request. Activities imported from Strava cannot be updated (the API
+    returns an error). Returns the stored values and the activity summary.
+    Notes go to add_activity_message.
     """
     if rpe is not None and (isinstance(rpe, bool) or not 1 <= rpe <= 10):
         return "Error: rpe must be an integer between 1 and 10."
@@ -1359,6 +1367,8 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
     if not payload:
         return "Error: at least one of rpe, feel, name or description must be provided."
 
+    if dry_run:
+        return dry_run_answer("PUT", f"/activity/{seg(activity_id)}", payload)
     result = await make_intervals_request(
         url=f"/activity/{seg(activity_id)}",
         method="PUT",

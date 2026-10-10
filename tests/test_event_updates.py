@@ -22,11 +22,14 @@ from intervals_mcp_server.utils.types import Step, Value, ValueUnits, WorkoutDoc
 
 
 def _capture(monkeypatch, existing: dict | None = None) -> list[dict]:
-    """Record write requests; a GET (read before an update) answers with *existing*."""
+    """Record write requests; a GET of one event (read before an update, read-back) answers with
+    *existing*, the GET of a day's events (duplicate check) with an empty calendar."""
     calls: list[dict] = []
 
     async def fake_request(*_args, **kwargs):
         if kwargs.get("method", "GET") == "GET":
+            if kwargs.get("params"):
+                return []
             return existing if existing is not None else {"id": "e123"}
         calls.append({"url": kwargs.get("url"), "method": kwargs.get("method"), "data": kwargs.get("data")})
         return {"id": "e123"}
@@ -40,7 +43,7 @@ def test_update_sends_only_the_changed_fields(monkeypatch):
     calls = _capture(monkeypatch)
     result = asyncio.run(add_or_update_event(event_id="77", name="Threshold 3x10 (moved)"))
     assert calls == [{"url": "/athlete/i1/events/77", "method": "PUT", "data": {"name": "Threshold 3x10 (moved)"}}]
-    assert result == "Successfully updated event id: e123"
+    assert result.startswith("Successfully updated event id: e123\nRead-back: Intervals.icu stored")
 
 
 def test_update_keeps_category_and_type_unless_passed(monkeypatch):

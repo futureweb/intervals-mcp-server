@@ -389,9 +389,10 @@ class WorkoutText(NamedTuple):
 _ROUTINE_WARNINGS = ("no warm-up step", "no cool-down step", "is not a common Intervals.icu activity type")
 
 
-def has_step_lines(text: str) -> bool:
-    """True when workout text contains a step line: "- ..." with a duration or distance
-    ("- 10m 55%", "- 400mtr Z4"). A bullet list of notes ("- legs heavy") is not a workout."""
+def step_lines(text: str) -> list[str]:
+    """The step lines of workout text: "- ..." with a duration or distance ("- 10m 55%",
+    "- 400mtr Z4"). A bullet list of notes ("- legs heavy") has none."""
+    found = []
     for line in (text or "").splitlines():
         stripped = line.strip()
         if not stripped.startswith("-"):
@@ -399,8 +400,15 @@ def has_step_lines(text: str) -> bool:
         for word in stripped[1:].split():
             token = word.strip(",;()[]{}!?\"'").rstrip(".:;+")
             if _DURATION_RE.fullmatch(token) or _DISTANCE_RE.fullmatch(token):
-                return True
-    return False
+                found.append(stripped)
+                break
+    return found
+
+
+def has_step_lines(text: str) -> bool:
+    """True when workout text contains a step line (see step_lines). A bullet list of notes
+    ("- legs heavy") is not a workout."""
+    return bool(step_lines(text))
 
 
 def is_structured_workout(event: Any) -> bool:
