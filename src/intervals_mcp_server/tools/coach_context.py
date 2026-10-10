@@ -11,6 +11,7 @@ by morritter in upstream pull request mvilanova/intervals-mcp-server#150.
 """
 
 import json
+import math
 import statistics
 from datetime import date, timedelta
 from typing import Any
@@ -61,16 +62,25 @@ RACE_LOOKAHEAD_DAYS = 42
 
 
 RECENT_DAYS = 7
-MIN_ROLLING_MEANS = 14  # 7-day means in the baseline needed for their spread (the z denominator)
+SPREAD_DAYS = 90  # days before the 7-day window whose 7-day means give the spread (z denominator)
+MIN_ROLLING_MEANS = 28  # 7-day means needed for that spread
+# The baseline mean has its own uncertainty: Var(7-d mean - 42-d mean) ~ spread^2 * (1 + 7/42).
+BASELINE_MEAN_FACTOR = math.sqrt(1 + RECENT_DAYS / BASELINE_DAYS)
+RECOVERY_Z_METHOD = (
+    "7-day mean minus the mean of the 42 days before it, divided by the SD of the 7-day means over the 90 days "
+    "before it times sqrt(1 + 7/42) (the baseline mean's own uncertainty); in simulations about 7 % of weeks "
+    "without a real change reach |z| > 2"
+)
 
 
 def _recovery(entries: list[dict[str, Any]], end: date) -> dict[str, Any]:  # pylint: disable=too-many-locals
     """7-day mean of HRV, resting HR and sleep against the 42 days before those 7 days (numbers only).
 
-    The baseline excludes the compared days. ``z`` relates the difference to the spread
-    (SD) of the 7-day means inside the baseline window, the matching reference for a 7-day
-    mean (the SD of daily values would understate it about 2.6-fold); ``baseline_sd`` is the
-    SD of the daily values.
+    The baseline excludes the compared days. ``z`` relates the difference to the
+    week-to-week spread: the SD of the 7-day means over the 90 days before the 7-day window
+    (the reference for a 7-day mean; overlapping means inside only 42 days underestimate it),
+    times sqrt(1 + 7/42) for the uncertainty of the baseline mean. ``baseline_sd`` is the SD of
+    the daily values.
     """
     out: dict[str, Any] = {}
     baseline_end = end - timedelta(days=RECENT_DAYS)
@@ -81,9 +91,9 @@ def _recovery(entries: list[dict[str, Any]], end: date) -> dict[str, Any]:  # py
         )
         recent = trend["rolling"].get(RECENT_DAYS) or {}
         baseline = before["baseline"]
-        rows = before["series"][RECENT_DAYS - 1:][-(BASELINE_DAYS - RECENT_DAYS + 1):]  # windows inside the fetched data
+        rows = before["series"][RECENT_DAYS - 1:][-(SPREAD_DAYS - RECENT_DAYS + 1):]  # windows inside the 90 days
         means = [row["rolling"][RECENT_DAYS] for row in rows if row["rolling"].get(RECENT_DAYS) is not None]
-        spread = statistics.stdev(means) if len(means) >= MIN_ROLLING_MEANS else None
+        spread = statistics.stdev(means) * BASELINE_MEAN_FACTOR if len(means) >= MIN_ROLLING_MEANS else None
         scale = 1 / 3600 if metric == "sleepSecs" else 1.0
         mean7 = recent.get("latest_mean")
         base_mean, base_sd = baseline.get("mean"), baseline.get("stdev")
@@ -96,7 +106,7 @@ def _recovery(entries: list[dict[str, Any]], end: date) -> dict[str, Any]:  # py
             "baseline_start": baseline.get("start"), "baseline_end": baseline.get("end"),
             "diff": rnd(diff * scale, 2) if diff is not None else None,
             "diff_pct": rnd(diff / base_mean * 100, 1) if diff is not None and base_mean else None,
-            "sd_7d_means": rnd(spread * scale, 2) if spread is not None else None,
+            "z_denominator": rnd(spread * scale, 2) if spread is not None else None, "z_spread_n": len(means),
             "z": rnd(diff / spread, 2) if diff is not None and spread else None,
             "latest": trend.get("latest"),
         }
@@ -194,7 +204,8 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
         f"Method: {method['acute_days']} d acute / {method['chronic_days']} d chronic, ratio of daily means, coupled; monotony = "
         f"mean/SD of 7 daily loads; zones power (cycling) or HR/pace, power Z4 = {method['threshold_as']} (threshold_as); "
         f"{HARD_RULE_SHORT.replace('hard session', 'hard')}.",
-        f"Recovery markers (z = difference / SD of the 7-d means in the prior 42 d): {_recovery_text(payload['recovery'])}",
+        f"Recovery markers (z vs the week-to-week spread of the prior 90 d; |z| up to about 2 is normal week-to-week variation): "
+        f"{_recovery_text(payload['recovery'])}",
         f"Durability 28 d: {_durability_text(payload['durability'], payload['efficiency'])}",
     ]
     if detail_level != "compact":
@@ -263,8 +274,8 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     three-zone intensity distribution of the last 7 and 28 days with polarization index,
     class, hard sessions/days and the drift between the two halves of the 28 days; recovery
     markers as numbers only (7-day mean of HRV, resting HR and sleep against the 42 days
-    before those 7 days, with n, difference and a z-score against the spread of 7-day means
-    in that baseline); durability (median aerobic decoupling
+    before those 7 days, with n, difference and a z-score against the week-to-week spread
+    of 7-day means over the 90 days before; |z| up to about 2 is normal variation); durability (median aerobic decoupling
     of steady sessions and efficiency factor over 28 days); the top sessions of the last 7
     days; the planned workouts of the next 7 days and the next race (when the end date is
     today); and the data coverage. A method line states the windows, the ACWR method
@@ -303,7 +314,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     if error:
         return error
     wellness_list, error = await fetch_wellness(
-        athlete_id_to_use, api_key, end - timedelta(days=BASELINE_DAYS + 7), end,
+        athlete_id_to_use, api_key, end - timedelta(days=SPREAD_DAYS + RECENT_DAYS), end,
         FITNESS_FIELDS + "," + ",".join(m for m, _, _ in RECOVERY_METRICS),
     )
     if error:
@@ -331,7 +342,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
             "acute_days": 7, "chronic_days": 28, "acwr": "ratio of the daily means, coupled (acute window inside the chronic one)",
             "monotony": "mean / SD of the last 7 daily loads (rest days 0)", "zone_basis": "auto (power for cycling, HR then pace otherwise)",
             "threshold_as": threshold_mode, "hard_session": HARD_RULE_SHORT,
-            "recovery_z": "7-day mean minus the mean of the 42 days before it, divided by the SD of the 7-day means in those 42 days",
+            "recovery_z": RECOVERY_Z_METHOD,
         },
         "load": load_metrics(activities, load_end),
         "sports": sport_breakdown(activities, load_end),
