@@ -714,7 +714,7 @@ def test_version_1_state_file_loads_and_keeps_its_format(tmp_path):
         ("[]", "is not a JSON object"),
         ({"version": 1, "clients": []}, "'clients' is not an object"),
         ({"version": 1, "refresh_tokens": "x"}, "'refresh_tokens' is not an object"),
-        ({"version": 2, "clients": {}}, "newer version"),
+        ({"version": 3, "clients": {}}, "newer version"),
         ({"version": "1"}, "unknown format version"),
     ],
     ids=["empty", "list", "clients-list", "tokens-string", "newer", "version-string"],

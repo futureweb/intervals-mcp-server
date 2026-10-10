@@ -3,6 +3,8 @@
 ``--version`` and ``--help`` are answered before any server module is imported, so they
 work with a broken configuration. ``--doctor`` checks the configuration piece by piece and
 lists every problem; when it is sound it also asks Intervals.icu whether the API key works.
+``grants list|remove|prune`` manages the stored connections and ``token-key`` creates the key
+for the multi-user mode (see :mod:`intervals_mcp_server.auth_grants`).
 Without flags the server starts; a configuration error then ends the process with a
 one-line message instead of a traceback (systemd restarts would otherwise fill the journal
 with stack traces that hide the cause).
@@ -27,7 +29,7 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split()) or type(exc).__name__
 
 
-def configuration_problems(environ: Mapping[str, str] | None = None) -> tuple[list[str], list[str]]:
+def configuration_problems(environ: Mapping[str, str] | None = None) -> tuple[list[str], list[str]]:  # pylint: disable=too-many-locals
     """Check the configuration without starting anything; return (errors, warnings)."""
     # pylint: disable=import-outside-toplevel
     from intervals_mcp_server.config import load_config
@@ -52,11 +54,17 @@ def configuration_problems(environ: Mapping[str, str] | None = None) -> tuple[li
             fastmcp_settings_from_env({name: env[name]})
         except ValueError as exc:
             errors.append(_one_line(exc))
-    if config is not None and transport in NETWORK_TRANSPORTS:
+    multi = (env.get("MCP_TENANCY", "").strip().lower() or "single") == "multi"
+    if config is not None and transport in NETWORK_TRANSPORTS and not multi:
         for name, value in (("API_KEY", config.api_key), ("ATHLETE_ID", config.athlete_id)):
             if not value:
                 warnings.append(f"{name} is not set: tool calls over {transport.value} will fail without it")
+    if multi and transport is not None and transport not in NETWORK_TRANSPORTS:
+        errors.append("MCP_TENANCY=multi needs a network transport (MCP_TRANSPORT=streamable-http, sse or http+sse)")
     errors.extend(_oauth_problems(env))
+    tenancy_errors, tenancy_warnings = _tenancy_problems(env)
+    errors.extend(tenancy_errors)
+    warnings.extend(tenancy_warnings)
     setting_errors, setting_warnings = _settings_problems(env)
     errors.extend(setting_errors)
     warnings.extend(setting_warnings)
@@ -121,6 +129,68 @@ def _settings_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  
     return errors, warnings
 
 
+def _tenancy_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  # pylint: disable=too-many-locals,too-many-branches
+    """The multi-user mode: settings, risks and the stored connections (counts only)."""
+    # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.auth import SingleUserOAuthProvider, normalize_athlete_id, oauth_config_from_env
+    from intervals_mcp_server.tenancy import budget_settings, tenancy_from_env
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    try:
+        tenancy = tenancy_from_env(env)
+    except ValueError as exc:
+        return [_one_line(exc)], []
+    oauth = (env.get("MCP_AUTH", "none").strip().lower() or "none") == "oauth"
+    owner = normalize_athlete_id(env.get("ATHLETE_ID", "")) if env.get("ATHLETE_ID", "").strip() else ""
+    if tenancy == "single":
+        allowed = [normalize_athlete_id(a) for a in env.get("OAUTH_ALLOWED_ATHLETES", "").split(",") if a.strip()]
+        others = [a for a in allowed if a != owner]
+        if oauth and owner and others:
+            warnings.append(
+                f"OAUTH_ALLOWED_ATHLETES lists {len(others)} athlete(s) besides ATHLETE_ID: in the single-user mode they "
+                "see the owner's data. Use MCP_TENANCY=multi to share the server with other athletes"
+            )
+        if env.get("OAUTH_TOKEN_KEY", "").strip() or env.get("OAUTH_TOKEN_KEY_FILE", "").strip():
+            warnings.append("OAUTH_TOKEN_KEY / OAUTH_TOKEN_KEY_FILE is only used with MCP_TENANCY=multi")
+        return errors, warnings
+    if not oauth:
+        return ["MCP_TENANCY=multi requires MCP_AUTH=oauth: every connection signs in with its own account"], warnings
+    _, _, budget_errors = budget_settings(env)
+    errors.extend(budget_errors)
+    if env.get("ATHLETE_TIMEZONE", "").strip():
+        warnings.append(
+            "ATHLETE_TIMEZONE applies to every athlete of the shared server; leave it empty so that each athlete's "
+            "Intervals.icu time zone is used"
+        )
+    if env.get("INTERVALS_OAUTH_SCOPE", "").strip():
+        warnings.append("INTERVALS_OAUTH_SCOPE is ignored with MCP_TENANCY=multi (the scopes follow the granted permissions)")
+    if "*" in env.get("OAUTH_ALLOWED_ATHLETES", ""):
+        warnings.append(
+            "OAUTH_ALLOWED_ATHLETES=* with OAUTH_ALLOW_ANY_ATHLETE=true: any Intervals.icu athlete can connect, store a "
+            "token on this server and use its request budget"
+        )
+    if not (env.get("API_KEY", "").strip() and owner):
+        warnings.append("API_KEY or ATHLETE_ID is not set: the owner connects like every other athlete (own Intervals.icu token)")
+    try:
+        provider = SingleUserOAuthProvider(oauth_config_from_env(dict(env)))
+    except ValueError:
+        return errors, warnings  # reported by the OAuth check
+    overview = provider.grant_overview()
+    if overview["legacy_grants"]:
+        warnings.append(
+            f"{overview['legacy_grants']} connection(s) from the single-user mode are served as the owner (ATHLETE_ID, API "
+            "key). If anyone else ever connected in the single-user mode, remove them: futureweb-intervals-mcp grants "
+            "remove --legacy"
+        )
+    if overview["unreadable_tokens"]:
+        warnings.append(
+            f"{overview['unreadable_tokens']} stored Intervals.icu token(s) cannot be opened with the configured "
+            "OAUTH_TOKEN_KEY; those athletes have to reconnect"
+        )
+    return errors, warnings
+
+
 def _oauth_problems(env: Mapping[str, str]) -> list[str]:
     # pylint: disable=import-outside-toplevel
     from intervals_mcp_server.auth import SingleUserOAuthProvider, oauth_config_from_env
@@ -154,14 +224,48 @@ def doctor() -> int:
         for error in errors:
             print(f"  - {error}")
         return 1
-    from intervals_mcp_server.tools.status import format_status, server_status  # pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tenancy import Credential, canonical_athlete_id, multi_user, use_credential
+    from intervals_mcp_server.tools.status import format_status, server_status
 
-    print(format_status(asyncio.run(server_status(include_private=True))))
+    owner = None
+    api_key, athlete = os.environ.get("API_KEY", "").strip(), os.environ.get("ATHLETE_ID", "").strip()
+    if multi_user() and api_key and athlete:
+        # The doctor checks the owner's own API key, the only credential the server holds itself.
+        owner = Credential(canonical_athlete_id(athlete), "apikey", api_key, None, None, owner=True)
+    with use_credential(owner):
+        print(format_status(asyncio.run(server_status(include_private=True))))
+    if multi_user():
+        _print_multi_user_overview()
     return 0
+
+
+def _print_multi_user_overview() -> None:
+    """Counts of the stored connections (``grants list`` shows the details)."""
+    # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.auth import SingleUserOAuthProvider, oauth_config_from_env
+    from intervals_mcp_server.tenancy import budget_settings
+
+    config = oauth_config_from_env()
+    overview = SingleUserOAuthProvider(config).grant_overview()
+    daily, window, _ = budget_settings()
+    print(
+        f"Multi-user mode: {overview['athletes']} athlete(s) with {overview['athlete_grants']} connection(s) and stored "
+        f"token(s), {overview['owner_grants'] + overview['legacy_grants']} owner connection(s); "
+        f"{'any athlete' if config.allow_any_athlete else str(len(config.allowed_athletes)) + ' allowed athlete(s)'}; "
+        f"token key with {config.vault.key_count if config.vault else 0} key(s); retention "
+        f"{str(config.token_retention_days) + ' days' if config.token_retention_days else 'off'}; budgets "
+        f"{daily or 'unlimited'} requests/athlete/day, {window or 'unlimited'} per 15 min shared"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     """Handle the command line; returns the process exit code."""
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if arguments[:1] in (["grants"], ["token-key"]):
+        from intervals_mcp_server.auth import main as auth_main  # pylint: disable=import-outside-toplevel
+
+        return auth_main(arguments)
     parser = argparse.ArgumentParser(
         prog=PROG,
         description="Futureweb Intervals MCP: an MCP server for Intervals.icu. Configured through environment "
@@ -169,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="store_true", help="print the version and exit")
     parser.add_argument("--doctor", action="store_true", help="check the configuration and the Intervals.icu API key")
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    parser.epilog = "Commands: 'grants list|remove|prune' (stored connections), 'token-key' (multi-user mode key)."
+    args = parser.parse_args(arguments)
     if args.version:
         print(__version__)
         return 0

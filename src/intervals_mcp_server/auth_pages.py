@@ -145,7 +145,7 @@ def _esc(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     provider: SingleUserOAuthProvider, request_id: str, username: str, error: str | None, form_token: str
 ) -> str:
     pending = provider.pending_login(request_id)
@@ -177,8 +177,15 @@ def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arg
     local = [m for m in ("password", "apikey") if m in config.login_methods]
     if "intervals" in config.login_methods:
         parts.append('<button type="submit" name="action" value="intervals">Continue with Intervals.icu</button>')
+        if config.multi_user:
+            parts.append(
+                '<p class="note">This server is shared. After the sign-in it stores your Intervals.icu access token '
+                "(encrypted) for this connection and uses it only for your own data, with the permissions chosen above. "
+                "Disconnecting the client deletes it; the server owner can see the server's logs.</p>"
+            )
         if local:
-            parts.append('<hr><p class="note">Or sign in on this server:</p>')
+            label = "Or, server owner only, sign in on this server:" if config.multi_user else "Or sign in on this server:"
+            parts.append(f'<hr><p class="note">{label}</p>')
     if local and provider.totp_required:
         parts.append(
             '<label for="totp">Authenticator code</label><input type="text" id="totp" name="totp" '
@@ -399,7 +406,7 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
             message = "Invalid credentials or authenticator code." if provider.totp_required else "Invalid credentials."
             return consent_page(request, request_id, username or provider.config.username, message, 401)
         provider.local_login_succeeded(key)
-        return _redirect(provider.complete_login(request_id, key, granted))
+        return _redirect(provider.complete_login(request_id, key, granted, method=action))
 
     async def intervals_callback(request: Request) -> Response:
         params = request.query_params
