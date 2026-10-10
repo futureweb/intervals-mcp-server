@@ -32,7 +32,10 @@ from intervals_mcp_server.utils.validation import (
 )
 from intervals_mcp_server.utils.workout_validation import (
     coerce_workout_doc,
+    has_step_lines,
     is_blank_workout_doc,
+    is_structured_workout,
+    warnings_note,
     workout_text_for_write,
     write_refusal,
 )
@@ -55,6 +58,7 @@ SPORT_CATEGORIES = ("WORKOUT", "RACE_A", "RACE_B", "RACE_C")
 # and can only be deleted one by one with delete_event.
 DELETABLE_CATEGORIES = ("WORKOUT", "RACE_A", "RACE_B", "RACE_C", "NOTE", "TARGET", "HOLIDAY", "SICK", "INJURED")
 MAX_DELETE_RANGE_DAYS = 31
+MAX_DELETE_EVENTS = 100
 MAX_BULK_EVENTS = 100
 
 
@@ -360,30 +364,38 @@ def _select_for_deletion(
 
 
 @tool("destructive")
-async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
+async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches,too-many-statements
     start_date: str,
     end_date: str,
     categories: str = "WORKOUT",
     dry_run: bool = True,
+    confirm_ids: str | None = None,
     include_paired: bool = False,
     athlete_id: str | None = None,
     api_key: str | None = None,
 ) -> str:
-    """DELETES calendar events of the given categories in a date range (preview by default).
+    """DELETES calendar events of the given categories in a date range, in two steps.
 
-    SAFE BY DEFAULT: with dry_run=true (the default) nothing is deleted; the answer lists the
-    events that WOULD be deleted. Show that list to the athlete and call again with
-    dry_run=false only after an explicit confirmation. Only the listed categories are touched
-    (default WORKOUT = planned workouts; races, notes, sick days etc. only when named), only
-    events that START in the range, at most 31 days per call, and planned workouts that are
-    already paired with a completed activity are kept unless include_paired=true.
+    1. Preview (dry_run=true, the default): nothing is deleted; the answer lists the events
+       that match (id, date, category, name). Show that list to the athlete.
+    2. Delete (dry_run=false) ONLY after the athlete confirmed the list: pass the confirmed ids
+       as confirm_ids. Only events that are in confirm_ids AND still match the filters are
+       deleted, one by one; events added since the preview are never deleted, and confirmed
+       ids that no longer match are reported, not deleted.
+
+    Only the listed categories are touched (default WORKOUT = planned workouts; races, notes,
+    sick days etc. only when named), only events that START in the range, at most 31 days per
+    call, and planned workouts already paired with a completed activity are kept unless
+    include_paired=true.
 
     Args:
         start_date: First day YYYY-MM-DD (inclusive)
         end_date: Last day YYYY-MM-DD (inclusive, at most 31 days after start_date)
         categories: Comma-separated categories to delete (default "WORKOUT"); allowed:
             WORKOUT, RACE_A, RACE_B, RACE_C, NOTE, TARGET, HOLIDAY, SICK, INJURED
-        dry_run: true (default) = only list what would be deleted; false = delete
+        dry_run: true (default) = only list what would be deleted; false = delete confirm_ids
+        confirm_ids: Comma-separated event ids from the preview that the athlete confirmed
+            (required with dry_run=false), e.g. "101,102,107"
         include_paired: Also delete planned workouts that are paired with a completed activity
             (optional, default false)
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
@@ -391,8 +403,10 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
 
     Returns:
         JSON with dry_run, the range and categories, "events" (id, date, category, type, name)
-        that would be / were deleted, "kept" (in the API result but not deleted, with the reason)
-        and, when deleting, "deleted_count" as reported by Intervals.icu.
+        that match now, "kept" (in the API result but not matching, with the reason) and, when
+        deleting, "deleted", "already_gone", "failed" (id and reason), "not_confirmed" (matching
+        events that were not in confirm_ids) and "no_longer_matching" (confirmed ids that do not
+        match any more).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -413,6 +427,18 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
     wanted = _parse_categories(categories)
     if isinstance(wanted, str):
         return wanted
+    confirmed: list[str] = []
+    if not dry_run:
+        confirmed = [part.strip() for part in (confirm_ids or "").split(",") if part.strip()]
+        if not confirmed:
+            return (
+                "Error: dry_run=false needs confirm_ids, the ids from the preview that the athlete confirmed. "
+                "Call with dry_run=true first and show the list. Nothing was deleted."
+            )
+        if not all(part.isascii() and part.isdigit() for part in confirmed):
+            return "Error: confirm_ids must be comma-separated numeric event ids. Nothing was deleted."
+        if len(confirmed) > MAX_DELETE_EVENTS:
+            return f"Error: at most {MAX_DELETE_EVENTS} events per call. Nothing was deleted."
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/events",
@@ -432,32 +458,43 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
         "kept": kept,
     }
     if dry_run:
+        ids = ",".join(str(row["id"]) for row in selected)
         payload["message"] = (
-            f"Preview only, nothing was deleted: {len(selected)} event(s) would be deleted. "
-            "Call again with dry_run=false after the athlete confirmed this list."
+            f"Preview only, nothing was deleted: {len(selected)} event(s) match. After the athlete confirmed "
+            f"this list, call again with dry_run=false and confirm_ids=\"{ids}\"."
             if selected else "Nothing to delete in this range for these categories."
         )
         return json.dumps(payload, ensure_ascii=False, indent=2)
-    if not selected:
-        payload.update({"deleted_count": 0, "message": "Nothing to delete in this range for these categories."})
-        return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    # One request for exactly these ids (events that no longer exist are ignored by the API).
-    deleted = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events/bulk-delete",
-        api_key=api_key,
-        method="PUT",
-        data=[{"id": row["id"]} for row in selected],
-    )
-    if isinstance(deleted, dict) and "error" in deleted:
-        payload["message"] = (
-            f"Error deleting events: {deleted.get('message')}. Some of the listed events may have been deleted; "
-            "check with get_events before retrying."
+    current = {str(row["id"]): row for row in selected}
+    to_delete = [current[i] for i in dict.fromkeys(confirmed) if i in current]
+    payload["not_confirmed"] = [row for key, row in current.items() if key not in confirmed]
+    payload["no_longer_matching"] = [i for i in dict.fromkeys(confirmed) if i not in current]
+    deleted: list[dict[str, Any]] = []
+    already_gone: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for row in to_delete:
+        answer = await make_intervals_request(
+            url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(row['id'])}", api_key=api_key, method="DELETE"
         )
-        return json.dumps(payload, ensure_ascii=False, indent=2)
-    count = deleted.get("eventsDeleted") if isinstance(deleted, dict) else None
-    payload["deleted_count"] = count
-    payload["message"] = f"Deleted {count if count is not None else len(selected)} of {len(selected)} listed event(s)."
+        if isinstance(answer, dict) and "error" in answer:
+            if answer.get("status_code") == 404:
+                already_gone.append(row)  # e.g. deleted by a retried request or in the web app
+            else:
+                failed.append({**row, "error": answer.get("message")})
+        else:
+            deleted.append(row)
+    payload.update({"deleted": deleted, "already_gone": already_gone, "failed": failed})
+    parts = [f"Deleted {len(deleted)} of {len(confirmed)} confirmed event(s)"]
+    if already_gone:
+        parts.append(f"{len(already_gone)} were already gone")
+    if failed:
+        parts.append(f"{len(failed)} failed (see failed; check with get_events before retrying)")
+    if payload["no_longer_matching"]:
+        parts.append(f"{len(payload['no_longer_matching'])} confirmed id(s) no longer match the range/filters and were not deleted")
+    if payload["not_confirmed"]:
+        parts.append(f"{len(payload['not_confirmed'])} matching event(s) were not confirmed and were kept")
+    payload["message"] = "; ".join(parts) + "."
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -494,6 +531,8 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     distance: int | None = None,
     indoor: bool | None = None,
     category: str | None = None,
+    description: str | None = None,
+    replace_workout: bool = False,
 ) -> str:
     """Post event for an athlete to Intervals.icu this follows the event api from intervals.icu
     If event_id is provided, the event will be updated instead of created.
@@ -503,7 +542,10 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     Moving an event to another day keeps its time of day. Passing workout_doc REPLACES the
     planned workout; an empty workout_doc ({} or no steps) is ignored and never clears it.
     The workout is validated first (same checks as validate_workout); with errors nothing is
-    written. Creating an event needs a name; the date defaults to today (athlete's time zone)
+    written, warnings are listed in the answer. Text-only workouts (strength, yoga: an exercise
+    list without durations) go into `description` (or a workout_doc with text steps only). On an
+    update, text without timed steps never silently replaces a structured (timed) workout: that
+    needs replace_workout=true. Creating an event needs a name; the date defaults to today (athlete's time zone)
     and the category to WORKOUT. Workouts and races need a sport: pass workout_type unless the
     name names exactly one sport ("Easy run" -> Run).
 
@@ -525,6 +567,11 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
         distance: Total expected distance of the workout in meters (optional, >= 0)
         indoor: Mark the event as an indoor/trainer session. Optional; omit to leave
             unchanged when updating an existing event.
+        description: Workout text instead of workout_doc (optional): plain text such as
+            "Squats 5x5, Deadlifts 3x5" or native Intervals.icu workout text, sent as-is.
+            Replaces the event's description; an empty string is ignored (never clears it).
+        replace_workout: Allow text without timed steps (description or a text-only workout_doc)
+            to replace an event that holds a structured workout (optional, default false)
 
     Example:
         "workout_doc": {
@@ -553,7 +600,8 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
             Cadence: {"cadence": {"value": 90, "units": "cadence"}}
             Pace by ftp: {"pace": {"value": 80, "units": "%pace"}}
             Pace by zone: {"pace": {"value": 2, "units": "pace_zone"}}
-            Absolute pace (seconds or decimal minutes per km; MINS_MILE, SECS_100M, SECS_500M alike):
+            Absolute pace: MINS_KM / MINS_MILE in seconds (335) or decimal minutes (5.583) per km/mile;
+            SECS_100M, SECS_100Y, SECS_500M in seconds:
                 {"pace": {"value": 335, "units": "MINS_KM"}}  -> "5:35/km Pace"
             Zone by power: {"power": {"value": 2, "units": "power_zone"}}
             Zone by heart rate: {"hr": {"value": 2, "units": "hr_zone"}}
@@ -618,32 +666,45 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
             event_type = None  # notes, holidays, sick and injured days have no sport
         validated_date = validated_date or athlete_today().isoformat()
 
-    description, doc_problem = workout_text_for_write(workout_doc, event_type, allow_text_only=not is_update)
-    if doc_problem:
-        return write_refusal(doc_problem)
+    workout = workout_text_for_write(workout_doc, event_type)
+    if workout.problem:
+        return write_refusal(workout.problem)
+    if description is not None and not description.strip():
+        description = None  # "" from a client filling optional fields: not given, never clears
+    if workout.text is not None and description is not None:
+        return "Error: pass either workout_doc or description, not both. Nothing was written."
+    text, text_only = workout.text, workout.text_only
+    if text is None and description is not None:
+        text, text_only = description, not has_step_lines(description)
 
     start_local = None
+    existing: dict[str, Any] | None = None
+    if is_update and (validated_date or (text is not None and text_only)):
+        existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id), api_key)
+        if fetch_error:
+            return f"Error: could not read event {event_id} before changing it: {fetch_error}. Nothing was changed."
+        if text is not None and text_only and is_structured_workout(existing) and not replace_workout:
+            return (
+                f"Error: event {event_id} holds a structured workout with timed steps; this text has none and would "
+                "replace it. Pass steps in workout_doc, or replace_workout=true to replace it with text. "
+                "Nothing was changed."
+            )
     if validated_date:
-        time_of_day = "T00:00:00"
-        if is_update:
-            existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id), api_key)
-            if fetch_error:
-                return f"Error: could not read event {event_id} before moving it: {fetch_error}. Nothing was changed."
-            time_of_day = _time_of_day(existing)
-        start_local = validated_date + time_of_day
+        start_local = validated_date + (_time_of_day(existing) if is_update else "T00:00:00")
 
     event_data = _prepare_event_data(
-        name, event_type, start_local, description, moving_time, distance, indoor, category=category
+        name, event_type, start_local, text, moving_time, distance, indoor, category=category
     )
     if is_update and not event_data:
         return "Error: nothing to update; pass at least one field to change."
-    return await _create_or_update_event_request(
+    answer = await _create_or_update_event_request(
         athlete_id_to_use, api_key, event_data, validated_date, event_id
     )
+    return answer + (warnings_note(workout.warnings) if answer.startswith("Successfully") else "")
 
 
 @tool("write", overwrites=True)
-async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
     name: str | None = None,
     description: str | None = None,
     start_date: str | None = None,
@@ -651,12 +712,15 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
     athlete_id: str | None = None,
     api_key: str | None = None,
     event_id: str | None = None,
+    clear_description: bool = False,
 ) -> str:
     """Add or update a plain text note (category NOTE) on the Intervals.icu calendar.
 
     Updates are partial: only the parameters you pass are changed, so renaming a note keeps
-    its text, colour and date. Only notes can be updated with this tool: the event is read
-    first and anything else (a planned workout, a race) is refused, never turned into a note.
+    its text, colour and date. An empty description is ignored on update (it never wipes the
+    text); pass clear_description=true to empty it on purpose. Only notes can be updated with
+    this tool: the event is read first and anything else (a planned workout, a race) is
+    refused, never turned into a note.
 
     Args:
         name: Title of the note (required when creating; must not be blank)
@@ -667,6 +731,7 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
         athlete_id: The Intervals.icu athlete ID (optional)
         api_key: The Intervals.icu API key (optional)
         event_id: The Intervals.icu event ID of a NOTE (optional, for updates)
+        clear_description: Empty the note's text on update (optional, default false)
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -681,6 +746,11 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
         start_date = start_date or athlete_today().isoformat()
         color = color or "green"
         description = description if description is not None else ""
+
+    elif clear_description:
+        description = ""
+    elif description is not None and not description.strip():
+        description = None  # a placeholder "" never wipes the note's text
 
     try:
         validated_date = validate_date(start_date) if start_date else None
@@ -748,10 +818,11 @@ _BULK_WORKOUT_KEYS = _BULK_COMMON_KEYS | {
 _BULK_NOTE_KEYS = _BULK_COMMON_KEYS | {"description", "color"}
 
 
-def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
+def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> dict[str, Any]:  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
     """Validate one bulk entry and build the API event body using the shared builders.
 
-    All problems of the entry are collected and reported together.
+    All problems of the entry are collected and reported together; validation warnings of its
+    workout are appended to *warnings*.
 
     Raises:
         ValueError: If the entry is invalid; the message lists every problem found.
@@ -807,11 +878,12 @@ def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=to
         if doc_error:
             problems.append(doc_error)
         else:
-            text, doc_problem = workout_text_for_write(
-                workout_doc, workout_type if isinstance(workout_type, str) else None
-            )
-            if doc_problem:
-                problems.append(doc_problem)
+            workout = workout_text_for_write(workout_doc, workout_type if isinstance(workout_type, str) else None)
+            if workout.problem:
+                problems.append(workout.problem)
+            text = workout.text
+            if warnings is not None:
+                warnings.extend(workout.warnings)
     amount_error = _check_amounts(entry.get("moving_time"), entry.get("distance"))
     if amount_error:
         problems.append(amount_error)
@@ -834,7 +906,7 @@ def _build_bulk_event_entry(entry: Any) -> dict[str, Any]:  # pylint: disable=to
 
 
 @tool("admin")
-async def add_events_bulk(
+async def add_events_bulk(  # pylint: disable=too-many-locals
     events: list[dict[str, Any]],
     athlete_id: str | None = None,
     api_key: str | None = None,
@@ -892,11 +964,15 @@ async def add_events_bulk(
 
     bodies: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     for index, entry in enumerate(events):
+        entry_warnings: list[str] = []
         try:
-            bodies.append(_build_bulk_event_entry(entry))
+            bodies.append(_build_bulk_event_entry(entry, entry_warnings))
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             errors.append({"index": index, "error": str(e)})
+        if entry_warnings:
+            warnings.append({"index": index, "warnings": entry_warnings})
 
     if errors:
         return json.dumps(
@@ -919,7 +995,7 @@ async def add_events_bulk(
     )
     if isinstance(result, dict) and "error" in result:
         return (
-            f"Error creating events in bulk: {result.get('message', 'Unknown error')}. "
+            f"Error creating events in bulk: {str(result.get('message', 'Unknown error')).rstrip('.')}. "
             "The events may have been partially or fully created; check get_events for the "
             "date range before retrying."
         )
@@ -952,6 +1028,7 @@ async def add_events_bulk(
             "error_count": len(errors),
             "created": created,
             "errors": errors,
+            "warnings": warnings,
         },
         indent=2,
     )
