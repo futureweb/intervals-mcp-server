@@ -375,6 +375,65 @@ def normalized_power(time: list[Any], watts: list[Any], start: int = 0, end: int
     return float((sum(fourth_powers) / len(fourth_powers)) ** 0.25)
 
 
+NP_MAX_GRID_S = 200_000  # longer clocks (multi-day recordings) fall back to the recorded samples
+NP_PAUSE_GAP_S = 5  # a longer gap between samples is a recording pause (0 W in the NP window)
+
+
+def rolling_fourth_powers(time: list[Any], watts: list[Any]) -> list[float | None]:  # pylint: disable=too-many-locals
+    """Per sample: the 4th power of the 30 s rolling mean power ending at it (None without power).
+
+    The window runs over the whole activity on a 1 s grid (partial at its start): a sample
+    spacing up to ``NP_PAUSE_GAP_S`` holds the last value (recordings every 2-3 s), a longer
+    gap is a recording pause and counts as 0 W. So the NP of a slice computed from these
+    values includes the 30 s before the slice and a pause does not restart the window. This
+    is how Intervals.icu computes the NP of an interval, so NP values of split or merged
+    steps are comparable with the NP of the Intervals.icu intervals.
+    """
+    out: list[float | None] = [None] * len(time)
+    points: list[tuple[int, int, float | None]] = []  # (sample index, second, watts)
+    for index, (moment, power) in enumerate(zip(time, watts, strict=False)):
+        if isinstance(moment, (int, float)) and not isinstance(moment, bool) and not is_missing(moment):
+            valid = isinstance(power, (int, float)) and not isinstance(power, bool) and not is_missing(power)
+            points.append((index, int(round(moment)), float(power) if valid else None))
+    if not points:
+        return out
+    origin, span = points[0][1], points[-1][1] - points[0][1] + 1
+    if span <= 0 or span > NP_MAX_GRID_S or any(b[1] <= a[1] for a, b in zip(points, points[1:], strict=False)):
+        return _rolling_fourth_powers_samples(points, out)
+    grid = [0.0] * span
+    for position, (_, second, power) in enumerate(points):
+        value = power or 0.0
+        following = points[position + 1][1] if position + 1 < len(points) else second + 1
+        hold = following - second if following - second <= NP_PAUSE_GAP_S else 1
+        for offset in range(hold):  # sparse recording: hold the value; a pause stays at 0 W
+            grid[second - origin + offset] = value
+    rolling, total = [], 0.0
+    for second, power in enumerate(grid):
+        total += power
+        if second >= NP_WINDOW_S:
+            total -= grid[second - NP_WINDOW_S]
+        rolling.append(total / min(second + 1, NP_WINDOW_S))
+    for index, second, power in points:
+        out[index] = rolling[second - origin] ** 4 if power is not None else None
+    return out
+
+
+def _rolling_fourth_powers_samples(points: list[tuple[int, int, float | None]], out: list[float | None]) -> list[float | None]:
+    """Fallback without a regular clock: the rolling window over the recorded samples."""
+    head, window_sum, count = 0, 0.0, 0
+    for position, (index, moment, power) in enumerate(points):
+        if power is not None:
+            window_sum += power
+            count += 1
+        while head < position and points[head][1] <= moment - NP_WINDOW_S:
+            if points[head][2] is not None:
+                window_sum -= points[head][2] or 0.0
+                count -= 1
+            head += 1
+        out[index] = (window_sum / count) ** 4 if power is not None and count else None
+    return out
+
+
 # ------------------------------------------------------------ stream relevance
 # Words in a custom stream's name/code that tie it to a sport family. Used only to hide
 # streams that a device or script computes for every activity (e.g. a running metric on

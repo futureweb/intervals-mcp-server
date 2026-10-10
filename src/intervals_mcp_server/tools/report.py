@@ -8,6 +8,7 @@ size: "compact" (core numbers, up to five key findings, sport-relevant custom fi
 quality), "standard" (the full analysis without raw stream dumps; default) or "full".
 """
 
+import asyncio
 import json
 from typing import Any
 
@@ -28,13 +29,13 @@ from intervals_mcp_server.utils.activity_context import (
     wprime_summary,
 )
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, is_missing
-from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps
+from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps, target_text
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
 from intervals_mcp_server.utils.fueling import activity_fueling
 from intervals_mcp_server.utils.power_compare import compare_power_streams as compute_power_comparison
 from intervals_mcp_server.utils.provenance import STRAVA_STUB_NOTE, freshness, is_strava_stub, provenance_notes, source_summary
 from intervals_mcp_server.utils.segments import detect_segments
-from intervals_mcp_server.utils.sports import hms, utc_offset
+from intervals_mcp_server.utils.sports import format_pace, hms, utc_offset
 from intervals_mcp_server.utils.streams import find_stream, gear_units_note, numeric_values
 from intervals_mcp_server.utils.work_sets import set_summary, split_work
 
@@ -120,6 +121,58 @@ def _num(value: Any) -> float | None:
     return float(value)
 
 
+ACTUAL_KEYS = {"power": "avg_watts", "hr": "avg_hr", "pace": "avg_speed_m_s"}
+
+
+TARGET_GROUP_PCT = 10.0  # work targets whose midpoints differ less are summarised as one range
+
+
+def _target_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Work rows grouped by similar targets (midpoints within 10 %), in order of first appearance."""
+    groups: list[list[dict[str, Any]]] = []
+    for row in rows:
+        target = row["planned"]["target"]
+        mid = target["low"] if target["high"] is None else (target["low"] + target["high"]) / 2
+        for group in groups:
+            first = group[0]["planned"]["target"]
+            ref = first["low"] if first["high"] is None else (first["low"] + first["high"]) / 2
+            if ref and abs(mid - ref) / ref * 100 < TARGET_GROUP_PCT and (target["high"] is None) == (first["high"] is None):
+                group.append(row)
+                break
+        else:
+            groups.append([row])
+    return groups
+
+
+def _work_vs_plan(work: list[dict[str, Any]], pace_units: str | None) -> str:
+    """'work steps 249/249/253 W vs 238-246 W planned' in the unit of the planned targets.
+
+    Power targets are compared with the average power, pace targets with the average pace
+    and HR targets with the average HR; nothing when the work steps mix target kinds.
+    Clearly different targets (e.g. an easy block and strides) are listed separately.
+    """
+    rows = [r for r in work if r["planned"].get("target")]
+    kinds = {r["planned"]["target"]["kind"] for r in rows}
+    if len(kinds) != 1:
+        return ""
+    kind = kinds.pop()
+    parts = []
+    for group in _target_groups(rows):
+        values = [r["metrics"][ACTUAL_KEYS[kind]] for r in group if r["metrics"].get(ACTUAL_KEYS[kind]) is not None]
+        if not values:
+            continue
+        targets = [r["planned"]["target"] for r in group]
+        highs = [t["high"] for t in targets]
+        span = {"kind": kind, "low": min(t["low"] for t in targets), "high": None if None in highs else max(highs),
+                "units": "bpm" if kind == "hr" else "W"}
+        if kind == "pace":
+            actual = ", ".join(format_pace(v, pace_units) for v in values)
+        else:
+            actual = "/".join(f"{v:.0f}" for v in values) + f" {span['units']}"
+        parts.append(f"{actual} vs {target_text(span, pace_units)} planned")
+    return "; work steps " + "; ".join(parts) if parts else ""
+
+
 def _execution_findings(execution: dict[str, Any]) -> list[str]:
     summary = execution["summary"]
     rows = [r for r in execution["rows"] if r.get("planned") and r.get("metrics")]
@@ -127,12 +180,7 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
     findings = []
     text = f"Plan: {summary['matched']}/{summary['planned_steps']} steps executed"
     if work:
-        watts = "/".join(f"{r['metrics']['avg_watts']:.0f}" for r in work if r["metrics"].get("avg_watts") is not None)
-        targets = [r["planned"]["target"] for r in work if r["planned"].get("target")]
-        if watts and targets:
-            low = min(t["low"] for t in targets)
-            high = max((t["high"] or t["low"]) for t in targets)
-            text += f"; work steps {watts} W vs {low:.0f}-{high:.0f} W planned"
+        text += _work_vs_plan(work, execution.get("pace_units"))
         text += f" ({summary['work_steps_in_range']} within ±5%, {summary.get('work_steps_inside_exact_range')} inside the exact range"
         if summary.get("work_time_in_target_pct_mean") is not None:
             text += f", mean time in target {summary['work_time_in_target_pct_mean']:.0f}%"
@@ -141,7 +189,11 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
     findings.append(text)
     extension = execution.get("extension")
     if extension:
-        efforts = ", ".join(f"{hms(e.get('elapsed_time'))} @ {e.get('average_watts')} W" for e in extension.get("efforts") or [])
+        efforts = ", ".join(
+            f"{hms(e.get('elapsed_time'))} @ {e['average_watts']} W" if e.get("average_watts") is not None
+            else f"{hms(e.get('elapsed_time'))} @ {format_pace(e.get('average_speed'), execution.get('pace_units'))}"
+            for e in extension.get("efforts") or []
+        )
         share = f", {summary['extension_work_share_pct']:.0f}% of the work" if summary.get("extension_work_share_pct") is not None else ""
         findings.append(
             f"Additional training after the plan: {hms(extension['duration_s'])} from {hms(extension.get('start_time'))}{share}"
@@ -192,7 +244,10 @@ def _key_findings(  # pylint: disable=too-many-arguments,too-many-positional-arg
 ) -> list[str]:
     """Up to five short findings for the compact report."""
     findings: list[str] = []
-    if execution and planned:
+    skipped = (execution or {}).get("summary", {}).get("plan_skipped")
+    if skipped:  # the plan comparison fell back to the intervals: say so instead of "0/0 steps"
+        findings.append(f"Plan: {skipped}")
+    if execution and planned and not skipped:
         findings.extend(_execution_findings(execution))
     elif intervals:
         main = _main_set_finding(intervals, _num(activity.get("icu_ftp")))
@@ -356,17 +411,21 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
 
     steps: Any = None
     plan_source = ""
+    doc: dict[str, Any] = {}
     if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
-        steps, plan_source = planned_workout_doc["steps"], "workout document provided by the caller"
+        doc, plan_source = planned_workout_doc, "workout document provided by the caller"
     elif activity.get("paired_event_id") and athlete_id:
         event = await _get_event(athlete_id, activity["paired_event_id"], api_key)
         if event:
-            steps = (event.get("workout_doc") or {}).get("steps")
+            doc = event.get("workout_doc") or {}
             plan_source = f"event {event.get('id')} ('{event.get('name')}')"
+    steps = doc.get("steps")
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
-               "include_all_streams": detail_level == "full"}
-    execution = analyze(planned, intervals, streams, tolerances=tolerances, context=context) if intervals else None
+               "include_all_streams": detail_level == "full", "pace_units": doc.get("pace_units")}
+    execution = (  # CPU-bound (many laps): run off the event loop
+        await asyncio.to_thread(analyze, planned, intervals, streams, tolerances=tolerances, context=context) if intervals else None
+    )
     pace_based = str(activity.get("type")) in PACE_SPORTS
     power = _power_check(streams)
     want_climbs = include_climbs if include_climbs is not None else (not intervals or (activity.get("total_elevation_gain") or 0) > 500)

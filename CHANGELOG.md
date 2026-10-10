@@ -9,6 +9,59 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Fixed (review findings: analytics)
+- `analyze_workout_execution` / `get_activity_report` / `get_activity_intervals` (plan vs
+  execution): a planned step can span any number of consecutive intervals, so runs with device
+  auto-laps (e.g. every 1 km) are no longer pushed to the end of the activity ("before the plan",
+  steps "not executed"); a long unmatched block before or after the plan is no longer cheap
+  (ANA-1). Device auto-laps are recognised (most of the time in laps of one distance or
+  duration): a step boundary inside an auto-lap is placed at the intensity change (least-squares
+  change point between the two targets), a step without a lap of its own between two matched steps
+  is found at its two intensity changes, an overrun of an auto-lapped step is reported as "longer
+  than planned" instead of "before the plan", and the boundary is only moved with that evidence;
+  lap presses are never moved, and an auto-lap boundary the samples cannot place is kept with its
+  durations not judged (ANA-2, second review R26-1/2/5). With auto-laps the text carries a caveat
+  and JSON `alignment_confidence` (high / medium / low) with `alignment_notes` and `auto_laps`
+  (R26-4). Laps of the length of a planned step (30/30 s, 3/3 min, 1 km / 1 km, hill repeats)
+  are lap presses unless the intensity changes clearly inside several of them (device auto-laps
+  of 1 km on 1 km repeats); only device auto-laps are ever merged for the alignment; an internal
+  error or an exhausted time budget of the plan comparison falls back to the interval analysis
+  with a note (also in the compact report) and a logged warning instead of failing the tool.
+  Open-ended targets (top zone, a %/W range with a start only; a start-only zone is that
+  zone) are lower bounds in adherence, time in target and the alignment, shown as "352 W or more";
+  zone watts are floored like the zone table (ANA-3, R26-11). Distance steps are matched and
+  flagged on distance; the plan clock restarts at the actual end of every step without duration,
+  and estimated planned totals are labelled (ANA-12, R26-8). Very many laps are merged pairwise for
+  the alignment and the analysis runs off the event loop (R26-6). Easy aerobic run steps are work; rest = recovery zone
+  (Z1) or a step between two clearly harder steps (ANA-11). A paired event with `"workout_doc":
+  null` (race, note) no longer crashes the analysis (API-6).
+- Pw:HR drift has the Intervals.icu decoupling sign (positive = HR rose relative to power; exact
+  intervals keep Intervals' own value) and the convention is stated (ANA-4).
+- NP of split or merged steps uses the 30 s rolling mean over the whole activity (on a 1 s grid:
+  recording pauses as 0 W, sparser sampling held) and stream speeds are distance / moving time, as Intervals.icu computes
+  interval values (ANA-10, R26-7).
+- `get_activity_report` key finding compares work steps in the unit of their targets (pace, HR or
+  W) instead of labelling pace/HR targets as watts, clearly different targets listed apart (ANA-7,
+  R26-10).
+- `get_best_efforts`: the end index is exclusive; a recording pause right after the window is no
+  longer counted inside it, and the window ends with its last sample (ANA-5).
+- Correlations, the weight trend and the nutrition weight change treat a stored 0 of a
+  physiological metric as no value, like the trend statistics (ANA-6).
+- Power zone watt bounds are floored like Intervals.icu (FTP 234: Z1 <= 128 W, Z2 129-175 W)
+  (ANA-8). `icu_intensity` is always read as percent, so a tiny value is no IF > 1 (ANA-9).
+- `get_coach_context` recovery markers compare the 7-day means with the 42 days before them; z
+  divides by the SD of the 7-day means over the 90 days before (times sqrt(1 + 7/42) for the
+  baseline mean) instead of the SD of single days; |z| up to about 2 is stated as normal variation
+  (ANA-14, R26-3).
+- `get_training_summary`: HR time in zones is reported (plain-list zone times were dropped), the
+  sweet-spot bucket is listed apart from Z1-Z7 (API-5); the load line says that the total takes
+  power, else HR, else pace per activity and that the per-method sums overlap, and CTL/ATL are read
+  at the end of each week or month (ANA-15, R26-9); a missing ATL no longer breaks the text (ANA-16).
+- `get_intensity_distribution` / `get_training_load` / `get_coach_context`: the pace basis uses GAP
+  zone times where Intervals.icu does (`use_gap_zone_times`) (API-18).
+- Robustness and units (ANA-16): `get_recovery_snapshot` with a baseline mean of 0, NaN values in
+  the performance tools, pace of swims per 100 m (execution analysis and best efforts).
+
 ### Added (phase 6: data quality, fueling, context)
 - `get_activity_data_audit` (new, read-only): provenance and data quality of one activity - source and
   file (Garmin Connect sync with the Garmin activity id, upload of a Garmin export, the Garmin

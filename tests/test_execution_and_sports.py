@@ -132,6 +132,10 @@ def test_sports_helpers():
     rows = zone_ranges("power", [55, 75, 999], ["Z1", "Z2", "Z3"], ftp=200)
     assert rows[1] == {"zone": 2, "name": "Z2", "upper_bound": 75, "lower_bound": 55, "min_watts": 111, "max_watts": 150}
     assert rows[2]["max_watts"] is None
+    # ANA-8: watt bounds are floored like Intervals.icu (FTP 234: Z1 <= 128, Z2 129-175 ... Z5 246-280)
+    rows = zone_ranges("power", [55, 75, 90, 105, 120, 150, 999], ftp=234)
+    assert [(r.get("min_watts"), r.get("max_watts")) for r in rows[:5]] == [(0, 128), (129, 175), (176, 210), (211, 245), (246, 280)]
+    assert zone_ranges("power", [70, 999], ftp=300)[0]["max_watts"] == 210  # no float-noise 209
     assert format_zone_table("hr", [133, 147], None) == "Z1 ≤133 bpm, Z2 133-147 bpm"
     assert format_zone_table("pace", [77.5, 999], None, threshold_pace=3.2258) == "Z1 ≤77.5% (slower to 6:40/km), Z2 >77.5% (6:40/km to faster)"
     assert to_utc_iso("2026-10-06T15:36:22Z") == "2026-10-06T15:36:22Z"

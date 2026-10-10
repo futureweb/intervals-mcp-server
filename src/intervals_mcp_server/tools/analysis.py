@@ -6,6 +6,7 @@ All tools are read-only; they combine the activity, its intervals, its streams a
 paired) the planned workout, and compute statistics from recorded samples only.
 """
 
+import asyncio
 import difflib
 import json
 from datetime import date, timedelta
@@ -491,17 +492,28 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
 
     Uses, in this order, the given planned_workout_doc, the given event_id, or the event
     paired with the activity, together with the intervals Intervals.icu detected. Planned
-    steps (repeats expanded) are aligned with the actual intervals by order, duration and
-    target intensity (never by interval names); a step may also match two or three
-    consecutive intervals of the same intensity (an effort split by a lap or a stop).
-    Planned steps are capped at their planned duration: when an interval is longer than
+    steps (repeats expanded) are aligned with the actual intervals by order, duration (or
+    distance) and target intensity (never by interval names); a step may also match any
+    number of consecutive intervals of about the same intensity (an effort split by laps,
+    e.g. 1 km device auto-laps, or a stop). Lap presses are kept as step boundaries. With
+    device auto-laps (most laps of one distance or duration) a step boundary inside a lap is
+    placed where the intensity changes, a step without a lap of its own between two matched
+    steps is found at its two intensity changes, and an overrun is reported as longer than
+    planned; a boundary the samples cannot place is kept and the durations there are not
+    judged. A caveat line and JSON alignment_confidence (high / medium / low) with notes say
+    how far the per-step results can be trusted. Open-ended targets (top zone, a %/W range
+    with a start only) are lower bounds. Steps in the recovery zone or between two clearly
+    harder steps count as rest (no length limit), easy aerobic steps as work. Steps without
+    duration (distance, lap button) restart the plan clock at their actual end. Planned
+    steps are capped at their planned duration: when an interval is longer than
     its step (beyond the tolerance), it is split logically (analysis only, nothing on
     Intervals.icu changes); the planned part is evaluated against the plan from the samples
     and the remainder is reported separately. For each step: planned vs actual (moving)
     duration, the target range (resolved to W, bpm or pace), the actual average, below/in/
     above target with the offset from the exact range, time within the target range (±5%),
     HR start/end, the HR drop in the first minute after work steps, cadence, power/speed
-    fade, Pw:HR drift for work steps of 10 min or more, the change of every custom stream
+    fade, Pw:HR drift for work steps of 10 min or more (Intervals.icu decoupling sign:
+    positive = HR rose relative to power), the change of every custom stream
     (e.g. stamina; clock counters and other-sport streams are left out) and notes on clear
     deviations (short, too long, off target, paused, shifted). The Intervals.icu interval
     type is kept and shown next to the planned step type when they differ. Everything after
@@ -557,7 +569,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     paired = event_id or activity.get("paired_event_id")
     if steps is None and paired and athlete_id:
         event = await _get_event(athlete_id, paired, api_key)
-        steps = (event or {}).get("workout_doc", {}).get("steps") if event else None
+        steps = ((event or {}).get("workout_doc") or {}).get("steps") if event else None
         if event:
             plan_source = f"event {event.get('id')} ('{event.get('name')}', {str(event.get('start_date_local', ''))[:10]})"
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
@@ -565,9 +577,11 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     if not planned and not paired and suggest_matches and athlete_id:
         candidates = await _match_candidates(athlete_id, activity, api_key)
 
+    doc = planned_workout_doc if isinstance(planned_workout_doc, dict) else ((event or {}).get("workout_doc") or {})
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
-               "include_all_streams": detail_level == "full"}
-    result = analyze(planned, intervals, streams, tolerances=tolerances, context=context)
+               "include_all_streams": detail_level == "full", "pace_units": doc.get("pace_units")}
+    # CPU-bound (many laps): run off the event loop so other requests are not blocked
+    result = await asyncio.to_thread(analyze, planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
     assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
@@ -575,6 +589,8 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     header = f"Workout execution for {_activity_header(activity)}"
     if planned:
         header += f"\nPlan source: {plan_source}"
+    elif paired and event:
+        header += f"\nEvent {event.get('id')} ('{event.get('name')}', {event.get('category')}) has no workout steps; analysing intervals only."
     elif paired:
         header += f"\nPlanned workout {paired} could not be loaded; analysing intervals only."
     else:

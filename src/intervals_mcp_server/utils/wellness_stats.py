@@ -136,6 +136,21 @@ def sort_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [entry for _, entry in _dated_entries(entries)]
 
 
+def metric_value(entry: dict[str, Any] | None, metric: str) -> float | None:
+    """Numeric value of a wellness metric on one entry; for metrics in ``ZERO_MEANS_MISSING``
+    a stored 0 is a placeholder ("no value") and returns None."""
+    value = _number((entry or {}).get(metric))
+    return None if value == 0 and metric in ZERO_MEANS_MISSING else value
+
+
+def _zero_cleaned(series: list[DateValue], metric: str) -> tuple[list[DateValue], int]:
+    """The series with stored 0 of a ``ZERO_MEANS_MISSING`` metric as None, and how many there were."""
+    if metric not in ZERO_MEANS_MISSING:
+        return series, 0
+    zeros = sum(1 for _, value in series if value == 0)
+    return [(day, None if value == 0 else value) for day, value in series], zeros
+
+
 def metric_series(entries: list[dict[str, Any]], metric: str) -> list[DateValue]:
     """One (day, value) tuple per calendar day from the first to the last entry date.
 
@@ -330,16 +345,7 @@ def compute_metric_trend(  # pylint: disable=too-many-arguments,too-many-locals
     Without a period the whole range of the entries is the period. For native metrics in
     ``ZERO_MEANS_MISSING`` a stored 0 is treated as missing and counted.
     """
-    full = metric_series(entries, metric)
-    zeros_missing = 0
-    if metric in ZERO_MEANS_MISSING:
-        cleaned: list[DateValue] = []
-        for day, value in full:
-            if value == 0:
-                zeros_missing += 1
-                value = None
-            cleaned.append((day, value))
-        full = cleaned
+    full, zeros_missing = _zero_cleaned(metric_series(entries, metric), metric)
     start, end = _as_date(period_start), _as_date(period_end)
     if end is not None:
         full = [item for item in full if item[0] <= end]
@@ -403,7 +409,7 @@ def _correlation(
         return None
 
 
-def compute_correlation(
+def compute_correlation(  # pylint: disable=too-many-locals
     entries: list[dict[str, Any]],
     metric_a: str,
     metric_b: str,
@@ -413,16 +419,21 @@ def compute_correlation(
     """Pearson r and Spearman rho between ``metric_a`` on a day and ``metric_b`` ``lag_days`` later.
 
     Only days where both values exist are paired; the coefficients are None when
-    fewer than ``min_pairs`` pairs exist.
+    fewer than ``min_pairs`` pairs exist. A stored 0 of a ``ZERO_MEANS_MISSING`` metric is
+    no value (as in the trend statistics) and counted in ``zeros_treated_as_missing``.
     """
     by_date = _entries_by_date(entries)
     pairs: list[tuple[float, float]] = []
     for day, entry in by_date.items():
         other = by_date.get(day + timedelta(days=lag_days))
-        value_a = _number(entry.get(metric_a))
-        value_b = _number(other.get(metric_b)) if other is not None else None
+        value_a = metric_value(entry, metric_a)
+        value_b = metric_value(other, metric_b) if other is not None else None
         if value_a is not None and value_b is not None:
             pairs.append((value_a, value_b))
+    zeros = sum(
+        1 for entry in by_date.values() for metric in dict.fromkeys((metric_a, metric_b))
+        if metric in ZERO_MEANS_MISSING and _number(entry.get(metric)) == 0
+    )
     xs = [a for a, _ in pairs]
     ys = [b for _, b in pairs]
     enough = len(pairs) >= min_pairs
@@ -435,6 +446,7 @@ def compute_correlation(
         "small_sample": len(pairs) < MIN_RELIABLE_PAIRS,
         "pearson_r": _correlation(xs, ys, "linear") if enough else None,
         "spearman_rho": _correlation(xs, ys, "ranked") if enough else None,
+        "zeros_treated_as_missing": zeros,
         "note": CAUSATION_NOTE,
     }
 
@@ -470,9 +482,10 @@ def weight_trend(
 ) -> dict[str, Any]:
     """Weight statistics per window: mean, first/last value, change and OLS slope per week.
 
-    The slope needs at least three weighed days in the window, the change at least two.
+    The slope needs at least three weighed days in the window, the change at least two. A
+    stored 0 is no value (``zeros_treated_as_missing``).
     """
-    series = metric_series(entries, "weight")
+    series, zeros = _zero_cleaned(metric_series(entries, "weight"), "weight")
     present = [(day, value) for day, value in series if value is not None]
     return {
         "metric": "weight",
@@ -480,6 +493,7 @@ def weight_trend(
         "end": series[-1][0].isoformat() if series else None,
         "days_total": len(series),
         "days_with_value": len(present),
+        "zeros_treated_as_missing": zeros,
         "latest": _point(present[-1] if present else None),
         "windows": {window: _weight_window(series, window) for window in windows},
     }
@@ -512,7 +526,7 @@ def _nutrition_day(
         "active_kcal": _number(get(active_field)),
         "balance_kcal": balance,
         "logged": logged,
-        "weight": _number(get("weight")),
+        "weight": metric_value(entry, "weight"),
     }
 
 
@@ -711,6 +725,8 @@ def format_correlation(result: dict[str, Any]) -> str:
         header += f" (fewer than {result['min_pairs']} paired days, no coefficients)"
     elif result.get("small_sample"):
         header += f" (small sample, fewer than {MIN_RELIABLE_PAIRS} paired days: indicative only)"
+    if result.get("zeros_treated_as_missing"):
+        header += f" ({result['zeros_treated_as_missing']} stored 0 treated as missing)"
     return "\n".join(
         [
             header,
@@ -739,6 +755,7 @@ def format_weight_trend(result: dict[str, Any]) -> str:
     lines = [
         f"Weight: {result['start'] or 'n/a'} to {result['end'] or 'n/a'}, "
         f"{result['days_total']} days, {result['days_with_value']} weighed; latest {latest_text}"
+        + (f" ({result['zeros_treated_as_missing']} stored 0 treated as missing)" if result.get("zeros_treated_as_missing") else "")
     ]
     lines.extend(_format_weight_window(w, s) for w, s in result["windows"].items())
     if not result["windows"]:

@@ -178,7 +178,9 @@ def test_top_sessions_keeps_the_hardest_short_session():
     assert [s["load"] for s in top[:4]] == [200, 190, 180, 170]
     assert top[-1]["intensity_factor"] == 1.05 and top[-1]["minutes"] == 25
     assert lm.top_sessions([]) == []
-    assert lm.intensity_factor({"icu_intensity": 0.9}) == 0.9 and lm.intensity_factor({"icu_intensity": None}) is None
+    assert lm.intensity_factor({"icu_intensity": 90}) == 0.9 and lm.intensity_factor({"icu_intensity": None}) is None
+    # ANA-9: icu_intensity is always percent; a tiny value is no IF > 1 and no "hard" session
+    assert lm.intensity_factor({"icu_intensity": 2.6}) == pytest.approx(0.026)
 
 
 # ------------------------------------------------------------------ intensity
@@ -195,6 +197,10 @@ def test_zone_seconds_and_three_zone_mapping():
     assert tid.three_zones([10, 20, 30], "pace") == [10, 20, 30]
     assert tid.three_zones([10, 20, 30, 40], "power") is None
     assert tid.zone_seconds(_act(END, icu_hr_zone_times=[0, 0, 0]), "hr") is None
+    # API-18: GAP zone times when Intervals.icu shows them (hilly runs)
+    hilly = _act(END, pace_zone_times=[3000, 5, 0, 0, 0, 0, 0], gap_zone_times=[2800, 192, 13, 0, 0, 0, 0], use_gap_zone_times=True)
+    assert tid.zone_seconds(hilly, "pace") == [2800, 192, 13, 0, 0, 0, 0]
+    assert tid.zone_seconds(dict(hilly, use_gap_zone_times=False), "pace") == [3000, 5, 0, 0, 0, 0, 0]
     assert tid.zone_seconds(_act(END, icu_zone_times="n/a"), "power") is None
     assert tid.mapping_text()["power"]["7"] == "Z1-Z2 | Z3-Z4 | Z5-Z7"
     assert tid.mapping_text("high")["power"]["7"] == "Z1-Z2 | Z3 | Z4-Z7"
