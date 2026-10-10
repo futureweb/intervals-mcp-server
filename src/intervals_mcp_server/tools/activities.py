@@ -1302,6 +1302,8 @@ async def update_activity(  # pylint: disable=too-many-arguments,too-many-positi
 
     if name is not None and not name.strip():
         return "Error: name must not be blank."
+    if clear_description and description is not None and description.strip():
+        return "Error: pass either description or clear_description=true, not both."
 
     payload: dict[str, Any] = {}
     if rpe is not None:

@@ -19,8 +19,10 @@ import functools
 import inspect
 import json
 import os
+import re
 from collections.abc import Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 from intervals_mcp_server.api.client import call_limits, unsafe_segment_reason
@@ -95,42 +97,98 @@ def _lists(value: Any, path: str = "", depth: int = 0) -> list[tuple[str, list[A
     return found
 
 
-def _shrink_json(payload: Any, limit: int) -> str | None:
-    """Valid JSON within limit by cutting the largest lists (with a "truncated" note), or None."""
-    root = payload if isinstance(payload, dict) else {"items": payload}
-    truncated: list[dict[str, Any]] = []
-    root["truncated"] = truncated
-    root["truncated_note"] = (
-        "Lists were cut to fit the size limit of one tool result (see truncated: kept items are the first ones). "
-        + _PAGING_HINT
-    )
+_DATE_KEYS = ("start_date_local", "start_date", "date", "start", "group", "week", "day", "id")
+_DATE_PREFIX = re.compile(r"\d{4}-\d{2}-\d{2}")
 
-    def size() -> int:
+
+def _item_date(item: Any) -> str | None:
+    if isinstance(item, dict):
+        for key in _DATE_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and _DATE_PREFIX.match(value):
+                return value[:19]
+    return None
+
+
+def _newest_first(items: list[Any]) -> bool | None:
+    """True for a newest-first list, False for oldest-first, None when not chronological."""
+    first, last = _item_date(items[0]), _item_date(items[-1])
+    if first and last and first != last:
+        return first > last
+    return None
+
+
+def _major_lists(root: Any, total: int) -> list[tuple[str, list[Any]]]:
+    """Lists worth cutting: at least a tenth of the result, not inside another such list."""
+    major: list[tuple[str, list[Any]]] = []
+    for path, items in sorted(_lists(root), key=lambda item: len(item[0])):
+        if any(path.startswith(outer + "[") for outer, _ in major):
+            continue
+        if len(json.dumps(items, ensure_ascii=False)) >= total * 0.1:
+            major.append((path, items))
+    return major
+
+
+@dataclass
+class _CutPlan:
+    """How one list of a too large JSON result is cut."""
+
+    items: list[Any]  # the list inside the result (cut in place)
+    original: list[Any]
+    tail: bool  # keep the last (newest) items
+    paged: bool  # the tool's paged list: next_offset follows the kept items
+    entry: dict[str, Any]  # the "truncated" entry
+
+
+def _shrink_json(payload: Any, limit: int) -> str | None:  # pylint: disable=too-many-locals
+    """Valid JSON within limit by cutting the large lists by the same fraction, or None.
+
+    Chronological lists keep their newest items; a paged list (the result has next_offset)
+    keeps its first items and gets the next_offset to continue with. "truncated" says which
+    lists were cut, how many items were kept and which end.
+    """
+    root = payload if isinstance(payload, dict) else {"items": payload}
+    major = _major_lists(root, len(json.dumps(root, ensure_ascii=False)))
+    if not major:
+        return None
+    paged = isinstance(payload, dict) and "next_offset" in payload
+    plans: list[_CutPlan] = []
+    for path, items in major:
+        top_level = "." not in path and "[" not in path
+        newest_first = _newest_first(items)
+        keep_tail = newest_first is False and not (paged and top_level)
+        end = "last (newest)" if keep_tail else ("first (newest)" if newest_first else "first")
+        plans.append(_CutPlan(items, list(items), keep_tail, paged and top_level,
+                              {"path": path, "kept": len(items), "total": len(items), "kept_items": end}))
+    root["truncated"] = [plan.entry for plan in plans]
+    root["truncated_note"] = (
+        "Lists were cut to fit the size limit of one tool result (see truncated: how many items were kept and "
+        "which end)." + (" Continue with next_offset." if paged else "") + " " + _PAGING_HINT
+    )
+    raw_offset = root.get("offset")
+    offset: int = raw_offset if isinstance(raw_offset, int) and not isinstance(raw_offset, bool) else 0
+
+    original_next = root.get("next_offset")
+
+    def apply(fraction: float) -> int:
+        for plan in plans:
+            keep = max(1, int(len(plan.original) * fraction))
+            plan.items[:] = plan.original[-keep:] if plan.tail else plan.original[:keep]
+            plan.entry["kept"] = keep
+            if plan.paged:
+                root["next_offset"] = offset + keep if keep < len(plan.original) else original_next
         return len(json.dumps(root, ensure_ascii=False))
 
-    for _ in range(8):
-        if size() <= limit:
-            break
-        candidates = sorted(_lists(root), key=lambda item: len(json.dumps(item[1], ensure_ascii=False)), reverse=True)
-        candidates = [c for c in candidates if c[0] != "truncated"]
-        if not candidates:
-            break
-        path, items = candidates[0]
-        original = list(items)
-        entry = {"path": path, "kept": len(original), "total": len(original)}
-        truncated.append(entry)  # counted in the size while searching
-        low, high = 1, len(original) - 1  # keep as many leading items as fit
-        while low < high:
-            middle = (low + high + 1) // 2
-            items[:] = original[:middle]
-            if size() <= limit:
-                low = middle
-            else:
-                high = middle - 1
-        items[:] = original[:low]
-        entry["kept"] = low
-    if size() > limit:
+    low, high = 0.0, 1.0
+    for _ in range(18):
+        middle = (low + high) / 2
+        if apply(middle) <= limit:
+            low = middle
+        else:
+            high = middle
+    if apply(low) > limit:
         return None
+    root["truncated"] = [plan.entry for plan in plans if plan.entry["kept"] < plan.entry["total"]]
     return json.dumps(root, ensure_ascii=False)
 
 

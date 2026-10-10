@@ -51,13 +51,16 @@ DURATION_TOLERANCE_S = 60
 # Step labels are written BEFORE the duration ("- Sprint 40mtr Z5 HR"), unescaped: a word of the
 # label that Intervals.icu reads as workout syntax would change the step. The checks work on
 # whitespace-separated words, so "30/30s" or "Rampe" stay plain labels while "2m" or "Z2" do not.
+_DURATION_RE = re.compile(r"(?:\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?(?:h|hr|hrs|m|min|mins|s|sec|secs))+", re.I)
+_DISTANCE_RE = re.compile(r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?(?:km|mi|mtr|y|yd|yds)", re.I)
+_ZONE_RE = re.compile(r"z\d(?:-z?\d)?", re.I)
 _TOKEN_SYNTAX = (
     (re.compile(r"\d+x(?:\d.*)?", re.I), "a repeat count such as 3x"),
-    (re.compile(r"(?:\d+(?:\.\d+)?(?:h|hr|hrs|m|min|mins|s|sec|secs))+", re.I), "a duration such as 2m or 30s"),
-    (re.compile(r"\d+(?:\.\d+)?(?:km|mi|mtr|y|yd|yds)", re.I), "a distance such as 400mtr"),
+    (_DURATION_RE, "a duration such as 2m or 30s"),
+    (_DISTANCE_RE, "a distance such as 400mtr"),
     (re.compile(r"\d+(?:-\d+)?w", re.I), "a power target in watts"),
     (re.compile(r"\d+(?:-\d+)?(?:rpm|bpm|spm)", re.I), "a cadence or heart rate"),
-    (re.compile(r"z\d(?:-z?\d)?", re.I), "a zone such as Z2"),
+    (_ZONE_RE, "a zone such as Z2"),
     (re.compile(r"\d+:\d\d(?:-\d+:\d\d)?(?:/\w+)?", re.I), "a pace or time such as 4:30"),
     (re.compile(r"intensity=.*", re.I), "the keyword intensity="),
 )
@@ -87,10 +90,15 @@ def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> 
         if found:
             return f"contains {found.group(0).strip() or found.group(0)!r}, which Intervals.icu would read as {meaning}"
     for word in text.split():
-        token = word.strip(",;()[]{}!?\"'")
+        # Surrounding punctuation does not hide a token: "Z2.", "Hold Z3:", "2m.", "Z2+", "(4:30)".
+        token = word.strip(",;()[]{}!?\"'").rstrip(".:;+")
         for pattern, meaning in _TOKEN_SYNTAX:
             if token and pattern.fullmatch(token):
                 return f"contains {token!r}, which Intervals.icu would read as {meaning}"
+        # Zones joined by / or + ("Z2/Z3", "Z2+Z3"); "30/30s" stays a plain label.
+        for part in re.split(r"[/+]", token):
+            if part != token and _ZONE_RE.fullmatch(part):
+                return f"contains {token!r}, which Intervals.icu would read as a zone such as Z2"
     for found in _KEYWORD_RE.finditer(text):
         if _KEYWORDS[found.group(1).lower()] not in flags:
             return (
@@ -382,8 +390,17 @@ _ROUTINE_WARNINGS = ("no warm-up step", "no cool-down step", "is not a common In
 
 
 def has_step_lines(text: str) -> bool:
-    """True when workout text contains at least one step line ("- 10m 55%") or repeat ("3x")."""
-    return re.search(r"^\s*(?:-|\d+\s*x\b)", text or "", re.MULTILINE | re.IGNORECASE) is not None
+    """True when workout text contains a step line: "- ..." with a duration or distance
+    ("- 10m 55%", "- 400mtr Z4"). A bullet list of notes ("- legs heavy") is not a workout."""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        for word in stripped[1:].split():
+            token = word.strip(",;()[]{}!?\"'").rstrip(".:;+")
+            if _DURATION_RE.fullmatch(token) or _DISTANCE_RE.fullmatch(token):
+                return True
+    return False
 
 
 def is_structured_workout(event: Any) -> bool:

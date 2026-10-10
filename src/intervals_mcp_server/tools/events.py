@@ -32,7 +32,6 @@ from intervals_mcp_server.utils.validation import (
 )
 from intervals_mcp_server.utils.workout_validation import (
     coerce_workout_doc,
-    has_step_lines,
     is_blank_workout_doc,
     is_structured_workout,
     warnings_note,
@@ -485,7 +484,7 @@ async def delete_events_by_date_range(  # pylint: disable=too-many-arguments,too
         else:
             deleted.append(row)
     payload.update({"deleted": deleted, "already_gone": already_gone, "failed": failed})
-    parts = [f"Deleted {len(deleted)} of {len(confirmed)} confirmed event(s)"]
+    parts = [f"Deleted {len(deleted)} of {len(dict.fromkeys(confirmed))} confirmed event(s)"]
     if already_gone:
         parts.append(f"{len(already_gone)} were already gone")
     if failed:
@@ -544,8 +543,8 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     The workout is validated first (same checks as validate_workout); with errors nothing is
     written, warnings are listed in the answer. Text-only workouts (strength, yoga: an exercise
     list without durations) go into `description` (or a workout_doc with text steps only). On an
-    update, text without timed steps never silently replaces a structured (timed) workout: that
-    needs replace_workout=true. Creating an event needs a name; the date defaults to today (athlete's time zone)
+    update, a description or a workout_doc without timed steps never silently replaces a
+    structured (timed) workout: that needs replace_workout=true. Creating an event needs a name; the date defaults to today (athlete's time zone)
     and the category to WORKOUT. Workouts and races need a sport: pass workout_type unless the
     name names exactly one sport ("Easy run" -> Run).
 
@@ -570,8 +569,8 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
         description: Workout text instead of workout_doc (optional): plain text such as
             "Squats 5x5, Deadlifts 3x5" or native Intervals.icu workout text, sent as-is.
             Replaces the event's description; an empty string is ignored (never clears it).
-        replace_workout: Allow text without timed steps (description or a text-only workout_doc)
-            to replace an event that holds a structured workout (optional, default false)
+        replace_workout: Allow a description or a workout_doc without timed steps to replace an
+            event that holds a structured workout (optional, default false)
 
     Example:
         "workout_doc": {
@@ -673,20 +672,23 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
         description = None  # "" from a client filling optional fields: not given, never clears
     if workout.text is not None and description is not None:
         return "Error: pass either workout_doc or description, not both. Nothing was written."
-    text, text_only = workout.text, workout.text_only
-    if text is None and description is not None:
-        text, text_only = description, not has_step_lines(description)
+    text = workout.text
+    # Text (a description, or a workout_doc without timed steps) replacing a structured workout
+    # needs replace_workout=true, however the text looks: "- legs heavy" is not a workout.
+    replaces_with_text = workout.text_only if text is not None else description is not None
+    if text is None:
+        text = description
 
     start_local = None
     existing: dict[str, Any] | None = None
-    if is_update and (validated_date or (text is not None and text_only)):
+    if is_update and (validated_date or replaces_with_text):
         existing, fetch_error = await _fetch_event(athlete_id_to_use, str(event_id), api_key)
         if fetch_error:
             return f"Error: could not read event {event_id} before changing it: {fetch_error}. Nothing was changed."
-        if text is not None and text_only and is_structured_workout(existing) and not replace_workout:
+        if replaces_with_text and is_structured_workout(existing) and not replace_workout:
             return (
-                f"Error: event {event_id} holds a structured workout with timed steps; this text has none and would "
-                "replace it. Pass steps in workout_doc, or replace_workout=true to replace it with text. "
+                f"Error: event {event_id} holds a structured workout with timed steps; this text would replace it. "
+                "Pass the new workout as steps in workout_doc, or replace_workout=true to replace it with text. "
                 "Nothing was changed."
             )
     if validated_date:
@@ -704,7 +706,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
 
 
 @tool("write", overwrites=True)
-async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals
+async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements,too-many-locals,too-many-branches
     name: str | None = None,
     description: str | None = None,
     start_date: str | None = None,
@@ -748,6 +750,8 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
         description = description if description is not None else ""
 
     elif clear_description:
+        if description is not None and description.strip():
+            return "Error: pass either description or clear_description=true, not both. Nothing was changed."
         description = ""
     elif description is not None and not description.strip():
         description = None  # a placeholder "" never wipes the note's text

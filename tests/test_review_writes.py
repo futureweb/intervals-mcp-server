@@ -512,3 +512,46 @@ def test_description_and_comment_lines_are_checked_for_structure(doc, problem):
 def test_description_is_kept_apart_from_the_steps():
     text = str(WorkoutDoc.from_dict({"description": "Threshold day", "steps": [{"duration": 600, "power": {"value": 90, "units": "%ftp"}}]}))
     assert text.startswith("Threshold day\n\n- 10m 90% ftp")
+
+
+# ------------------------------------------------------------------ R25-14 / R25-15 / R25-17
+@pytest.mark.parametrize("text", ["Notes for today:\n- legs heavy\n- keep it easy", "- 10m 55%\n- 20m 90%"])
+def test_any_description_needs_replace_workout_on_a_structured_event(monkeypatch, text):
+    calls = _router(monkeypatch, lambda url, method, p, d: STRUCTURED if method == "GET" else {"id": 5})
+    result = asyncio.run(add_or_update_event(event_id="5", description=text))
+    assert "holds a structured workout" in result and not _writes(calls)
+    asyncio.run(add_or_update_event(event_id="5", description=text, replace_workout=True))
+    assert _writes(calls) == [{"url": "/athlete/i1/events/5", "method": "PUT", "params": None, "data": {"description": text}}]
+
+
+def test_bullet_notes_are_not_workout_steps():
+    from intervals_mcp_server.utils.workout_validation import has_step_lines  # pylint: disable=import-outside-toplevel
+
+    assert not has_step_lines("Notes for today:\n- legs heavy\n- keep it easy")
+    assert has_step_lines("Warmup\n- 10m 55%") and has_step_lines("- 400mtr Z4")
+
+
+def test_clear_flag_and_new_text_together_are_refused(monkeypatch):
+    calls = _router(monkeypatch, lambda url, method, p, d: {"id": 7, "category": "NOTE"} if method == "GET" else {"id": 7})
+    assert "not both" in asyncio.run(add_or_update_note(event_id="7", description="new", clear_description=True))
+    assert "not both" in asyncio.run(update_activity("i5", description="new", clear_description=True))
+    from intervals_mcp_server.tools.wellness import update_wellness  # pylint: disable=import-outside-toplevel
+
+    assert "not both" in asyncio.run(update_wellness(date="2026-10-09", comments="new", clear_comments=True))
+    assert not _writes(calls)
+
+
+def test_range_delete_counts_unique_confirmed_ids(monkeypatch):
+    _router(monkeypatch, _calendar)
+    payload = json.loads(asyncio.run(delete_events_by_date_range("2026-10-12", "2026-10-13", dry_run=False, confirm_ids="1,1,1")))
+    assert payload["message"].startswith("Deleted 1 of 1 confirmed")
+
+
+@pytest.mark.parametrize("label", ["Stay in Z2.", "Z2/Z3", "Hold Z3:", "2m.", "Push 4:30.", "Z2+", "2-3m", "(Z2)"])
+def test_tokens_with_punctuation_are_still_refused(label):
+    assert label_problem(label) is not None
+
+
+@pytest.mark.parametrize("label", ["30/30s on", "Einfahren Rampe", "Sprint!", "Over-unders", "VO2max"])
+def test_plain_labels_with_punctuation_pass(label):
+    assert label_problem(label) is None

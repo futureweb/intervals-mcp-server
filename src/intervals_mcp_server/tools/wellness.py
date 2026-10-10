@@ -127,7 +127,7 @@ _SUBJECTIVE_SCALE_MAX = 4
 
 
 @tool("write", overwrites=True)
-async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     date: str,
     soreness: int | None = None,
     fatigue: int | None = None,
@@ -204,6 +204,8 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
                 f"and {_SUBJECTIVE_SCALE_MAX}."
             )
         body[name] = value
+    if clear_comments and comments is not None and comments.strip():
+        return "Error: pass either comments or clear_comments=true, not both."
     if clear_comments:
         body["comments"] = ""
     elif comments is not None and comments.strip():

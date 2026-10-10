@@ -21,13 +21,15 @@ First public beta of the Futureweb fork. Based on upstream
   `create_library_workout`); with errors nothing is sent, warnings are listed in the answer. An
   empty `workout_doc` (`{}`, no steps) is ignored and never wipes a planned workout. Text-only
   workouts (strength, yoga) use the new `description` parameter of `add_or_update_event` or a
-  workout_doc with text steps only; on update such text replaces a structured (timed) workout only
-  with `replace_workout=true`. New errors:
+  workout_doc with text steps only; on update a `description` (whatever it looks like, e.g. a bullet
+  list) or a workout_doc without timed steps replaces a structured (timed) workout only with
+  `replace_workout=true`. New errors:
   open-ended (lap-press / free-ride without duration) steps, duration and distance on one step,
   non-whole or non-positive durations, units that do not fit the target kind (HR in `%ftp` ...),
   value plus range, implausible absolute paces (walking and hiking up to 40:00/km), step labels
-  with words that Intervals.icu would read as workout syntax (`2m`, `85%`, `Z2`, `3x`, `ramp` unless
-  the step is a ramp ...; line breaks are never rendered), description or comment lines that would
+  with words that Intervals.icu would read as workout syntax (`2m`, `2-3m.`, `85%`, `Z2`, `Z2/Z3`,
+  `3x`, `ramp` unless the step is a ramp ...; surrounding punctuation does not hide them; line
+  breaks are never rendered), description or comment lines that would
   become steps, repeats or warm-up/cool-down sections; the description is followed by a blank line. Bulk
   entries get the same type checks (no crash on `"70"`, no per-character string steps), at most
   100 entries, blank names and non-string colours are refused, `created_count` counts the events
@@ -36,7 +38,7 @@ First public beta of the Futureweb fork. Based on upstream
   a note); moving an event keeps its time of day; negative `moving_time`/`distance` and blank names
   or messages are refused; an empty description or comment on update is ignored (new
   `clear_description` for notes and activities, `clear_comments` for wellness empty them on
-  purpose); dates must be `YYYY-MM-DD`; events and notes created without a date use today in the
+  purpose; a clear flag together with new text is refused); dates must be `YYYY-MM-DD`; events and notes created without a date use today in the
   athlete's time zone.
 - Sport inference matches whole words and no longer defaults to Ride: a workout or race whose name
   does not name exactly one sport needs `workout_type`; notes, sick, holiday and injury days are
@@ -60,7 +62,9 @@ First public beta of the Futureweb fork. Based on upstream
   `MCP_TOOL_TIMEOUT_S`) and says when a limit cut its result; `compare_best_efforts` takes at most
   10 durations.
 - Tool results are capped (`MCP_MAX_OUTPUT_CHARS`, default 100000) with a note instead of silent
-  truncation (JSON stays valid: the largest lists are cut and `truncated` says what was kept); `get_activity_streams` pages by size (default `max_points` 2000, at most 20000) and
+  truncation (JSON stays valid: the large lists are cut by the same fraction, chronological lists
+  keep their newest items, a paged list gets the matching `next_offset`, and `truncated` says what
+  was kept); `get_activity_streams` pages by size (default `max_points` 2000, at most 20000) and
   its JSON output is one valid JSON object with `next_start_index`; `get_wellness_data` pages by
   day with the `start_date` to continue.
 - "Today" and all default date ranges use the athlete's time zone (profile `timezone`, looked up

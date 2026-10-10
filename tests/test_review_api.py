@@ -446,7 +446,7 @@ def test_global_output_cap_never_cuts_silently():
     cut = tool_guard.cap_output(payload, limit=10_000)
     shrunk = json.loads(cut)  # still valid JSON, the list is cut and says so
     assert len(cut) <= 10_000 and shrunk["athlete"] == "i1" and shrunk["rows"][0]["id"] == 0
-    assert shrunk["truncated"] == [{"path": "rows", "kept": len(shrunk["rows"]), "total": 500}]
+    assert shrunk["truncated"] == [{"path": "rows", "kept": len(shrunk["rows"]), "total": 500, "kept_items": "first"}]
     assert "detail_level" in shrunk["truncated_note"] and "offset" in shrunk["truncated_note"]
     blob = json.dumps({"blob": "z" * 50_000})
     replaced = json.loads(tool_guard.cap_output(blob, limit=10_000))
@@ -471,3 +471,24 @@ def test_interval_definitions_come_from_the_activity_owner(monkeypatch):
     monkeypatch.setattr(api_client, "make_intervals_request", fake_request)
     asyncio.run(get_activity_intervals("i5"))
     assert "/athlete/i42/custom-item" in calls and "/athlete/i1/custom-item" not in calls
+
+
+# ------------------------------------------------------------------ R25-16
+def test_json_cut_sets_next_offset_and_keeps_newest_items():
+    activities = {"total": 130, "offset": 0, "limit": 200, "next_offset": None,
+                  "activities": [{"id": f"i{i}", "start_date_local": f"2026-10-{30 - i % 30:02d}T08:00:00", "x": "y" * 700}
+                                 for i in range(130)]}
+    cut = json.loads(tool_guard.cap_output(json.dumps(activities), limit=50_000))
+    kept = len(cut["activities"])
+    assert kept < 130 and cut["next_offset"] == kept and cut["activities"][0]["id"] == "i0"
+    weeks = {"groups": [{"group": f"2025-{w // 4 + 1:02d}-{w % 4 * 7 + 1:02d} (ISO week)", "x": "c" * 2000} for w in range(48)]}
+    cut = json.loads(tool_guard.cap_output(json.dumps(weeks), limit=30_000))
+    assert cut["groups"][-1]["group"].startswith("2025-12-22") and cut["truncated"][0]["kept_items"] == "last (newest)"
+
+
+def test_json_cut_is_proportional():
+    report = {"activity": {"id": "i1"}, "intervals": [{"n": i, "x": "a" * 900} for i in range(96)],
+              "execution": {"rows": [{"n": i, "x": "b" * 900} for i in range(96)]}}
+    cut = json.loads(tool_guard.cap_output(json.dumps(report), limit=60_000))
+    kept = {entry["path"]: entry["kept"] for entry in cut["truncated"]}
+    assert kept["intervals"] == kept["execution.rows"] > 20
