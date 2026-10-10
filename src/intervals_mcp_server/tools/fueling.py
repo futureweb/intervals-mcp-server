@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
@@ -60,7 +61,7 @@ async def _single(activity_id: str, athlete_id: str | None) -> dict[str, Any] | 
     activity = result[0] if isinstance(result, list) and result else result
     if not isinstance(activity, dict) or not activity:
         return f"No activity {activity_id} found."
-    owner = str(activity.get("icu_athlete_id") or athlete_id or config.athlete_id or "")
+    owner = str(activity.get("icu_athlete_id") or athlete_id or default_athlete(config.athlete_id) or "")
     index = await get_custom_item_index(athlete_id=owner) if owner else {}
     defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     figures = activity_fueling(activity, defs)

@@ -15,6 +15,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
@@ -125,7 +126,7 @@ async def _audit_activity(  # pylint: disable=too-many-locals
             "start": format_local_start(activity), "source": source_summary(activity)}
     if is_strava_stub(activity):
         return {**head, "strava_stub": True, "note": STRAVA_STUB_NOTE, "api_calls": calls}
-    owner = str(activity.get("icu_athlete_id") or athlete_id or config.athlete_id or "")
+    owner = str(activity.get("icu_athlete_id") or athlete_id or default_athlete(config.athlete_id) or "")
     index = await get_custom_item_index(athlete_id=owner) if owner else {}
     field_defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     sport = str(activity.get("type") or "")

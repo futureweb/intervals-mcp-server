@@ -145,7 +145,7 @@ def _esc(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     provider: SingleUserOAuthProvider, request_id: str, username: str, error: str | None, form_token: str
 ) -> str:
     pending = provider.pending_login(request_id)
@@ -165,6 +165,13 @@ def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arg
             f'<div class="perm"><input type="checkbox" id="perm_{permission}" name="grant" value="{permission}" '
             f'{checked}{disabled}><label for="perm_{permission}" style="margin:0">{_esc(_PERMISSION_TEXT.get(permission, permission))}</label></div>'
         )
+    if config.multi_user and config.intervals_offer_chats and "intervals" in config.login_methods:
+        perms.append(
+            '<div class="perm"><input type="checkbox" id="perm_chats" name="chats" value="1">'
+            '<label for="perm_chats" style="margin:0">Activity comments (read; post with the write permission). '
+            "Intervals.icu grants this as chat access, which also covers your private chats; this server only uses "
+            "activity comments. Optional.</label></div>"
+        )
     parts = [
         f'<p><span class="client">{_esc(name)}</span>{badge} wants to access your Intervals.icu data through this server.</p>',
         f'<p class="note">Redirect after sign-in: {_esc(pending.redirect_host or "unknown")}</p>',
@@ -177,8 +184,20 @@ def _consent_body(  # pylint: disable=too-many-arguments,too-many-positional-arg
     local = [m for m in ("password", "apikey") if m in config.login_methods]
     if "intervals" in config.login_methods:
         parts.append('<button type="submit" name="action" value="intervals">Continue with Intervals.icu</button>')
+        if config.multi_user:
+            days = max(1, config.refresh_token_ttl // 86400)
+            if config.token_retention_days:
+                days = min(days, config.token_retention_days)
+            parts.append(
+                '<p class="note">This server is shared. After the sign-in it stores your Intervals.icu access token '
+                "(encrypted) for this connection and uses it only for your own data, with the permissions chosen above. "
+                "It is deleted when your client revokes the connection on disconnect, after "
+                f"{days} days without use, or when you ask the server owner; revoking the app in Intervals.icu stops it "
+                "at once. The server owner can see the server's logs.</p>"
+            )
         if local:
-            parts.append('<hr><p class="note">Or sign in on this server:</p>')
+            label = "Or, server owner only, sign in on this server:" if config.multi_user else "Or sign in on this server:"
+            parts.append(f'<hr><p class="note">{label}</p>')
     if local and provider.totp_required:
         parts.append(
             '<label for="totp">Authenticator code</label><input type="text" id="totp" name="totp" '
@@ -367,7 +386,7 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
             logger.warning("Login rate limit reached for %s", key)
             return error_page("Too many failed sign-in attempts. Please try again later.", 429, retry_after)
         if action == "intervals" and "intervals" in provider.config.login_methods:
-            location, browser = provider.begin_intervals_login(request_id, granted, key)
+            location, browser = provider.begin_intervals_login(request_id, granted, key, chats=form.get("chats") == "1")
             response = _redirect(location)
             response.set_cookie(
                 _cookie_name(provider), browser, max_age=600, path="/", secure=_secure(provider), httponly=True, samesite="lax"
@@ -399,7 +418,7 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
             message = "Invalid credentials or authenticator code." if provider.totp_required else "Invalid credentials."
             return consent_page(request, request_id, username or provider.config.username, message, 401)
         provider.local_login_succeeded(key)
-        return _redirect(provider.complete_login(request_id, key, granted))
+        return _redirect(provider.complete_login(request_id, key, granted, method=action))
 
     async def intervals_callback(request: Request) -> Response:
         params = request.query_params

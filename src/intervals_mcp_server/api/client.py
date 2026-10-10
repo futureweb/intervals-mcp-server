@@ -7,6 +7,7 @@ including request management, error handling, and client lifecycle.
 
 from json import JSONDecodeError
 import asyncio
+import http.cookiejar
 import json
 import logging
 import math
@@ -25,6 +26,16 @@ import httpx  # pylint: disable=import-error
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.cache import TTLCache
+from intervals_mcp_server.tenancy import (
+    BUDGETS,
+    Credential,
+    current_credential,
+    multi_user,
+    rejected_token_message,
+    request_refusal,
+    same_athlete,
+)
 
 logger = logging.getLogger("intervals_icu_mcp_server")
 
@@ -199,8 +210,14 @@ async def _get_httpx_client() -> httpx.AsyncClient:
 
     # Use this module's httpx_client
     if httpx_client is None or httpx_client.is_closed:
-        httpx_client = httpx.AsyncClient()
+        httpx_client = httpx.AsyncClient(cookies=_no_cookies())
     return httpx_client
+
+
+def _no_cookies() -> http.cookiejar.CookieJar:
+    """A cookie jar that stores nothing: the client is shared by every connection (multi-user mode),
+    so a cookie set for one athlete's request must never be sent with another's."""
+    return http.cookiejar.CookieJar(policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
 
 
 _ACTIVE_SESSIONS = 0
@@ -312,8 +329,12 @@ def _prepare_request_config(
     url: str,
     api_key: str | None,
     method: str,
-) -> tuple[str, httpx.BasicAuth, dict[str, str], str | None]:
+    credential: Credential | None = None,
+) -> tuple[str, httpx.BasicAuth | None, dict[str, str], str | None]:
     """Prepare request configuration including headers, auth, and URL.
+
+    In the multi-user mode *credential* (the calling connection's) decides the authentication:
+    the athlete's OAuth token as a Bearer header, or the owner's API key.
 
     Returns:
         Tuple of (full_url, auth, headers, error_message).
@@ -324,6 +345,13 @@ def _prepare_request_config(
 
     if method in ["POST", "PUT"]:
         headers["Content-Type"] = "application/json"
+
+    if credential is not None:
+        full_url = f"{config.intervals_api_base_url}{url}"
+        if credential.kind == "bearer":
+            headers["Authorization"] = f"Bearer {credential.secret}"
+            return full_url, None, headers, None
+        return full_url, httpx.BasicAuth("API_KEY", credential.secret), headers, None
 
     # Use provided api_key or fall back to global API_KEY
     key_to_use = api_key if api_key is not None else config.api_key
@@ -430,6 +458,76 @@ def _transport_error(error: Exception, method: str) -> tuple[str, bool]:
     return text, maybe_applied
 
 
+def _tenant_refusal(url: str, method: str, api_key: str | None, credential: Credential | None) -> dict[str, Any] | None:
+    """Multi-user mode: refuse a request without the calling connection's credential, with a
+    passed API key, for another athlete or outside the connection's Intervals.icu scopes."""
+    path = url.split("?", 1)[0]
+    if credential is None:
+        logger.warning("%s %s refused: multi-user mode and no connection credential", method, path)
+        return {
+            "error": True,
+            "message": "Not sent: this server runs in multi-user mode and the request does not belong to a signed-in connection.",
+        }
+    if api_key is not None:
+        return {"error": True, "message": "Not sent: an API key cannot be passed on this shared server."}
+    reason = request_refusal(method, url, credential)
+    if reason:
+        logger.warning("%s %s refused for the connection of athlete %s", method, path, credential.athlete_id)
+        return {"error": True, "refused": True, "message": reason}
+    return None
+
+
+FOREIGN_ACTIVITY = "403 Forbidden: this activity belongs to another athlete."
+# Owner of activity ids seen by a connection: (credential partition, activity id) -> athlete id.
+_ACTIVITY_OWNERS: TTLCache[str] = TTLCache(24 * 3600, max_entries=4096)
+
+
+def _remember_activity_owners(url: str, result: Any, credential: Credential) -> None:
+    """Note the owners of the activities an answer contains (the activity itself, or an activity list)."""
+    parts = [part for part in url.split("?", 1)[0].split("/") if part]
+    items: list[Any] = []
+    if len(parts) == 2 and parts[0] == "activity" and isinstance(result, dict):
+        items = [result]
+    elif len(parts) >= 3 and parts[0] == "athlete" and parts[2].split(".", 1)[0] == "activities" and isinstance(result, list):
+        items = result
+    for item in items:
+        if isinstance(item, dict) and item.get("id") is not None and item.get("icu_athlete_id"):
+            _ACTIVITY_OWNERS.set((credential.partition, str(item["id"])), str(item["icu_athlete_id"]))
+
+
+async def _activity_owner_refusal(url: str, method: str, credential: Credential) -> dict[str, Any] | None:
+    """Multi-user mode: a request for an activity's sub-resource (streams, intervals, messages ...) or a
+    write to an activity is only sent when the activity is the connection's own athlete's.
+
+    The owner is looked up once per connection and activity (``GET /activity/<id>``, cached; activity
+    listings fill the cache too). ``GET /activity/<id>`` itself is checked on its answer.
+    """
+    parts = [part for part in url.split("?", 1)[0].split("/") if part]
+    if len(parts) < 2 or parts[0] != "activity" or (len(parts) == 2 and method == "GET"):
+        return None
+    owner = _ACTIVITY_OWNERS.get((credential.partition, parts[1]))
+    if owner is None:
+        found = await make_intervals_request(url=f"/activity/{seg(parts[1])}")
+        if isinstance(found, dict) and found.get("error"):
+            return found
+        owner = str(found.get("icu_athlete_id") or "") if isinstance(found, dict) else ""
+        if not owner:
+            return {"error": True, "message": "Not sent: the owner of this activity could not be checked."}
+    if not same_athlete(owner, credential.athlete_id):
+        logger.warning("%s %s refused: the activity belongs to another athlete", method, url.split("?", 1)[0])
+        return {"error": True, "status_code": 403, "message": FOREIGN_ACTIVITY}
+    return None
+
+
+def _foreign_activity(url: str, result: Any, credential: Credential) -> bool:
+    """True when ``GET /activity/<id>`` answered with another athlete's activity (multi-user mode)."""
+    parts = [part for part in url.split("?", 1)[0].split("/") if part]
+    if len(parts) != 2 or parts[0] != "activity" or not isinstance(result, dict):
+        return False
+    owner = result.get("icu_athlete_id")
+    return bool(owner) and not same_athlete(owner, credential.athlete_id)
+
+
 def _refusal(url: str, method: str) -> dict[str, Any] | None:
     """Error result for a request that must not be sent: an unsafe path, or a write during a dry run."""
     reason = unsafe_path_reason(url)
@@ -443,7 +541,7 @@ def _refusal(url: str, method: str) -> dict[str, Any] | None:
     return None
 
 
-async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-statements,too-many-return-statements
+async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-statements,too-many-return-statements,too-many-branches
     url: str,
     api_key: str | None = None,
     params: dict[str, Any] | None = None,
@@ -473,18 +571,33 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
     not_sent = _refusal(url, method)
     if not_sent:
         return not_sent
+    credential = None
+    if multi_user():
+        credential = current_credential()
+        not_sent = _tenant_refusal(url, method, api_key, credential)
+        if not_sent:
+            return not_sent
+        assert credential is not None  # refused above otherwise
+        not_sent = await _activity_owner_refusal(url, method, credential)
+        if not_sent:
+            return not_sent
 
     # Prepare request configuration
-    full_url, auth, headers, error_msg = _prepare_request_config(url, api_key, method)
+    full_url, auth, headers, error_msg = _prepare_request_config(url, api_key, method, credential)
     if error_msg:
         return {"error": True, "message": error_msg}
-    secrets = (api_key, get_config().api_key)
+    secrets = (api_key, get_config().api_key, credential.secret if credential is not None else None)
 
     limits = _CALL_LIMITS.get()
     if limits is not None:
         refusal = limits.admit()
         if refusal:
             logger.warning("Tool call limit reached (%s); %s %s not sent", limits.hit, method, url)
+            return {"error": True, "limit_reached": True, "message": refusal}
+    if credential is not None:
+        refusal = BUDGETS.admit(credential)
+        if refusal:
+            logger.warning("Request budget of athlete %s reached; %s %s not sent", credential.athlete_id, method, url.split("?", 1)[0])
             return {"error": True, "limit_reached": True, "message": refusal}
 
     def _timeout() -> float:
@@ -531,7 +644,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
             return await _send_request(client)
 
     def _time_for_retry(delay: float) -> bool:
-        return limits is None or limits.remaining_s() > delay + 1.0
+        if limits is not None and limits.remaining_s() <= delay + 1.0:
+            return False
+        # Multi-user mode: every attempt counts against the athlete's and the shared budget.
+        return credential is None or BUDGETS.admit(credential) is None
 
     try:
         retryable = retry_statuses(method)
@@ -558,9 +674,15 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
             await asyncio.sleep(delay)
 
         assert response is not None  # the loop either set it or raised
-        return _parse_response(response, full_url)
+        result = _parse_response(response, full_url)
+        if credential is not None:
+            if _foreign_activity(url, result, credential):
+                logger.warning("GET %s answered with another athlete's activity; refused", url.split("?", 1)[0])
+                return {"error": True, "status_code": 403, "message": FOREIGN_ACTIVITY}
+            _remember_activity_owners(url, result, credential)
+        return result
     except httpx.HTTPStatusError as e:
-        return _handle_http_status_error(e, secrets)
+        return _handle_http_status_error(e, secrets, credential)
     except httpx.RequestError as e:
         message, maybe_applied = _transport_error(e, method)
         message = _redact(message, secrets)
@@ -572,15 +694,19 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
         return {"error": True, "message": message}
 
 
-def _handle_http_status_error(e: httpx.HTTPStatusError, secrets: tuple[str | None, ...] = ()) -> dict[str, Any]:
+def _handle_http_status_error(
+    e: httpx.HTTPStatusError, secrets: tuple[str | None, ...] = (), credential: Credential | None = None
+) -> dict[str, Any]:
     """Handle HTTP status errors and return formatted error dict.
 
     The message keeps the status code and the reason Intervals.icu gave (e.g. "Invalid oldest:
-    Text 'bad' could not be parsed"), shortened and with the API key removed.
+    Text 'bad' could not be parsed"), shortened and with the API key removed. A 401 / 403 for an
+    athlete's OAuth token (multi-user mode) says how to reconnect.
 
     Args:
         e: The HTTPStatusError exception.
-        secrets: Values that must not appear in the message (API keys).
+        secrets: Values that must not appear in the message (API keys, tokens).
+        credential: The connection credential of the request (multi-user mode).
 
     Returns:
         Error dictionary with status code and message.
@@ -588,8 +714,11 @@ def _handle_http_status_error(e: httpx.HTTPStatusError, secrets: tuple[str | Non
     error_code = e.response.status_code
     reason = _api_reason(e.response, secrets)
     logger.error("HTTP error: %s - %s", error_code, reason or "(no reason given)")
+    message = _get_error_message(error_code, reason)
+    if credential is not None and credential.kind == "bearer" and error_code in (401, 403):
+        message = rejected_token_message(error_code) + (f" Intervals.icu says: {reason}" if reason else "")
     return {
         "error": True,
         "status_code": error_code,
-        "message": _get_error_message(error_code, reason),
+        "message": message,
     }

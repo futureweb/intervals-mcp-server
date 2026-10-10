@@ -10,10 +10,18 @@ for the MCP client and, optionally, an OAuth *client* of Intervals.icu for the s
 ``this server <-- OAuth 2 ("Sign in with Intervals.icu") ------>  Intervals.icu``
 
 The athlete proves who they are by signing in at Intervals.icu; only the athletes in
-``OAUTH_ALLOWED_ATHLETES`` (default: ``ATHLETE_ID``) may connect.  The Intervals.icu token
-is used for that identity check only and is never stored or handed to the MCP client;
-data access keeps using the configured API key.  A password sign-in is available as an
-alternative (or fallback) when no Intervals.icu OAuth app is configured.
+``OAUTH_ALLOWED_ATHLETES`` (default: ``ATHLETE_ID``) may connect.  In the default single-user
+mode the Intervals.icu token is used for that identity check only and is never stored or
+handed to the MCP client; data access keeps using the configured API key.  A password
+sign-in is available as an alternative (or fallback) when no Intervals.icu OAuth app is
+configured.
+
+In the multi-user mode (``MCP_TENANCY=multi``, see :mod:`intervals_mcp_server.tenancy`) the
+server keeps the athlete's Intervals.icu token, sealed with AES-GCM
+(:mod:`intervals_mcp_server.token_vault`), in a grant record of the state file
+(:mod:`intervals_mcp_server.auth_grants`, format version 2), and every tool call of that
+connection uses it.  The API key is only used for the owner (``ATHLETE_ID``) after the owner
+signed in.  Revoking a grant deletes its stored token.
 
 Served on top of what the MCP SDK provides when ``FastMCP`` is created with
 ``auth_server_provider`` and ``auth`` (metadata, ``/authorize``, ``/token``,
@@ -62,11 +70,22 @@ Environment variables (all optional unless noted):
                                    answer again (a client retrying after a lost response; default 120)
 ``OAUTH_REFRESH_REUSE_REVOKE``     revoke the grant when a rotated refresh token is used after the
                                    grace period (default ``true``; ``false`` only refuses that request)
+``MCP_TENANCY``                    ``single`` (default) or ``multi``: one credential per connection
+``OAUTH_TOKEN_KEY`` / ``OAUTH_TOKEN_KEY_FILE``  key(s) that seal the stored Intervals.icu tokens
+                                   (required with ``multi``)
+``OAUTH_ALLOW_ANY_ATHLETE``        accept ``OAUTH_ALLOWED_ATHLETES=*`` in the multi-user mode
+``OAUTH_TOKEN_RETENTION_DAYS``     multi-user mode: drop stored tokens unused for this many days (0 = off)
+``INTERVALS_OAUTH_EXCLUDE_AREAS``  multi-user mode: Intervals.icu scope areas never requested
+``INTERVALS_OAUTH_OFFER_CHATS``    multi-user mode: offer "activity comments" (CHATS) on the consent page
+``OAUTH_MAX_GRANTS_PER_ATHLETE``   multi-user mode: connections kept per athlete (default 5)
+``OAUTH_OWNER_ACCOUNTS``           single-user mode: the owner's other accounts allowed to sign in
+``INTERVALS_OAUTH_BASE_URL``       Intervals.icu OAuth endpoints (default https://intervals.icu; tests)
 
 Access tokens live in memory only; registered clients and refresh tokens are persisted
 (as digests) so a restart does not disconnect clients.  The state file is written in a
 worker thread, in-memory state only changes once the write succeeded, and a file that
-cannot be read is never overwritten.  Secrets are never logged.
+cannot be read is never overwritten.  A change of the file by someone else (the ``grants``
+CLI) is picked up before the next request.  Secrets are never logged.
 """
 
 from __future__ import annotations
@@ -119,9 +138,32 @@ from intervals_mcp_server.auth_clients import (
     normalize_allow_entry,
 )
 from intervals_mcp_server.auth_clients import log_safe as _for_log
+from intervals_mcp_server.auth_grants import (
+    DEFAULT_STATE_FILE,
+    SINGLE_USER_STATE_VERSION,
+    STATE_VERSION,
+    Grant,
+    PendingGrant,
+    file_signature,
+    grant_context,
+    state_file_lock,
+    state_format_problem,
+    write_state_file,
+)
 from intervals_mcp_server.auth_totp import generate_secret, match_counter, normalize_secret, provisioning_uri
+from intervals_mcp_server.tenancy import (
+    AREA_ORDER,
+    Credential,
+    canonical_athlete_id,
+    intervals_scopes_for,
+    parse_intervals_scopes,
+    same_athlete,
+    tenancy_from_env,
+)
+from intervals_mcp_server.token_vault import TokenVault, VaultError, vault_from_env
 
 __all__ = [
+    "CredentialError",
     "INTERVALS_CALLBACK_PATH",
     "LOGIN_PATH",
     "PERMISSION_SCOPE_PREFIX",
@@ -150,13 +192,13 @@ SCOPE = "mcp"
 PERMISSION_SCOPE_PREFIX = "intervals:"
 LOGIN_PATH = "/oauth/login"
 INTERVALS_CALLBACK_PATH = "/oauth/intervals/callback"
-INTERVALS_AUTHORIZE_URL = "https://intervals.icu/oauth/authorize"
-INTERVALS_TOKEN_URL = "https://intervals.icu/api/oauth/token"
+DEFAULT_INTERVALS_OAUTH_BASE = "https://intervals.icu"
+INTERVALS_AUTHORIZE_URL = DEFAULT_INTERVALS_OAUTH_BASE + "/oauth/authorize"
+INTERVALS_TOKEN_URL = DEFAULT_INTERVALS_OAUTH_BASE + "/api/oauth/token"
 DEFAULT_INTERVALS_SCOPE = "ACTIVITY:READ"
 DEFAULT_TRUSTED_CLIENT_HOSTS = ("chatgpt.com", "claude.ai", "claude.com")
 LOGIN_METHODS = ("intervals", "password", "apikey")
 DEFAULT_USERNAME = "athlete"
-DEFAULT_STATE_FILE = "./oauth_state.json"
 DEFAULT_ACCESS_TOKEN_TTL = 3600
 DEFAULT_REFRESH_TOKEN_TTL = 30 * 24 * 3600
 DEFAULT_LOGIN_RATE_LIMIT = 5
@@ -179,7 +221,12 @@ DEFAULT_REFRESH_REUSE_GRACE = 120
 MAX_ROTATED_REFRESH_TOKENS = 2000
 MAX_RATE_LIMIT_KEYS = 10_000
 
-_STATE_VERSION = 1
+# A grant's last use is written to the state file at most this often (seconds).
+LAST_USE_WRITE_INTERVAL = 3600
+# Multi-user mode: grants per athlete (OAUTH_MAX_GRANTS_PER_ATHLETE) and in total; the least
+# recently used ones are revoked first.
+DEFAULT_MAX_GRANTS_PER_ATHLETE = 5
+MAX_GRANT_RECORDS = 500
 _HASH_PREFIX = "pbkdf2_sha256"
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -334,6 +381,45 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
     # Kept out of repr(); compared in constant time. It is the key the server already holds.
     api_key: str | None = field(default=None, repr=False)
     totp_secret: str | None = field(default=None, repr=False)
+    # Multi-user mode (MCP_TENANCY=multi); see intervals_mcp_server.tenancy.
+    tenancy: str = "single"
+    owner_athlete: str | None = None
+    # The server's API_KEY for the owner's own connections (multi-user mode only).
+    owner_api_key: str | None = field(default=None, repr=False)
+    allow_any_athlete: bool = False
+    vault: TokenVault | None = field(default=None, repr=False, compare=False)
+    token_retention_days: int = 0
+    intervals_exclude_areas: frozenset[str] = frozenset()
+    intervals_offer_chats: bool = False
+    intervals_oauth_base: str = DEFAULT_INTERVALS_OAUTH_BASE
+    max_grants_per_athlete: int = DEFAULT_MAX_GRANTS_PER_ATHLETE
+    # Other Intervals.icu accounts of the owner (OAUTH_OWNER_ACCOUNTS): allowed in the single-user mode.
+    owner_accounts: frozenset[str] = frozenset()
+
+    @property
+    def multi_user(self) -> bool:
+        """True with ``MCP_TENANCY=multi``: every connection uses its own credential."""
+        return self.tenancy == "multi"
+
+    @property
+    def intervals_authorize_url(self) -> str:
+        """Authorization endpoint of Intervals.icu."""
+        return self.intervals_oauth_base.rstrip("/") + "/oauth/authorize"
+
+    @property
+    def intervals_token_url(self) -> str:
+        """Token endpoint of Intervals.icu."""
+        return self.intervals_oauth_base.rstrip("/") + "/api/oauth/token"
+
+    def athlete_allowed(self, athlete_id: str) -> bool:
+        """True when *athlete_id* may connect (``OAUTH_ALLOWED_ATHLETES``, or any with the explicit opt-in)."""
+        if self.allow_any_athlete:
+            return bool(athlete_id)
+        return normalize_athlete_id(athlete_id) in self.allowed_athletes
+
+    def is_owner(self, athlete_id: str) -> bool:
+        """True when *athlete_id* is the server owner (``ATHLETE_ID``)."""
+        return self.owner_athlete is not None and same_athlete(athlete_id, self.owner_athlete)
 
     @property
     def issuer(self) -> str:
@@ -507,16 +593,31 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
 
     client_id = env.get("INTERVALS_OAUTH_CLIENT_ID", "").strip() or None
     client_secret = env.get("INTERVALS_OAUTH_CLIENT_SECRET", "").strip() or None
+    tenancy = tenancy_from_env(env)
     athletes_raw = env.get("OAUTH_ALLOWED_ATHLETES", "").strip() or env.get("ATHLETE_ID", "").strip()
     athletes = frozenset(normalize_athlete_id(a) for a in athletes_raw.split(",") if a.strip())
+    allow_any = "*" in athletes
+    if allow_any:
+        if tenancy != "multi" or not _env_bool(env, "OAUTH_ALLOW_ANY_ATHLETE", False):
+            raise ValueError(
+                "OAUTH_ALLOWED_ATHLETES='*' (any Intervals.icu athlete) is only accepted with MCP_TENANCY=multi and "
+                "OAUTH_ALLOW_ANY_ATHLETE=true; list the athlete ids instead"
+            )
+        athletes = athletes - {"*"}
     if "intervals" in methods:
         if not client_id or not client_secret:
             raise ValueError(
                 "OAUTH_LOGIN=intervals requires INTERVALS_OAUTH_CLIENT_ID and INTERVALS_OAUTH_CLIENT_SECRET "
                 "(apply for an app at https://intervals.icu/oauth/apply)"
             )
-        if not athletes:
+        if not athletes and not allow_any:
             raise ValueError("OAUTH_LOGIN=intervals requires OAUTH_ALLOWED_ATHLETES or ATHLETE_ID")
+    owner_accounts = frozenset(
+        normalize_athlete_id(a) for a in env.get("OAUTH_OWNER_ACCOUNTS", "").split(",") if a.strip()
+    )
+    if tenancy == "single":
+        _check_single_user_allowlist(env, athletes, owner_accounts)
+    multi = _multi_user_settings(env, tenancy, methods, api_key, totp_secret is not None)
 
     # Imported here: the config module loads .env on import, which must not happen
     # merely because the auth module was imported (tests, --doctor).
@@ -549,7 +650,88 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         permission_classes=tuple(p for p in PERMISSION_CLASSES if p in permissions),
         api_key=api_key if "apikey" in methods else None,
         totp_secret=totp_secret,
+        tenancy=tenancy,
+        allow_any_athlete=allow_any,
+        owner_accounts=owner_accounts,
+        **multi,
     )
+
+
+def _check_single_user_allowlist(env: Mapping[str, str], athletes: frozenset[str], owner_accounts: frozenset[str]) -> None:
+    """Single-user mode: every allowed athlete sees the owner's data, so only the owner may be on the list.
+
+    ``OAUTH_OWNER_ACCOUNTS`` names other Intervals.icu accounts of the owner that may sign in too.
+    """
+    owner = env.get("ATHLETE_ID", "").strip()
+    others = sorted(athletes - owner_accounts - ({normalize_athlete_id(owner)} if owner else set()))
+    if (owner and others) or (not owner and len(others) > 1):
+        raise ValueError(
+            f"OAUTH_ALLOWED_ATHLETES names {len(others)} athlete(s) besides ATHLETE_ID: in the single-user mode every "
+            "allowed athlete sees the owner's data. To share the server use MCP_TENANCY=multi; for your own other "
+            "Intervals.icu accounts set OAUTH_OWNER_ACCOUNTS"
+        )
+
+
+def _oauth_base(env: Mapping[str, str]) -> str:
+    raw = env.get("INTERVALS_OAUTH_BASE_URL", "").strip().rstrip("/")
+    if not raw:
+        return DEFAULT_INTERVALS_OAUTH_BASE
+    parts = urlsplit(raw)
+    if not parts.hostname or not (parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS)):
+        raise ValueError("INTERVALS_OAUTH_BASE_URL must be an https URL (http only for localhost / 127.0.0.1)")
+    return raw
+
+
+def _multi_user_settings(  # pylint: disable=too-many-locals
+    env: Mapping[str, str], tenancy: str, methods: tuple[str, ...], api_key: str, totp: bool
+) -> dict[str, Any]:
+    """The OAuthConfig fields of the multi-user mode; raise ValueError when it is incomplete."""
+    athlete = env.get("ATHLETE_ID", "").strip()
+    settings: dict[str, Any] = {
+        "owner_athlete": canonical_athlete_id(athlete) if athlete else None,
+        "intervals_oauth_base": _oauth_base(env),
+    }
+    if tenancy != "multi":
+        return settings
+    if "intervals" not in methods:
+        raise ValueError(
+            "MCP_TENANCY=multi needs the Intervals.icu sign-in (OAUTH_LOGIN=intervals, optionally with password): "
+            "other athletes can only connect with their own Intervals.icu account"
+        )
+    local = [m for m in methods if m != "intervals"]
+    if local and not (athlete and api_key):
+        raise ValueError(
+            f"MCP_TENANCY=multi with OAUTH_LOGIN={','.join(methods)} needs ATHLETE_ID and API_KEY: the "
+            f"{'/'.join(local)} sign-in is the owner's and uses the owner's API key"
+        )
+    if local and not totp:
+        raise ValueError(
+            f"MCP_TENANCY=multi with the {'/'.join(local)} sign-in needs OAUTH_TOTP_SECRET: on a shared sign-in page it "
+            "is the one way to the owner's API key. Use OAUTH_LOGIN=intervals (you sign in with Intervals.icu as "
+            "ATHLETE_ID and still use the API key) or add the authenticator code"
+        )
+    try:
+        vault = vault_from_env(env)
+    except ValueError as exc:
+        raise ValueError(f"MCP_TENANCY=multi: {exc}") from exc
+    if vault is None:
+        raise ValueError(
+            "MCP_TENANCY=multi needs OAUTH_TOKEN_KEY or OAUTH_TOKEN_KEY_FILE to encrypt the stored Intervals.icu tokens "
+            "(create a key file with: futureweb-intervals-mcp token-key --file <path>)"
+        )
+    exclude = {a.strip().upper() for a in env.get("INTERVALS_OAUTH_EXCLUDE_AREAS", "").split(",") if a.strip()}
+    unknown = sorted(exclude - set(AREA_ORDER))
+    if unknown:
+        raise ValueError(f"INTERVALS_OAUTH_EXCLUDE_AREAS contains unknown area(s) {', '.join(unknown)}; use {', '.join(AREA_ORDER)}")
+    settings.update(
+        owner_api_key=(api_key or None) if athlete else None,
+        vault=vault,
+        token_retention_days=_env_int(env, "OAUTH_TOKEN_RETENTION_DAYS", 0, minimum=0),
+        intervals_exclude_areas=frozenset(exclude),
+        intervals_offer_chats=_env_bool(env, "INTERVALS_OAUTH_OFFER_CHATS", False),
+        max_grants_per_athlete=_env_int(env, "OAUTH_MAX_GRANTS_PER_ATHLETE", DEFAULT_MAX_GRANTS_PER_ATHLETE),
+    )
+    return settings
 
 
 # --------------------------------------------------------------------------- #
@@ -581,6 +763,8 @@ class _UpstreamLogin:
     browser_digest: str
     expires_at: float
     key: str = "unknown"
+    # Scope requested at Intervals.icu (multi-user mode: from the granted permission classes).
+    intervals_scope: str = ""
 
 
 @dataclass
@@ -592,6 +776,9 @@ class _TokenRecord:
     expires_at: int
     grant_id: str
     resource: str | None = None
+    # The athlete who signed in (canonical id) and how; None for grants from before they were recorded.
+    athlete_id: str | None = None
+    method: str | None = None
 
 
 @dataclass
@@ -636,6 +823,14 @@ class _TokenStore:
     # Digests of exchanged refresh tokens (in memory): reuse after the grace period
     # revokes the grant (RFC 9700 4.14.2).
     rotated: dict[str, _RotatedToken] = field(default_factory=dict)
+
+
+class _ExternalChange(Exception):
+    """The state file was changed by someone else (the grants CLI) since it was last read."""
+
+
+class CredentialError(Exception):
+    """The connection has no usable Intervals.icu credential (the message says what to do)."""
 
 
 class LoginError(Exception):
@@ -729,15 +924,22 @@ def _redirect_uri_allowed(uri: str, hosts: frozenset[str] | None = None) -> bool
     return hosts is None or allowlist_match(parts.hostname, parts.path, hosts)
 
 
-def _record_from_state(raw: Any) -> _TokenRecord:
-    """A persisted refresh-token record; raises ValueError / TypeError / KeyError when malformed."""
+def _record_from_state(raw: Any, version: int = 1) -> _TokenRecord:
+    """A persisted refresh-token record; raises ValueError / TypeError / KeyError when malformed.
+
+    Format 2 records must name their grant (no id is invented: a token is only served with
+    its grant record).
+    """
     if not isinstance(raw, dict):
         raise TypeError("not an object")
     client_id = raw["client_id"]
     scopes = raw.get("scopes", [SCOPE])
     expires_at = raw["expires_at"]
+    if version >= STATE_VERSION and not raw.get("grant_id"):
+        raise KeyError("grant_id")
     grant_id = raw.get("grant_id") or secrets.token_urlsafe(16)
     resource = raw.get("resource")
+    athlete, method = raw.get("athlete_id"), raw.get("method")
     if not isinstance(client_id, str) or not isinstance(grant_id, str):
         raise TypeError("client_id and grant_id must be strings")
     if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
@@ -746,36 +948,12 @@ def _record_from_state(raw: Any) -> _TokenRecord:
         raise TypeError("expires_at must be a number")
     if resource is not None and not isinstance(resource, str):
         raise TypeError("resource must be a string")
-    return _TokenRecord(client_id, list(scopes), int(expires_at), grant_id, resource)
-
-
-def _state_format_problem(data: Any) -> str | None:
-    """Why *data* is not a state file this version can use, or None."""
-    if not isinstance(data, dict):
-        return "is not a JSON object"
-    version = data.get("version", 1)
-    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-        return f"has an unknown format version {version!r}"
-    if version > _STATE_VERSION:
-        return f"was written by a newer version of the server (format {version}, this version reads {_STATE_VERSION})"
-    for key in ("clients", "refresh_tokens"):
-        if not isinstance(data.get(key, {}), dict):
-            return f"has an unexpected format ('{key}' is not an object)"
-    return None
-
-
-def _fsync_directory(path: Path) -> None:
-    """Make a rename in *path* durable; not every file system supports it."""
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    if (athlete is not None and not (isinstance(athlete, str) and athlete)) or (method is not None and not isinstance(method, str)):
+        raise TypeError("athlete_id and method must be strings")
+    return _TokenRecord(
+        client_id, list(scopes), int(expires_at), grant_id, resource,
+        canonical_athlete_id(athlete) if athlete else None, method,
+    )
 
 
 def granted_classes(scopes: list[str] | None) -> set[str] | None:
@@ -817,14 +995,20 @@ IntervalsTokenExchange = Callable[[str], Awaitable[dict[str, Any]]]
 class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,too-many-public-methods
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """OAuth 2.1 provider for one athlete: consent, Intervals.icu or password sign-in, persisted refresh tokens."""
+    """OAuth 2.1 provider: consent, Intervals.icu or password sign-in, persisted refresh tokens.
 
-    def __init__(
+    Despite its name it also serves the multi-user mode (``MCP_TENANCY=multi``): each grant then
+    has a record naming the athlete who connected and, for athletes other than the owner, their
+    sealed Intervals.icu token (see :meth:`connection_credential`).
+    """
+
+    def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         config: OAuthConfig,
         clock: Callable[[], float] = time.time,
         fetch: Fetcher | None = None,
         intervals_exchange: IntervalsTokenExchange | None = None,
+        intervals_refresh: IntervalsTokenExchange | None = None,
     ) -> None:
         self._config = config
         self._clock = clock
@@ -839,12 +1023,21 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             config.client_hosts, " ".join(config.scopes_supported), fetch=fetch, clock=clock
         )
         self._intervals_exchange = intervals_exchange or self._exchange_intervals_code
+        self._intervals_refresh = intervals_refresh or self._refresh_intervals_token
         self._totp_last_counter = -1
         # Key for the consent form tokens (CSRF); a restart also drops the pending requests.
         self._form_key = secrets.token_bytes(32)
         # Entries of the state file this version could not read: written back unchanged.
         self._raw_clients: dict[str, Any] = {}
         self._raw_refresh: dict[str, Any] = {}
+        self._raw_grants: dict[str, Any] = {}
+        # Multi-user mode: grant records (persisted) and the grants of issued codes (memory only).
+        self._grants: dict[str, Grant] = {}
+        self._code_grants: dict[str, PendingGrant] = {}
+        # Multi-user mode: grants of the single-user mode refused until `grants adopt-legacy --owner`.
+        self._awaiting_adoption: set[str] = set()
+        # (inode, mtime, size) of the state file as last read or written by this process.
+        self._known_signature: tuple[int, int, int] | None = None
         self._state_lock = anyio.Lock()
         self._load_state()
         self._check_state_writable()
@@ -861,11 +1054,11 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
 
     # ----- persistence ---------------------------------------------------- #
 
-    def _load_state(self) -> None:
-        """Read the state file; anything unusable raises ValueError and the file stays untouched."""
+    def _read_state_file(self) -> dict[str, Any] | None:
+        """The parsed state file, None when there is none; ValueError when it cannot be used."""
         path = self._config.state_file
         if not path.exists():
-            return
+            return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -873,16 +1066,46 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                 f"OAUTH_STATE_FILE {path} could not be read ({_one_line(exc)}); the file was left unchanged. "
                 "Repair it, restore a backup or move it away (all clients then have to connect again)"
             ) from exc
-        problem = _state_format_problem(data)
+        problem = state_format_problem(data)
         if problem:
             raise ValueError(
                 f"OAUTH_STATE_FILE {path} {problem}; the file was left unchanged. "
                 "Repair it, restore a backup or move it away (all clients then have to connect again)"
             )
+        return data
+
+    def _load_state(self) -> None:
+        """Read the state file; anything unusable raises ValueError and the file stays untouched."""
+        signature = file_signature(self._config.state_file)
+        data = self._read_state_file()
+        self._known_signature = signature
+        if data is None:
+            return
+        self._apply_state(data)
+        logger.info(
+            "OAuth state loaded: %d client(s), %d refresh token(s)%s",
+            len(self._clients),
+            len(self._tokens.refresh),
+            f", {len(self._grants)} multi-user grant record(s)" if self._config.multi_user else "",
+        )
+
+    def _apply_state(self, data: dict[str, Any]) -> None:  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+        """Replace the persisted tables with *data*; memory-only tokens of vanished grants are dropped.
+
+        Multi-user mode, fail closed: a token is only served with its grant record. Connections of
+        the single-user mode (format 1) whose record names the owner become owner grant records
+        here, once; those without a recorded athlete are refused but kept in the file until the
+        operator adopts them (``grants adopt-legacy --owner``); other athletes' are dropped. Tokens
+        kept verbatim (an unreadable client or grant) keep their grant record in the file.
+        """
         now = self._clock()
+        multi = self._config.multi_user
+        version = data.get("version", 1) if isinstance(data.get("version", 1), int) else 1
+        clients: dict[str, OAuthClientInformationFull] = {}
+        raw_clients: dict[str, Any] = {}
         for client_id, raw in data.get("clients", {}).items():
             try:
-                self._clients[client_id] = OAuthClientInformationFull.model_validate(raw)
+                clients[client_id] = OAuthClientInformationFull.model_validate(raw)
             except ValidationError as exc:
                 # Kept verbatim (a stricter SDK must not silently delete registrations).
                 logger.warning(
@@ -890,30 +1113,163 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                     _for_log(client_id),
                     exc.error_count(),
                 )
-                self._raw_clients[client_id] = raw
+                raw_clients[client_id] = raw
+        stored_grants: dict[str, Any] = data.get("grants") or {}
+        grants: dict[str, Grant] = {}
+        raw_grants: dict[str, Any] = {}
+        for grant_id, raw in stored_grants.items():
+            try:
+                grants[grant_id] = Grant.from_state(raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("OAuth state: a grant entry could not be read (%s)", _one_line(exc))
+                raw_grants[grant_id] = raw
+        refresh: dict[str, _TokenRecord] = {}
+        raw_refresh: dict[str, Any] = {}
+        dropped: set[str] = set()
+        awaiting: set[str] = set()
+        converted: dict[str, Grant] = {}
         for digest, raw in data.get("refresh_tokens", {}).items():
             try:
-                record = _record_from_state(raw)
+                record = _record_from_state(raw, version)
             except (KeyError, TypeError, ValueError) as exc:
+                if not multi and self._raw_record_of_other_athlete(raw, grants, raw_grants):
+                    dropped.add(str(raw.get("grant_id")))
+                    continue
                 logger.warning("OAuth state: a refresh token entry could not be read (%s); kept in the file", _one_line(exc))
-                self._raw_refresh[digest] = raw
+                raw_refresh[digest] = raw
                 continue
             if record.expires_at <= now:
                 continue
-            if record.client_id in self._raw_clients:
-                self._raw_refresh[digest] = raw
+            grant = grants.get(record.grant_id)
+            if record.grant_id in raw_grants:
+                if multi:  # kept with its grant record for a version that can read it; never usable here
+                    raw_refresh[digest] = raw
+                else:  # a single-user file must not hand it to the owner's API key
+                    dropped.add(record.grant_id)
                 continue
-            known = record.client_id in self._clients or is_metadata_client_id(record.client_id)
-            if known:
-                self._tokens.refresh[digest] = record
-                if is_metadata_client_id(record.client_id):
-                    # Its document is fetched even while unknown client ids use up the budget.
-                    self.metadata_clients.remember(record.client_id)
-        logger.info(
-            "OAuth state loaded: %d client(s), %d refresh token(s)",
-            len(self._clients),
-            len(self._tokens.refresh),
+            if multi and grant is None:
+                grant = self._grant_for_record(record, version, converted)
+                if grant is None:
+                    if record.athlete_id is None or self._config.is_owner(record.athlete_id):
+                        raw_refresh[digest] = raw  # refused until adopted; kept for the owner
+                        awaiting.add(record.grant_id)
+                    else:
+                        dropped.add(record.grant_id)
+                    continue
+            if not self._usable(record, grant):
+                dropped.add(record.grant_id)
+                continue
+            if record.client_id in raw_clients:
+                raw_refresh[digest] = raw  # kept verbatim, with its grant record
+                continue
+            if not (record.client_id in clients or is_metadata_client_id(record.client_id)):
+                continue
+            refresh[digest] = record
+            if is_metadata_client_id(record.client_id):
+                # Its document is fetched even while unknown client ids use up the budget.
+                self.metadata_clients.remember(record.client_id)
+        grants.update(converted)
+        live = {record.grant_id for record in refresh.values()}
+        kept_raw = {raw.get("grant_id") for raw in raw_refresh.values() if isinstance(raw, dict)}
+        self._clients, self._raw_clients = clients, raw_clients
+        self._tokens.refresh, self._raw_refresh = refresh, raw_refresh
+        self._grants = {grant_id: grant for grant_id, grant in grants.items() if grant_id in live}
+        self._raw_grants = {}
+        if multi:
+            self._raw_grants = dict(raw_grants)
+            self._raw_grants.update(
+                {gid: stored_grants[gid] for gid in kept_raw if isinstance(gid, str) and gid in stored_grants and gid not in live}
+            )
+        self._tokens.access = {d: r for d, r in self._tokens.access.items() if r.grant_id in live}
+        self._tokens.rotated = {d: r for d, r in self._tokens.rotated.items() if r.record.grant_id in live}
+        if converted:
+            logger.info("OAuth state: %d connection(s) of the owner from the single-user mode became owner grants", len(converted))
+        self._awaiting_adoption = awaiting
+        if awaiting:
+            logger.warning(
+                "OAuth state: %d connection(s) from the single-user mode are refused in the multi-user mode until you "
+                "confirm they are yours: futureweb-intervals-mcp grants adopt-legacy --owner (grants list shows them)",
+                len(awaiting),
+            )
+        if dropped:
+            logger.warning(
+                "OAuth state: %d connection(s) cannot be used in the %s-user mode (other athletes, an athlete no longer "
+                "allowed, or no owner API key); they are removed at the next write",
+                len(dropped),
+                "multi" if multi else "single",
+            )
+
+    def _grant_for_record(self, record: _TokenRecord, version: int, converted: dict[str, Grant]) -> Grant | None:
+        """Multi-user mode, a token without grant record: an owner grant only for a format-1 record naming the owner."""
+        config = self._config
+        if version >= STATE_VERSION or not record.athlete_id or not config.is_owner(record.athlete_id):
+            return None
+        if not self._owner_key_available():
+            return None
+        now = self._now()
+        return converted.setdefault(
+            record.grant_id,
+            Grant(config.owner_athlete or record.athlete_id, "owner", record.method or "legacy", record.client_id, now, now, (), None, now),
         )
+
+    def _raw_record_of_other_athlete(self, raw: Any, grants: dict[str, Grant], raw_grants: dict[str, Any]) -> bool:
+        """Single-user mode: an unreadable refresh record that evidently belongs to another athlete."""
+        if not isinstance(raw, dict):
+            return False
+        grant_id = raw.get("grant_id")
+        if isinstance(grant_id, str) and grant_id in raw_grants:
+            return True
+        grant = grants.get(grant_id) if isinstance(grant_id, str) else None
+        athlete = grant.athlete_id if grant is not None else raw.get("athlete_id")
+        if grant is not None and grant.kind == "athlete" and not self._config.is_owner(grant.athlete_id):
+            return True
+        return isinstance(athlete, str) and not self._single_user_athlete(athlete)
+
+    def _owner_key_available(self) -> bool:
+        return bool(self._config.owner_athlete and self._config.owner_api_key)
+
+    def _single_user_athlete(self, athlete: str) -> bool:
+        """Single-user mode: the owner, or one of the owner's other accounts on the allowlist."""
+        config = self._config
+        return config.is_owner(athlete) or normalize_athlete_id(athlete) in (config.allowed_athletes | config.owner_accounts)
+
+    def _usable(self, record: _TokenRecord | None, grant: Grant | None) -> bool:
+        """Whether a token (its record and grant record) may be used in the configured mode.
+
+        Single-user mode: every connection reaches the owner's data with the API key, so only the
+        owner's connections (and those from before athletes were recorded) are kept. Multi-user
+        mode, fail closed: only with a grant record; owner grants need the owner's API key, athlete
+        grants their sealed token, and the athlete must still be allowed.
+        """
+        config = self._config
+        recorded = record.athlete_id if record is not None else None
+        if grant is not None and recorded and not same_athlete(recorded, grant.athlete_id):
+            return False
+        if not config.multi_user:
+            if grant is not None and grant.kind == "athlete" and not config.is_owner(grant.athlete_id):
+                return False
+            athlete = grant.athlete_id if grant is not None else recorded
+            return athlete is None or self._single_user_athlete(athlete)
+        if grant is None:
+            return False
+        if grant.kind == "owner":
+            return self._owner_key_available() and config.is_owner(grant.athlete_id)
+        return bool(grant.sealed) and config.vault is not None and config.athlete_allowed(grant.athlete_id)
+
+    def _sync_from_disk(self) -> None:
+        """Pick up a change of the state file made by someone else (``grants remove``)."""
+        signature = file_signature(self._config.state_file)
+        if signature == self._known_signature:
+            return
+        try:
+            data = self._read_state_file()
+        except ValueError as exc:
+            # Keep serving from memory; writes are refused until the file is readable again.
+            logger.error("%s", _one_line(exc))
+            return
+        self._known_signature = signature
+        self._apply_state(data or {})
+        logger.info("OAUTH_STATE_FILE %s was changed by another process; reloaded", self._config.state_file)
 
     def _check_state_writable(self) -> None:
         """Fail at startup, not at the first sign-in, when the state file cannot be written."""
@@ -943,33 +1299,39 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                     "expires_at": record.expires_at,
                     "grant_id": record.grant_id,
                     **({"resource": record.resource} if record.resource else {}),
+                    **({"athlete_id": record.athlete_id} if record.athlete_id else {}),
+                    **({"method": record.method} if record.method else {}),
                 }
                 for digest, record in self._tokens.refresh.items()
                 if record.expires_at > now
             }
         )
-        return {"version": _STATE_VERSION, "clients": clients, "refresh_tokens": refresh}
+        if not self._config.multi_user:
+            return {"version": SINGLE_USER_STATE_VERSION, "clients": clients, "refresh_tokens": refresh}
+        live = {record.grant_id for record in self._tokens.refresh.values() if record.expires_at > now}
+        grants: dict[str, Any] = dict(self._raw_grants)
+        grants.update({grant_id: grant.to_state() for grant_id, grant in self._grants.items() if grant_id in live})
+        return {"version": STATE_VERSION, "clients": clients, "refresh_tokens": refresh, "grants": grants}
 
     def _write_state(self, data: dict[str, Any]) -> None:
-        """Atomically replace the state file (runs in a worker thread)."""
+        """Atomically replace the state file (runs in a worker thread, under the file lock).
+
+        Refused (``_ExternalChange``) when the file changed since this process last read or
+        wrote it, so a change by the grants CLI is never overwritten.
+        """
         path = self._config.state_file
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(tmp_name, 0o600)
-            os.replace(tmp_name, path)
-        except BaseException:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
-        _fsync_directory(path.parent)
+        with state_file_lock(path):
+            if file_signature(path) != self._known_signature:
+                raise _ExternalChange()
+            write_state_file(path, data)
+            self._known_signature = file_signature(path)
 
     def _tables(self) -> list[dict[str, Any]]:
         store = self._tokens
-        return [self._clients, store.codes, store.used_codes, store.access, store.refresh, store.rotated]
+        return [
+            self._clients, store.codes, store.used_codes, store.access, store.refresh, store.rotated,
+            self._grants, self._code_grants,
+        ]
 
     def _changes_since(self, before: list[dict[str, Any]]) -> list[tuple[list[str], dict[str, Any]]]:
         """Per table: keys added or replaced, and the old entries removed or replaced."""
@@ -995,6 +1357,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         so a client can simply retry: a refresh token or code is never lost to a full disk.
         """
         async with self._state_lock:
+            self._sync_from_disk()
             before = [dict(table) for table in self._tables()]
             try:
                 yield
@@ -1004,6 +1367,11 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             changes = self._changes_since(before)
             try:
                 await anyio.to_thread.run_sync(self._write_state, self._state_snapshot())
+            except _ExternalChange:
+                self._undo(changes)
+                self._sync_from_disk()
+                logger.warning("OAUTH_STATE_FILE %s changed during a write; the change was not saved", self._config.state_file)
+                raise OSError("the OAuth state file was changed by another process; please try again") from None
             except Exception as exc:
                 self._undo(changes)
                 if isinstance(exc, OSError):
@@ -1021,18 +1389,25 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     def _client_scopes(self, client: OAuthClientInformationFull) -> list[str]:
         return client.scope.split() if client.scope else [SCOPE]
 
-    def _issue_tokens(
-        self, client_id: str, scopes: list[str], grant_id: str, resource: str | None
+    def _issue_tokens(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        client_id: str,
+        scopes: list[str],
+        grant_id: str,
+        resource: str | None,
+        athlete_id: str | None = None,
+        method: str | None = None,
     ) -> OAuthToken:
         """Add a new access / refresh token pair (call inside :meth:`_state_change`)."""
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(32)
         now = self._now()
+        athlete = canonical_athlete_id(athlete_id) if athlete_id else None
         self._tokens.access[_digest(access)] = _TokenRecord(
-            client_id, scopes, now + self._config.access_token_ttl, grant_id, resource
+            client_id, scopes, now + self._config.access_token_ttl, grant_id, resource, athlete, method
         )
         self._tokens.refresh[_digest(refresh)] = _TokenRecord(
-            client_id, scopes, now + self._config.refresh_token_ttl, grant_id, resource
+            client_id, scopes, now + self._config.refresh_token_ttl, grant_id, resource, athlete, method
         )
         if is_metadata_client_id(client_id):
             self.metadata_clients.remember(client_id)
@@ -1055,6 +1430,9 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             del store.used_codes[code]
         for code in [c for c, rec in store.codes.items() if rec.expires_at <= now]:
             del store.codes[code]
+        for code in [c for c in self._code_grants if c not in store.codes]:
+            del self._code_grants[code]  # the token of a sign-in whose code was never exchanged
+        self._purge_grants(now)
         for digest in [d for d, rot in store.rotated.items() if rot.record.expires_at <= now]:
             del store.rotated[digest]
         for rotated in store.rotated.values():
@@ -1095,14 +1473,33 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         elapsed = int(self._clock() - rotated.rotated_at)
         return rotated.response.model_copy(update={"expires_in": max(1, (rotated.response.expires_in or 1) - elapsed)})
 
+    def _purge_grants(self, now: float) -> None:
+        """Drop grant records (and their stored tokens) without live tokens or unused for too long."""
+        if not self._grants:
+            return
+        store = self._tokens
+        live = {rec.grant_id for rec in store.refresh.values()} | {rec.grant_id for rec in store.access.values()}
+        retention = self._config.token_retention_days * 86400
+        for grant_id, grant in list(self._grants.items()):
+            if grant_id not in live:
+                del self._grants[grant_id]
+            elif retention and grant.kind == "athlete" and grant.last_used_at < now - retention:
+                logger.info(
+                    "Dropping the connection of athlete %s unused for %d days (OAUTH_TOKEN_RETENTION_DAYS)",
+                    _for_log(grant.athlete_id),
+                    self._config.token_retention_days,
+                )
+                self._revoke_grant(grant_id)
+
     def _revoke_grant(self, grant_id: str) -> None:
-        """Drop every token of a grant (call inside :meth:`_state_change`)."""
+        """Drop every token of a grant and its stored Intervals.icu token (call inside :meth:`_state_change`)."""
         store = self._tokens
         for bucket in (store.access, store.refresh):
             for digest in [d for d, rec in bucket.items() if rec.grant_id == grant_id]:
                 del bucket[digest]
         for digest in [d for d, rot in store.rotated.items() if rot.record.grant_id == grant_id]:
             del store.rotated[digest]
+        self._grants.pop(grant_id, None)
 
     @staticmethod
     def _evict_for_key(table: dict[str, Any], key: str, per_key: int, total: int) -> None:
@@ -1257,13 +1654,78 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                     raise _Refused("authorization code is not valid")
                 grant_id = secrets.token_urlsafe(16)
                 self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
-                token = self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
+                athlete, method = self._attach_grant(code.code, grant_id, code.client_id)
+                token = self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource, athlete, method)
         except _Refused as exc:
             raise TokenError("invalid_grant", str(exc)) from None
         logger.info("Issued tokens to client %s", _for_log(client.client_id))
         return token
 
-    async def load_refresh_token(
+    def _attach_grant(self, code: str, grant_id: str, client_id: str) -> tuple[str | None, str | None]:
+        """The athlete and sign-in method of a code; multi-user mode: its grant record (inside :meth:`_state_change`).
+
+        The athlete's Intervals.icu token is sealed for this grant. Intervals.icu applies the
+        scopes of an athlete's latest sign-in to all of the athlete's tokens, so the other
+        grants of the athlete get the new scopes as well. An athlete keeps at most
+        ``OAUTH_MAX_GRANTS_PER_ATHLETE`` grants (the least recently used ones are revoked).
+        """
+        pending = self._code_grants.pop(code, None)
+        if not self._config.multi_user:
+            return ((pending.athlete_id or None), pending.method) if pending is not None else (None, None)
+        if pending is None:
+            raise _Refused("authorization code is not valid")
+        now = self._now()
+        self._limit_grants(pending.athlete_id)
+        sealed = None
+        if pending.kind == "athlete":
+            vault = self._config.vault
+            if vault is None or not pending.token:
+                raise _Refused("authorization code is not valid")
+            sealed = vault.seal(pending.token, grant_context(grant_id, pending.athlete_id))
+            for other_id, other in list(self._grants.items()):
+                if other.kind == "athlete" and same_athlete(other.athlete_id, pending.athlete_id):
+                    self._grants[other_id] = Grant(
+                        other.athlete_id, other.kind, other.method, other.client_id, other.created_at,
+                        other.last_used_at, pending.intervals_scopes, other.sealed, other.persisted_use,
+                    )
+        self._grants[grant_id] = Grant(
+            athlete_id=pending.athlete_id,
+            kind=pending.kind,
+            method=pending.method,
+            client_id=client_id,
+            created_at=now,
+            last_used_at=now,
+            intervals_scopes=pending.intervals_scopes,
+            sealed=sealed,
+            persisted_use=now,
+        )
+        return pending.athlete_id, pending.method
+
+    def _limit_grants(self, athlete_id: str) -> None:
+        """Multi-user mode: make room for one more grant of *athlete_id*, least recently used first.
+
+        The owner's grants (``ATHLETE_ID``, e.g. the long-lived ChatGPT connection) are never
+        evicted: neither by the per-athlete cap nor by the total cap.
+        """
+        def by_use(grant_id: str) -> int:
+            return self._grants[grant_id].last_used_at
+
+        def evictable(grant: Grant) -> bool:
+            return grant.kind == "athlete" and not self._config.is_owner(grant.athlete_id)
+
+        if self._config.is_owner(athlete_id):
+            return
+        mine = sorted(
+            (gid for gid, g in self._grants.items() if evictable(g) and same_athlete(g.athlete_id, athlete_id)), key=by_use
+        )
+        while mine and len(mine) >= self._config.max_grants_per_athlete:
+            logger.info("Athlete %s has too many connections; revoking the least recently used one", _for_log(athlete_id))
+            self._revoke_grant(mine.pop(0))
+        others = sorted((gid for gid, g in self._grants.items() if evictable(g)), key=by_use)
+        while others and len(self._grants) >= MAX_GRANT_RECORDS:
+            self._revoke_grant(others.pop(0))
+
+    async def load_refresh_token(  # pylint: disable=too-many-return-statements
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
         """Return the refresh token if it belongs to *client* and has not expired.
@@ -1272,9 +1734,12 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         that lost the response retries); presented later it revokes the whole grant, because
         then two parties hold tokens of one grant (RFC 9700, refresh token rotation).
         """
+        self._sync_unlocked()
         self._purge_expired_tokens()
         digest = _digest(refresh_token)
         record = self._tokens.refresh.get(digest)
+        if record is not None and not self._usable(record, self._grants.get(record.grant_id)):
+            return None
         if record is None:
             rotated = self._tokens.rotated.get(digest)
             if rotated is None or rotated.record.client_id != client.client_id:
@@ -1334,7 +1799,8 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
                     raise _Refused("refresh token is not valid")
                 del self._tokens.refresh[digest]
                 token = self._issue_tokens(
-                    record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource
+                    record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource,
+                    record.athlete_id, record.method,
                 )
                 self._remember_rotated(digest, record, token)
         except _Refused as exc:
@@ -1347,13 +1813,26 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         logger.info("Refreshed tokens for client %s", _for_log(client.client_id))
         return token
 
+    def _sync_unlocked(self) -> None:
+        """Pick up a change of the state file by another process unless a write is in progress."""
+        if not self._state_lock.locked():
+            self._sync_from_disk()
+
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Return the access token metadata used by the bearer middleware (audience-checked)."""
+        """Return the access token metadata used by the bearer middleware (audience-checked).
+
+        In the multi-user mode the grant id is the token's ``subject``: the SDK binds a
+        session to it, so one connection cannot use another connection's session.
+        """
+        self._sync_unlocked()
         self._purge_expired_tokens()
         record = self._tokens.access.get(_digest(token))
         if record is None:
             return None
         if record.resource and not self._config.same_origin(record.resource):
+            return None
+        multi = self._config.multi_user
+        if not self._usable(record, self._grants.get(record.grant_id)):
             return None
         return AccessToken(
             token=token,
@@ -1361,7 +1840,145 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             scopes=record.scopes,
             expires_at=record.expires_at,
             resource=record.resource,
+            subject=record.grant_id if multi else None,
         )
+
+    # ----- multi-user mode: the credential of a connection ----------------- #
+
+    def _owner_credential(self, grant_id: str | None) -> Credential:
+        config = self._config
+        if not (config.owner_athlete and config.owner_api_key):
+            raise CredentialError(
+                "This connection belongs to the server owner, but the server has no owner API key (ATHLETE_ID and "
+                "API_KEY). Disconnect and reconnect with 'Continue with Intervals.icu'."
+            )
+        return Credential(config.owner_athlete, "apikey", config.owner_api_key, grant_id, None, owner=True)
+
+    async def connection_credential(self, token: str) -> Credential:
+        """The Intervals.icu credential of the connection holding access *token* (multi-user mode).
+
+        Owner grants use the owner's API key, athlete grants their own sealed Intervals.icu token.
+        Fail closed: a token without a grant record is refused, never served as the owner's.
+        Raises :class:`CredentialError` with a message for the client when the connection cannot
+        be served (revoked, not allowed, unreadable token).
+        """
+        record = self._tokens.access.get(_digest(token))
+        if record is None or record.expires_at <= self._clock():
+            raise CredentialError("This connection's access token is no longer valid. Reconnect the server in your MCP client.")
+        grant = self._grants.get(record.grant_id)
+        if grant is None or not self._usable(record, grant):
+            raise CredentialError(
+                "This connection can no longer be used on this server. Disconnect and reconnect the server in your MCP client."
+            )
+        if grant.kind == "owner":
+            credential = self._owner_credential(record.grant_id)
+        else:
+            credential = await self._athlete_credential(record.grant_id, grant)
+        await self._touch(record.grant_id)
+        return credential
+
+    async def _athlete_credential(self, grant_id: str, grant: Grant) -> Credential:
+        vault = self._config.vault
+        try:
+            if vault is None or grant.sealed is None:
+                raise VaultError("no stored token")
+            payload, key_index = vault.open_with_key(grant.sealed, grant_context(grant_id, grant.athlete_id))
+        except VaultError as exc:
+            logger.warning("Stored Intervals.icu token of athlete %s cannot be opened: %s", _for_log(grant.athlete_id), exc)
+            raise CredentialError(
+                "The stored Intervals.icu sign-in of this connection cannot be read (the server's token key changed). "
+                "Disconnect and reconnect the server in your MCP client."
+            ) from None
+        expires_at = payload.get("expires_at")
+        if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at <= self._clock() + 60:
+            payload = await self._refresh_athlete_token(grant_id, grant, payload)
+        elif key_index:
+            await self._reseal(grant_id, payload)  # opened with an older key: rotate it to the first key
+        access = payload.get("access_token")
+        if not isinstance(access, str) or not access:
+            raise CredentialError("The stored Intervals.icu sign-in of this connection is incomplete. Reconnect the server.")
+        return Credential(
+            canonical_athlete_id(grant.athlete_id),
+            "bearer",
+            access,
+            grant_id,
+            frozenset(grant.intervals_scopes),
+            owner=self._config.is_owner(grant.athlete_id),
+        )
+
+    async def _refresh_athlete_token(self, grant_id: str, grant: Grant, payload: dict[str, Any]) -> dict[str, Any]:
+        """Renew an expiring Intervals.icu token with its refresh token (only if Intervals.icu issued one)."""
+        refresh_token = payload.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise CredentialError(
+                "The Intervals.icu sign-in of this connection has expired. Disconnect and reconnect the server in your MCP client."
+            )
+        try:
+            answer = await self._intervals_refresh(refresh_token)
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            logger.warning("Intervals.icu token refresh for athlete %s failed: %s", _for_log(grant.athlete_id), type(exc).__name__)
+            raise CredentialError(
+                "Intervals.icu did not renew the sign-in of this connection. Disconnect and reconnect the server in your MCP client."
+            ) from None
+        renewed = _token_payload(answer, self._now(), previous=payload)
+        if renewed is None:
+            raise CredentialError("Intervals.icu did not renew the sign-in of this connection. Reconnect the server.")
+        await self._reseal(grant_id, renewed)
+        return renewed
+
+    async def _reseal(self, grant_id: str, payload: dict[str, Any]) -> None:
+        """Store *payload* sealed with the first key (after a refresh or a key rotation)."""
+        vault = self._config.vault
+        assert vault is not None  # checked by the caller
+        try:
+            async with self._state_change():
+                current = self._grants.get(grant_id)
+                if current is not None:
+                    self._grants[grant_id] = Grant(
+                        current.athlete_id, current.kind, current.method, current.client_id, current.created_at,
+                        current.last_used_at, current.intervals_scopes,
+                        vault.seal(payload, grant_context(grant_id, current.athlete_id)), current.persisted_use,
+                    )
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not store the re-sealed token of a connection: %s", _one_line(exc))
+
+    async def _touch(self, grant_id: str) -> None:
+        """Remember the grant's last use; written to the file at most every LAST_USE_WRITE_INTERVAL."""
+        grant = self._grants.get(grant_id)
+        if grant is None:
+            return
+        now = self._now()
+        grant.last_used_at = now
+        if now - grant.persisted_use < LAST_USE_WRITE_INTERVAL:
+            return
+        grant.persisted_use = now
+        try:
+            async with self._state_change():
+                self._purge_expired_tokens()  # also applies OAUTH_TOKEN_RETENTION_DAYS
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not record the last use of a connection: %s", _one_line(exc))
+
+    def grant_overview(self) -> dict[str, Any]:
+        """Counts for ``--doctor`` (no ids, no tokens): grants by kind and unreadable stored tokens."""
+        vault = self._config.vault
+        unreadable = old_key = 0
+        for grant_id, grant in self._grants.items():
+            if grant.kind != "athlete":
+                continue
+            try:
+                if vault is None or grant.sealed is None:
+                    raise VaultError("missing")
+                old_key += 1 if vault.open_with_key(grant.sealed, grant_context(grant_id, grant.athlete_id))[1] else 0
+            except VaultError:
+                unreadable += 1
+        return {
+            "athletes": len({normalize_athlete_id(g.athlete_id) for g in self._grants.values() if g.kind == "athlete"}),
+            "athlete_grants": sum(1 for g in self._grants.values() if g.kind == "athlete"),
+            "owner_grants": sum(1 for g in self._grants.values() if g.kind == "owner"),
+            "legacy_grants": len(self._awaiting_adoption),
+            "unreadable_tokens": unreadable,
+            "old_key_tokens": old_key,
+        }
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         """Revoke the whole grant (access + refresh token) the given token belongs to."""
@@ -1469,8 +2086,27 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         picked = set(chosen or []) | {"read"}
         return tuple(p for p in pending.offered if p in picked) or ("read",)
 
-    def complete_login(self, request_id: str, login_key: str, granted: tuple[str, ...] | None = None) -> str:
-        """Consume the pending request, mint a code and return the client redirect URL."""
+    def complete_login(  # pylint: disable=too-many-arguments
+        self,
+        request_id: str,
+        login_key: str,
+        granted: tuple[str, ...] | None = None,
+        *,
+        method: str = "password",
+        grant: PendingGrant | None = None,
+    ) -> str:
+        """Consume the pending request, mint a code and return the client redirect URL.
+
+        The code carries who signed in: *grant* for an Intervals.icu sign-in, otherwise (password
+        or API key, *method*) the owner. In the multi-user mode it becomes the grant record; in the
+        single-user mode the athlete is recorded with the refresh token.
+        """
+        if grant is None:
+            # A password or API-key sign-in is the owner's: it uses the owner's API key.
+            owner = self._config.owner_athlete
+            if self._config.multi_user and (method not in ("password", "apikey") or not owner or not self._owner_key_available()):
+                raise LoginError("This sign-in cannot be used on this server.", 403)
+            grant = PendingGrant(owner or "", "owner", method)
         pending = self._pending.pop(request_id, None)
         if pending is None:
             # Expired, denied or finished in another tab while this sign-in was running.
@@ -1490,6 +2126,7 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=params.resource,
         )
+        self._code_grants[code] = grant
         logger.info(
             "Sign-in succeeded; issuing authorization code to client %s (%s)", _for_log(pending.client_id), ", ".join(classes)
         )
@@ -1505,8 +2142,13 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
 
     # ----- sign-in with Intervals.icu -------------------------------------- #
 
-    def begin_intervals_login(self, request_id: str, granted: tuple[str, ...], login_key: str = "unknown") -> tuple[str, str]:
-        """Return (Intervals.icu authorize URL, browser binding value for a cookie)."""
+    def begin_intervals_login(
+        self, request_id: str, granted: tuple[str, ...], login_key: str = "unknown", *, chats: bool = False
+    ) -> tuple[str, str]:
+        """Return (Intervals.icu authorize URL, browser binding value for a cookie).
+
+        *chats*: the athlete ticked "activity comments" (multi-user mode, only when offered).
+        """
         if self.pending_login(request_id) is None:
             raise LoginError("This sign-in link is invalid or has expired.")
         # Only the latest attempt of a request counts (the cookie of an earlier one is overwritten anyway).
@@ -1515,22 +2157,35 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self._evict_for_key(self._upstream, login_key, MAX_PENDING_PER_KEY, MAX_PENDING_LOGINS)
         state = secrets.token_urlsafe(32)
         browser = secrets.token_urlsafe(32)
+        scope = self.intervals_scope_for(granted, chats=chats)
         self._upstream[state] = _UpstreamLogin(
             request_id=request_id,
             granted=granted,
             browser_digest=_digest(browser),
             expires_at=self._clock() + LOGIN_REQUEST_TTL,
             key=login_key,
+            intervals_scope=scope,
         )
         query = urlencode(
             {
                 "client_id": self._config.intervals_client_id or "",
                 "redirect_uri": self._config.intervals_redirect_uri,
-                "scope": self._config.intervals_scope,
+                "scope": scope,
                 "state": state,
             }
         )
-        return f"{INTERVALS_AUTHORIZE_URL}?{query}", browser
+        return f"{self._config.intervals_authorize_url}?{query}", browser
+
+    def intervals_scope_for(self, granted: tuple[str, ...], chats: bool = False) -> str:
+        """The scope requested at Intervals.icu: in the multi-user mode exactly what the granted classes need.
+
+        ``CHATS`` (activity comments; Intervals.icu then also allows reading private chats) only
+        when the server offers it (``INTERVALS_OAUTH_OFFER_CHATS``) and the athlete ticked it.
+        """
+        if not self._config.multi_user:
+            return self._config.intervals_scope
+        include = chats and self._config.intervals_offer_chats
+        return intervals_scopes_for(granted, self._config.intervals_exclude_areas, include_chats=include)
 
     async def finish_intervals_login(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self, state: str, browser: str, code: str | None, error: str | None, login_key: str
@@ -1553,23 +2208,48 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             raise LoginError("Intervals.icu did not confirm the sign-in. Please try again.", 502) from exc
         athlete = payload.get("athlete") if isinstance(payload, dict) else None
         athlete_id = normalize_athlete_id(athlete.get("id", "")) if isinstance(athlete, dict) else ""
-        if not athlete_id or athlete_id not in self._config.allowed_athletes:
+        allowed = (
+            self._config.athlete_allowed(athlete_id) if self._config.multi_user else athlete_id in self._config.allowed_athletes
+        )
+        if not athlete_id or not allowed:
             self._pending.pop(upstream.request_id, None)
             self.record_login_failure(login_key)
             logger.warning("Intervals.icu athlete %s is not allowed on this server", _for_log(athlete_id or "(unknown)"))
             raise LoginError("This Intervals.icu account is not allowed to use this server.", 403)
+        if self._config.multi_user:
+            grant = self._grant_from_sign_in(payload, athlete_id, upstream)
+        else:
+            athlete = canonical_athlete_id(athlete_id)
+            grant = PendingGrant(athlete, "owner" if self._config.is_owner(athlete) else "athlete", "intervals")
         logger.info("Intervals.icu sign-in confirmed for athlete %s", _for_log(athlete_id))
-        return self.complete_login(upstream.request_id, login_key, upstream.granted)
+        return self.complete_login(upstream.request_id, login_key, upstream.granted, method="intervals", grant=grant)
 
-    async def _exchange_intervals_code(self, code: str) -> dict[str, Any]:
-        """POST the code to Intervals.icu; only the athlete id of the answer is used."""
+    def _grant_from_sign_in(self, payload: dict[str, Any], athlete_id: str, upstream: _UpstreamLogin) -> PendingGrant:
+        """Multi-user mode: the grant of an Intervals.icu sign-in.
+
+        The owner (``ATHLETE_ID``) keeps using the server's API key when one is configured; its
+        Intervals.icu token is not kept. Every other athlete's token is kept (sealed at the code
+        exchange) with the scopes Intervals.icu granted.
+        """
+        athlete = canonical_athlete_id(athlete_id)
+        requested = parse_intervals_scopes(upstream.intervals_scope)
+        if self._config.is_owner(athlete) and self._owner_key_available():
+            return PendingGrant(athlete, "owner", "intervals", tuple(sorted(requested)))
+        token = _token_payload(payload, self._now())
+        if token is None:
+            self._pending.pop(upstream.request_id, None)
+            raise LoginError("Intervals.icu did not return an access token. Please try again.", 502)
+        granted = parse_intervals_scopes(payload.get("scope")) or requested
+        return PendingGrant(athlete, "athlete", "intervals", tuple(sorted(granted)), token)
+
+    async def _post_intervals_token(self, fields: dict[str, str]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
             response = await client.post(
-                INTERVALS_TOKEN_URL,
+                self._config.intervals_token_url,
                 data={
                     "client_id": self._config.intervals_client_id or "",
                     "client_secret": self._config.intervals_client_secret or "",
-                    "code": code,
+                    **fields,
                 },
                 headers={"Accept": "application/json"},
             )
@@ -1579,6 +2259,31 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         if not isinstance(data, dict):
             raise ValueError("unexpected token response")
         return data
+
+    async def _exchange_intervals_code(self, code: str) -> dict[str, Any]:
+        """POST the code to Intervals.icu (single-user mode: only the athlete id of the answer is used)."""
+        return await self._post_intervals_token({"code": code})
+
+    async def _refresh_intervals_token(self, refresh_token: str) -> dict[str, Any]:
+        """Standard OAuth refresh at Intervals.icu (only used if Intervals.icu ever issues refresh tokens)."""
+        return await self._post_intervals_token({"grant_type": "refresh_token", "refresh_token": refresh_token})
+
+
+def _token_payload(answer: Any, now: int, previous: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """What is sealed from an Intervals.icu token answer: the access token and, if issued, refresh token and expiry."""
+    if not isinstance(answer, dict):
+        return None
+    access = answer.get("access_token")
+    if not isinstance(access, str) or not access.strip():
+        return None
+    payload: dict[str, Any] = {"access_token": access.strip(), "token_type": str(answer.get("token_type") or "Bearer")}
+    refresh = answer.get("refresh_token") or (previous or {}).get("refresh_token")
+    if isinstance(refresh, str) and refresh:
+        payload["refresh_token"] = refresh
+    expires_in = answer.get("expires_in")
+    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool) and expires_in > 0:
+        payload["expires_at"] = int(now + expires_in)
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -1605,17 +2310,21 @@ def oauth_from_env(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     """
     env = os.environ if environ is None else environ
     mode = _auth_mode(env)
+    tenancy = tenancy_from_env(env)
     if mode == "none":
+        if tenancy == "multi":
+            raise ValueError("MCP_TENANCY=multi requires MCP_AUTH=oauth: every connection signs in with its own account")
         return {}
     if mode != "oauth":
         raise ValueError(f"MCP_AUTH must be 'none' or 'oauth', got {mode!r}")
     config = oauth_config_from_env(env)
     provider = SingleUserOAuthProvider(config)
     logger.info(
-        "OAuth enabled; issuer %s, sign-in %s, state file %s",
+        "OAuth enabled; issuer %s, sign-in %s, state file %s, %s-user mode",
         config.issuer,
         "+".join(config.login_methods),
         config.state_file,
+        config.tenancy,
     )
     return {"auth_server_provider": provider, "auth": auth_settings(config)}
 
@@ -1687,12 +2396,20 @@ def auth_status_from_env(environ: Mapping[str, str] | None = None, include_priva
 
 
 def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-locals
-    """CLI helpers: ``hash-password`` (OAUTH_PASSWORD_HASH) and ``totp-secret`` (OAUTH_TOTP_SECRET)."""
+    """CLI helpers: ``hash-password``, ``totp-secret``, ``token-key`` and ``grants``."""
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    if arguments[:1] == ["grants"]:
+        from intervals_mcp_server.auth_grants import grants_main  # pylint: disable=import-outside-toplevel
+
+        return grants_main(arguments[1:])
     parser = argparse.ArgumentParser(
         prog="python -m intervals_mcp_server.auth",
         description="Helpers for the built-in OAuth authorization server.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("grants", help="list or remove connections (see: grants --help)")
+    key_cmd = commands.add_parser("token-key", help="create a key for OAUTH_TOKEN_KEY / OAUTH_TOKEN_KEY_FILE (multi-user mode)")
+    key_cmd.add_argument("--file", help="write the key to this new file (mode 0600) instead of printing it")
     hasher = commands.add_parser(
         "hash-password", help="hash a password for OAUTH_PASSWORD_HASH (read from stdin by default)"
     )
@@ -1706,8 +2423,20 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-loca
     totp_cmd.add_argument("--account", default=os.environ.get("OAUTH_USERNAME", "").strip() or DEFAULT_USERNAME,
                           help="account name shown in the authenticator app")
     totp_cmd.add_argument("--issuer", default="Intervals MCP", help="issuer shown in the authenticator app")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
 
+    if args.command == "token-key":
+        from intervals_mcp_server.token_vault import generate_key, write_key_file  # pylint: disable=import-outside-toplevel
+
+        if args.file:
+            try:
+                write_key_file(Path(args.file))
+            except OSError as exc:
+                parser.error(f"cannot create {args.file}: {exc.strerror or exc}")
+            print(f"Key written to {args.file} (mode 0600). Set OAUTH_TOKEN_KEY_FILE={args.file}")
+        else:
+            print(f"OAUTH_TOKEN_KEY={generate_key()}")
+        return 0
     if args.command == "totp-secret":
         secret = generate_secret()
         print(f"OAUTH_TOTP_SECRET={secret}")

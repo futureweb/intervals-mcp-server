@@ -507,7 +507,8 @@ def test_intervals_configuration_validation(tmp_path):
     env.pop("ATHLETE_ID")
     with pytest.raises(ValueError, match="OAUTH_ALLOWED_ATHLETES"):
         oauth_config_from_env(env)
-    config = oauth_config_from_env(intervals_env(tmp_path, OAUTH_ALLOWED_ATHLETES="i1, I2 ,3"))
+    # Other athletes than ATHLETE_ID only as the owner's own accounts in the single-user mode (R30-2).
+    config = oauth_config_from_env(intervals_env(tmp_path, OAUTH_ALLOWED_ATHLETES="i1, I2 ,3", OAUTH_OWNER_ACCOUNTS="1,2,3"))
     assert config.allowed_athletes == frozenset({"1", "2", "3"})
     assert config.login_methods == ("intervals",)
     assert oauth_config_from_env(make_env(tmp_path, INTERVALS_OAUTH_CLIENT_ID="1", INTERVALS_OAUTH_CLIENT_SECRET="x")).login_methods == ("intervals",)
