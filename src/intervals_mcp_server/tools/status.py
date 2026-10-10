@@ -85,7 +85,10 @@ async def server_status(include_private: bool = False) -> dict[str, Any]:
             }
         )
     if multi:
-        daily, _, _ = budget_settings()
+        if credential is not None and not credential.owner and not include_private:
+            # How the owner signs in (methods, second factor) is none of the other athletes' business.
+            status["auth"] = {"mode": "oauth"}
+        daily = budget_settings().daily
         status["connection"] = (
             {
                 "credential": credential.description,

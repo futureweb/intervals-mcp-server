@@ -9,17 +9,20 @@ share a ``grant_id``. In the single-user mode the state file stores no grant rec
       "<grant_id>": {
         "athlete_id": "i123456",          # canonical id of the athlete who signed in
         "kind": "athlete" | "owner",      # own Intervals.icu token, or the owner's API key
-        "method": "intervals" | "password" | "apikey",
+        "method": "intervals" | "password" | "apikey" | "legacy",
         "client_id": "...", "created_at": 1760000000, "last_used_at": 1760000000,
         "intervals_scopes": ["ACTIVITY:READ", ...],
         "credential": "v1.<AES-GCM sealed token>"   # kind athlete only
       }
     }
 
-Refresh tokens without a grant record come from the single-user mode (``legacy``): they
-belong to the owner, because in the single-user mode every connection used the owner's API
-key. Version 2 makes older releases refuse the file instead of serving other athletes'
-connections with the owner's API key.
+Every refresh token also names its athlete (``athlete_id``; the single-user mode records it
+too, format 1 readers ignore the field). In the multi-user mode a token is only served with a
+grant record; a token without one is refused, never treated as the owner's. Connections of the
+single-user mode become owner grants at the first multi-user start only when their record names
+the owner; those from before this release (no athlete recorded) are refused until the operator
+adopts them once with ``grants adopt-legacy --owner``. Version 2 makes older releases refuse the
+file instead of serving other athletes' connections with the owner's API key.
 
 ``futureweb-intervals-mcp grants list|remove|prune`` works on the state file directly (no
 tokens are shown or decrypted); a running server notices the change and drops the removed
@@ -64,10 +67,10 @@ DEFAULT_STATE_FILE = "./oauth_state.json"
 STATE_VERSION = 2
 SINGLE_USER_STATE_VERSION = 1
 GRANT_KINDS = ("athlete", "owner")
-GRANT_METHODS = ("intervals", "password", "apikey")
+GRANT_METHODS = ("intervals", "password", "apikey", "legacy")
 
 
-def state_format_problem(data: Any) -> str | None:
+def state_format_problem(data: Any) -> str | None:  # pylint: disable=too-many-return-statements
     """Why *data* is not a state file this version can use, or None."""
     if not isinstance(data, dict):
         return "is not a JSON object"
@@ -79,6 +82,12 @@ def state_format_problem(data: Any) -> str | None:
     for key in ("clients", "refresh_tokens"):
         if not isinstance(data.get(key, {}), dict):
             return f"has an unexpected format ('{key}' is not an object)"
+    if version >= STATE_VERSION and not isinstance(data.get("grants"), dict):
+        # Format 2 needs its grant records: without them a connection could not be told apart
+        # from the owner's, so a missing or damaged table stops the server instead.
+        return "has an unexpected format ('grants' is missing or not an object)"
+    if "grants" in data and not isinstance(data["grants"], dict):
+        return "has an unexpected format ('grants' is not an object)"
     return None
 
 
@@ -178,6 +187,7 @@ def state_file_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        _keep_owner(fd, path if path.exists() else path.parent)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -200,8 +210,23 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _keep_owner(new: Path | int, reference: Path) -> None:
+    """When run as root (``docker exec``, sudo), give a new file the owner of *reference*, so the
+    server running as another user can still read and replace the state file."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    try:
+        info = reference.stat()
+    except OSError:
+        return
+    if isinstance(new, int):
+        os.fchown(new, info.st_uid, info.st_gid)
+    else:
+        os.chown(new, info.st_uid, info.st_gid)
+
+
 def write_state_file(path: Path, data: Mapping[str, Any]) -> None:
-    """Atomically replace *path* with *data* (mode 0600, fsynced)."""
+    """Atomically replace *path* with *data* (mode 0600, fsynced, owner of the old file kept)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
@@ -210,6 +235,7 @@ def write_state_file(path: Path, data: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_name, 0o600)
+        _keep_owner(Path(tmp_name), path if path.exists() else path.parent)
         os.replace(tmp_name, path)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
@@ -256,12 +282,15 @@ def grant_rows(data: Mapping[str, Any], now: float | None = None) -> list[dict[s
     grants = data.get("grants", {}) if isinstance(data.get("grants", {}), dict) else {}
     expiries: dict[str, int] = {}
     clients: dict[str, str] = {}
+    athletes: dict[str, str] = {}
     for record in data.get("refresh_tokens", {}).values():
         if isinstance(record, dict) and isinstance(record.get("grant_id"), str):
             expires = record.get("expires_at", 0)
             if isinstance(expires, (int, float)) and expires > now:
                 expiries[record["grant_id"]] = max(expiries.get(record["grant_id"], 0), int(expires))
                 clients.setdefault(record["grant_id"], str(record.get("client_id", "")))
+                if isinstance(record.get("athlete_id"), str):
+                    athletes[record["grant_id"]] = record["athlete_id"]
     rows = []
     for grant_id, raw in grants.items():
         raw = raw if isinstance(raw, dict) else {}
@@ -280,12 +309,13 @@ def grant_rows(data: Mapping[str, Any], now: float | None = None) -> list[dict[s
         )
     for grant_id, expires in expiries.items():
         if grant_id not in grants:
+            athlete = athletes.get(grant_id)
             rows.append(
                 {
                     "grant_id": grant_id,
-                    "athlete_id": "owner (ATHLETE_ID)",
+                    "athlete_id": athlete or "unknown",
                     "kind": "legacy",
-                    "method": "single-user mode",
+                    "method": "single-user mode" + ("" if athlete else ", before athletes were recorded"),
                     "client": _client_label(data, clients.get(grant_id, "")),
                     "created": "-",
                     "last_used": "-",
@@ -308,6 +338,40 @@ def _remove(data: dict[str, Any], doomed: set[str]) -> int:
     return len(doomed)
 
 
+def _adopt_legacy(data: dict[str, Any], owner: str, now: float) -> tuple[int, int]:
+    """Make the single-user connections without a recorded athlete (or with the owner) owner grants.
+
+    Format 1: the owner is recorded in the refresh records (the server turns them into owner grant
+    records at its first multi-user start). Format 2: owner grant records are added. Connections
+    recorded with another athlete are never adopted. Returns (adopted, skipped).
+    """
+    from intervals_mcp_server.tenancy import same_athlete  # pylint: disable=import-outside-toplevel
+
+    grants = data.get("grants") if isinstance(data.get("grants"), dict) else None
+    adopted: set[str] = set()
+    skipped: set[str] = set()
+    for record in data.get("refresh_tokens", {}).values():
+        grant_id = record.get("grant_id") if isinstance(record, dict) else None
+        if not isinstance(grant_id, str) or (grants is not None and grant_id in grants):
+            continue
+        expires = record.get("expires_at", 0)
+        if not isinstance(expires, (int, float)) or expires <= now:
+            continue
+        athlete = record.get("athlete_id")
+        if athlete is not None and not same_athlete(athlete, owner):
+            skipped.add(grant_id)
+            continue
+        record["athlete_id"] = owner
+        record["method"] = record.get("method") or "legacy"
+        adopted.add(grant_id)
+        if grants is not None:
+            grants[grant_id] = {
+                "athlete_id": owner, "kind": "owner", "method": "legacy", "client_id": str(record.get("client_id", "")),
+                "created_at": int(now), "last_used_at": int(now), "intervals_scopes": [],
+            }
+    return len(adopted), len(skipped)
+
+
 def _select(data: Mapping[str, Any], args: argparse.Namespace, now: float) -> set[str]:
     from intervals_mcp_server.tenancy import same_athlete  # pylint: disable=import-outside-toplevel
 
@@ -326,7 +390,7 @@ def _select(data: Mapping[str, Any], args: argparse.Namespace, now: float) -> se
     return {gid for gid, raw in grants.items() if isinstance(raw, dict) and same_athlete(raw.get("athlete_id", ""), args.athlete)}
 
 
-def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> int:  # pylint: disable=too-many-locals
+def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None) -> int:  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
     """``grants list``, ``grants remove <athlete> | --grant ID | --legacy`` and ``grants prune --days N``."""
     env = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
@@ -341,6 +405,12 @@ def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None
     target.add_argument("athlete", nargs="?", help="athlete id: remove every grant of this athlete")
     target.add_argument("--grant", help="remove one grant by its id")
     target.add_argument("--legacy", action="store_true", help="remove the grants from the single-user mode")
+    adopter = commands.add_parser(
+        "adopt-legacy",
+        help="confirm once that the connections from the single-user mode without a recorded athlete are the owner's",
+    )
+    adopter.add_argument("--owner", action="store_true", required=True,
+                         help="required confirmation: these connections belong to ATHLETE_ID")
     pruner = commands.add_parser("prune", help="remove athlete grants (and their tokens) unused for some days")
     default_days = env.get("OAUTH_TOKEN_RETENTION_DAYS", "").strip()
     pruner.add_argument("--days", type=int, default=int(default_days) if default_days.isdigit() and int(default_days) > 0 else None,
@@ -364,6 +434,22 @@ def grants_main(argv: list[str] | None = None, environ: Mapping[str, str] | None
                         f"{row['athlete_id']:<20} {row['kind']:<8} {row['client'][:34]:<34} {row['created']:<17} "
                         f"{row['last_used']:<17} {'yes' if row['token_stored'] else 'no':<6} {row['grant_id']}"
                     )
+            return 0
+        if args.command == "adopt-legacy":
+            from intervals_mcp_server.tenancy import canonical_athlete_id  # pylint: disable=import-outside-toplevel
+
+            owner = env.get("ATHLETE_ID", "").strip()
+            if not owner:
+                print("grants: adopt-legacy needs ATHLETE_ID (the owner) in the environment", file=sys.stderr)
+                return 2
+            with state_file_lock(path):
+                data = _read_state(path)
+                adopted, skipped = _adopt_legacy(data, canonical_athlete_id(owner), now)
+                if adopted:
+                    write_state_file(path, data)
+            print(f"Adopted {adopted} connection(s) from the single-user mode as the owner's ({canonical_athlete_id(owner)})"
+                  + (f"; {skipped} connection(s) of other athletes were left out (remove them with 'grants remove')" if skipped else "")
+                  + ".")
             return 0
         with state_file_lock(path):
             data = _read_state(path)

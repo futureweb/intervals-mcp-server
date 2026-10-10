@@ -154,7 +154,11 @@ class IntervalsFastMCP(FastMCP[Any]):
                 user = request.user
             except (AssertionError, AttributeError):
                 user = None
-        token = getattr(user, "access_token", None) or get_access_token()
+        token = getattr(user, "access_token", None)
+        if token is None and (request is None or not multi_user()):
+            # Outside an HTTP request (in-process calls). In the multi-user mode an HTTP request
+            # without its own token is never served with the session's or another request's token.
+            token = get_access_token()
         return token if isinstance(token, AccessToken) else None
 
     async def _as_connection(self, action: Callable[[], Awaitable[T]], refuse: Callable[[str], Exception]) -> T:

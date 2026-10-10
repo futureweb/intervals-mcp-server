@@ -144,20 +144,13 @@ def _tenancy_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  #
     oauth = (env.get("MCP_AUTH", "none").strip().lower() or "none") == "oauth"
     owner = normalize_athlete_id(env.get("ATHLETE_ID", "")) if env.get("ATHLETE_ID", "").strip() else ""
     if tenancy == "single":
-        allowed = [normalize_athlete_id(a) for a in env.get("OAUTH_ALLOWED_ATHLETES", "").split(",") if a.strip()]
-        others = [a for a in allowed if a != owner]
-        if oauth and owner and others:
-            warnings.append(
-                f"OAUTH_ALLOWED_ATHLETES lists {len(others)} athlete(s) besides ATHLETE_ID: in the single-user mode they "
-                "see the owner's data. Use MCP_TENANCY=multi to share the server with other athletes"
-            )
+        # Other athletes on the allowlist are a configuration error (reported by the OAuth check).
         if env.get("OAUTH_TOKEN_KEY", "").strip() or env.get("OAUTH_TOKEN_KEY_FILE", "").strip():
             warnings.append("OAUTH_TOKEN_KEY / OAUTH_TOKEN_KEY_FILE is only used with MCP_TENANCY=multi")
         return errors, warnings
     if not oauth:
         return ["MCP_TENANCY=multi requires MCP_AUTH=oauth: every connection signs in with its own account"], warnings
-    _, _, budget_errors = budget_settings(env)
-    errors.extend(budget_errors)
+    errors.extend(budget_settings(env).errors)
     if env.get("ATHLETE_TIMEZONE", "").strip():
         warnings.append(
             "ATHLETE_TIMEZONE applies to every athlete of the shared server; leave it empty so that each athlete's "
@@ -179,14 +172,19 @@ def _tenancy_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  #
     overview = provider.grant_overview()
     if overview["legacy_grants"]:
         warnings.append(
-            f"{overview['legacy_grants']} connection(s) from the single-user mode are served as the owner (ATHLETE_ID, API "
-            "key). If anyone else ever connected in the single-user mode, remove them: futureweb-intervals-mcp grants "
-            "remove --legacy"
+            f"{overview['legacy_grants']} connection(s) from the single-user mode have no recorded athlete and are refused "
+            "until you confirm they are yours: futureweb-intervals-mcp grants adopt-legacy --owner (or remove them with "
+            "grants remove --legacy)"
         )
     if overview["unreadable_tokens"]:
         warnings.append(
             f"{overview['unreadable_tokens']} stored Intervals.icu token(s) cannot be opened with the configured "
             "OAUTH_TOKEN_KEY; those athletes have to reconnect"
+        )
+    if overview["old_key_tokens"]:
+        warnings.append(
+            f"{overview['old_key_tokens']} stored token(s) are still sealed with an older key of OAUTH_TOKEN_KEY; they are "
+            "sealed again with the first key at their next use. Keep the old key until this count is 0"
         )
     return errors, warnings
 
@@ -248,14 +246,16 @@ def _print_multi_user_overview() -> None:
 
     config = oauth_config_from_env()
     overview = SingleUserOAuthProvider(config).grant_overview()
-    daily, window, _ = budget_settings()
+    budgets = budget_settings()
     print(
         f"Multi-user mode: {overview['athletes']} athlete(s) with {overview['athlete_grants']} connection(s) and stored "
-        f"token(s), {overview['owner_grants'] + overview['legacy_grants']} owner connection(s); "
+        f"token(s), {overview['owner_grants']} owner connection(s), {overview['legacy_grants']} waiting for adoption; "
         f"{'any athlete' if config.allow_any_athlete else str(len(config.allowed_athletes)) + ' allowed athlete(s)'}; "
         f"token key with {config.vault.key_count if config.vault else 0} key(s); retention "
         f"{str(config.token_retention_days) + ' days' if config.token_retention_days else 'off'}; budgets "
-        f"{daily or 'unlimited'} requests/athlete/day, {window or 'unlimited'} per 15 min shared"
+        f"{budgets.daily or 'unlimited'} requests/athlete/day, {budgets.window or 'unlimited'} per 15 min shared "
+        f"(at most {budgets.athlete_share}% per athlete, {budgets.owner_reserve}% reserved for the owner); activity "
+        f"comments (CHATS) {'offered' if config.intervals_offer_chats else 'not offered'}"
     )
 
 

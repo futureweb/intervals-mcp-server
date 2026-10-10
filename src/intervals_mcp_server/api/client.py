@@ -26,6 +26,7 @@ import httpx  # pylint: disable=import-error
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 
 from intervals_mcp_server.config import get_config
+from intervals_mcp_server.utils.cache import TTLCache
 from intervals_mcp_server.tenancy import (
     BUDGETS,
     Credential,
@@ -476,6 +477,48 @@ def _tenant_refusal(url: str, method: str, api_key: str | None, credential: Cred
     return None
 
 
+FOREIGN_ACTIVITY = "403 Forbidden: this activity belongs to another athlete."
+# Owner of activity ids seen by a connection: (credential partition, activity id) -> athlete id.
+_ACTIVITY_OWNERS: TTLCache[str] = TTLCache(24 * 3600, max_entries=4096)
+
+
+def _remember_activity_owners(url: str, result: Any, credential: Credential) -> None:
+    """Note the owners of the activities an answer contains (the activity itself, or an activity list)."""
+    parts = [part for part in url.split("?", 1)[0].split("/") if part]
+    items: list[Any] = []
+    if len(parts) == 2 and parts[0] == "activity" and isinstance(result, dict):
+        items = [result]
+    elif len(parts) >= 3 and parts[0] == "athlete" and parts[2].split(".", 1)[0] == "activities" and isinstance(result, list):
+        items = result
+    for item in items:
+        if isinstance(item, dict) and item.get("id") is not None and item.get("icu_athlete_id"):
+            _ACTIVITY_OWNERS.set((credential.partition, str(item["id"])), str(item["icu_athlete_id"]))
+
+
+async def _activity_owner_refusal(url: str, method: str, credential: Credential) -> dict[str, Any] | None:
+    """Multi-user mode: a request for an activity's sub-resource (streams, intervals, messages ...) or a
+    write to an activity is only sent when the activity is the connection's own athlete's.
+
+    The owner is looked up once per connection and activity (``GET /activity/<id>``, cached; activity
+    listings fill the cache too). ``GET /activity/<id>`` itself is checked on its answer.
+    """
+    parts = [part for part in url.split("?", 1)[0].split("/") if part]
+    if len(parts) < 2 or parts[0] != "activity" or (len(parts) == 2 and method == "GET"):
+        return None
+    owner = _ACTIVITY_OWNERS.get((credential.partition, parts[1]))
+    if owner is None:
+        found = await make_intervals_request(url=f"/activity/{seg(parts[1])}")
+        if isinstance(found, dict) and found.get("error"):
+            return found
+        owner = str(found.get("icu_athlete_id") or "") if isinstance(found, dict) else ""
+        if not owner:
+            return {"error": True, "message": "Not sent: the owner of this activity could not be checked."}
+    if not same_athlete(owner, credential.athlete_id):
+        logger.warning("%s %s refused: the activity belongs to another athlete", method, url.split("?", 1)[0])
+        return {"error": True, "status_code": 403, "message": FOREIGN_ACTIVITY}
+    return None
+
+
 def _foreign_activity(url: str, result: Any, credential: Credential) -> bool:
     """True when ``GET /activity/<id>`` answered with another athlete's activity (multi-user mode)."""
     parts = [part for part in url.split("?", 1)[0].split("/") if part]
@@ -532,6 +575,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
     if multi_user():
         credential = current_credential()
         not_sent = _tenant_refusal(url, method, api_key, credential)
+        if not_sent:
+            return not_sent
+        assert credential is not None  # refused above otherwise
+        not_sent = await _activity_owner_refusal(url, method, credential)
         if not_sent:
             return not_sent
 
@@ -597,7 +644,10 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
             return await _send_request(client)
 
     def _time_for_retry(delay: float) -> bool:
-        return limits is None or limits.remaining_s() > delay + 1.0
+        if limits is not None and limits.remaining_s() <= delay + 1.0:
+            return False
+        # Multi-user mode: every attempt counts against the athlete's and the shared budget.
+        return credential is None or BUDGETS.admit(credential) is None
 
     try:
         retryable = retry_statuses(method)
@@ -625,9 +675,11 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
 
         assert response is not None  # the loop either set it or raised
         result = _parse_response(response, full_url)
-        if credential is not None and _foreign_activity(url, result, credential):
-            logger.warning("GET %s answered with another athlete's activity; refused", url.split("?", 1)[0])
-            return {"error": True, "status_code": 403, "message": "403 Forbidden: this activity belongs to another athlete."}
+        if credential is not None:
+            if _foreign_activity(url, result, credential):
+                logger.warning("GET %s answered with another athlete's activity; refused", url.split("?", 1)[0])
+                return {"error": True, "status_code": 403, "message": FOREIGN_ACTIVITY}
+            _remember_activity_owners(url, result, credential)
         return result
     except httpx.HTTPStatusError as e:
         return _handle_http_status_error(e, secrets, credential)

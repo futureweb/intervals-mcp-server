@@ -39,11 +39,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 __all__ = [
     "AREA_ORDER",
     "BUDGETS",
+    "BudgetSettings",
     "CLASS_SCOPES",
     "Credential",
     "RequestBudgets",
@@ -205,7 +206,8 @@ AREA_ORDER = ("ACTIVITY", "WELLNESS", "CALENDAR", "LIBRARY", "SETTINGS", "CHATS"
 # What each permission class of this server needs at Intervals.icu. read: every read tool
 # (activity comments are CHATS); write: activity name/RPE/feel and comments, wellness,
 # calendar entries and library workouts; destructive: deleting events, library workouts and
-# custom items; admin: sport settings, custom items and bulk event creation.
+# custom items; admin: sport settings, custom items and bulk event creation. CHATS is only
+# requested on the athlete's explicit choice (it also covers private chats).
 CLASS_SCOPES: dict[str, tuple[str, ...]] = {
     "read": ("ACTIVITY:READ", "WELLNESS:READ", "CALENDAR:READ", "LIBRARY:READ", "SETTINGS:READ", "CHATS:READ"),
     "write": ("ACTIVITY:WRITE", "WELLNESS:WRITE", "CALENDAR:WRITE", "LIBRARY:WRITE", "CHATS:WRITE"),
@@ -233,13 +235,17 @@ def scope_satisfied(granted: Iterable[str], required: str) -> bool:
     return access == "READ" and f"{area}:WRITE" in granted_set
 
 
-def intervals_scopes_for(classes: Iterable[str], exclude_areas: Iterable[str] = ()) -> str:
+def intervals_scopes_for(classes: Iterable[str], exclude_areas: Iterable[str] = (), include_chats: bool = False) -> str:
     """The Intervals.icu ``scope`` parameter for the granted permission classes.
 
     ``X:READ`` is dropped where ``X:WRITE`` is requested (WRITE implies READ); areas in
-    *exclude_areas* (``INTERVALS_OAUTH_EXCLUDE_AREAS``) are never requested.
+    *exclude_areas* (``INTERVALS_OAUTH_EXCLUDE_AREAS``) are never requested. ``CHATS`` (activity
+    comments, but Intervals.icu then also allows reading private chats) only with *include_chats*:
+    the athlete's explicit choice on the consent page.
     """
     excluded = {area.strip().upper() for area in exclude_areas}
+    if not include_chats:
+        excluded.add("CHATS")
     wanted: set[str] = set()
     for permission in classes:
         wanted.update(CLASS_SCOPES.get(permission, ()))
@@ -321,7 +327,7 @@ def _classes_for(scope: str) -> list[str]:
     return [cls for cls, scopes in CLASS_SCOPES.items() if any(scope_satisfied([s], scope) for s in scopes)]
 
 
-def request_refusal(method: str, url: str, credential: Credential) -> str | None:
+def request_refusal(method: str, url: str, credential: Credential) -> str | None:  # pylint: disable=too-many-return-statements
     """Why a request must not be sent for *credential* in multi-user mode, or None.
 
     Only the connection athlete's own endpoints are reachable: ``/athlete/<own id or 0>/...``
@@ -342,6 +348,13 @@ def request_refusal(method: str, url: str, credential: Credential) -> str | None
             )
     if credential.intervals_scopes is not None:
         needed = required_scope(method, url)
+        if needed and needed.startswith("CHATS:") and not scope_satisfied(credential.intervals_scopes, needed):
+            return (
+                f"Not sent: activity comments need the Intervals.icu permission {needed}, which this connection did not "
+                "grant. It is optional on this shared server, because Intervals.icu then also lets the stored token read "
+                "your private chats: to use comments, disconnect and reconnect the server in your MCP client and tick "
+                "'Activity comments' on the consent page (offered only when the server owner enabled it)."
+            )
         if needed and not scope_satisfied(credential.intervals_scopes, needed):
             classes = _classes_for(needed)
             allow = f" and allow '{classes[0]}'" if classes else ""
@@ -374,10 +387,12 @@ def rejected_token_message(status: int) -> str:
 
 DEFAULT_ATHLETE_DAILY_REQUESTS = 1000
 DEFAULT_APP_REQUESTS_PER_15MIN = 2000
+DEFAULT_ATHLETE_SHARE_PERCENT = 50
+DEFAULT_OWNER_RESERVED_PERCENT = 20
 APP_WINDOW_S = 15 * 60
 
 
-def _count_setting(env: Mapping[str, str], name: str, default: int) -> tuple[int, str | None]:
+def _count_setting(env: Mapping[str, str], name: str, default: int, maximum: int | None = None) -> tuple[int, str | None]:
     raw = env.get(name, "").strip()
     if not raw:
         return default, None
@@ -385,26 +400,43 @@ def _count_setting(env: Mapping[str, str], name: str, default: int) -> tuple[int
         value = int(raw)
     except ValueError:
         value = -1
-    if value < 0:
-        return default, f"{name} must be a whole number >= 0 (0 = no limit), got {raw!r}; the server uses {default}"
+    if value < 0 or (maximum is not None and value > maximum):
+        limit = f"between 0 and {maximum}" if maximum is not None else ">= 0 (0 = no limit)"
+        return default, f"{name} must be a whole number {limit}, got {raw!r}; the server uses {default}"
     return value, None
 
 
-def budget_settings(environ: Mapping[str, str] | None = None) -> tuple[int, int, list[str]]:
-    """(per-athlete daily requests, shared requests per 15 minutes, errors) as the server applies them."""
+class BudgetSettings(NamedTuple):
+    """The request budgets as the server applies them (and what is wrong with the settings)."""
+
+    daily: int
+    window: int
+    athlete_share: int
+    owner_reserve: int
+    errors: list[str]
+
+
+def budget_settings(environ: Mapping[str, str] | None = None) -> BudgetSettings:
+    """Per-athlete daily requests, shared requests per 15 minutes, the per-athlete share of that
+    window and the share reserved for the owner, in percent."""
     env = os.environ if environ is None else environ
     daily, daily_error = _count_setting(env, "MCP_ATHLETE_DAILY_REQUESTS", DEFAULT_ATHLETE_DAILY_REQUESTS)
     window, window_error = _count_setting(env, "MCP_APP_REQUESTS_PER_15MIN", DEFAULT_APP_REQUESTS_PER_15MIN)
-    return daily, window, [error for error in (daily_error, window_error) if error]
+    share, share_error = _count_setting(env, "MCP_ATHLETE_SHARE_PERCENT", DEFAULT_ATHLETE_SHARE_PERCENT, maximum=100)
+    reserve, reserve_error = _count_setting(env, "MCP_OWNER_RESERVED_PERCENT", DEFAULT_OWNER_RESERVED_PERCENT, maximum=100)
+    errors = [e for e in (daily_error, window_error, share_error, reserve_error) if e]
+    return BudgetSettings(daily, window, share, reserve, errors)
 
 
 class RequestBudgets:
     """Soft request budgets of the OAuth-token connections (in memory; a restart resets them).
 
     Intervals.icu limits an OAuth app as a whole, so every athlete's requests count against
-    one shared limit. Each athlete gets a daily budget (UTC day, ``MCP_ATHLETE_DAILY_REQUESTS``)
-    and all of them together a 15-minute budget (``MCP_APP_REQUESTS_PER_15MIN``). The owner's
-    API key is not an OAuth token and is not counted. The per-call budget
+    one shared limit. Each athlete gets a daily budget (UTC day, ``MCP_ATHLETE_DAILY_REQUESTS``);
+    all of them together a 15-minute budget (``MCP_APP_REQUESTS_PER_15MIN``), of which one athlete
+    may use at most ``MCP_ATHLETE_SHARE_PERCENT`` and the other athletes together leave
+    ``MCP_OWNER_RESERVED_PERCENT`` to the owner. Every attempt counts, retries included. The
+    owner's API key is not an OAuth token and is not counted. The per-call budget
     (``MCP_TOOL_MAX_REQUESTS``) applies on top.
     """
 
@@ -412,7 +444,9 @@ class RequestBudgets:
         self._clock = clock
         self._lock = threading.Lock()
         self._daily: dict[str, tuple[str, int]] = {}
-        self._window: tuple[int, int] = (-1, 0)
+        self._bucket = -1
+        self._in_window: dict[str, int] = {}
+        self._owner_keys: set[str] = set()
 
     def _day(self) -> str:
         return datetime.fromtimestamp(self._clock(), timezone.utc).date().isoformat()
@@ -423,10 +457,10 @@ class RequestBudgets:
         return count if day == self._day() else 0
 
     def admit(self, credential: Credential, environ: Mapping[str, str] | None = None) -> str | None:
-        """Count one request of *credential*, or say why it may not be sent."""
+        """Count one request (or retry) of *credential*, or say why it may not be sent."""
         if credential.kind != "bearer":
             return None
-        daily, window, _ = budget_settings(environ)
+        settings = budget_settings(environ)
         key = _plain(credential.athlete_id)
         with self._lock:
             today = self._day()
@@ -434,29 +468,45 @@ class RequestBudgets:
             if day != today:
                 count = 0
             bucket = int(self._clock() // APP_WINDOW_S)
-            current, in_window = self._window
-            if current != bucket:
-                in_window = 0
-            if daily and count >= daily:
-                return (
-                    f"Not sent: your daily budget of {daily} Intervals.icu API requests on this shared server is used "
-                    "up; it resets at 00:00 UTC. Narrow the requests (shorter date ranges, fewer activities)."
-                )
-            if window and in_window >= window:
-                return (
-                    f"Not sent: this shared server reached its limit of {window} Intervals.icu API requests per 15 "
-                    "minutes for all connected athletes together. Try again in a few minutes."
-                )
+            if bucket != self._bucket:
+                self._bucket, self._in_window = bucket, {}
+            refusal = self._refusal(settings, credential, count, key)
+            if refusal:
+                return refusal
             self._daily = {k: v for k, v in self._daily.items() if v[0] == today}
             self._daily[key] = (today, count + 1)
-            self._window = (bucket, in_window + 1)
+            self._in_window[key] = self._in_window.get(key, 0) + 1
+        return None
+
+    def _refusal(self, settings: BudgetSettings, credential: Credential, count: int, key: str) -> str | None:  # pylint: disable=too-many-return-statements
+        if settings.daily and count >= settings.daily:
+            return (
+                f"Not sent: your daily budget of {settings.daily} Intervals.icu API requests on this shared server is used "
+                "up; it resets at 00:00 UTC. Narrow the requests (shorter date ranges, fewer activities)."
+            )
+        window = settings.window
+        if not window:
+            return None
+        total = sum(self._in_window.values())
+        busy = "Not sent: this shared server reached its limit of Intervals.icu API requests per 15 minutes"
+        if total >= window:
+            return f"{busy} ({window} for all connected athletes together). Try again in a few minutes."
+        if credential.owner:
+            self._owner_keys.add(key)
+            return None
+        share = max(1, window * settings.athlete_share // 100)
+        if self._in_window.get(key, 0) >= share:
+            return f"{busy} for one athlete ({share} of the {window} all athletes share). Try again in a few minutes."
+        friends = sum(n for k, n in self._in_window.items() if k not in self._owner_keys)
+        if friends >= window * (100 - settings.owner_reserve) // 100:
+            return f"{busy} for the connected athletes (the rest is reserved for the server owner). Try again in a few minutes."
         return None
 
     def reset(self) -> None:
         """Forget all counts (tests)."""
         with self._lock:
             self._daily.clear()
-            self._window = (-1, 0)
+            self._bucket, self._in_window = -1, {}
 
 
 BUDGETS = RequestBudgets()

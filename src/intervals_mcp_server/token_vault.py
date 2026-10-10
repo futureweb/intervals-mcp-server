@@ -5,7 +5,9 @@ AES-256-GCM. The associated data names the grant and the athlete, so a sealed to
 to another grant or athlete in the file does not open. Keys come from ``OAUTH_TOKEN_KEY``
 (base64 of 32 random bytes) or ``OAUTH_TOKEN_KEY_FILE`` (a file holding the key, readable by
 the server user only, e.g. mode 0600); several keys may be given comma-separated (or one per
-line): the first seals, all of them open, so a key can be rotated. Create a key with::
+line): the first seals, all of them open, and a token opened with an older key is sealed again
+with the first one at its next use, so a key can be rotated (put the new key first, remove the
+old one once ``--doctor`` reports no token that only it can open). Create a key with::
 
     futureweb-intervals-mcp token-key --file /etc/intervals-mcp/token.key
 
@@ -93,6 +95,10 @@ class TokenVault:
 
     def open(self, value: str, context: str) -> dict[str, Any]:
         """Decrypt a value made by :meth:`seal` with the same *context*; raise VaultError otherwise."""
+        return self.open_with_key(value, context)[0]
+
+    def open_with_key(self, value: str, context: str) -> tuple[dict[str, Any], int]:
+        """Like :meth:`open`, plus the position of the key that opened it (0 = the current key)."""
         parts = value.split(".") if isinstance(value, str) else []
         if len(parts) != 2 or parts[0] != _PREFIX:
             raise VaultError("not a sealed value of this server")
@@ -100,7 +106,7 @@ class TokenVault:
             raw = _b64decode(parts[1])
         except (binascii.Error, ValueError) as exc:
             raise VaultError("the sealed value is damaged") from exc
-        for aead in self._keys:
+        for index, aead in enumerate(self._keys):
             try:
                 data = aead.decrypt(raw[:_NONCE_BYTES], raw[_NONCE_BYTES:], context.encode("utf-8"))
             except InvalidTag:
@@ -111,7 +117,7 @@ class TokenVault:
                 raise VaultError("unexpected sealed payload") from exc
             if not isinstance(payload, dict):
                 raise VaultError("unexpected sealed payload")
-            return payload
+            return payload, index
         raise VaultError(
             "no configured key opens it (OAUTH_TOKEN_KEY changed?), or it is damaged or belongs to another grant"
         )
