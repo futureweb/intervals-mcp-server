@@ -8,22 +8,32 @@ the server module and tool modules without creating cyclic imports.
 import inspect
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.exceptions import ResourceError, ToolError
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.types import GetPromptResult, Icon, TextContent, ToolAnnotations
 from mcp.types import Tool as MCPTool
+from pydantic import AnyUrl
 
 from intervals_mcp_server.api.client import setup_api_client
-from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
+from intervals_mcp_server.auth import (
+    CredentialError,
+    SingleUserOAuthProvider,
+    granted_classes,
+    install_login_routes,
+    oauth_from_env,
+)
 from intervals_mcp_server.branding import WEBSITE_URL, install_icon_routes, server_icons
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 from intervals_mcp_server.guides import SERVER_INSTRUCTIONS
+from intervals_mcp_server.tenancy import Credential, multi_user, use_credential
 from intervals_mcp_server.tool_guard import guarded
 from intervals_mcp_server.toolsets import in_toolset
 
@@ -80,6 +90,17 @@ def compact_schema(schema: Any) -> Any:
 
     return walk(schema)
 
+
+class CredentialSource(Protocol):  # pylint: disable=too-few-public-methods
+    """What resolves the Intervals.icu credential of a connection (the OAuth provider)."""
+
+    def connection_credential(self, token: str) -> Awaitable[Credential]:
+        """The credential of the connection holding access *token*; CredentialError when there is none."""
+
+
+T = TypeVar("T")
+
+
 class IntervalsFastMCP(FastMCP[Any]):
     """FastMCP that honours the permission scopes of an OAuth access token.
 
@@ -95,6 +116,8 @@ class IntervalsFastMCP(FastMCP[Any]):
     """
 
     toolset: str = "full"
+    # Multi-user mode: resolves each connection's Intervals.icu credential (the OAuth provider).
+    credential_source: CredentialSource | None = None
 
     def add_tool(  # pylint: disable=too-many-arguments
         self,
@@ -115,6 +138,11 @@ class IntervalsFastMCP(FastMCP[Any]):
         registered.parameters = compact_schema(registered.parameters)
 
     def _token_scopes(self) -> list[str] | None:
+        token = self._access_token()
+        return list(token.scopes) if token is not None else None
+
+    def _access_token(self) -> AccessToken | None:
+        """The OAuth access token of the request being handled (that request's, not the session's)."""
         request: Any = None
         try:
             request = self.get_context().request_context.request
@@ -126,8 +154,34 @@ class IntervalsFastMCP(FastMCP[Any]):
                 user = request.user
             except (AssertionError, AttributeError):
                 user = None
-        token = getattr(user, "access_token", None) or get_access_token()
-        return list(token.scopes) if token is not None else None
+        token = getattr(user, "access_token", None)
+        if token is None and (request is None or not multi_user()):
+            # Outside an HTTP request (in-process calls). In the multi-user mode an HTTP request
+            # without its own token is never served with the session's or another request's token.
+            token = get_access_token()
+        return token if isinstance(token, AccessToken) else None
+
+    async def _as_connection(self, action: Callable[[], Awaitable[T]], refuse: Callable[[str], Exception]) -> T:
+        """Run *action* with the calling connection's Intervals.icu credential (multi-user mode).
+
+        Single-user mode: unchanged, the API client uses API_KEY. Multi-user mode: the
+        credential comes from the request's own access token, never from arguments; without
+        one nothing runs.
+        """
+        if not multi_user():
+            return await action()
+        token = self._access_token()
+        if token is None or self.credential_source is None:
+            raise refuse(
+                "This server runs in multi-user mode: every request needs a connection signed in with OAuth. "
+                "Reconnect the server in your MCP client."
+            )
+        try:
+            credential = await self.credential_source.connection_credential(token.token)
+        except CredentialError as exc:
+            raise refuse(str(exc)) from None
+        with use_credential(credential):
+            return await action()
 
     async def list_tools(self) -> list[Any]:
         """Tools of the classes the current connection was granted."""
@@ -160,7 +214,11 @@ class IntervalsFastMCP(FastMCP[Any]):
                 f"Tool '{name}' needs the '{permission}' permission, but this connection was only granted "
                 f"{', '.join(sorted(allowed))}. Reconnect the MCP client and allow '{permission}' on the consent page."
             )
-        return await super().call_tool(name, arguments)
+        return await self._as_connection(lambda: FastMCP.call_tool(self, name, arguments), ToolError)
+
+    async def read_resource(self, uri: AnyUrl | str) -> Iterable[ReadResourceContents]:
+        """Read a resource with the calling connection's credential (multi-user mode)."""
+        return await self._as_connection(lambda: FastMCP.read_resource(self, uri), ResourceError)
 
 
 # Optional built-in OAuth 2.1 authorization server (MCP_AUTH=oauth), see auth.py.
@@ -175,6 +233,8 @@ mcp.toolset = get_config().toolset
 install_icon_routes(mcp)
 if oauth_provider is not None:
     install_login_routes(mcp, oauth_provider)
+    if oauth_provider.config.multi_user:
+        mcp.credential_source = oauth_provider
 
 F = TypeVar("F", bound=Callable[..., Any])
 

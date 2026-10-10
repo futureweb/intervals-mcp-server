@@ -76,6 +76,7 @@ from intervals_mcp_server.server_setup import (  # noqa: E402
     start_server,
 )
 from intervals_mcp_server.utils.validation import validate_athlete_id  # noqa: E402
+from intervals_mcp_server.tenancy import multi_user  # noqa: E402
 
 # Configure logging
 logging.basicConfig(
@@ -261,7 +262,10 @@ def run() -> None:
 
     # Setup transport and start server
     selected_transport = setup_transport()
-    if selected_transport in NETWORK_TRANSPORTS:
+    if multi_user():
+        if selected_transport not in NETWORK_TRANSPORTS or oauth_provider is None:
+            raise ValueError("MCP_TENANCY=multi needs a network transport (MCP_TRANSPORT) with MCP_AUTH=oauth")
+    elif selected_transport in NETWORK_TRANSPORTS:
         missing = [name for name, value in (("API_KEY", config.api_key), ("ATHLETE_ID", config.athlete_id)) if not value]
         if missing:
             logger.warning("%s not set: every tool call needs it as an argument and will fail otherwise", " and ".join(missing))

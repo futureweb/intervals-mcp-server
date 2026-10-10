@@ -14,6 +14,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from intervals_mcp_server.tenancy import default_athlete
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import assigned_field_ids
@@ -81,7 +82,7 @@ async def _get_streams(
 
 
 async def _defs(item_type: str, athlete_id: Any) -> dict[str, dict[str, Any]]:
-    athlete = str(athlete_id) if athlete_id else config.athlete_id
+    athlete = str(athlete_id) if athlete_id else default_athlete(config.athlete_id)
     if not athlete:
         return {}
     return (await get_custom_item_index(athlete_id=athlete)).get(item_type, {})
@@ -514,7 +515,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     activity, error = await _get_activity(activity_id)
     if error or activity is None:
         return error or "Error"
-    athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
+    athlete_id = str(activity.get("icu_athlete_id") or default_athlete(config.athlete_id) or "")
     intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
     intervals: list[dict[str, Any]] = []
     load_errors: list[str] = []  # API errors are reported, never shown as missing data (API-7)

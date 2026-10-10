@@ -5,8 +5,9 @@ The athlete profile, sport settings, custom item definitions and the gear catalo
 cached so that every activity listing does not refetch them. Entries expire after a TTL,
 so changes made in the Intervals.icu web app show up without a restart, and the tools
 that change the cached data drop the affected entries. Keys combine the athlete id with
-a partition per API key, so a call with another account's key never sees the first
-account's data.
+a partition per credential, so a call with another account's key never sees the first
+account's data. In the multi-user mode the partition is the calling connection's grant
+(its id, never a digest of its token), and the owner's API key keeps the default partition.
 """
 
 import itertools
@@ -25,9 +26,17 @@ _MAX_KEY_SLOTS = 32
 
 
 def cache_key(athlete_id: Any, api_key: str | None = None) -> tuple[str, str]:
-    """(athlete id, API key partition); the configured key and None share one partition."""
-    from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
+    """(athlete id, credential partition); the configured key and None share one partition.
 
+    Multi-user mode: the partition of the calling connection (``grant:<grant id>`` for an
+    athlete's token); without a connection the entry goes to a partition no connection reads.
+    """
+    from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tenancy import current_credential, multi_user  # pylint: disable=import-outside-toplevel
+
+    if multi_user():
+        credential = current_credential()
+        return str(athlete_id), credential.partition if credential is not None else "no-connection"
     if not api_key or api_key == get_config().api_key:
         return str(athlete_id), DEFAULT_KEY
     slot = _KEY_SLOTS.get(api_key)

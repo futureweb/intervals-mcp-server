@@ -55,6 +55,9 @@ def resolve_athlete_id(
 ) -> tuple[str, str | None]:
     """Resolve athlete ID from parameter or default, with error message if missing.
 
+    In the multi-user mode the default is the athlete of the calling connection, never the
+    configured ATHLETE_ID (the API client refuses requests for other athletes anyway).
+
     Args:
         athlete_id: Optional athlete ID parameter.
         default_athlete_id: Default athlete ID to use if athlete_id is None.
@@ -64,7 +67,9 @@ def resolve_athlete_id(
         athlete_id_to_use will be empty string if not found.
         error_message will be None if athlete_id is resolved successfully.
     """
-    athlete_id_to_use = athlete_id if athlete_id is not None else default_athlete_id
+    from intervals_mcp_server.tenancy import connection_athlete  # pylint: disable=import-outside-toplevel
+
+    athlete_id_to_use = athlete_id if athlete_id is not None else (connection_athlete() or default_athlete_id)
     if not athlete_id_to_use:
         return (
             "",
