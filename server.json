@@ -1,0 +1,105 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.futureweb/intervals-mcp-server",
+  "title": "Futureweb Intervals MCP",
+  "description": "Self-hosted Intervals.icu MCP server: training analytics, Garmin data, wellness, workout planning",
+  "version": "1.0.0b1",
+  "websiteUrl": "https://github.com/futureweb/intervals-mcp-server",
+  "repository": {
+    "url": "https://github.com/futureweb/intervals-mcp-server",
+    "source": "github",
+    "id": "1411779515"
+  },
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/futureweb/intervals-mcp-server/main/docs/assets/icon-futureweb-256.png",
+      "mimeType": "image/png",
+      "sizes": ["256x256"]
+    },
+    {
+      "src": "https://raw.githubusercontent.com/futureweb/intervals-mcp-server/main/docs/assets/icon-futureweb.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "futureweb-intervals-mcp",
+      "version": "1.0.0b1",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "API_KEY",
+          "description": "Intervals.icu API key (Settings > Developer Settings)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ATHLETE_ID",
+          "description": "Intervals.icu athlete ID",
+          "isRequired": true,
+          "placeholder": "i123456"
+        },
+        {
+          "name": "MCP_PERMISSIONS",
+          "description": "Enabled tool classes: read (default, read-only), read,write, or all (adds destructive and admin tools)",
+          "default": "read"
+        },
+        {
+          "name": "MCP_TOOLSET",
+          "description": "full (every tool of the enabled classes) or core (curated coaching set)",
+          "default": "full",
+          "choices": ["full", "core"]
+        },
+        {
+          "name": "ATHLETE_TIMEZONE",
+          "description": "Time zone for 'today' and default date ranges, e.g. Europe/Vienna; default: the Intervals.icu athlete profile",
+          "placeholder": "Europe/Vienna"
+        }
+      ]
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/futureweb/intervals-mcp-server:1.0.0b1",
+      "runtimeHint": "docker",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "API_KEY",
+          "description": "Intervals.icu API key (Settings > Developer Settings)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ATHLETE_ID",
+          "description": "Intervals.icu athlete ID",
+          "isRequired": true,
+          "placeholder": "i123456"
+        },
+        {
+          "name": "MCP_PERMISSIONS",
+          "description": "Enabled tool classes: read (default, read-only), read,write, or all (adds destructive and admin tools)",
+          "default": "read"
+        },
+        {
+          "name": "MCP_TOOLSET",
+          "description": "full (every tool of the enabled classes) or core (curated coaching set)",
+          "default": "full",
+          "choices": ["full", "core"]
+        },
+        {
+          "name": "ATHLETE_TIMEZONE",
+          "description": "Time zone for 'today' and default date ranges, e.g. Europe/Vienna; default: the Intervals.icu athlete profile",
+          "placeholder": "Europe/Vienna"
+        }
+      ]
+    }
+  ]
+}

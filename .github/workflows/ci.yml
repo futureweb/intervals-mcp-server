@@ -71,9 +71,13 @@ jobs:
         run: uv build
 
       - name: Check the built distributions
+        # twine validates the metadata and that the README renders; check_dist.py that both
+        # distributions carry every package file (assets/, guides/) and that the README has
+        # the MCP Registry ownership line and only absolute links (the PyPI page).
         run: |
           ls -l dist/
-          uv run --locked --with twine twine check dist/*
+          uv run --locked --with twine twine check --strict dist/*
+          uv run --no-project python scripts/check_dist.py dist/
 
       - name: Install the wheel into a clean environment and run the CLI
         # Guards against an sdist/wheel that is missing modules: the published
@@ -116,6 +120,8 @@ jobs:
 
       - name: Smoke test the image
         run: |
+          # MCP Registry ownership proof: the label must carry the name from server.json.
+          test "$(docker inspect --format '{{ index .Config.Labels "io.modelcontextprotocol.server.name" }}' "${IMAGE_NAME}:ci")" = "$(jq -r .name server.json)"
           docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" \
             python -c "import intervals_mcp_server.server; print('import ok')"
           test "$(docker run --rm -e API_KEY -e ATHLETE_ID "${IMAGE_NAME}:ci" futureweb-intervals-mcp --version)" = "$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)"
@@ -148,4 +154,88 @@ jobs:
       - name: Analyse the code with pylint
         # --fail-on=E,F keeps real errors (e.g. undefined names) failing while
         # --fail-under=0 stops style/complexity notes from turning the check red.
-        run: uv run --locked --with pylint pylint --disable=C0301 --fail-under=0 --fail-on=E,F $(git ls-files '*.py')
+        run: |
+          # The file list is meant to be split into arguments (no spaces in tracked names).
+          # shellcheck disable=SC2046
+          uv run --locked --with pylint pylint --disable=C0301 --fail-under=0 --fail-on=E,F $(git ls-files '*.py')
+
+  publishing:
+    name: Publishing metadata and Claude Desktop bundle
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Release metadata consistent (versions, registry name, ownership proofs)
+        run: uv run --no-project python scripts/check_release_metadata.py
+
+      - name: Validate server.json against the published MCP Registry schema
+        run: |
+          schema="$(jq -r '."$schema"' server.json)"
+          case "${schema}" in
+            https://static.modelcontextprotocol.io/schemas/*/server.schema.json) ;;
+            *) echo "::error::server.json \$schema is not a published MCP Registry schema: ${schema}"; exit 1 ;;
+          esac
+          uvx --from check-jsonschema==0.38.2 check-jsonschema --schemafile "${schema}" server.json
+
+      - name: Validate server.json with mcp-publisher (the publisher used by release.yml)
+        run: |
+          scripts/install-mcp-publisher.sh "${RUNNER_TEMP}/mcp-publisher"
+          "${RUNNER_TEMP}/mcp-publisher/mcp-publisher" validate server.json
+
+      - name: Set up Node.js (MCPB CLI)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Build the Claude Desktop bundle (.mcpb)
+        run: packaging/mcpb/build.sh dist-mcpb
+
+      - name: Smoke test the bundle (unpacked and started the way Claude Desktop starts it)
+        run: |
+          bundle_dir="${RUNNER_TEMP}/bundle"
+          mkdir -p "${bundle_dir}"
+          unzip -q dist-mcpb/*.mcpb -d "${bundle_dir}"
+          test -z "$(find "${bundle_dir}" -name '.env*' -o -name '__pycache__')"
+          test "$(uv run --directory "${bundle_dir}" --frozen --no-dev futureweb-intervals-mcp --version)" = "$(uv version --short)"
+          uv run --no-project python scripts/mcp_stdio_smoke.py --min-tools 40 -- \
+            uv run --directory "${bundle_dir}" --frozen --no-dev futureweb-intervals-mcp
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mcpb
+          path: dist-mcpb/*.mcpb
+          if-no-files-found: error
+
+  actionlint:
+    name: Lint workflows (actionlint)
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install actionlint (pinned, checksum verified)
+        run: |
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --quiet -
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}" actionlint
+
+      - name: Lint the workflows (shellcheck runs on the scripts)
+        run: |
+          shellcheck --version | head -n 2
+          "${RUNNER_TEMP}/actionlint" -color
+          shellcheck packaging/mcpb/build.sh scripts/*.sh

@@ -11,6 +11,9 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# Claude Desktop bundle output (packaging/mcpb/build.sh) and local tool installs
+dist-mcpb/
+.tools/
 downloads/
 eggs/
 .eggs/

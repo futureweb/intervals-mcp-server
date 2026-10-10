@@ -68,10 +68,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ###########################################
 FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS runtime
 
+# io.modelcontextprotocol.server.name proves to the official MCP Registry that this image
+# belongs to the server name in server.json (checked by scripts/check_release_metadata.py).
 LABEL org.opencontainers.image.title="intervals-mcp-server" \
       org.opencontainers.image.description="Model Context Protocol server for Intervals.icu" \
       org.opencontainers.image.source="https://github.com/futureweb/intervals-mcp-server" \
-      org.opencontainers.image.licenses="GPL-3.0-only"
+      org.opencontainers.image.licenses="GPL-3.0-only" \
+      io.modelcontextprotocol.server.name="io.github.futureweb/intervals-mcp-server"
 
 # Unprivileged runtime user without a login shell; /data holds the OAuth state.
 RUN groupadd --system --gid 10001 mcp \
