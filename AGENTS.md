@@ -7,7 +7,7 @@ This project is a Python 3.12 backend service built with FastMCP and httpx. All 
   - `uv venv --python 3.12`
   - `source .venv/bin/activate`
 - Sync dependencies including dev extras with `uv sync --all-extras`.
-- When editing or running the server manually use `mcp run src/intervals_mcp_server/server.py`.
+- When editing or running the server manually use `uv run futureweb-intervals-mcp` (`--doctor` checks the configuration).
 
 ## Testing Instructions
 - Run unit tests with `pytest` from the repository root.

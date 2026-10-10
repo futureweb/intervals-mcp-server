@@ -420,6 +420,103 @@ LIBRARY_WORKOUT = {"id": 77, "name": "SST 3x12", "type": "Ride", "folder_id": 30
 GEAR_WITH_REMINDER = [dict(GEAR_DATA[0], reminders=[{"id": 1, "name": "Chain wax", "distance": 400000, "distance_used": 250000, "percent_used": 62.5, "last_reset": "2026-08-01"}])] + GEAR_DATA[1:]
 
 
+# ---------------------------------------------------------------- phase 6: fatigue, tests, sensors
+LONG_RIDE_THRESHOLDS = (400.0, 600.0)
+LONG_RIDE_PAUSE_S = 300
+
+
+def long_ride_streams(hr_step: float = 10.0, with_pause: bool = True, power: float = 190.0) -> list[dict[str, Any]]:  # pylint: disable=too-many-locals
+    """1 Hz long ride: 10 min warm-up 150 W, 15 min steady, 1 min coasting, 2 min at 300 W (FTP 250),
+    1 min coasting, a 5 min recording pause and 30 min steady with a 120 m climb in its second half.
+
+    Heart rate is 130 bpm before 400 kJ, +hr_step after 400 kJ and +2*hr_step after 600 kJ (cumulative
+    work of the samples), so the matched-power drift per phase is known exactly. Stamina falls by
+    0.01 per second, potential stamina by 0.005.
+    """
+    blocks = [(600, 150.0), (900, power), (60, 0.0), (120, 300.0), (60, 0.0), (1800, power)]
+    names = ("time", "watts", "heartrate", "cadence", "temp", "altitude", "distance", "velocity_smooth")
+    data: dict[str, list[Any]] = {name: [] for name in (*names, "Stamina", "PotentialStamina")}
+    moment, work, distance, altitude, samples = 0, 0.0, 0.0, 500.0, 0
+    for number, (secs, watts) in enumerate(blocks):
+        if with_pause and number == 5:
+            moment += LONG_RIDE_PAUSE_S
+        for k in range(secs):
+            work += watts / 1000
+            climbing = number == 5 and 600 <= k < 1800
+            altitude += 0.1 if climbing else 0.0
+            distance += 4.0
+            data["time"].append(moment)
+            data["watts"].append(watts)
+            data["heartrate"].append(130 + hr_step * sum(1 for t in LONG_RIDE_THRESHOLDS if work >= t))
+            data["cadence"].append(90 if watts > 0 else 0)
+            data["temp"].append(20.0)
+            data["altitude"].append(round(altitude, 2))
+            data["distance"].append(distance)
+            data["velocity_smooth"].append(4.0)
+            data["Stamina"].append(round(100 - samples * 0.01, 2))
+            data["PotentialStamina"].append(round(100 - samples * 0.005, 2))
+            moment += 1
+            samples += 1
+    streams = [{"type": name, "custom": False, "data": data[name]} for name in names]
+    streams += [{"type": "Stamina", "custom": True, "data": data["Stamina"]},
+                {"type": "PotentialStamina", "custom": True, "data": data["PotentialStamina"]}]
+    return streams
+
+
+def long_ride_activity(aid: str, day: str, gear: str = "b1", **extra: Any) -> dict[str, Any]:
+    """Activity payload of a long ride (FTP 250 W, 80 kg, 639 kJ as in long_ride_streams)."""
+    base = {
+        "id": aid, "name": f"Long ride {aid}", "type": "Ride", "start_date_local": f"{day}T08:00:00",
+        "gear": {"id": gear}, "icu_ftp": 250, "icu_weight": 80.0, "icu_joules": 639000, "moving_time": 3540,
+        "elapsed_time": 3840, "trainer": False,
+        "stream_types": ["time", "watts", "heartrate", "cadence", "temp", "altitude", "distance", "velocity_smooth",
+                         "Stamina", "PotentialStamina"],
+    }
+    base.update(extra)
+    return base
+
+
+def submax_streams(test_watts: float = 248.0, after_watts: float = 100.0, before_watts: float = 150.0) -> list[dict[str, Any]]:
+    """1 Hz streams: 15 min before the test, 180 s test (samples 900-1079), then 5 min after.
+
+    HR rises from 120 to 150 bpm during the test and drops by 0.5 bpm per second when the
+    rider eases off afterwards (after_watts below half the target), else it stays at 150.
+    """
+    time, watts, heart = [], [], []
+    for t in range(1380):
+        if t < 900:
+            w, h = before_watts, 120.0
+        elif t < 1080:
+            w, h = test_watts, 120.0 + (t - 900) * 30 / 179
+        else:
+            w = after_watts
+            h = max(100.0, 150.0 - (t - 1079) * 0.5) if after_watts < 123 else 150.0
+        time.append(t)
+        watts.append(w)
+        heart.append(round(h, 1))
+    return [{"type": "time", "data": time}, {"type": "watts", "data": watts}, {"type": "heartrate", "data": heart}]
+
+
+def submax_activity(aid: str, day: str, **test: Any) -> dict[str, Any]:
+    """Activity with an Intervals.icu submax_fatigue_test (power, 180 s, target 246 W); ``test`` overrides fields."""
+    block = {
+        "type": "POWER", "start_index": 900, "end_index": 1080, "end_index_hrrc": 1140, "duration": 180,
+        "average_watts": 248, "average_mps": 0.0, "cv": 5.0, "final_bpm": 150, "hrrc": 28, "target": 246.0,
+        "max_cv_percent": 10, "tolerance_percent": 5, "rpe": 5, "tte_mins": 5, "ignore": False,
+        "efficiency_factor": round(248 / 150, 4),
+    }
+    block.update(test)
+    return {"id": aid, "name": f"SFT {aid}", "type": "Ride", "start_date_local": f"{day}T07:00:00", "gear": {"id": "b1"},
+            "trainer": False, "icu_ftp": 234, "submax_fatigue_test": block}
+
+
+SFT_SPORT_SETTINGS = [
+    {**SPORT_SETTINGS_DATA[0], "sft_type": "POWER", "sft_duration": 180, "sft_max_start_secs": 1800,
+     "sft_target_percent": 105, "sft_tolerance_percent": 5, "sft_max_cv_percent": 10, "sft_ftp": None,
+     "sft_threshold_pace": None},
+]
+
+
 # ---------------------------------------------------- phase 6: data quality, fueling, context
 FUELING_ITEMS = CUSTOM_ITEMS_DATA + [
     {"id": 30, "type": "ACTIVITY_FIELD", "name": "Fluid intake", "content": {"code": "FluidIntake", "type": "numeric", "units": "L"}},

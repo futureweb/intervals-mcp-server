@@ -209,7 +209,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     assert "Today 2026-10-09: completed load 0 + planned, not yet done 100" in result
     assert "Planned workouts: 4 (3 with a planned load, sum 300); 1 without a planned load are not included" in result
     assert "Intervals.icu's own projection" in result
-    assert "Races: 2026-10-18 RACE_A 'Gran Fondo'" in result
+    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo'" in result
     assert "reproduces the stored CTL within 0.00 and ATL within 0.00" in result
     assert "2026-W42 (2026-10-12 to 2026-10-18): load 80 (2 planned, 1 without load)" in result
     payload = json.loads(asyncio.run(get_load_projection(end_date="2026-10-20", output_format="json")))
@@ -221,7 +221,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     compact = asyncio.run(get_load_projection(detail_level="compact"))
     assert "Weeks (" not in compact and "Lowest projected form" in compact
     full = asyncio.run(get_load_projection(detail_level="full", ctl_days=30))
-    assert "Days: 10-09 load 100" in full and "model CTL 30 d" in full
+    assert "Days (end of day): 10-09 load 100" in full and "model CTL 30 d" in full
 
 
 def test_get_load_projection_validation_and_missing_data(monkeypatch):
