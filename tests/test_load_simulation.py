@@ -385,9 +385,25 @@ def test_projection_end_extends_to_target_and_scenario(monkeypatch):
                                                       output_format="json", detail_level="compact")))
     assert sim["to"] == "2027-01-03"
     assert asyncio.run(get_load_projection(end_date="2026-10-20", target_date="2026-10-25")).startswith(
-        "Error: target_date must lie after today and not after 2026-10-20")
+        "Error: target_date must lie from today (2026-10-09) to 2026-10-20")
     assert "must lie from 2026-10-09 to 2026-10-20" in asyncio.run(get_load_projection(
         end_date="2026-10-20", scenario=[{"date": "2026-10-21", "load": 10}]))
+
+
+def test_target_date_today_gives_the_start_of_race_day(monkeypatch):
+    """Race day itself: target_date = today gives CTL/ATL/form at the start of today (end of yesterday), no taper search."""
+    _setup(monkeypatch, {"/events": [*EVENTS, {"id": 9, "category": "RACE_B", "type": "Ride", "name": "Club race",
+                                               "start_date_local": f"{TODAY.isoformat()}T09:00:00", "moving_time": 7200}]})
+    payload = json.loads(asyncio.run(get_load_projection(target_date=TODAY.isoformat(), target_form="5,15", output_format="json")))
+    target = payload["target"]
+    assert target["date"] == TODAY.isoformat() and target["source"] == "target_date"
+    assert target["category"] == "RACE_B" and target["event"] == "Club race"
+    yesterday = (TODAY - timedelta(days=1)).isoformat()
+    row = next(d for d in payload["days"] if d["date"] == yesterday) if any(d["date"] == yesterday for d in payload["days"]) else payload["start"]
+    assert target["baseline"]["ctl"] == row["ctl"] and target["baseline"]["form"] == row["form"]
+    assert target["search"]["available"] is False
+    text = asyncio.run(get_load_projection(target_date=TODAY.isoformat()))
+    assert f"Target {TODAY.isoformat()} RACE_B 'Club race'" in text and "start of day" in text
 
 
 @pytest.mark.parametrize(
@@ -395,7 +411,7 @@ def test_projection_end_extends_to_target_and_scenario(monkeypatch):
     [
         ({"taper_days": 0}, "Error: taper_days must be between 1 and 42."),
         ({"target_form": "high"}, "Error: target_form must be a range"),
-        ({"target_date": "2026-10-09"}, "Error: target_date must lie after today"),
+        ({"target_date": "2026-10-08"}, "Error: target_date must lie from today (2026-10-09)"),
         ({"target_date": "18.10.2026"}, "Error: "),
         ({"scenario": "[{\"date\": \"2026-10-10\"}]"}, "Error: sessions[0]: give 'load'"),
         ({"scenario": {"weekly": []}}, "Error: scenario needs"),

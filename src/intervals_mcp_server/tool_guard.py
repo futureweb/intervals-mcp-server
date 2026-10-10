@@ -20,7 +20,7 @@ import inspect
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
@@ -33,19 +33,38 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Largest tool result in characters (MCP_MAX_OUTPUT_CHARS). Claude Code's default limit is
 # 25k tokens; MCP clients cut or reject larger results without telling the model.
 DEFAULT_MAX_OUTPUT_CHARS = 100_000
+MIN_MAX_OUTPUT_CHARS = 2_000
 # Size the paging tools (streams, wellness) aim for, so they page before the hard cap.
 OUTPUT_BUDGET_CHARS = 60_000
 
 _IN_TOOL: ContextVar[bool] = ContextVar("intervals_in_tool_call", default=False)
 
 
-def max_output_chars() -> int:
-    """Hard cap of a tool result (MCP_MAX_OUTPUT_CHARS, default 100000)."""
+def output_limit_setting(environ: Mapping[str, str] | None = None) -> tuple[int, str | None, str | None]:
+    """(characters used, error, warning) for MCP_MAX_OUTPUT_CHARS, as the server applies it (also --doctor).
+
+    Empty: the default. Not a whole number: the default, with an error. Not positive: the minimum,
+    with an error. Below the minimum: the minimum, with a warning.
+    """
+    raw = (os.environ if environ is None else environ).get("MCP_MAX_OUTPUT_CHARS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_OUTPUT_CHARS, None, None
     try:
-        value = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "") or DEFAULT_MAX_OUTPUT_CHARS)
+        value = int(raw)
     except ValueError:
-        return DEFAULT_MAX_OUTPUT_CHARS
-    return max(value, 2_000)
+        return (DEFAULT_MAX_OUTPUT_CHARS, f"MCP_MAX_OUTPUT_CHARS must be a whole number of characters, got {raw!r}; "
+                f"the server uses the default {DEFAULT_MAX_OUTPUT_CHARS}", None)
+    if value <= 0:
+        return (MIN_MAX_OUTPUT_CHARS, f"MCP_MAX_OUTPUT_CHARS must be a positive whole number, got {raw!r}; the server "
+                f"uses the minimum {MIN_MAX_OUTPUT_CHARS}", None)
+    if value < MIN_MAX_OUTPUT_CHARS:
+        return MIN_MAX_OUTPUT_CHARS, None, f"MCP_MAX_OUTPUT_CHARS={raw} is below the minimum; the server uses {MIN_MAX_OUTPUT_CHARS}"
+    return value, None, None
+
+
+def max_output_chars() -> int:
+    """Hard cap of a tool result (MCP_MAX_OUTPUT_CHARS, default 100000, at least 2000)."""
+    return output_limit_setting()[0]
 
 
 def output_budget() -> int:
@@ -271,11 +290,10 @@ def guarded(func: F) -> F:
         from intervals_mcp_server.config import get_config  # pylint: disable=import-outside-toplevel
 
         athlete = bound.arguments.get("athlete_id") or get_config().athlete_id
-        api_key = bound.arguments.get("api_key")
         marker = _IN_TOOL.set(True)
         try:
             with call_limits() as limits:
-                zone_token = await activate_athlete_timezone(str(athlete) if athlete else None, api_key)
+                zone_token = await activate_athlete_timezone(str(athlete) if athlete else None)
                 try:
                     result = await func(*args, **kwargs)
                 finally:

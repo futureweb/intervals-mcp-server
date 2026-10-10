@@ -10,7 +10,9 @@ quality), "standard" (the full analysis without raw stream dumps; default) or "f
 
 import asyncio
 import json
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -32,6 +34,7 @@ from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_ST
 from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps, target_text
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
 from intervals_mcp_server.utils.fueling import activity_fueling
+from intervals_mcp_server.utils.params import ActivityId, DetailLevel, OutputFormat
 from intervals_mcp_server.utils.power_compare import compare_power_streams as compute_power_comparison
 from intervals_mcp_server.utils.provenance import STRAVA_STUB_NOTE, freshness, is_strava_stub, provenance_notes, source_summary
 from intervals_mcp_server.utils.segments import detect_segments
@@ -312,7 +315,7 @@ def _quality_notes(  # pylint: disable=too-many-arguments,too-many-positional-ar
     return notes
 
 
-async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str | None, field_defs: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+async def _route_history(activity: dict[str, Any], athlete_id: str, field_defs: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
     """Earlier activities on the activity's Intervals.icu route (one list request, one for the route name)."""
     route_id = activity.get("route_id")
     if not route_id or not athlete_id:
@@ -320,13 +323,13 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str
     pairs = start_end_pairs(field_defs)
     codes = sorted({code for start, end, _ in pairs for code in (start, end)})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": "2000-01-01", "newest": str(activity.get("start_date_local") or "")[:10], "route_id": route_id,
                 "limit": MAX_ROUTE_HISTORY + 1, "fields": ",".join([ROUTE_FIELDS, *codes])},
     )
     candidates = [a for a in result if isinstance(a, dict)] if isinstance(result, list) else []
     history = route_history(activity, candidates, pairs, truncated=len(candidates) >= MAX_ROUTE_HISTORY + 1)
-    route = await make_intervals_request(url=f"/athlete/{athlete_id}/routes/{route_id}", api_key=api_key)
+    route = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/routes/{seg(route_id)}")
     history["route_name"] = route.get("name") if isinstance(route, dict) and "error" not in route else None
     if isinstance(result, dict) and "error" in result:
         history["error"] = result.get("message")
@@ -335,59 +338,45 @@ async def _route_history(activity: dict[str, Any], athlete_id: str, api_key: str
 
 @tool("read")
 async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    activity_id: str,
-    api_key: str | None = None,
-    planned_workout_doc: dict[str, Any] | None = None,
-    include_climbs: bool | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    duration_tolerance_pct: float | None = None,
-    start_tolerance_s: float | None = None,
-    pause_tolerance_s: float | None = None,
-    include_route_history: bool = False,
+    activity_id: ActivityId,
+    planned_workout_doc: Annotated[dict[str, Any] | None, Field(
+        description='Workout document {"steps": [...]} to compare against, e.g. when the event was deleted'
+    )] = None,
+    include_climbs: Annotated[bool | None, Field(
+        description="Force (true) or suppress (false) the climbs; default only without intervals or above 500 m gain"
+    )] = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = core numbers, up to 5 key findings, data-quality flags; standard = full analysis, "
+        "at most 30 interval lines; full = everything, all custom fields and streams"
+    )] = "standard",
+    duration_tolerance_pct: Annotated[float | None, Field(
+        description="Step duration tolerance in % before a step is split or flagged short; default 10"
+    )] = None,
+    start_tolerance_s: Annotated[float | None, Field(
+        description="Plan timeline shift before a step is flagged, seconds; default 120"
+    )] = None,
+    pause_tolerance_s: Annotated[float | None, Field(
+        description="Recording pause per step before it is flagged, seconds; default 60"
+    )] = None,
+    include_route_history: Annotated[bool, Field(
+        description="Add earlier activities on the same Intervals.icu route (2 extra requests)"
+    )] = False,
 ) -> str:
-    """Complete compact analysis of one activity in a single call (overview, plan vs execution, power meters, climbs)
+    """Use first for any question about one activity: overview, plan vs execution, power meter check, climbs and data quality in one call (read-only, 3-4 API requests).
 
-    Loads the activity, its intervals, one set of streams (time, power, HR, cadence, speed,
-    distance, altitude, second power meter and every custom stream) and, when paired or
-    provided, the planned workout, then reports: a compact overview with thresholds, device
-    data and the custom fields assigned to the sport; the plan-vs-execution analysis (steps
-    capped at their planned duration, everything after the plan reported separately as
-    additional training, see analyze_workout_execution) or the intervals when there is no
-    plan; a second-power-meter check only when a second power stream with enough valid
-    samples exists (identical streams are reported as such, never compared); a climb summary
-    for activities without intervals (or on request); and data-quality notes (unknown sensors,
-    gear streams whose values are gear positions rather than tooth counts, counter and
-    other-sport streams left out). Use the specialised tools for the full detail of any
-    section. The overview carries fueling (carbs used/ingested per hour, sweat loss, energy),
-    weather (temperature, feels-like, wind, head/tailwind share) and W′ balance (max depletion,
-    time below 75/50/25 % of W′ from the w_bal stream; W′bal below 0 is flagged as a W′/CP model
-    mismatch), as one short context line in compact; the data-quality notes name
-    the source, upload/analysis times, recording stops and zero placeholders (full audit:
-    get_activity_data_audit). include_route_history adds earlier activities on the same
-    Intervals.icu route (time, power, W/kg, HR, weather, stamina; two extra requests). Read-only.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        planned_workout_doc: Workout document with "steps" to compare against when the calendar
-            event no longer exists (optional)
-        include_climbs: Force (True) or suppress (False) the climb section; default: only when
-            the activity has no intervals or more than 500 m of elevation gain
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (core numbers, up to 5 key findings, sport-assigned custom fields,
-            data-quality flags), "standard" (default, full analysis without raw stream dumps,
-            at most 30 interval lines) or "full" (everything, all custom fields and streams)
-        duration_tolerance_pct: Step duration tolerance in % before a step is split or flagged
-            short (optional, default 10; see analyze_workout_execution)
-        start_tolerance_s: Plan timeline shift in seconds before a step is flagged (optional, default 120)
-        pause_tolerance_s: Recording pause per step in seconds before it is flagged (optional, default 60)
-        include_route_history: Compare with earlier activities on the same route (optional, default False)
+    The overview has thresholds, device, sport-assigned custom fields, fueling, weather and W′
+    balance. With a paired event or planned_workout_doc the plan-vs-execution analysis follows
+    (as analyze_workout_execution), otherwise the intervals; a second-power-meter check only with
+    enough valid paired samples; climbs without intervals or above 500 m gain; then data-quality
+    notes. compact = core numbers and up to 5 key findings. Full detail: get_activity_details,
+    analyze_workout_execution, compare_power_streams, analyze_climbs, get_activity_data_audit.
+    Methods: intervals://methods/activity-data, intervals://methods/execution (get_guide).
     """
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
         return tolerances
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -399,14 +388,14 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
                                "strava_stub": True, "notes": [STRAVA_STUB_NOTE], "api_calls": 1}, ensure_ascii=False, default=str)
         return f"== Overview\n{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')})\n== Data quality\n- {STRAVA_STUB_NOTE}"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    await resolve_gear_for_activity(activity, athlete_id=athlete_id or None, api_key=api_key)
-    index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key) if athlete_id else {}
+    await resolve_gear_for_activity(activity, athlete_id=athlete_id or None)
+    index = await get_custom_item_index(athlete_id=athlete_id) if athlete_id else {}
     field_defs, stream_defs, interval_defs = (index.get(t, {}) for t in (ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD))
-    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, activity.get("type")))
     sport = str(activity.get("type") or "")
-    expected = (await expected_field_codes(athlete_id, api_key, field_defs, [sport])).get(sport) if athlete_id and sport else assigned
+    expected = (await expected_field_codes(athlete_id, field_defs, [sport])).get(sport) if athlete_id and sport else assigned
 
-    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
     intervals_payload = intervals_result if isinstance(intervals_result, dict) and "error" not in intervals_result else {}
     intervals = [i for i in intervals_payload.get("icu_intervals") or [] if isinstance(i, dict)]
 
@@ -415,7 +404,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     if "watts" in available:
         wanted.append("w_bal")  # computed by Intervals.icu on request; silently omitted without W′ data
     streams_result = await make_intervals_request(
-        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params={"types": ",".join(wanted)}
+        url=f"/activity/{seg(activity_id)}/streams", params={"types": ",".join(wanted)}
     )
     streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
     w_bal = find_stream(streams, "w_bal")
@@ -429,7 +418,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     if isinstance(planned_workout_doc, dict) and isinstance(planned_workout_doc.get("steps"), list):
         doc, plan_source = planned_workout_doc, "workout document provided by the caller"
     elif activity.get("paired_event_id") and athlete_id:
-        event = await _get_event(athlete_id, activity["paired_event_id"], api_key)
+        event = await _get_event(athlete_id, activity["paired_event_id"])
         if event:
             doc = event.get("workout_doc") or {}
             plan_source = f"event {event.get('id')} ('{event.get('name')}')"
@@ -446,7 +435,7 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     climbs = _climb_summary(streams, activity.get("type"), None if detail_level == "full" else MAX_CLIMBS) if want_climbs and streams else None
     notes = _quality_notes(activity, available, streams, intervals, power, stream_defs, execution,
                            provenance_notes(activity, field_defs, expected, intervals, compact=detail_level == "compact"))
-    route, route_calls = await _route_history(activity, athlete_id, api_key, field_defs) if include_route_history else (None, 0)
+    route, route_calls = await _route_history(activity, athlete_id, field_defs) if include_route_history else (None, 0)
     # An API error is not "no intervals" / "file not retained": say what failed (API-7).
     notes = [_load_error_note(note, intervals_result, streams_result) for note in notes]
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)

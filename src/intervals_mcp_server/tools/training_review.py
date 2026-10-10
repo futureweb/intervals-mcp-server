@@ -7,12 +7,15 @@ This module contains read-only tools for a weekly training review:
 """
 
 from datetime import date, datetime
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import canonical_athlete_id
 from intervals_mcp_server.utils.dates import athlete_today
+from intervals_mcp_server.utils.params import AthleteId
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -112,26 +115,18 @@ def _format_week(week: dict[str, Any]) -> str:
 
 @tool("read")
 async def get_weekly_summary(
-    start_date: str,
-    end_date: str,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
+    start_date: Annotated[str, Field(description="First day YYYY-MM-DD")],
+    end_date: Annotated[str, Field(description="Last day YYYY-MM-DD")],
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Get a weekly training summary (read-only) from Intervals.icu.
+    """Use for a quick per-week overview from Intervals.icu's athlete summary (read-only, one API call).
 
-    Returns one block per ISO week (weeks start on Monday) with the number of sessions,
-    moving time, distance and training load, a breakdown per sport category, the time
-    spent in heart rate zones (non-zero zones only), and the
-    CTL (fitness), ATL (fatigue) and form at the END of the week (or the latest day with
-    data for the current week). Sessions without heart rate data (e.g. strength) are
-    still counted; in live data, WeightTraining activities were reported under the
-    "Workout" category. Rows belonging to other athletes (followed/coached) are ignored.
-
-    Args:
-        start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+    Per ISO week (from Monday): sessions, moving time, distance and training load, a split per
+    sport category, time in HR zones (non-zero zones only) and CTL/ATL/form/ramp at the end of
+    the week (the latest day with data for the current week). Sessions without HR (e.g.
+    strength) are counted. Rows of other (followed or coached) athletes are ignored. Grouping by
+    month, sport or gear, separate power/HR/pace loads and custom fields: get_training_summary.
+    Method: intervals://methods/summary (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -142,7 +137,6 @@ async def get_weekly_summary(
 
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/athlete-summary.json",
-        api_key=api_key,
         params={"start": start_date, "end": end_date},
     )
     if isinstance(result, dict) and "error" in result:
@@ -153,7 +147,7 @@ async def get_weekly_summary(
     # The endpoint may also return rows for other athletes (followed/coached) when called
     # with an API key; keep only the requested athlete (rows without athlete_id are kept).
     # The alias "0" (the key's own athlete) is resolved to the real id the rows carry.
-    wanted = await canonical_athlete_id(athlete_id_to_use, api_key)
+    wanted = await canonical_athlete_id(athlete_id_to_use)
     rows = [
         w
         for w in result
@@ -332,30 +326,20 @@ def _build_compliance_report(  # pylint: disable=too-many-locals
 
 @tool("read")
 async def get_plan_compliance(
-    start_date: str,
-    end_date: str,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
+    start_date: Annotated[str, Field(description="First day YYYY-MM-DD")],
+    end_date: Annotated[str, Field(description="Last day YYYY-MM-DD")],
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Compare planned workouts with executed activities (read-only) for a date range.
+    """Use to compare planned workouts with the activities done in a date range (read-only, two API calls).
 
-    Planned workouts are calendar events with category WORKOUT. They are linked to
-    activities via the event's paired_activity_id and/or the activity's paired_event_id.
-    For each pair the planned vs. actual duration and training load are shown with the
-    deviation in percent. Planned workouts in the past without a linked activity are listed
-    as missed; unpaired workouts today or in the future are listed as upcoming (not
-    missed); "today" is the server's local date. Activities without a linked planned
-    workout are listed as unplanned; activities linked to a planned workout outside the
-    queried range are listed separately as "planned outside range" (not unplanned and not
-    counted in the completion percentage). An activity is never counted for two events.
-    The completion percentage is completed / (completed + missed). NOTE events that set
-    training availability, allowed sports or a maximum training time are listed as well.
-
-    Args:
-        start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
+    Planned workouts (calendar WORKOUT events) are linked to activities by the event's
+    paired_activity_id or the activity's paired_event_id; each pair shows planned vs actual
+    duration and load with the deviation in %. An activity counts for one event only. Unlinked
+    past workouts are missed, those of today or later upcoming (athlete's local date).
+    Activities without a planned workout are unplanned; those linked to a workout outside the
+    range are listed apart. Completion = completed / (completed + missed). NOTE events with
+    training availability, allowed sports or a maximum training time are listed too.
+    Method: intervals://methods/summary (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -366,12 +350,12 @@ async def get_plan_compliance(
 
     params = {"oldest": start_date, "newest": end_date}
     events = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", params=params
     )
     if isinstance(events, dict) and "error" in events:
         return f"Error fetching events: {events.get('message')}"
     activities = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/activities", api_key=api_key, params=params
+        url=f"/athlete/{seg(athlete_id_to_use)}/activities", params=params
     )
     if isinstance(activities, dict) and "error" in activities:
         return f"Error fetching activities: {activities.get('message')}"

@@ -76,11 +76,16 @@ def test_get_activities(monkeypatch):
     async def fake_request(*_args, **_kwargs):
         return [sample]
 
-    # Patch in both api.client and tools modules to ensure it works
+    async def fake_gear_request(*_args, **_kwargs):
+        return []
+
+    # Patch in both api.client and tools modules to ensure it works; the gear names come from the
+    # gear catalogue (no request may leave the test).
     monkeypatch.setattr("intervals_mcp_server.api.client.make_intervals_request", fake_request)
     monkeypatch.setattr(
         "intervals_mcp_server.tools.activities.make_intervals_request", fake_request
     )
+    monkeypatch.setattr("intervals_mcp_server.tools.gear.make_intervals_request", fake_gear_request)
     result = asyncio.run(get_activities(athlete_id="1", limit=1, include_unnamed=True))
     assert "Morning Ride" in result
     assert "Activities:" in result

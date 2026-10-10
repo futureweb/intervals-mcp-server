@@ -63,7 +63,7 @@ _SECURITY_HEADERS = {
     "Content-Security-Policy": (
         # No form-action: Chrome applies it to the redirect after the POST, which goes to
         # Intervals.icu or to the MCP client's redirect URI.
-        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'"
     ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
@@ -87,12 +87,17 @@ _PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Connect - Intervals MCP</title>
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 body{font-family:system-ui,-apple-system,sans-serif;background:#f4f5f7;color:#1f2933;margin:0;
 display:flex;min-height:100vh;align-items:center;justify-content:center}
 main{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);
 width:min(28rem,90vw);box-sizing:border-box}
 h1{font-size:1.25rem;margin:0 0 1rem}
+.brand{display:flex;align-items:center;gap:.6rem;margin:0 0 1rem;font-size:.85rem;font-weight:600;color:#0b2550}
+.brand img{width:40px;height:40px}
 p{font-size:.9rem;color:#52606d;margin:.5rem 0}
 .client{font-weight:600;color:#1f2933}
 .badge{display:inline-block;font-size:.75rem;padding:.1rem .45rem;border-radius:999px;margin-left:.3rem}
@@ -114,6 +119,7 @@ hr{border:0;border-top:1px solid #e4e7eb;margin:1rem 0}
 </head>
 <body>
 <main>
+<div class="brand"><img src="/icon.svg" alt="" width="40" height="40"><span>Futureweb Intervals MCP</span></div>
 <h1>__TITLE__</h1>
 __BODY__
 </main>

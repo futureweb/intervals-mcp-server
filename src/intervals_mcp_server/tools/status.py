@@ -20,9 +20,10 @@ from intervals_mcp_server.auth import auth_status_from_env
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INPUT_FIELD, INTERVAL_FIELD
+from intervals_mcp_server.utils.params import OutputFormat
 
 # Import mcp instance from shared module for tool registration
-from intervals_mcp_server.mcp_instance import disabled_tools, mcp, tool, tool_permissions
+from intervals_mcp_server.mcp_instance import disabled_tools, mcp, tool, tool_permissions, tools_outside_toolset
 
 config = get_config()
 
@@ -36,7 +37,7 @@ def _package_version() -> str:
     return __version__
 
 
-async def server_status(api_key: str | None = None, include_private: bool = False) -> dict[str, Any]:
+async def server_status(include_private: bool = False) -> dict[str, Any]:
     """Collect the status as a dict (shared by the tool and the --doctor CLI flag).
 
     *include_private* adds what only the operator needs (``--doctor``): bind address, port,
@@ -44,20 +45,23 @@ async def server_status(api_key: str | None = None, include_private: bool = Fals
     """
     permissions = tool_permissions()
     hidden = disabled_tools()
-    registered = {name: cls for name, cls in permissions.items() if name not in hidden}
+    outside = tools_outside_toolset()
+    registered = {name: cls for name, cls in permissions.items() if name not in hidden and name not in outside}
     status: dict[str, Any] = {
         "version": _package_version(),
         "permissions_enabled": sorted(config.permissions),
+        "toolset": config.toolset,
         "tools_registered": len(registered),
         "tools_by_class": {
             cls: sorted(n for n, c in registered.items() if c == cls) for cls in ("read", "write", "destructive", "admin")
         },
         "tools_hidden": hidden,
+        "tools_outside_toolset": sorted(outside),
         "transport": os.getenv("MCP_TRANSPORT", "stdio"),
         "auth": auth_status_from_env(include_private=include_private),
         "athlete_id_configured": bool(config.athlete_id),
         "athlete_id": config.athlete_id or None,
-        "api_key_configured": bool(config.api_key or api_key),
+        "api_key_configured": bool(config.api_key),
         "api_base_url": config.intervals_api_base_url,
         "units_overrides": config.custom_units_overrides,
         "api": {"ok": False, "detail": "not checked"},
@@ -74,17 +78,17 @@ async def server_status(api_key: str | None = None, include_private: bool = Fals
     if not config.athlete_id:
         status["api"] = {"ok": False, "detail": "ATHLETE_ID is not set"}
         return status
-    if not (config.api_key or api_key):
+    if not config.api_key:
         status["api"] = {"ok": False, "detail": "API_KEY is not set"}
         return status
     result = await api_client.make_intervals_request(
-        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings", api_key=api_key
+        url=f"/athlete/{api_client.seg(config.athlete_id)}/sport-settings"
     )
     if isinstance(result, dict) and "error" in result:
         status["api"] = {"ok": False, "detail": str(result.get("message"))}
         return status
     status["api"] = {"ok": True, "detail": f"sport settings for {len(result) if isinstance(result, list) else '?'} sport group(s) readable"}
-    index = await get_custom_item_index(athlete_id=config.athlete_id, api_key=api_key)
+    index = await get_custom_item_index(athlete_id=config.athlete_id)
     status["custom_items"] = {
         "activity_fields": len(index.get(ACTIVITY_FIELD, {})),
         "activity_streams": len(index.get(ACTIVITY_STREAM, {})),
@@ -100,13 +104,15 @@ def format_status(status: dict[str, Any]) -> str:
     lines = [
         f"Futureweb Intervals MCP {status['version']}",
         f"Permissions enabled: {', '.join(status['permissions_enabled'])} (MCP_PERMISSIONS); "
-        f"{status['tools_registered']} tools registered",
+        f"tool set {status.get('toolset', 'full')} (MCP_TOOLSET); {status['tools_registered']} tools registered",
     ]
     for cls, names in status["tools_by_class"].items():
         if names:
             lines.append(f"  {cls}: {', '.join(names)}")
     if status["tools_hidden"]:
         lines.append("  hidden (class not enabled): " + ", ".join(f"{n} [{c}]" for n, c in sorted(status["tools_hidden"].items())))
+    if status.get("tools_outside_toolset"):
+        lines.append(f"  outside the tool set: {len(status['tools_outside_toolset'])} tools (MCP_TOOLSET=full shows them)")
     auth = status.get("auth") or {}
     where = ""
     if "host" in status:
@@ -141,20 +147,9 @@ def format_status(status: dict[str, Any]) -> str:
 
 
 @tool("read")
-async def get_server_status(api_key: str | None = None, output_format: str = "text") -> str:
-    """Diagnostics: server version, enabled permission classes, registered tools, API reachability
-
-    Shows which tool classes are enabled (read / write / destructive / admin), which tools
-    are hidden because their class is disabled, the transport configuration, whether an
-    athlete and API key are configured, whether Intervals.icu answers, and how many custom
-    activity fields, streams, interval fields and wellness fields the account defines
-    (a sync bridge typically adds streams such as stamina). The API key is never shown.
-
-    Args:
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-    """
-    status = await server_status(api_key)
+async def get_server_status(output_format: OutputFormat = "text") -> str:
+    """Use to check the connection when tools are missing or fail: server version, enabled permission classes and tool set, registered and hidden tools, whether Intervals.icu answers, and the athlete's custom field and stream counts. The API key is never shown."""
+    status = await server_status()
     if output_format.strip().lower() == "json":
         return json.dumps(status, ensure_ascii=False)
     return format_status(status)
@@ -281,41 +276,100 @@ def workout_planning_validation(start_date: str = "") -> str:
     return (
         f"Plan structured workouts for {day}. Gather get_sport_settings (thresholds and zones), "
         "get_recovery_snapshot(detail_level='compact'), get_training_summary for the last 4 weeks and get_events for "
-        "the week. Draft each workout as a workout document, run validate_workout(workout_doc, workout_type, name, "
+        "the week. Read the workout format (resource intervals://workout-syntax or get_guide(topic='workout-syntax')), "
+        "draft each workout as a workout document, run validate_workout(workout_doc, workout_type, name, "
         "start_date) and show the preview and the validation result to the athlete. Write to the calendar with "
         "add_or_update_event only after explicit confirmation." + _NO_DIAGNOSIS
     )
 
 
-# ------------------------------------------------------------------ resources
-@mcp.resource("intervals://guide")
-def usage_guide() -> str:
-    """How to use this server: tool groups, recommended call order and conventions."""
+@mcp.prompt()
+def race_week(race_date: str = "", race_name: str = "") -> str:
+    """Race-week check: taper and form on race day, remaining sessions, fueling plan from history, weather, logistics."""
+    race = race_name or "the race"
+    if race_date:
+        calendar = (
+            f"1) Calendar: check with get_events(categories='RACE_A,RACE_B,RACE_C') that {race} is on {race_date} "
+            "(the date must be YYYY-MM-DD; ask if it is unclear) and list the remaining workouts until then. "
+        )
+        target = f"target_date='{race_date}'"
+    else:
+        calendar = (
+            "1) Race date: none was given. List the races of the coming weeks with get_events(categories="
+            "'RACE_A,RACE_B,RACE_C') and ask the athlete which race and date is meant before going on; do not assume "
+            "the next A race. Then list the remaining workouts until the race. "
+        )
+        target = "target_date='<the confirmed race date, YYYY-MM-DD>'"
     return (
-        "Futureweb Intervals MCP usage guide\n"
-        "1. Start with get_server_status to see enabled tool classes and custom item counts. For a weekly analysis the "
-        "recommended first call is get_coach_context (load, intensity, recovery, durability, plan and method in about 2k "
-        "characters); go to the detail tools below only where needed.\n"
-        "2. One activity: get_activity_report (compact, 3-4 API calls) then get_activity_details, "
-        "get_activity_intervals(detail_level='compact'), get_best_efforts, compare_power_streams, analyze_climbs as needed.\n"
-        "3. Streams: list_activity_streams first, then get_activity_streams with output_format='full', slicing and downsample.\n"
-        "4. Recovery: get_recovery_snapshot, get_wellness_trends, get_nutrition_summary.\n"
-        "5. Periods: get_training_summary (week/month/sport/gear), get_weekly_summary, get_plan_compliance, "
-        "compare_workouts, get_power_hr_efficiency, get_fatigue_resistance, curves.\n"
-        "5a. Load and intensity: get_coach_context first (compact weekly overview) then get_training_load (ACWR, monotony, "
-        "strain, deload weeks), get_intensity_distribution (three zones, polarization index, hard days), get_durability "
-        "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts; with scenario a "
-        "what-if plan that is not written to the calendar, target_date/target_form for the form on race day).\n"
-        "6. Planning: get_sport_settings / get_training_zones, get_training_plan, get_workout_library, "
-        "validate_workout, then (if the write class is enabled) add_or_update_event.\n"
-        "Conventions: times are local (timezone name when stored, else the UTC offset) and UTC; run/walk/hike "
-        "cadence in steps per minute (spm = 2 x the stored per-leg value, shown as stored), bike cadence in rpm; "
-        "temperatures in °C; 'no value' = null/NaN; a 0 in a device-file field may "
-        "mean the source field was absent; Intervals.icu load is never mixed with device loads; custom fields come "
-        "from the athlete's own definitions; most tools accept output_format='json' and detail_level.\n"
+        f"Act as an endurance coach preparing race week for {race}. " + calendar
+        + f"2) Taper and form: get_load_projection({target}, detail_level='compact') for CTL, ATL and form at the "
+        "start of race day (on race day itself target_date is today); add target_form (e.g. '5,15' or '5%,20%') only "
+        "if the athlete names a target range, to see how the load of the last taper_days days would have to change. "
+        "Nothing is written. "
+        "3) Recovery: get_recovery_snapshot(detail_level='compact'); today's wellness may still be incomplete. "
+        "4) Fueling plan: get_fueling_analysis in period mode (start_date about 180 days back, sport_types of the "
+        "race) for the carbohydrate, fluid and sodium intake per hour the athlete has actually used on long "
+        "sessions, with sample sizes; base the plan per hour on that history and say where data is missing. "
+        "5) Weather: this server has no forecast; ask the athlete for it or use one they provide. A previous "
+        "edition or the same course (get_activity_report(activity_id, include_route_history=true)) shows past "
+        "conditions and pacing. "
+        "6) Logistics checklist: bike/shoes and their maintenance reminders (get_gear_list, then get_gear_details), "
+        "food and bottles, start time and warm-up, travel, sleep, documents. "
+        "Answer with form on race day, which remaining sessions to keep or shorten, the fueling plan per hour and "
+        "the checklist. Calendar changes only after the athlete asks: validate_workout, then add_or_update_event."
+        + _NO_DIAGNOSIS
     )
 
 
+@mcp.prompt()
+def fueling_review(activity_id: str = "", weeks: int = 12) -> str:
+    """Fueling review of one activity or of the long sessions of the last weeks (carbs, fluid, sodium per hour)."""
+    scope = (
+        f"activity {activity_id}: get_fueling_analysis(activity_id='{activity_id}', detail_level='full')"
+        if activity_id
+        else f"the last {weeks} weeks: get_fueling_analysis with start_date {weeks} weeks back (period mode)"
+    )
+    return (
+        f"Review the fueling of {scope}. Report carbohydrates used (Intervals.icu estimate) and ingested in g and "
+        "g/h, the ingested share, fluid, sodium and sweat loss per hour where custom fields exist, grouped by sport, "
+        "duration and intensity with sample sizes. Sessions without logged intake are missing data, not 0. Used "
+        "versus ingested is no 1:1 energy deficit (body stores contribute). Compare with targets only when the "
+        "athlete states them; give at most two concrete changes for the next long session." + _NO_DIAGNOSIS
+    )
+
+
+@mcp.prompt()
+def plan_health_check(weeks: int = 4) -> str:
+    """Check the planned weeks: load ramp, monotony, rest days, form, races and plan consistency (what-if, nothing written)."""
+    return (
+        f"Check the training plan of the next {weeks} weeks as an endurance coach. Call get_coach_context("
+        "detail_level='compact') for the current state, then get_load_projection(detail_level='standard', end_date "
+        f"{weeks} weeks ahead): weekly load and sessions, ramp, monotony, rest days, lowest form, the model check and "
+        "the weeks outside the cited ranges, planned workouts without a load. get_training_plan shows phases, weekly "
+        "targets and races; get_events the single workouts. For an alternative, simulate it with "
+        "get_load_projection(scenario=...) (sessions or weekly blocks; never written to the calendar) and compare "
+        "with the calendar plan. Report the problems with their numbers and at most two changes; write only after "
+        "the athlete asks (validate_workout, then add_or_update_event)." + _NO_DIAGNOSIS
+    )
+
+
+@mcp.prompt()
+def coach_handoff(end_date: str = "") -> str:
+    """Compact summary for handing the athlete over to another coach or a new session."""
+    day = f"end_date='{end_date}'" if end_date else "today"
+    return (
+        f"Write a compact handover summary (at most about 300 words) for another coach or a new chat session, as of {day}. "
+        "Use get_coach_context(detail_level='compact'), get_sport_settings (thresholds per sport), "
+        "get_activities(detail_level='compact', limit=10) for the recent key sessions, "
+        "get_recovery_snapshot(detail_level='compact') and get_events for the next 14 days (planned workouts and "
+        "races; get_training_plan for phases). Structure: athlete and sports with thresholds; current load, fitness "
+        "and form; key sessions of the last two weeks with their activity ids; recovery markers against baselines "
+        "with missing values named; upcoming races and the plan; open questions and agreements. Facts with dates and "
+        "ids only, so the next coach can look them up." + _NO_DIAGNOSIS
+    )
+
+
+# ------------------------------------------------------------------ resources
 @mcp.resource("intervals://custom-items")
 async def custom_items_resource() -> str:
     """The athlete's custom item definitions (codes, names, units, types) as compact JSON."""

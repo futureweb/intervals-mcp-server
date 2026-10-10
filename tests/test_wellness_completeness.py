@@ -398,3 +398,37 @@ def test_coach_context_check_respects_errors_and_the_request_budget(monkeypatch)
     assert len(sent) == 3
     assert "Today 2026-10-10: completeness not checked (Error fetching wellness data: Not sent: this tool call reached its limit of 3" in limited
     assert "Note: this tool call reached its limit of 3 Intervals.icu API requests" in limited
+
+
+def test_daily_metrics_are_their_own_group(monkeypatch):
+    """Device values computed once a day (endurance/hill score, fitness age, race predictions, acute
+    load, VO2max, daily goals) are daily metrics, not night/morning values, listed between those and
+    the day totals."""
+    _now(monkeypatch)
+    daily = {
+        "GarminEnduranceScore": "Garmin Endurance Score", "GarminHillScore": "Garmin Hill Score",
+        "GarminHillStrength": "Garmin Hill Strength", "GarminHillEndurance": "Garmin Hill Endurance",
+        "GarminFitnessAge": "Garmin Fitness Age", "GarminPredicted5KSeconds": "Garmin Predicted 5K",
+        "GarminPredictedMarathonSeconds": "Garmin Predicted Marathon", "GarminAcuteLoad": "Garmin Acute Training Load",
+        "GarminVO2MaxCycling": "Garmin Cycling VO2max", "GarminStepsGoal": "Garmin Daily Steps Goal",
+    }
+    entries = completeness_wellness()
+    for entry in entries[:-1]:
+        entry.update(dict.fromkeys(daily, 50), vo2max=52)
+    defs = {**DEFS, **{code: {"name": name} for code, name in daily.items()}}
+    info = today_completeness(entries, TODAY, defs)
+    groups = {item["field"]: item["group"] for item in info["missing_usual_fields"]}
+    assert all(groups[code] == "daily_metric" for code in [*daily, "vo2max"])
+    assert groups["avgSleepingHR"] == "night_morning" and groups["GarminSkinTempDeviationC"] == "night_morning"
+    assert groups["GarminTotalCalories"] == "day_total"
+    order = [item["group"] for item in info["missing_usual_fields"]]
+    assert order == sorted(order, key=["night_morning", "daily_metric", "day_total"].index)
+    lines = completeness_line(info).split("\n")
+    assert len(lines) == 3 and lines[0].startswith("Today 2026-10-10 is incomplete") and "night/morning values" in lines[0]
+    assert lines[1].startswith("Daily metrics not yet available (device estimates computed once a day): VO2max, Garmin")
+    assert "Garmin Endurance Score" in lines[1] and "Garmin Endurance Score" not in lines[0]
+    assert lines[2].startswith("Day totals not yet available")
+    # Only daily metrics missing: one line with the hint.
+    only = {**info, "missing_usual_fields": [i for i in info["missing_usual_fields"] if i["group"] == "daily_metric"]}
+    assert completeness_line(only).startswith("Today 2026-10-10 is incomplete (last updated 09:46 local): daily metrics")
+    assert completeness_line(only).count("\n") == 0

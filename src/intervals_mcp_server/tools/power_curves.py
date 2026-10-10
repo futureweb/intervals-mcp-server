@@ -6,11 +6,14 @@ This module contains tools for retrieving athlete power curve data.
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.formatting import format_power_curves
+from intervals_mcp_server.utils.params import AthleteId, Environment
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -127,33 +130,26 @@ def _extract_curve_data(
 
 @tool("read")
 async def get_athlete_power_curves(
-    activity_type: str = "Ride",
-    durations: list[int] | None = None,
-    indoor_outdoor: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    this_season: bool = True,
-    last_season: bool = True,
-    include_normalised: bool = True,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
+    activity_type: Annotated[str, Field(description="Activity type of the curves, e.g. Ride, VirtualRide, Run")] = "Ride",
+    durations: Annotated[
+        list[int] | None,
+        Field(description="Durations in seconds as a JSON array of integers, e.g. [5, 60, 300, 1200]; default 5 s to 60 min"),
+    ] = None,
+    indoor_outdoor: Annotated[Environment, Field(description="Only indoor or outdoor activities; omit for both")] = None,
+    start_date: Annotated[str | None, Field(description="First day YYYY-MM-DD of an extra custom-range curve; needs end_date")] = None,
+    end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD of the custom-range curve, after start_date")] = None,
+    this_season: Annotated[bool, Field(description="Include this season's curve (s0)")] = True,
+    last_season: Annotated[bool, Field(description="Include last season's curve (s1)")] = True,
+    include_normalised: Annotated[bool, Field(description="Include W/kg values")] = True,
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Get power curves for an athlete from Intervals.icu.
+    """Use for an athlete's best power per duration over whole periods: season bests, progress between seasons or date ranges.
 
-    Returns best power output for selected durations across specified time periods.
-    Uses FFT power computation. Power values are in watts.
-
-    Args:
-        activity_type: Activity type (e.g. "Ride", "Run", "VirtualRide"). Default is "Ride".
-        durations: Durations in seconds to include. Default is [5, 15, 30, 60, 120, 300, 600, 1200, 3600]
-        indoor_outdoor: Filter by location — "indoor" or "outdoor". Omit for no filtering.
-        start_date: Start date (YYYY-MM-DD) for custom date range curve. Must be used with end_date.
-        end_date: End date (YYYY-MM-DD) for custom date range curve. Must be used with start_date.
-        this_season: Include this season's curve (default True)
-        last_season: Include last season's curve (default True)
-        include_normalised: Include weight-normalised W/kg values (default True)
-        athlete_id: Intervals.icu athlete ID (optional, uses ATHLETE_ID from .env if not provided)
-        api_key: Optional API key override. Uses API_KEY from .env if not provided.
+    Returns watts and W/kg per duration for this season, last season and/or a custom range,
+    each with the activity that set it. Defaults: Ride, 5 s to 60 min, both seasons;
+    durations that are not curve points are left out. Read-only, one API call. One activity:
+    get_best_efforts; HR and pace: get_hr_curves, get_pace_curves. Method:
+    intervals://methods/comparisons (get_guide).
     """
     if durations is None:
         durations = list(DEFAULT_DURATIONS)
@@ -186,7 +182,6 @@ async def get_athlete_power_curves(
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id_to_use)}/power-curves",
         params=params,
-        api_key=api_key,
     )
 
     if isinstance(result, dict) and "error" in result:

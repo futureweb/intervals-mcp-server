@@ -11,6 +11,8 @@ from typing import List, Dict, Optional, Any, Union
 from enum import Enum, StrEnum
 import json
 
+from pydantic.json_schema import SkipJsonSchema
+
 
 __all__ = [
     "Option",
@@ -36,7 +38,7 @@ class Option(Enum):
 
 
 class WorkoutTarget(Enum):
-    """Enumeration of workout target types."""
+    """Which target the device follows: AUTO, POWER, HR or PACE."""
 
     AUTO = "AUTO"
     POWER = "POWER"
@@ -45,7 +47,7 @@ class WorkoutTarget(Enum):
 
 
 class HrTarget(Enum):
-    """Enumeration of heart rate target averaging methods."""
+    """Heart rate target averaging."""
 
     LAP = "lap"
     INSTANT = "1s"
@@ -55,7 +57,7 @@ class HrTarget(Enum):
 
 
 class Intensity(Enum):
-    """Enumeration of workout step intensity types."""
+    """Step type (optional; warmup/cooldown flags are the usual way)."""
 
     ACTIVE = "active"
     REST = "rest"
@@ -67,7 +69,7 @@ class Intensity(Enum):
 
 
 class PaceUnits(Enum):
-    """Enumeration of pace unit types for swimming and running."""
+    """Pace units of the workout."""
 
     SECS_100M = "SECS_100M"
     SECS_100Y = "SECS_100Y"
@@ -77,7 +79,7 @@ class PaceUnits(Enum):
 
 
 class ValueUnits(Enum):
-    """Enumeration of value unit types for workout steps (power, heart rate, pace, cadence)."""
+    """Target units. power: %ftp, w, power_zone, %mmp; hr: %hr, %lthr, hr_zone; pace: %pace, pace_zone, MINS_KM, MINS_MILE, SECS_100M, SECS_100Y, SECS_500M; cadence: rpm."""
 
     PERCENT_MMP = "%mmp"
     PERCENT_HR = "%hr"
@@ -125,17 +127,13 @@ def float_to_str(value: float) -> str:
 
 @dataclass
 class Value:
-    """Represents a value with units for workout step intensity (power, heart rate, pace, cadence).
-
-    Can represent a single value, a range (start-end), or a ramp. Supports various unit types
-    including percentages, zones, and absolute values.
-    """
+    """A step target: value, or start and end (a range; a ramp with ramp=true on the step), with units. MINS_KM/MINS_MILE: seconds (335 = 5:35/km) or decimal minutes (5.583; 5.35 would be 5:21, not 5:35); SECS_100M/SECS_100Y/SECS_500M: seconds."""
 
     value: Optional[float] = None
     start: Optional[float] = None
     end: Optional[float] = None
     units: Optional[ValueUnits] = None
-    target: Optional[HrTarget] = None
+    target: SkipJsonSchema[Optional[HrTarget]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert Value instance to dictionary for JSON serialization."""
@@ -239,22 +237,17 @@ class Value:
 
 @dataclass
 class Step:  # pylint: disable=too-many-instance-attributes
-    """Represents a single step in a workout.
-
-    A step can be a warmup, cooldown, interval, or repeat block. It can specify
-    duration, distance, intensity targets (power, heart rate, pace, cadence), and
-    contain nested steps for repeats.
-    """
+    """One workout step: duration (s) or distance (m) with a target (power, hr, pace or cadence), or reps with nested steps. See intervals://workout-syntax."""
 
     text: Optional[str] = None
-    text_locale: Optional[Dict[str, str]] = None
+    text_locale: SkipJsonSchema[Optional[Dict[str, str]]] = None
     duration: Optional[int] = None
     distance: Optional[float] = None
-    until_lap_press: Optional[bool] = None
+    until_lap_press: SkipJsonSchema[Optional[bool]] = None  # open-ended steps cannot be written
     reps: Optional[int] = None
     warmup: Optional[bool] = None
     cooldown: Optional[bool] = None
-    intensity: Optional[Intensity] = None
+    intensity: SkipJsonSchema[Optional[Intensity]] = None
     steps: Optional[List["Step"]] = None
     ramp: Optional[bool] = None
     freeride: Optional[bool] = None
@@ -263,12 +256,12 @@ class Step:  # pylint: disable=too-many-instance-attributes
     hr: Optional[Value] = None
     pace: Optional[Value] = None
     cadence: Optional[Value] = None
-    hidepower: Optional[bool] = None
+    hidepower: SkipJsonSchema[Optional[bool]] = None
     # these are filled in with actual watts, bpm etc. when resolve=true parameter is supplied to the endpoint
-    _power: Optional[Value] = None
-    _hr: Optional[Value] = None
-    _pace: Optional[Value] = None
-    _distance: Optional[float] = None
+    _power: SkipJsonSchema[Optional[Value]] = None
+    _hr: SkipJsonSchema[Optional[Value]] = None
+    _pace: SkipJsonSchema[Optional[Value]] = None
+    _distance: SkipJsonSchema[Optional[float]] = None
 
     def to_dict(self) -> Dict[str, Any]:  # pylint: disable=too-many-branches
         """Convert Step instance to dictionary for JSON serialization.
@@ -505,31 +498,28 @@ class SportSettings:
 
 @dataclass
 class WorkoutDoc:  # pylint: disable=too-many-instance-attributes
-    """Represents a complete workout document with description, steps, and settings.
+    """Structured workout: steps (required for a structured workout) and an optional description. See intervals://workout-syntax."""
 
-    This is the main structure used to define workouts for the Intervals.icu API,
-    containing workout metadata, step definitions, and sport-specific settings.
-
-    Many instance attributes are required to match the Intervals.icu API schema exactly.
-    """
+    # The fields hidden from the JSON schema are filled by Intervals.icu (thresholds, zone times,
+    # locales); they are accepted and passed on unchanged.
 
     description: Optional[str] = None
-    description_locale: Optional[Dict[str, str]] = None
+    description_locale: SkipJsonSchema[Optional[Dict[str, str]]] = None
     duration: Optional[int] = None
     distance: Optional[float] = None
-    ftp: Optional[int] = None
-    lthr: Optional[int] = None
-    threshold_pace: Optional[float] = None  # meters/sec
-    pace_units: Optional[PaceUnits] = None
-    sport_settings: Optional[SportSettings] = None
-    category: Optional[str] = None
+    ftp: SkipJsonSchema[Optional[int]] = None
+    lthr: SkipJsonSchema[Optional[int]] = None
+    threshold_pace: SkipJsonSchema[Optional[float]] = None  # meters/sec
+    pace_units: SkipJsonSchema[Optional[PaceUnits]] = None
+    sport_settings: SkipJsonSchema[Optional[SportSettings]] = None
+    category: SkipJsonSchema[Optional[str]] = None
     target: Optional[WorkoutTarget] = None
     steps: Optional[List[Step]] = None
-    zone_times: Optional[List[Union[int, Any]]] = (
+    zone_times: SkipJsonSchema[Optional[List[Union[int, Any]]]] = (
         None  # sometimes array of ints otherwise array of objects
     )
-    options: Optional[Dict[str, str]] = None
-    locales: Optional[List[str]] = None
+    options: SkipJsonSchema[Optional[Dict[str, str]]] = None
+    locales: SkipJsonSchema[Optional[List[str]]] = None
 
     def to_dict(self) -> Dict[str, Any]:  # pylint: disable=too-many-branches
         """Convert WorkoutDoc instance to dictionary for JSON serialization.

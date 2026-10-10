@@ -5,11 +5,14 @@ the calendar day for existing events to avoid duplicates.
 """
 
 import json
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.formatting import event_type_label
+from intervals_mcp_server.utils.params import AthleteId, OutputFormat
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 from intervals_mcp_server.utils.workout_validation import format_validation, validate_workout_doc
@@ -22,22 +25,14 @@ config = get_config()
 
 @tool("read")
 async def preview_workout(
-    workout_doc: dict[str, Any],
-    workout_type: str = "Ride",
-    moving_time: int | None = None,
-    output_format: str = "text",
+    workout_doc: Annotated[dict[str, Any], Field(description="Workout document with steps, as for add_or_update_event. Format: intervals://workout-syntax")],
+    workout_type: Annotated[str, Field(description="Sport of the workout, e.g. Ride, GravelRide, Run")] = "Ride",
+    moving_time: Annotated[int | None, Field(description="Expected moving time in seconds, compared with the step sum")] = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Render a workout document as Intervals.icu workout text and report its totals (no API call)
+    """Use to show the athlete how a drafted workout will look before writing it: renders the workout document as Intervals.icu workout text with its totals (no API call, nothing written).
 
-    Expands repeat blocks, sums the planned duration and distance, counts steps with
-    targets and open-ended (lap-press / free-ride) steps, and shows the workout text that
-    add_or_update_event would send. Use validate_workout for the full check list.
-
-    Args:
-        workout_doc: Structured workout with "steps" (same format as add_or_update_event)
-        workout_type: Activity type the workout is for, e.g. Ride, GravelRide, Run (default Ride)
-        moving_time: Expected moving time in seconds to compare against the step sum (optional)
-        output_format: "text" (default) or "json"
+    Expands repeats, sums planned duration and distance, counts steps with targets and open-ended steps, and shows the text add_or_update_event would send. Full check list: validate_workout.
     """
     result = validate_workout_doc(workout_doc, workout_type, moving_time)
     if output_format.strip().lower() == "json":
@@ -47,36 +42,18 @@ async def preview_workout(
 
 @tool("read")
 async def validate_workout(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-nested-blocks
-    workout_doc: dict[str, Any],
-    workout_type: str,
-    name: str | None = None,
-    start_date: str | None = None,
-    moving_time: int | None = None,
-    check_calendar: bool = True,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    workout_doc: Annotated[dict[str, Any], Field(description="Workout document with steps, as for add_or_update_event. Format: intervals://workout-syntax")],
+    workout_type: Annotated[str, Field(description="Sport of the workout, e.g. Ride, GravelRide, Run, Swim")],
+    name: Annotated[str | None, Field(description="Planned event name, for the duplicate check")] = None,
+    start_date: Annotated[str | None, Field(description="Planned day YYYY-MM-DD, for the calendar check")] = None,
+    moving_time: Annotated[int | None, Field(description="Expected moving time in seconds, compared with the step sum")] = None,
+    check_calendar: Annotated[bool, Field(description="Look up the events already on start_date")] = True,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Validate a workout document before writing it to the calendar (read-only)
+    """Use before every workout write (add_or_update_event, add_events_bulk, create_library_workout) to check a drafted workout document; read-only, nothing is written.
 
-    Checks: every step has a duration or distance (open-ended steps are flagged), repeat
-    blocks have a positive count and nested steps, targets use supported units with
-    plausible values, ramps have start/end ranges, pace targets on rides and power targets
-    on runs are flagged, warm-up and cool-down presence, the step sum versus moving_time,
-    and the activity type. With start_date and check_calendar the events already on that
-    day are listed and a same-name event is flagged as a possible duplicate. Nothing is
-    written.
-
-    Args:
-        workout_doc: Structured workout with "steps" (same format as add_or_update_event)
-        workout_type: Activity type, e.g. Ride, GravelRide, Run, Swim
-        name: Planned event name, used for the duplicate check (optional)
-        start_date: Planned date YYYY-MM-DD, used for the calendar check (optional)
-        moving_time: Expected moving time in seconds to compare against the step sum (optional)
-        check_calendar: Look up existing events on start_date (optional, default True)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Checks durations or distances per step, repeat blocks, target units per sport and plausible values, ramps and ranges, warm-up and cool-down, the step sum against moving_time and the sport; with start_date it lists the events already on that day and flags a same-name event as a possible duplicate. Format: intervals://workout-syntax (get_guide). Show the result to the athlete before writing.
     """
     result = validate_workout_doc(workout_doc, workout_type, moving_time)
     calendar: list[dict[str, Any]] = []
@@ -94,7 +71,7 @@ async def validate_workout(  # pylint: disable=too-many-arguments,too-many-posit
                     calendar_note = error_msg
                 else:
                     events = await make_intervals_request(
-                        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key,
+                        url=f"/athlete/{seg(athlete_id_to_use)}/events",
                         params={"oldest": start_date, "newest": start_date},
                     )
                     if isinstance(events, dict) and "error" in events:

@@ -11,15 +11,18 @@ request with a field selection. The pure logic lives in ``utils.provenance``.
 
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
 
-from intervals_mcp_server.api.client import make_intervals_request
+from pydantic import Field
+
+from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.training_load import filter_types, resolve_period, wanted_types
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, CustomFieldDefs
 from intervals_mcp_server.utils.load_metrics import num, parse_day
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OptionalActivityId, OutputFormat, SportTypes
 from intervals_mcp_server.utils.provenance import (
     AUDIT_LIST_FIELDS,
     BASELINE_DAYS,
@@ -58,11 +61,11 @@ BRIDGE_NOTE = (
 
 
 async def expected_field_codes(
-    athlete_id: str, api_key: str | None, defs: CustomFieldDefs, activity_types: list[str]
+    athlete_id: str, defs: CustomFieldDefs, activity_types: list[str]
 ) -> dict[str, set[str] | None]:
     """Custom activity field codes each sport expects: its own field list, else the union of its family's
     lists (GravelRide follows Ride), else None (nothing assigned anywhere in the family)."""
-    by_type = await field_assignments(athlete_id, api_key, defs, activity_types)
+    by_type = await field_assignments(athlete_id, defs, activity_types)
     out: dict[str, set[str] | None] = {}
     for sport in activity_types:
         codes = by_type.get(sport)
@@ -79,10 +82,10 @@ def _error(result: Any, what: str) -> str | None:
     return None
 
 
-async def _recent(athlete_id: str, api_key: str | None, day: date, extra_codes: set[str]) -> tuple[list[dict[str, Any]], str | None]:
+async def _recent(athlete_id: str, day: date, extra_codes: set[str]) -> tuple[list[dict[str, Any]], str | None]:
     fields = ",".join([AUDIT_LIST_FIELDS, *sorted(extra_codes)])
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": (day - timedelta(days=BASELINE_DAYS)).isoformat(), "newest": day.isoformat(), "fields": fields},
     )
     error = _error(result, "the activity list")
@@ -108,9 +111,9 @@ def _baseline(activity: dict[str, Any], recent: list[dict[str, Any]], codes: set
 
 
 async def _audit_activity(  # pylint: disable=too-many-locals
-    activity_id: str, athlete_id: str | None, api_key: str | None, detail_level: str
+    activity_id: str, athlete_id: str | None, detail_level: str
 ) -> dict[str, Any] | str:
-    result = await make_intervals_request(url=f"/activity/{activity_id}", api_key=api_key, params={"intervals": "true"})
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", params={"intervals": "true"})
     error = _error(result, "the activity")
     if error:
         return error
@@ -123,25 +126,29 @@ async def _audit_activity(  # pylint: disable=too-many-locals
     if is_strava_stub(activity):
         return {**head, "strava_stub": True, "note": STRAVA_STUB_NOTE, "api_calls": calls}
     owner = str(activity.get("icu_athlete_id") or athlete_id or config.athlete_id or "")
-    index = await get_custom_item_index(athlete_id=owner, api_key=api_key) if owner else {}
+    index = await get_custom_item_index(athlete_id=owner) if owner else {}
     field_defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     sport = str(activity.get("type") or "")
-    expected = (await expected_field_codes(owner, api_key, field_defs, [sport])).get(sport) if owner and sport else None
+    expected = (await expected_field_codes(owner, field_defs, [sport])).get(sport) if owner and sport else None
     day = parse_day(activity.get("start_date_local"))
     recent: list[dict[str, Any]] = []
     listing = None
     if owner and day:
-        recent, error = await _recent(owner, api_key, day, set(expected or []))
+        recent, error = await _recent(owner, day, set(expected or []))
         calls += 1
         if error is None:
             listing = listing_status(activity, [a for a in recent if str(a.get("start_date_local") or "")[:10] == day.isoformat()])
     baseline = _baseline(activity, recent, set(expected or field_defs))
     intervals = [i for i in activity.get("icu_intervals") or [] if isinstance(i, dict)] if "icu_intervals" in activity else None
     streams = None
+    streams_error = None
     if detail_level != "compact" and activity.get("stream_types"):
-        streams_result = await make_intervals_request(url=f"/activity/{activity_id}/streams", api_key=api_key)
+        streams_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/streams")
         calls += 1
-        streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
+        # A failed request is an API error, not "no streams": coverage stays unchecked (None).
+        streams_error = _error(streams_result, "the streams")
+        if streams_error is None:
+            streams = [s for s in streams_result if isinstance(s, dict)] if isinstance(streams_result, list) else []
     time_data = next((s.get("data") for s in streams or [] if s.get("type") == "time"), None)
     fields = field_inventory(activity, field_defs, expected, baseline)
     return {
@@ -151,7 +158,7 @@ async def _audit_activity(  # pylint: disable=too-many-locals
         "recording": recording_summary(activity, time_data),
         "laps_and_intervals": laps_and_intervals(activity, intervals),
         "sensors": sensor_summary(activity),
-        "streams": stream_inventory(activity, stream_defs, streams, baseline),
+        "streams": {**stream_inventory(activity, stream_defs, streams, baseline), "error": streams_error},
         "fields": fields,
         "baseline": {k: v for k, v in (baseline or {}).items() if k != "ids"} or None,
         "context_data": {
@@ -183,6 +190,8 @@ def _stream_text(info: dict[str, Any], baseline: dict[str, Any] | None, detail_l
         elif info["coverage"]:
             lines.append(f"  coverage: every returned stream has a value in every sample ({len(info['coverage'])} streams)")
     lines.extend(f"  - {issue}" for issue in info["issues"])
+    if info.get("error"):
+        lines.append(f"  - {info['error']}; stream coverage not checked")
     return lines
 
 
@@ -256,16 +265,16 @@ def _activity_text(audit: dict[str, Any], detail_level: str) -> str:  # pylint: 
 
 
 async def _coverage(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    athlete_id: str, api_key: str | None, start_date: str | None, end_date: str | None, sport_types: str | None, detail_level: str,
+    athlete_id: str, start_date: str | None, end_date: str | None, sport_types: str | None, detail_level: str,
 ) -> dict[str, Any] | str:
     period = resolve_period(start_date, end_date, DEFAULT_PERIOD_DAYS, MAX_PERIOD_DAYS)
     if isinstance(period, str):
         return period
     start, end = period
-    index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)
+    index = await get_custom_item_index(athlete_id=athlete_id)
     field_defs, stream_defs = index.get(ACTIVITY_FIELD, {}), index.get(ACTIVITY_STREAM, {})
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": ",".join([AUDIT_LIST_FIELDS, *sorted(field_defs)])},
     )
     error = _error(result, "activities")
@@ -273,7 +282,7 @@ async def _coverage(  # pylint: disable=too-many-arguments,too-many-positional-a
         return error
     activities = filter_types([a for a in result if isinstance(a, dict)] if isinstance(result, list) else [], wanted_types(sport_types))
     types = sorted({str(a.get("type") or "unknown") for a in activities})
-    expected = await expected_field_codes(athlete_id, api_key, field_defs, types)
+    expected = await expected_field_codes(athlete_id, field_defs, types)
     summary = coverage_summary(activities, field_defs, expected, stream_defs)
     if detail_level == "compact":
         for entry in summary.values():
@@ -315,36 +324,34 @@ def _coverage_text(payload: dict[str, Any], detail_level: str) -> str:
 
 @tool("read")
 async def get_activity_data_audit(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
-    activity_id: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    activity_id: Annotated[OptionalActivityId, Field(
+        description="Activity to audit, e.g. i123456789; omit for the coverage of a period"
+    )] = None,
+    start_date: Annotated[str | None, Field(
+        description="Period: first day YYYY-MM-DD; default 27 days before end_date; max 366 days"
+    )] = None,
+    end_date: Annotated[EndDate, Field(description="Period: last day YYYY-MM-DD; default today")] = None,
+    sport_types: SportTypes = None,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = no stream download, shorter lists; full = every stream, gap and field"
+    )] = "standard",
 ) -> str:
-    """Data audit of one activity or data coverage of a period (read-only)
+    """Use to check where an activity's data came from and what is missing, or without activity_id how complete the data of a period is.
 
-    With activity_id: source (Garmin sync, upload, Strava stub), upload/analysis times, filtered
-    duplicates, recording stops, FIT laps vs intervals and edits, sensor identity, streams vs
-    those usual for the sport with coverage, custom fields with value / zero placeholder / none,
-    fields the Garmin Intervals Bridge could fill. Without activity_id: per sport how many
-    activities have power, HR, GPS, weather, custom streams and fields. Facts, no verdict.
-
-    Args:
-        activity_id: Activity; omit for the period coverage
-        start_date: YYYY-MM-DD (default end_date - 27 days)
-        end_date: YYYY-MM-DD (default today)
-        sport_types: e.g. "Ride,GravelRide"
-        output_format: "text" or "json"
-        detail_level: "compact" (no streams), "standard" or "full"
+    One activity: source (sync, upload, Strava stub), upload and analysis times, filtered
+    duplicates, recording stops, FIT laps vs intervals and edits, sensors, streams vs those usual
+    for the sport with coverage, custom fields with value / zero placeholder / none, fields the
+    Garmin Intervals Bridge could fill. Period (default 28 days to end_date): per sport how many
+    activities have power, HR, GPS, weather, custom streams and fields. Facts and counts, no
+    verdict; read-only, 1-3 API requests. Method: intervals://methods/activity-data (get_guide).
     """
     if detail_level not in DETAIL_LEVELS:
         return f"Error: detail_level must be one of {', '.join(DETAIL_LEVELS)}."
     as_json = output_format.strip().lower() == "json"
     if activity_id:
-        audit = await _audit_activity(activity_id, athlete_id, api_key, detail_level)
+        audit = await _audit_activity(activity_id, athlete_id, detail_level)
         if isinstance(audit, str):
             return audit
         if as_json:
@@ -353,7 +360,7 @@ async def get_activity_data_audit(  # pylint: disable=too-many-arguments,too-man
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
-    payload = await _coverage(athlete_id_to_use, api_key, start_date, end_date, sport_types, detail_level)
+    payload = await _coverage(athlete_id_to_use, start_date, end_date, sport_types, detail_level)
     if isinstance(payload, str):
         return payload
     if as_json:

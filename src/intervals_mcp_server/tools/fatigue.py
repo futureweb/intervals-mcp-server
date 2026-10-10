@@ -10,8 +10,11 @@ judged. Methods: ``utils.fatigue_profile`` and ``utils.submax``.
 # pylint: disable=too-many-lines
 
 import json
-from typing import Any
+from typing import Annotated, Any, Literal
 
+from pydantic import BeforeValidator, Field
+
+from intervals_mcp_server.api.client import seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
@@ -35,6 +38,7 @@ from intervals_mcp_server.utils.fatigue_profile import (
     ride_profile,
     stamina_codes,
 )
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OutputFormat, SportTypes, StartDate, lower_choice
 from intervals_mcp_server.utils.sports import hms, is_indoor
 from intervals_mcp_server.utils.submax import REASONS, context_checks, normalise_test, trends, validity
 from intervals_mcp_server.utils.validation import resolve_athlete_id
@@ -102,7 +106,7 @@ async def _ride_list(  # pylint: disable=too-many-arguments,too-many-positional-
     """Activities by id (already de-duplicated and capped) or of the date range (filtered by sport, newest first)."""
     if activity_ids:
         return await _activities_by_ids(api, activity_ids)
-    result = await api.get(f"/athlete/{athlete_id}/activities", {"oldest": span[0], "newest": span[1], "fields": fields})
+    result = await api.get(f"/athlete/{seg(athlete_id)}/activities", {"oldest": span[0], "newest": span[1], "fields": fields})
     error = _error(result, "activities")
     if error:
         return [], error
@@ -271,9 +275,9 @@ def _heterogeneity(rides: list[dict[str, Any]]) -> list[str]:
     return notes
 
 
-async def _stamina_names(athlete_id: str, api_key: str | None) -> dict[str, str]:
+async def _stamina_names(athlete_id: str) -> dict[str, str]:
     try:
-        index = await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)
+        index = await get_custom_item_index(athlete_id=athlete_id)
     except Exception:  # pylint: disable=broad-exception-caught  # names only help to recognise streams
         return {}
     return {str(code): str(item.get("name") or "") for code, item in (index.get(ACTIVITY_STREAM) or {}).items()}
@@ -281,50 +285,43 @@ async def _stamina_names(athlete_id: str, api_key: str | None) -> dict[str, str]
 
 @tool("read")
 async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
-    activity_ids: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str = "Ride,GravelRide",
-    power_bands: str | None = None,
-    work_thresholds: str = "750,1500",
-    threshold_unit: str = "kj",
-    min_segment_secs: int = 120,
-    climb_after_hours: float = 2.0,
-    min_climb_gain_m: float = 100.0,
-    limit: int = 6,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    athlete_id: str | None = None,
-    api_key: str | None = None,
+    activity_ids: Annotated[
+        str | None, Field(description="Comma-separated activity ids (capped to limit); default the long rides of the period")
+    ] = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 180 days before end_date")] = None,
+    end_date: EndDate = None,
+    sport_types: Annotated[str, Field(description="Comma-separated activity types of the period search")] = "Ride,GravelRide",
+    power_bands: Annotated[
+        str | None,
+        Field(description='Comma-separated non-overlapping bands in W as "low-high", e.g. "180-200"; default 75-85 % FTP'),
+    ] = None,
+    work_thresholds: Annotated[str, Field(description='1-3 comma-separated positive values in threshold_unit, e.g. "750,1500"')] = "750,1500",
+    threshold_unit: Annotated[
+        Literal["kj", "kj_per_kg"],
+        BeforeValidator(lower_choice),
+        Field(description="kj = absolute work; kj_per_kg = kJ per kg body mass"),
+    ] = "kj",
+    min_segment_secs: Annotated[int, Field(description="Minimum steady segment length in seconds, >= 90")] = 120,
+    climb_after_hours: Annotated[float, Field(description="Climbs starting after this many hours are marked late, >= 0")] = 2.0,
+    min_climb_gain_m: Annotated[float, Field(description="Minimum climb elevation gain in metres, > 0")] = 100.0,
+    limit: Annotated[int, Field(description="Rides analysed, newest first; capped to 1-12")] = 6,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[
+        DetailLevel,
+        Field(description="compact = ride totals, changes, climb count; standard adds thresholds, phases, climbs, method; full adds every segment"),
+    ] = "standard",
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Long-ride fatigue profile: HR, W/bpm, cadence and stamina at matched power before vs after work thresholds
+    """Use to see how long rides change at matched power as work accumulates: HR, W/bpm, cadence and Garmin stamina in steady segments of a power band (default 75-85 % FTP) before vs after work thresholds.
 
-    For given rides (activity_ids) or the long rides of a period (default 180 days, rides
-    reaching the highest threshold), steady segments in a power band (default 75-85 % FTP)
-    are split into phases by work (default 750 / 1,500 kJ, or kJ per kg body mass) and
-    compared with the phase before the first threshold. Each threshold and climb carries the
-    prior work (kJ, kJ/kg, kJ and time above FTP, efforts above FTP) and Garmin stamina /
-    potential stamina at its start and end. Across rides: median and range of the changes
-    with n, small samples flagged, rides split by prior work above FTP. Method in the output;
-    statistics only, no verdict. API calls: activity list (or one per id) plus one stream
-    request per ride.
-
-    Args:
-        activity_ids: Comma-separated activity IDs (optional; default the long rides of the period)
-        start_date: Start date YYYY-MM-DD (optional, default 180 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Sports of the period search (default "Ride,GravelRide")
-        power_bands: Bands in W as "low-high", e.g. "180-200" (optional, default 75-85 % FTP)
-        work_thresholds: 1-3 work thresholds (default "750,1500")
-        threshold_unit: "kj" (default) or "kj_per_kg"
-        min_segment_secs: Minimum steady segment length in s, >= 90 (default 120)
-        climb_after_hours: Climbs starting after this many hours are marked late (default 2)
-        min_climb_gain_m: Minimum climb gain in m (default 100)
-        limit: Rides of the period, newest first, 1-12 (default 6)
-        output_format: "text" (default) or "json"
-        detail_level: "compact", "standard" (default) or "full" (adds every segment)
-        athlete_id: The Intervals.icu athlete ID (optional, default ATHLETE_ID)
-        api_key: The Intervals.icu API key (optional, default API_KEY)
+    Phases by work (default 750 / 1,500 kJ, or kJ/kg) are compared with the phase before the
+    first threshold. Threshold crossings and climbs carry the prior work (kJ, kJ/kg, kJ and
+    time above FTP, efforts above FTP). Rides from activity_ids or the long rides of a period
+    (default 180 days, reaching the highest threshold; limit 6, max 12). Across rides: median
+    and range of the changes with n, small samples flagged. Statistics only, no verdict.
+    Read-only; one stream call per ride plus 1-4 (one more per id with activity_ids). Fresh vs
+    fatigued power curves: get_fatigue_resistance. Method: intervals://methods/fatigue
+    (get_guide).
     """
     athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -350,13 +347,13 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
     capped = min(max(limit, 1), MAX_PROFILE_RIDES)
     ids, dropped_ids, duplicate_ids = cap_ids(activity_ids, capped)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error = await _ride_list(api, athlete, ids, span, PROFILE_FIELDS, None if ids else sport_types)
     if error:
         return error
     profile_weight: float | None = None
     if any(not _num(a.get("icu_weight")) for a in activities):
-        result = await api.get(f"/athlete/{athlete}")
+        result = await api.get(f"/athlete/{seg(athlete)}")
         profile_weight = _num(result.get("icu_weight")) if isinstance(result, dict) else None
 
     def weight_of(activity: dict[str, Any]) -> tuple[float | None, str]:
@@ -390,8 +387,8 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         band_source = f"default 75-85 % of FTP {_num(selected[0].get('icu_ftp')):g} W of the newest ride"
     else:
         band_source = "given"
-    names = await _stamina_names(athlete, api_key)
-    gear_map = await get_gear_map(athlete_id=athlete, api_key=api_key)
+    names = await _stamina_names(athlete)
+    gear_map = await get_gear_map(athlete_id=athlete)
     unit_label = "kJ/kg" if unit == "kj_per_kg" else "kJ"
     labels = phase_labels(thresholds, unit_label)
     rides: list[dict[str, Any]] = []
@@ -399,7 +396,7 @@ async def get_long_ride_fatigue_profile(  # pylint: disable=too-many-arguments,t
         weight, weight_source = weight_of(activity)
         listed = [{"type": t} for t in activity.get("stream_types") or []]
         codes = stamina_codes(listed, names)
-        result = await api.get(f"/activity/{activity.get('id')}/streams", {"types": ",".join([*CORE_STREAMS, *codes.values()])})
+        result = await api.get(f"/activity/{seg(activity.get('id'))}/streams", {"types": ",".join([*CORE_STREAMS, *codes.values()])})
         streams = [s for s in result if isinstance(s, dict)] if isinstance(result, list) else []
         if not streams:
             skipped.append({"id": activity.get("id"), "reason": _error(result, "streams") or "no streams returned"})
@@ -579,42 +576,31 @@ def _group_lines(group: dict[str, Any], detail_level: str) -> list[str]:
 
 @tool("read")
 async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    tolerance_pct: float | None = None,
-    require_recovery: bool = False,
-    check_context: bool = True,
-    limit: int = 30,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    athlete_id: str | None = None,
-    api_key: str | None = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 180 days before end_date")] = None,
+    end_date: EndDate = None,
+    sport_types: Annotated[SportTypes, Field(description='Comma-separated activity types, e.g. "Ride,Run"; omit for all')] = None,
+    tolerance_pct: Annotated[
+        float | None, Field(description="Allowed deviation of the average from the target in %, 0-50; default the test's own")
+    ] = None,
+    require_recovery: Annotated[bool, Field(description="Exclude tests without an HR recovery (HRRc) part")] = False,
+    check_context: Annotated[bool, Field(description="Check intervals and streams around each power test (2 API calls each)")] = True,
+    limit: Annotated[int, Field(description="Tests, newest first; capped to 1-60")] = 30,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[
+        DetailLevel,
+        Field(description="compact = counts, exclusion reasons, HR/EF/HRRc trends; standard adds each test, stream trends, ISO weeks; full adds context notes"),
+    ] = "standard",
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Submaximal fatigue tests detected by Intervals.icu (#SFT): validity and trend over the weeks
+    """Use to follow the submaximal fatigue tests Intervals.icu detects (#SFT) over the weeks: which are valid benchmarks and how HR responds.
 
-    Lists the tests of the period (default 180 days) with target, average, CV, HR at the end,
-    efficiency factor and HR recovery (HRRc; missing is never 0) and trends the valid ones per
-    sport family and test type (power and pace never pooled) and ISO week: n, change, slope,
-    SD. Valid: average within the tolerance (default the test's own), CV within its limit, not
-    ignored and, with check_context, not part of a longer work interval, not continued after
-    the test and not after hard riding. Detections inside a regular workout are excluded with
-    the reason. HRRc trends use tests with a recovery part (require_recovery excludes the
-    others). Statistics only, no verdict. API calls: sport settings, activity list, plus
-    intervals and streams per test with check_context.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 180 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated sports (optional, default all)
-        tolerance_pct: Allowed deviation from the target in % (optional, default the test's own)
-        require_recovery: Exclude tests without HR recovery (default False)
-        check_context: Check intervals and streams around each power test (default True)
-        limit: Tests, newest first, 1-60 (default 30)
-        output_format: "text" (default) or "json"
-        detail_level: "compact", "standard" (default) or "full"
-        athlete_id: The Intervals.icu athlete ID (optional, default ATHLETE_ID)
-        api_key: The Intervals.icu API key (optional, default API_KEY)
+    Lists the tests of the period (default 180 days; limit 30, max 60) with target, average,
+    CV, end HR, efficiency factor and HR recovery (HRRc; not measured is never 0). Valid: on
+    target, steady, not ignored and (check_context) not inside a longer work interval, not
+    continued, not after hard riding; excluded tests carry the reason. Valid tests are
+    trended per sport family and test type (power and pace never pooled) and ISO week: n,
+    change, slope, SD. Statistics only, no verdict. Read-only; 2 API calls plus 2 per power
+    test with check_context. Method: intervals://methods/fatigue (get_guide).
     """
     athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -628,8 +614,8 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
         return span
     capped = min(max(limit, 1), MAX_SUBMAX_TESTS)
 
-    api = _Api(api_key)
-    settings_result = await api.get(f"/athlete/{athlete}/sport-settings")
+    api = _Api()
+    settings_result = await api.get(f"/athlete/{seg(athlete)}/sport-settings")
     settings = _sft_settings(settings_result) if not _error(settings_result, "sport settings") else {}
     activities, error = await _ride_list(api, athlete, [], span, SUBMAX_FIELDS, sport_types)
     if error:
@@ -639,10 +625,10 @@ async def get_submax_test_trends(  # pylint: disable=too-many-arguments,too-many
     tests = tests[:capped]
     for test in tests:
         if check_context and test["test_type"] == "POWER":
-            intervals_result = await api.get(f"/activity/{test['activity_id']}/intervals")
+            intervals_result = await api.get(f"/activity/{seg(test['activity_id'])}/intervals")
             items = intervals_result.get("icu_intervals") if isinstance(intervals_result, dict) else None
             intervals = [i for i in items or [] if isinstance(i, dict)]
-            stream_result = await api.get(f"/activity/{test['activity_id']}/streams", {"types": "time,watts,heartrate"})
+            stream_result = await api.get(f"/activity/{seg(test['activity_id'])}/streams", {"types": "time,watts,heartrate"})
             streams = {
                 str(s.get("type")): s.get("data") or []
                 for s in (stream_result if isinstance(stream_result, list) else []) if isinstance(s, dict)

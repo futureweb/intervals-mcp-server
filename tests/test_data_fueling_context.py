@@ -380,6 +380,19 @@ def test_get_activity_data_audit_duplicate_and_stub(monkeypatch):
     assert asyncio.run(get_activity_data_audit("i9")) == "Error fetching the activity: boom"
 
 
+def test_get_activity_data_audit_reports_a_failed_streams_request(monkeypatch):
+    """A failed streams request is an API error, never "no streams" (stage 3 follow-up)."""
+    _routes(monkeypatch, **{"/streams": {"error": True, "status_code": 429, "message": "429 Too Many Requests"}})
+    result = asyncio.run(get_activity_data_audit("i50"))
+    assert "- Error fetching the streams: 429 Too Many Requests; stream coverage not checked" in result
+    assert "returned none of the listed streams" not in result and "coverage (valid samples)" not in result
+    payload = json.loads(asyncio.run(get_activity_data_audit("i50", output_format="json")))
+    assert payload["streams"]["error"] == "Error fetching the streams: 429 Too Many Requests"
+    assert payload["streams"]["coverage"] is None and payload["streams"]["issues"] == []
+    _routes(monkeypatch)
+    assert json.loads(asyncio.run(get_activity_data_audit("i50", output_format="json")))["streams"]["error"] is None
+
+
 def test_get_activity_data_audit_period_coverage(monkeypatch):
     """Without an activity: one list request with every custom field code, per type counts."""
     calls = []

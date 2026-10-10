@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="96" fill="#FFFFFF"/>
+  <g transform="translate(0 40)">
+  <g fill="#F57A0A">
+    <!-- three ascending bars with rounded tops and flat bottoms -->
+    <path d="M104 316 v-56 a24 24 0 0 1 24 -24 h60 a24 24 0 0 1 24 24 v56 z"/>
+    <path d="M226 276 v-96 a24 24 0 0 1 24 -24 h60 a24 24 0 0 1 24 24 v96 z"/>
+    <path d="M348 226 v-146 a24 24 0 0 1 24 -24 h60 a24 24 0 0 1 24 24 v146 z"/>
+  </g>
+  <!-- connector: data line stepping up under the bars into two endpoints -->
+  <path d="M76 346 H196 C222 346 218 306 244 306 H318 C344 306 340 256 366 256 H424 C440 256 452 268 452 284 V346"
+        fill="none" stroke="#0B2550" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="76" cy="346" r="38" fill="#0B2550"/>
+  <circle cx="452" cy="346" r="38" fill="#0B2550"/>
+  </g>
+</svg>

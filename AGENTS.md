@@ -15,6 +15,7 @@ This project is a Python 3.12 backend service built with FastMCP and httpx. All 
 - Run static type checks using `uv run --locked mypy src tests`.
 - Pylint (`pylint --disable=C0301 $(git ls-files '*.py')`) is advisory; keep new code free of new messages (targeted `# pylint: disable=` comments are accepted for long tool functions).
 - Every MCP tool is registered with `@tool("<permission class>")` from `intervals_mcp_server.mcp_instance`; tools of disabled classes are not exposed (MCP_PERMISSIONS, default read).
+- The docstring is the tool description: at most 900 characters, first sentence says when to use the tool, no Args section. Every parameter is `Annotated[..., Field(description=...)]` (shared aliases in `utils/params.py`), parameters with fixed values are `Literal` enums; tools never take an API key. Long method explanations go into `guides/methods/<topic>.md` (served as `intervals://methods/<topic>` and by `get_guide`). `tests/test_catalogue.py` checks these rules and the token budget.
 - Tests use synthetic fixtures (see `tests/sample_data.py`); never add real athlete ids, hostnames or keys.
 - All three steps (`ruff`, `mypy`, and `pytest`) should succeed before committing.
 

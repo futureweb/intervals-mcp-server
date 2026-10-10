@@ -16,7 +16,9 @@ import math
 import re
 import statistics
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import BeforeValidator, Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -36,6 +38,19 @@ from intervals_mcp_server.utils.sports import (
 )
 from intervals_mcp_server.utils.streams import find_stream
 from intervals_mcp_server.utils.work_sets import INTENSITY_TOL_PTS, interval_secs, matches_pattern, pattern_of, set_summary, split_work
+from intervals_mcp_server.utils.params import (
+    ActivityId,
+    AthleteId,
+    EndDate,
+    Environment,
+    GearId,
+    OptionalActivityId,
+    OutputFormat,
+    SportTypes,
+    StartDate,
+    lower_choice,
+    upper_choice,
+)
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 
 # Import mcp instance from shared module for tool registration
@@ -93,8 +108,7 @@ GEAR_CALL_NOTE = "(plus 1 for the gear catalog unless cached)"
 class _Api:  # pylint: disable=too-few-public-methods
     """Issues GET requests for one tool call and counts them."""
 
-    def __init__(self, api_key: str | None) -> None:
-        self.api_key = api_key
+    def __init__(self) -> None:
         self.calls = 0
 
     async def get(
@@ -102,7 +116,7 @@ class _Api:  # pylint: disable=too-few-public-methods
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """GET an endpoint (path relative to the API base) and count the call."""
         self.calls += 1
-        return await make_intervals_request(url=url, api_key=self.api_key, params=params)
+        return await make_intervals_request(url=url, params=params)
 
 
 # ------------------------------------------------------------------ helpers
@@ -494,44 +508,24 @@ def _effort_text(row: dict[str, Any]) -> str:
 
 @tool("read")
 async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-return-statements
-    activity_id: str,
-    stream: str = "watts",
-    durations: str | None = "5,30,60,300,1200,3600",
-    distances: str | None = None,
-    count: int = 1,
-    exclude_intervals: bool = False,
-    start_index: int | None = None,
-    end_index: int | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    activity_id: ActivityId,
+    stream: Annotated[str, Field(description="Stream, e.g. watts, heartrate, velocity_smooth (speed), cadence")] = "watts",
+    durations: Annotated[str | None, Field(description='Comma-separated seconds; "" for distances only')] = "5,30,60,300,1200,3600",
+    distances: Annotated[str | None, Field(description='Comma-separated metres, e.g. "1000,5000" (added to durations)')] = None,
+    count: Annotated[int, Field(description="Non-overlapping best efforts per duration or distance, 1-20")] = 1,
+    exclude_intervals: Annotated[bool, Field(description="Ignore samples inside detected intervals")] = False,
+    start_index: Annotated[int | None, Field(description="First sample index searched")] = None,
+    end_index: Annotated[int | None, Field(description="Sample index to stop before")] = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Best efforts of one activity for given durations or distances (peak power, HR, pace)
+    """Use for the peak efforts of one activity: best average power, HR or speed over durations (s) or distances (m), e.g. peak 5 s to 20 min power or the fastest km of a run (velocity_smooth with distances).
 
-    Asks Intervals.icu for the best average of a stream over each requested duration (seconds)
-    or distance (metres) and reports, per effort, the average (W, bpm or m/s with pace), where
-    it happened as elapsed h:mm:ss from the activity's time stream (the clock includes recording
-    pauses; an effort window that spans a pause is flagged with the paused time, because the
-    duration is elapsed time and the paused seconds lie inside the window; sample indices when
-    the time stream is missing), the sample indices (usable as start_index /
-    end_index in other tools) and the duration/distance covered. Use it to find the peak 5 s /
-    1 min / 5 min / 20 min power of a ride, the fastest kilometre of a run (stream
-    velocity_smooth with distances) or the highest sustained heart rate. Durations longer than
-    the activity are reported as not available. The window ends with its last sample (the end
-    index is exclusive), so a pause right after the effort is not counted inside it. One API
-    call per duration or distance plus one for the time stream (and one for the sport's pace
-    units with velocity_smooth).
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        stream: Stream to evaluate: watts (default), heartrate, velocity_smooth, cadence ...
-        durations: Comma-separated durations in seconds (optional, default "5,30,60,300,1200,3600")
-        distances: Comma-separated distances in metres, e.g. "1000,5000" for runs (optional)
-        count: Number of best (non-overlapping) efforts per duration/distance, 1-20 (optional, default 1)
-        exclude_intervals: Ignore samples inside detected intervals (optional, default False)
-        start_index: First sample index to search from (optional)
-        end_index: Sample index to stop before (optional)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Returns per effort the average (W, bpm or m/s with pace) and its position as elapsed
+    h:mm:ss and sample indices (usable as start_index / end_index); windows spanning a
+    recording pause are flagged. Default durations 5 s to 60 min; longer than the activity =
+    not available. Read-only; one API call per duration or distance plus 1-2. Several
+    activities: compare_best_efforts; period bests: get_athlete_power_curves. Method:
+    intervals://methods/comparisons (get_guide).
     """
     duration_list = _numbers(durations, "durations")
     if isinstance(duration_list, str):
@@ -544,7 +538,7 @@ async def get_best_efforts(  # pylint: disable=too-many-arguments,too-many-posit
     if not 1 <= count <= MAX_EFFORT_COUNT:
         return f"Error: count must be between 1 and {MAX_EFFORT_COUNT}."
 
-    api = _Api(api_key)
+    api = _Api()
     time_data = _time_stream(await api.get(f"/activity/{seg(activity_id)}/streams", {"types": "time"}))
     pace_units = None
     if stream == "velocity_smooth":  # pace in the sport's units (per 100 m for swims)
@@ -617,41 +611,26 @@ def _best_average(result: Any) -> float | None:
 
 @tool("read")
 async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-branches,too-many-return-statements
-    activity_ids: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    gear_id: str | None = None,
-    stream: str = "watts",
-    durations: str = "60,300,1200",
-    limit: int = 10,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    activity_ids: Annotated[str | None, Field(description="Comma-separated activity ids; otherwise the date range is used")] = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; without activity_ids default 90 days before end_date")] = None,
+    end_date: EndDate = None,
+    sport_types: SportTypes = None,
+    gear_id: GearId = None,
+    stream: Annotated[str, Field(description="Stream, e.g. watts, heartrate, velocity_smooth")] = "watts",
+    durations: Annotated[str, Field(description='Comma-separated seconds, at most 10, e.g. "60,300,1200"')] = "60,300,1200",
+    limit: Annotated[int, Field(description="Maximum activities, newest first; capped to 1-25")] = 10,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Compare the best efforts (e.g. 1 / 5 / 20 min power) of several activities side by side
+    """Use to compare peak efforts (e.g. 1 / 5 / 20 min power) of several activities side by side: development over a block, races, or whether a new bike or power meter reads differently.
 
-    Builds a matrix of activities (rows: date, name, id, sport, gear name, FTP at the time)
-    by durations (columns: best average of the stream) and names the best activity per
-    duration. Activities come from a comma-separated id list or from a date range (default
-    the last 90 days) and can be narrowed by sport type and gear id. Use it to see how peak
-    power developed over a block, to compare races, or to check whether a new bike / power
-    meter reads differently. Different bikes may have different power meters; nothing is
-    calibrated. One API call per activity and duration (at most 25 activities), plus one to
-    list the activities (or one per id) and one for the gear catalog.
-
-    Args:
-        activity_ids: Comma-separated activity IDs (optional; otherwise the date range is used)
-        start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide" (optional)
-        gear_id: Keep only activities done on this gear id (optional)
-        stream: Stream to evaluate: watts (default), heartrate, velocity_smooth ...
-        durations: Comma-separated durations in seconds (optional, default "60,300,1200")
-        limit: Maximum number of activities, newest first, 1-25 (optional, default 10)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Returns a matrix of activities (date, sport, gear, FTP at the time) by duration with the
+    best average of the stream, and the best activity per duration. Activities come from
+    activity_ids or a date range (default the last 90 days), filtered by sport and gear; newest
+    first, limit 10 (max 25), at most 10 durations. Power meters of different bikes are not
+    calibrated against each other; no verdict. Read-only; one API call per activity and
+    duration (up to 250) plus the list and gear calls. One activity in detail: get_best_efforts.
+    Method: intervals://methods/comparisons (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -671,7 +650,7 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
         return date_error
     capped = min(max(limit, 1), MAX_COMPARE_ACTIVITIES)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error, source = await _collect_activities(
         api, athlete_id_to_use, activity_ids=activity_ids, start_date=start_date, end_date=end_date
     )
@@ -683,7 +662,7 @@ async def compare_best_efforts(  # pylint: disable=too-many-arguments,too-many-p
     filters = _filter_text(sport_types, gear_id, start_date, end_date)
     if not selected:
         return f"No activities found ({source}{'; ' + filters if filters else ''})."
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
 
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -944,71 +923,52 @@ def _family_filter(
 
 @tool("read")
 async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
-    min_secs: int | None = None,
-    max_secs: int | None = None,
-    min_intensity: float | None = None,
-    max_intensity: float | None = None,
-    target: str | None = None,
-    min_reps: int | None = None,
-    max_reps: int | None = None,
-    limit: int = 20,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    gear_id: str | None = None,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    reference_activity_id: str | None = None,
-    ftp_range: str | None = None,
-    ftp_tolerance_pct: float = 5.0,
-    sort_by: str | None = None,
+    min_secs: Annotated[int | None, Field(description="Shortest interval (s); required without reference_activity_id")] = None,
+    max_secs: Annotated[int | None, Field(description="Longest interval (s); required without reference_activity_id")] = None,
+    min_intensity: Annotated[float | None, Field(description="Lowest % of FTP, 0-300 (rounded down)")] = None,
+    max_intensity: Annotated[float | None, Field(description="Highest % of FTP, 0-300 (rounded up)")] = None,
+    target: Annotated[
+        Literal["POWER", "HR", "PACE"] | None,
+        BeforeValidator(upper_choice),
+        Field(description="Workout target type (not the sport); omit for any"),
+    ] = None,
+    min_reps: Annotated[int | None, Field(description="Minimum matching repetitions per activity")] = None,
+    max_reps: Annotated[int | None, Field(description="Maximum matching repetitions per activity")] = None,
+    limit: Annotated[int, Field(description="Maximum activities returned")] = 20,
+    start_date: Annotated[
+        str | None, Field(description="First day YYYY-MM-DD; default 365 days before the reference, else no limit")
+    ] = None,
+    end_date: Annotated[str | None, Field(description="Last day YYYY-MM-DD; default no limit")] = None,
+    sport_types: Annotated[
+        str | None,
+        Field(description='Comma-separated activity types or "all"; default the sport family of the reference or of most results'),
+    ] = None,
+    gear_id: GearId = None,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    reference_activity_id: Annotated[
+        OptionalActivityId, Field(description="Activity whose main work set defines the search window and the ranking")
+    ] = None,
+    ftp_range: Annotated[str | None, Field(description='Only activities with FTP at the time in "low-high" W, e.g. "225-240"')] = None,
+    ftp_tolerance_pct: Annotated[
+        float, Field(description="FTP difference in % to the reference or newest result flagged as other FTP context")
+    ] = 5.0,
+    sort_by: Annotated[
+        Literal["comparability", "date"] | None,
+        BeforeValidator(lower_choice),
+        Field(description="Default comparability with a reference, else date (newest first)"),
+    ] = None,
 ) -> str:
-    """Find activities containing intervals of a given length and intensity (% of FTP), ranked by comparability
+    """Use to find earlier activities with intervals of a given length and intensity (% of FTP), or like the main set of a reference activity, ranked by comparability.
 
-    Wraps the Intervals.icu interval search: activities with WORK intervals between min_secs
-    and max_secs long at min_intensity-max_intensity percent of FTP, optionally restricted to
-    a workout target (POWER, HR or PACE; this is the target type, not the sport) and a repeat
-    count. With reference_activity_id the window is derived from that activity's main work set
-    (e.g. 3 x 10 min threshold: interval length ±25 %, intensity ±8 % of FTP; explicit values
-    override) and results are ranked by comparability with it. Defaults: the sport family of the
-    reference activity, otherwise the family with the most results (cycling, running ...);
-    other families are counted, not silently dropped; sport_types="all" keeps the previous
-    cross-sport behaviour. Per activity: date, sport, name, id, the interval summary, moving
-    time, load, intensity, FTP at the time, gear, power meter and compliance, plus a
-    comparability score 0-100 with its reasons (matching interval group, same sport type,
-    same gear, FTP context within ftp_tolerance_pct of the reference or newest result).
-    Absolute watts of different bikes / power meters are not comparable; compare % of FTP
-    across gear. The API has no date, sport or gear filter, so those are applied here on the
-    returned list (more results are requested from the API). With a reference activity and
-    no start_date only the 365 days before the reference count (default window, shown in the
-    output with the number of older matches; an explicit start_date allows any range). One
-    API call (plus two for a reference activity and one for the gear catalog).
-
-    Args:
-        min_secs: Minimum interval length in seconds (required unless reference_activity_id is given)
-        max_secs: Maximum interval length in seconds (required unless reference_activity_id is given)
-        min_intensity: Minimum intensity in % of FTP (0-300, whole percent; decimals are rounded down)
-        max_intensity: Maximum intensity in % of FTP (0-300, whole percent; decimals are rounded up)
-        target: Workout target type POWER, HR or PACE (optional)
-        min_reps: Minimum number of matching repetitions in the activity (optional)
-        max_reps: Maximum number of matching repetitions in the activity (optional)
-        limit: Maximum number of activities to return (optional, default 20)
-        start_date: Keep only activities on or after this local date YYYY-MM-DD (optional; with a
-            reference activity the default is 365 days before it, otherwise no limit)
-        end_date: Keep only activities on or before this local date YYYY-MM-DD (optional)
-        sport_types: Comma-separated sport types to keep, e.g. "Ride,VirtualRide"; "all" for every
-            sport (optional, default: sport family of the reference or of most results)
-        gear_id: Keep only activities done on this gear id (optional)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-        reference_activity_id: Activity whose main work set defines the search window and the
-            comparability ranking (optional)
-        ftp_range: Keep only activities whose FTP at the time is in this range, e.g. "225-240" (optional)
-        ftp_tolerance_pct: FTP difference to the reference (or newest result) flagged as another
-            FTP context (optional, default 5)
-        sort_by: "comparability" (default with a reference) or "date" (newest first, default otherwise)
+    Pass min/max_secs and min/max_intensity, or reference_activity_id (window from its main
+    set: length ±25 %, intensity ±8 points of FTP; explicit values win; only the 365 days
+    before it unless start_date is given). Returns per activity date, sport, interval summary,
+    load, FTP at the time, gear, power meter, compliance and a comparability score 0-100 with
+    reasons. Sport defaults to one family (other families are counted, "all" keeps every
+    sport); watts of different power meters are not comparable, use % of FTP. Read-only; one
+    API call (+2 with a reference, +1 gear catalog). Details: get_activity_intervals; same
+    workout over time: compare_workouts. Method: intervals://methods/comparisons (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -1022,7 +982,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     order = (sort_by or ("comparability" if reference_activity_id else "date")).strip().lower()
     if order not in ("comparability", "date"):
         return "Error: sort_by must be 'comparability' or 'date'."
-    api = _Api(api_key)
+    api = _Api()
     reference: dict[str, Any] | None = None
     pattern: dict[str, Any] | None = None
     if reference_activity_id:
@@ -1059,7 +1019,7 @@ async def find_similar_intervals(  # pylint: disable=too-many-arguments,too-many
     )
     if ftp_bounds:
         selected = [a for a in selected if (f := _num(a.get("icu_ftp"))) is not None and ftp_bounds[0] <= f <= ftp_bounds[1]]
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key) if selected else {}
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use) if selected else {}
     anchor = reference or (selected[0] if selected else None)
     scored = [(a, _comparability(a, params, pattern, anchor, ftp_tolerance_pct, gear_map)) for a in selected]
     if order == "comparability":
@@ -1150,27 +1110,23 @@ def _histogram_rows(result: Any, speed: bool) -> list[dict[str, Any]]:
 
 @tool("read")
 async def get_activity_histogram(  # pylint: disable=too-many-locals
-    activity_id: str,
-    metric: str = "power",
-    bucket_size: int | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    activity_id: ActivityId,
+    metric: Annotated[
+        Literal["power", "hr", "pace", "gap"],
+        BeforeValidator(lower_choice),
+        Field(description="power (W), hr (bpm), pace or gap (grade-adjusted pace); pace and gap buckets are m/s"),
+    ] = "power",
+    bucket_size: Annotated[
+        int | None, Field(description="Bucket width in W (power, default 25) or bpm (hr, default 5); not for pace or gap")
+    ] = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Time-in-bucket histogram of an activity for power, heart rate, pace or grade-adjusted pace
+    """Use for the time distribution of one activity independent of zone definitions: how polarised a ride was, time above FTP, the pace spread of a run.
 
-    Returns how many seconds (and what percentage of the recorded time) the activity spent in
-    each power (W), heart rate (bpm), pace or GAP bucket, as computed by Intervals.icu. Use it
-    to see how polarised a ride was, how much time was spent above FTP, or the pace
-    distribution of a run independent of the zone definitions. Pace and GAP buckets are speeds
-    in m/s and are shown with the matching pace range. The bucket size can be chosen for power
-    and heart rate only. One API call.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        metric: "power" (default), "hr", "pace" or "gap"
-        bucket_size: Bucket width in W (power, default 25) or bpm (hr, default 5) (optional)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Returns the seconds and % of recorded time in each power (W), heart rate (bpm), pace or
+    grade-adjusted pace bucket, as computed by Intervals.icu; pace and GAP buckets are speeds
+    in m/s shown with the pace range. bucket_size applies to power and hr only. Read-only,
+    one API call. Method: intervals://methods/comparisons (get_guide).
     """
     key = metric.strip().lower()
     if key not in HISTOGRAMS:
@@ -1182,7 +1138,7 @@ async def get_activity_histogram(  # pylint: disable=too-many-locals
         if bucket_size <= 0:
             return "Error: bucket_size must be positive."
     width = bucket_size or default_bucket
-    api = _Api(api_key)
+    api = _Api()
     result = await api.get(f"/activity/{seg(activity_id)}/{endpoint}", {"bucketSize": width} if width else None)
     error = _error(result, f"{key} histogram")
     if error:
@@ -1350,73 +1306,50 @@ def _comparability_notes(rows: list[dict[str, Any]]) -> list[str]:
 
 @tool("read")
 async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
-    query: str | None = None,
-    activity_ids: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str | None = None,
-    limit: int = 8,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    reference_activity_id: str | None = None,
-    gear_id: str | None = None,
-    min_interval_secs: int | None = None,
-    max_interval_secs: int | None = None,
-    min_intensity: float | None = None,
-    max_intensity: float | None = None,
-    min_reps: int | None = None,
-    max_reps: int | None = None,
-    ftp_range: str | None = None,
-    include_rpe: bool = True,
-    comparable_only: bool = True,
+    query: Annotated[str | None, Field(description='Text in activity names, or "#tag" for an exact tag')] = None,
+    activity_ids: Annotated[str | None, Field(description="Comma-separated activity ids (query is then ignored)")] = None,
+    start_date: Annotated[
+        str | None,
+        Field(description="First day YYYY-MM-DD; default 90 days before end_date (name search: none, or 365 days before the reference)"),
+    ] = None,
+    end_date: EndDate = None,
+    sport_types: Annotated[
+        str | None,
+        Field(description='Comma-separated activity types or "all"; default the sport family of the reference or newest'),
+    ] = None,
+    limit: Annotated[int, Field(description="Maximum activities, newest first; capped to 1-12")] = 8,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    reference_activity_id: Annotated[
+        OptionalActivityId, Field(description="Activity whose main set defines the pattern; default the newest")
+    ] = None,
+    gear_id: GearId = None,
+    min_interval_secs: Annotated[
+        int | None, Field(description="Only WORK intervals at least this long (s); shorter ones under 2 min are surges")
+    ] = None,
+    max_interval_secs: Annotated[int | None, Field(description="Only WORK intervals at most this long (s)")] = None,
+    min_intensity: Annotated[
+        float | None, Field(description="Only WORK intervals at or above this % of FTP (replaces the 70 % floor)")
+    ] = None,
+    max_intensity: Annotated[float | None, Field(description="Only WORK intervals at or below this % of FTP")] = None,
+    min_reps: Annotated[int | None, Field(description="Only main sets with at least this many intervals")] = None,
+    max_reps: Annotated[int | None, Field(description="Only main sets with at most this many intervals")] = None,
+    ftp_range: Annotated[str | None, Field(description='Only activities with FTP at the time in "low-high" W, e.g. "225-240"')] = None,
+    include_rpe: Annotated[bool, Field(description="Show whole-activity RPE and its trend")] = True,
+    comparable_only: Annotated[
+        bool, Field(description="Table only activities matching the pattern; false tables all, with the reason")
+    ] = True,
 ) -> str:
-    """Compare repeated executions of the same workout over time on truly comparable work intervals
+    """Use to compare repeated executions of the same workout over time (e.g. every 3 x 10 min threshold session) on truly comparable work intervals.
 
-    Collects activities by name search (e.g. "Threshold" or a tag such as "#threshold"), by id
-    list or by date range (default the last 90 days). A name search with a reference activity
-    and no start_date keeps the 365 days before the reference (shown in the filters; an
-    explicit start_date allows any range). Per activity the WORK intervals are split
-    into the main set (the largest group of intervals of similar length, within 25 %, and
-    intensity, within 8 % of FTP), short surges/sprints under 2 min (listed, never averaged
-    in), other WORK intervals and intervals below 70 % FTP (warm-ups / recoveries labelled
-    WORK). The main set is summarised with time-weighted means (power, NP, HR, cadence),
-    average and maximum HR per interval and W/bpm. Only activities whose main set matches the
-    reference pattern are compared: the pattern comes from reference_activity_id, otherwise
-    from the newest activity found (interval length within 25 %, intensity within 8 % of FTP);
-    the others are listed with the reason. Sport defaults to the sport family of the reference
-    (or newest) activity (cycling, running ...); sport_types="all" keeps every sport. Trends
-    (first -> last) are reported separately for power, HR, max HR, cadence, W/bpm and RPE; RPE
-    is always the whole-activity RPE, never per interval; fewer than 3 activities are marked
-    as not reliable. Gear, power meter and indoor/outdoor are shown per row and different
-    sensors are flagged: absolute watts of different power meters are not comparable. One API
-    call to collect the activities (or one per id, plus one for a reference outside the list)
-    plus one per activity for its intervals (at most 12).
-
-    Args:
-        query: Text to match in activity names, tags with leading # (optional)
-        activity_ids: Comma-separated activity IDs (optional)
-        start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date; also filters query
-            results, which default to 365 days before reference_activity_id when one is given)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated sport types, e.g. "Ride,VirtualRide"; "all" for every sport
-            (optional, default: the sport family of the reference / newest activity)
-        limit: Maximum number of activities, newest first, 1-12 (optional, default 8)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-        reference_activity_id: Activity whose main set defines the pattern to compare (optional)
-        gear_id: Keep only activities done on this gear id (optional)
-        min_interval_secs: Only work intervals at least this long (optional; shorter ones are surges)
-        max_interval_secs: Only work intervals at most this long (optional)
-        min_intensity: Only work intervals at or above this % of FTP (optional)
-        max_intensity: Only work intervals at or below this % of FTP (optional)
-        min_reps: Only activities whose main set has at least this many intervals (optional)
-        max_reps: Only activities whose main set has at most this many intervals (optional)
-        ftp_range: Only activities whose FTP at the time is in this range, e.g. "225-240" (optional)
-        include_rpe: Show the whole-activity RPE column and trend (optional, default True)
-        comparable_only: Compare only activities matching the reference pattern (optional, default
-            True); False puts every activity in the table with its comparability note
+    Activities by name search (query), activity_ids or a date range (default the last 90
+    days); limit 8 (max 12). WORK intervals are split into main set (similar length and
+    intensity), surges, other and excluded; the main set gets time-weighted power, NP, HR, max
+    HR, cadence, W/bpm. Only activities matching the reference pattern (reference_activity_id,
+    else the newest; length ±25 %, intensity ±8 points of FTP) are compared; trends first ->
+    last with n (< 3 not reliable). RPE is whole-activity only; gear and power meter
+    differences are flagged; no verdict. Read-only; one API call per activity plus 1-3 (one
+    more per id with activity_ids). Method: intervals://methods/comparisons (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -1432,7 +1365,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         return reps
     capped = min(max(limit, 1), MAX_WORKOUTS)
 
-    api = _Api(api_key)
+    api = _Api()
     fetch_limit = min(capped * 4, MAX_SEARCH_RESULTS)
     name_search = bool(query) and not activity_ids and not (start_date or end_date)
     activities, error, source = await _collect_activities(
@@ -1480,7 +1413,7 @@ async def compare_workouts(  # pylint: disable=too-many-arguments,too-many-posit
         return f"No activities found ({source}{'; ' + filters_text if filters_text else ''})." + (
             f" Note: {truncated} A name search with start_date/end_date lists that range instead." if truncated else ""
         )
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
     split_filters = {"min_secs": min_interval_secs, "max_secs": max_interval_secs, "min_pct": min_intensity, "max_pct": max_intensity}
     rows: list[dict[str, Any]] = []
     for activity in reversed(selected):
@@ -1689,57 +1622,36 @@ def _trend_text(trend: dict[str, Any]) -> str:
 
 @tool("read")
 async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
-    start_date: str | None = None,
-    end_date: str | None = None,
-    sport_types: str = "Ride,GravelRide,VirtualRide",
-    power_bands: str = "150-200,200-250,250-300",
-    min_interval_secs: int = 300,
-    limit: int = 30,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    gear_id: str | None = None,
-    environment: str | None = None,
-    min_start_minutes: float = 0.0,
-    max_start_minutes: float | None = None,
-    min_activities_per_group: int = MIN_ACTIVITIES_PER_GROUP,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 90 days before end_date")] = None,
+    end_date: EndDate = None,
+    sport_types: Annotated[str, Field(description='Comma-separated activity types, e.g. "Ride,VirtualRide"')] = "Ride,GravelRide,VirtualRide",
+    power_bands: Annotated[
+        str, Field(description='Comma-separated non-overlapping bands in W as "low-high"; low <= W < high')
+    ] = "150-200,200-250,250-300",
+    min_interval_secs: Annotated[int, Field(description="Shortest WORK interval counted, in seconds")] = 300,
+    limit: Annotated[int, Field(description="Maximum activities, newest first; capped to 1-60")] = 30,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    gear_id: GearId = None,
+    environment: Environment = None,
+    min_start_minutes: Annotated[float, Field(description="Only intervals starting at least this many minutes into the activity")] = 0.0,
+    max_start_minutes: Annotated[
+        float | None, Field(description="Only intervals starting at most this many minutes into the activity")
+    ] = None,
+    min_activities_per_group: Annotated[
+        int, Field(description="Independent activities needed in the oldest and in the newest group for a trend, >= 1")
+    ] = MIN_ACTIVITIES_PER_GROUP,
 ) -> str:
-    """Power-to-heart-rate ratio (W per bpm) per power band across steady intervals over time
+    """Use to track power-to-heart-rate efficiency (W per bpm at the same power) over weeks.
 
-    Takes the activities of the date range (default the last 90 days) for the given sports,
-    fetches their intervals and puts every WORK interval of at least min_interval_secs with
-    both power and heart rate into the power band matching its average power (bands are
-    half-open, low <= W < high, and must not overlap). Per activity and band it reports the
-    number of intervals and the time-weighted mean watts, mean HR and W/bpm. Per band the
-    mean W/bpm of the oldest group of independent activities (each activity counts once) is
-    compared with the newest group; a trend needs at least min_activities_per_group
-    activities in each group, otherwise the band is reported as not reliable. The change is
-    compared with the day-to-day standard deviation of the per-activity values. When the
-    activities use more than one bike / power meter, trends are computed per gear (watts of
-    different power meters are never mixed). Optional filters: gear, indoor/outdoor, and the
-    position of the interval in the ride (minutes from the start, e.g. to skip warm-ups or
-    fatigued late intervals). A higher W/bpm at the same power usually means lower HR for the
-    same output, but heat, fatigue, hydration, cadence, indoor/outdoor and power meter
-    differences all move the ratio: this is a statistical comparison, not a fitness verdict,
-    and a single activity never shows an improvement. One API call to list the activities
-    plus one per activity (at most 60) and one for the gear catalog.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 90 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        sport_types: Comma-separated sport types (optional, default "Ride,GravelRide,VirtualRide")
-        power_bands: Comma-separated non-overlapping bands in W as "low-high" (optional, default "150-200,200-250,250-300")
-        min_interval_secs: Minimum WORK interval length in seconds (optional, default 300)
-        limit: Maximum number of activities, newest first, 1-60 (optional, default 30)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-        gear_id: Keep only activities done on this gear id (optional)
-        environment: "indoor" (trainer / virtual) or "outdoor" (optional, default both)
-        min_start_minutes: Only intervals starting at least this many minutes into the activity (optional, default 0)
-        max_start_minutes: Only intervals starting at most this many minutes into the activity (optional)
-        min_activities_per_group: Independent activities needed in the oldest and in the newest
-            group for a trend (optional, default 3)
+    Puts every WORK interval of at least min_interval_secs with power and HR into the power
+    band of its average power; returns per activity and band the count and time-weighted W,
+    HR and W/bpm, and per band the oldest vs the newest group of activities (each counts once;
+    at least 3 per group, else not reliable) compared with the day-to-day SD. Default the
+    last 90 days of rides, limit 30 (max 60); trends per gear when several power meters are
+    involved; filters for gear, indoor/outdoor and interval start time. Heat, fatigue,
+    cadence and sensors move the ratio: statistics only, no fitness verdict. Read-only; one API
+    call per activity plus 2. Method: intervals://methods/comparisons (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -1759,7 +1671,7 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
         return span
     capped = min(max(limit, 1), MAX_EFFICIENCY_ACTIVITIES)
 
-    api = _Api(api_key)
+    api = _Api()
     activities, error, _ = await _collect_activities(api, athlete_id_to_use, start_date=span[0], end_date=span[1])
     if error:
         return error
@@ -1769,7 +1681,7 @@ async def get_power_hr_efficiency(  # pylint: disable=too-many-arguments,too-man
     selected = selected[:capped]
     if not selected:
         return f"No activities found between {span[0]} and {span[1]} for sports {sport_types}."
-    gear_map = await get_gear_map(athlete_id=athlete_id_to_use, api_key=api_key)
+    gear_map = await get_gear_map(athlete_id=athlete_id_to_use)
     rows: list[dict[str, Any]] = []
     for activity in reversed(selected):
         intervals, error = await _work_intervals(api, activity.get("id"))
@@ -1974,41 +1886,29 @@ def _fatigue_table(block: dict[str, Any], rows: list[dict[str, Any]], thresholds
 
 @tool("read")
 async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
-    activity_id: str | None = None,
-    activity_type: str = "Ride",
-    durations: str = "60,300,1200",
-    curves: str = "42d",
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    suggest_thresholds: bool = True,
+    activity_id: Annotated[
+        OptionalActivityId, Field(description="Activity whose curves are compared; omit for the athlete curves")
+    ] = None,
+    activity_type: Annotated[str, Field(description="Activity type of the curves and kJ thresholds, e.g. Ride, VirtualRide")] = "Ride",
+    durations: Annotated[str, Field(description='Comma-separated seconds, e.g. "60,300,1200"')] = "60,300,1200",
+    curves: Annotated[
+        str, Field(description='Comma-separated athlete curve ids, e.g. "42d,90d,1y,s0"; ignored with activity_id')
+    ] = "42d",
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    suggest_thresholds: Annotated[
+        bool, Field(description="Suggest kJ0/kJ1 when not both are configured; a suggestion only, nothing is saved")
+    ] = True,
 ) -> str:
-    """Fatigue resistance: best power fresh vs after the athlete's kJ thresholds (kJ0, kJ1)
+    """Use for fatigue resistance: best power fresh vs after the athlete's work thresholds kJ0 / kJ1 (Intervals.icu fatigued power curves).
 
-    Intervals.icu keeps, besides the normal power curve, two "fatigued" curves built only from
-    efforts that started after a configurable amount of work (sport settings after_kj0 /
-    after_kj1). The sport settings are read first: when no threshold is configured the
-    fatigued curves equal the fresh curve, so no pseudo values are shown - the tool explains
-    the configuration and (suggest_thresholds) proposes plausible thresholds from body mass
-    (15 / 30 kJ per kg) limited by the work of your recent rides of at least an hour, as a
-    suggestion only: settings are never changed. When configured, the fresh curve is compared
-    with the kJ0 / kJ1 curves (with an activity_id that activity's curves, otherwise the
-    athlete curves for each id in `curves`, e.g. 42d, 90d, s0, 1y): watts per duration and
-    the change in %. A fatigued curve without data is reported as missing and one equal to the
-    fresh curve at every duration as identical; no change is computed for either. API calls:
-    the sport settings, then one per activity curve or one for the athlete curves, plus two for
-    a threshold suggestion.
-
-    Args:
-        activity_id: The Intervals.icu activity ID (optional; without it the athlete curves are used)
-        activity_type: Sport whose curves and kJ thresholds apply (optional, default "Ride")
-        durations: Comma-separated durations in seconds (optional, default "60,300,1200")
-        curves: Comma-separated athlete curve ids such as "42d,90d,s0" (optional, default "42d")
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-        suggest_thresholds: Suggest kJ thresholds when they are not configured (optional, default
-            True; read-only, nothing is saved)
+    Reads the sport settings first. When they hold no kJ thresholds no fatigued values are
+    shown: the tool explains the setting and (suggest_thresholds) proposes thresholds from
+    body mass and recent rides, never saved. Otherwise returns watts per duration fresh and
+    after kJ0 / kJ1 with the change in %, for one activity or for athlete curves (default
+    42d); a fatigued curve without data is reported as missing, one equal to fresh as
+    identical, without a change. Read-only, 2-5 API calls. Within one long ride:
+    get_long_ride_fatigue_profile. Method: intervals://methods/comparisons (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -2022,7 +1922,7 @@ async def get_fatigue_resistance(  # pylint: disable=too-many-arguments,too-many
     if not activity_id and not curve_ids:
         return "Error: at least one curve id is required when no activity_id is given."
 
-    api = _Api(api_key)
+    api = _Api()
     thresholds, note = await _kj_thresholds(api, athlete_id_to_use, activity_type)
     if thresholds is None:
         keys: tuple[str, ...] = ("kj0", "kj1")  # thresholds unknown: show what Intervals.icu returns, with the caveat

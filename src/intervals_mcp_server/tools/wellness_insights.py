@@ -9,7 +9,9 @@ picked up dynamically from the athlete's custom item definitions.
 
 import json
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -24,6 +26,7 @@ from intervals_mcp_server.utils.custom_fields import (
 )
 from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.formatting import event_type_label
+from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OutputFormat, StartDate
 from intervals_mcp_server.utils.sports import format_local_start, hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
 from intervals_mcp_server.utils.wellness_completeness import completeness_line, completeness_start, today_completeness
@@ -102,12 +105,12 @@ def _resolve_range(start_date: str | None, end_date: str | None, default_days: i
 
 
 async def _fetch_wellness(
-    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None
+    athlete_id: str, start: str, end: str, fields: str | None = None
 ) -> tuple[list[dict[str, Any]], str | None]:
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/wellness", params=params)
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching wellness data: {result.get('message', 'Unknown error')}"
     if isinstance(result, dict):
@@ -118,14 +121,14 @@ async def _fetch_wellness(
 
 
 async def _fetch_activities(  # pylint: disable=too-many-arguments
-    athlete_id: str, api_key: str | None, start: str, end: str, fields: str | None = None,
+    athlete_id: str, start: str, end: str, fields: str | None = None,
     errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Activities of the range; an API error is appended to *errors* (it is not "no activities")."""
     params: dict[str, str] = {"oldest": start, "newest": end}
     if fields:
         params["fields"] = fields
-    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", api_key=api_key, params=params)
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/activities", params=params)
     if isinstance(result, dict) and "error" in result and errors is not None:
         errors.append(f"activities could not be loaded: {result.get('message', 'Unknown error')}")
     if not isinstance(result, list):
@@ -133,8 +136,8 @@ async def _fetch_activities(  # pylint: disable=too-many-arguments
     return [a for a in result if isinstance(a, dict)]
 
 
-async def _defs(athlete_id: str, api_key: str | None, item_type: str) -> CustomFieldDefs:
-    return (await get_custom_item_index(athlete_id=athlete_id, api_key=api_key)).get(item_type, {})
+async def _defs(athlete_id: str, item_type: str) -> CustomFieldDefs:
+    return (await get_custom_item_index(athlete_id=athlete_id)).get(item_type, {})
 
 
 def flatten_sport_info(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -285,42 +288,29 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
 @tool("read")
 async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments,too-many-branches,too-many-return-statements,too-many-statements
-    date_str: str | None = None,
-    days_back: int = 3,
-    baseline_metrics: str = DEFAULT_BASELINE_METRICS,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
-    detail_level: str = "standard",
+    date_str: Annotated[str | None, Field(description="The day YYYY-MM-DD; default today")] = None,
+    days_back: Annotated[int, Field(description="Days before date_str to include, 0-14")] = 3,
+    baseline_metrics: Annotated[
+        str, Field(description="Comma-separated wellness field codes (native or custom) for the baseline block")
+    ] = DEFAULT_BASELINE_METRICS,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[
+        DetailLevel,
+        Field(description="compact = no custom fields; standard = up to 20 custom fields per day; full = all"),
+    ] = "standard",
 ) -> str:
-    """Compact recovery / readiness context for a day in one call (read-only, no verdict)
+    """Use for the recovery and readiness context of one day in one call (default today; read-only, numbers only, no readiness verdict).
 
-    Returns, for the given day and the days before it: the native wellness values (RHR,
-    HRV, sleeping HR, sleep, sleep score, readiness, SpO2, respiration, weight, steps,
-    kcal), CTL/ATL/form/ramp rate, subjective scores, every custom wellness field with a
-    value (e.g. device values such as Body Battery, training readiness, sleep stages,
-    respiration or skin temperature written by a sync bridge), which values are missing
-    and when the record was last updated; personal baselines (7-day mean, 42-day mean,
-    median, SD and the latest value's deviation) for the selected metrics; the activities
-    of those days with their loads and device fields; and the planned events of the day.
-    The current day's aggregates (steps, calories) can still be incomplete and are flagged
-    as preliminary (only when the day is today); for today a line (JSON today_completeness)
-    names the usual fields (present on 80 % of the 14 previous days) not yet in today's record,
-    night/morning values apart from day totals: not yet available, not normal.
-    No readiness verdict is computed.
-
-    Args:
-        date_str: The day in YYYY-MM-DD format (optional, default today)
-        days_back: How many days before date_str to include, 0-14 (optional, default 3)
-        baseline_metrics: Comma-separated wellness metrics for the baseline block
-            (optional, default "hrv,restingHR,avgSleepingHR,sleepScore,readiness,respiration,spO2")
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (native values, fitness, baselines, activities, planned; no custom
-            field dump), "standard" (default, plus up to 20 custom wellness fields per day) or
-            "full" (every custom field). Device composite scores (readiness, Body Battery ...) are
-            derived values, not independent measurements.
+    For the day and days_back days before: native wellness values, CTL/ATL/form/ramp rate,
+    subjective scores, custom wellness fields with a value (e.g. Body Battery or skin
+    temperature from a sync bridge), missing values and the record's update time; personal
+    baselines of baseline_metrics (7-day and 42-day mean, median, SD, latest value vs baseline
+    with z-score; small samples flagged); the activities of those days with loads and device
+    fields; the planned events of the day. Today is flagged preliminary and a line (JSON
+    today_completeness) names the usual fields not yet in today's record, grouped by when they
+    usually arrive: not yet available, not normal. Trends: get_wellness_trends.
+    Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -342,20 +332,20 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     check_today = target == today
     fetch_start = min(start, completeness_start(date.fromisoformat(target)).isoformat()) if check_today else start
 
-    fetched, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, target)
+    fetched, error = await _fetch_wellness(athlete_id_to_use, fetch_start, target)
     if error:
         return error
     entries = [e for e in fetched if start <= str(e.get("id"))[:10] <= target]
     baseline_entries, _ = await _fetch_wellness(
-        athlete_id_to_use, api_key, baseline_start, target, fields="id," + ",".join(metrics)
+        athlete_id_to_use, baseline_start, target, fields="id," + ",".join(metrics)
     )
-    input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
-    field_defs = await _defs(athlete_id_to_use, api_key, ACTIVITY_FIELD)
+    input_defs = await _defs(athlete_id_to_use, INPUT_FIELD)
+    field_defs = await _defs(athlete_id_to_use, ACTIVITY_FIELD)
     completeness = today_completeness(fetched, date.fromisoformat(target), input_defs) if check_today else None
     load_errors: list[str] = []
-    activities = await _fetch_activities(athlete_id_to_use, api_key, start, target, errors=load_errors)
+    activities = await _fetch_activities(athlete_id_to_use, start, target, errors=load_errors)
     events_result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events", api_key=api_key, params={"oldest": target, "newest": target}
+        url=f"/athlete/{seg(athlete_id_to_use)}/events", params={"oldest": target, "newest": target}
     )
     events = [e for e in events_result if isinstance(e, dict)] if isinstance(events_result, list) else []
     if isinstance(events_result, dict) and "error" in events_result:
@@ -420,46 +410,30 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
 # ------------------------------------------------------------------- trends
 @tool("read")
 async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
-    start_date: str | None = None,
-    end_date: str | None = None,
-    metrics: str = DEFAULT_TREND_METRICS,
-    windows: str = "7,14,42",
-    correlations: str | None = None,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 41 days before end_date (42 days)")] = None,
+    end_date: EndDate = None,
+    metrics: Annotated[
+        str,
+        Field(description="Comma-separated, at most 16: native codes (hrv, restingHR, weight, ctl ...), custom field codes, eftp_<Type>"),
+    ] = DEFAULT_TREND_METRICS,
+    windows: Annotated[str, Field(description="Comma-separated rolling windows in days, 2-365")] = "7,14,42",
+    correlations: Annotated[
+        str | None,
+        Field(description='Comma-separated pairs "a:b" or "a:b:lag_days" (b lag days later), e.g. "hrv:readiness,restingHR:sleepScore:1"'),
+    ] = None,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Wellness trends with rolling means, personal baselines, outliers and optional correlations
+    """Use for multi-day wellness trends against the athlete's own baseline (default the 42 days ending today; read-only, statistics only).
 
-    For every requested wellness metric (native fields such as hrv, restingHR,
-    avgSleepingHR, respiration, sleepScore, readiness, spO2, weight, ctl, atl, steps,
-    or any custom wellness field by its code, and eFTP per sport as eftp_Ride /
-    eftp_Run) it reports, with units (HRV ms, resting/sleeping HR bpm, respiration
-    breaths/min, SpO2 %, readiness and sleep score 0-100, weight kg, custom fields with
-    their definition units such as a temperature deviation in °C): the daily values of
-    the last two weeks of the requested period with trailing means, statistics over the
-    requested period only, a personal baseline (the 42 days ending at end_date), the
-    latest value versus the baseline (difference, percent, z-score), rolling means at the
-    end of the period, the last 7 days versus the 7 days before, and outliers (|z| >= 2.5)
-    within the period. The output states the requested period, the extra history fetched
-    for rolling windows and the baseline, and the baseline window separately. Missing days
-    are never filled in; for physiological metrics a stored 0 counts as missing. Baselines
-    with fewer than 14 values and correlations with fewer than 30 paired days are flagged
-    as small samples. Weight additionally gets a 7/14/28-day trend with the slope in kg
-    per week. Optional correlations between metric pairs are statistical associations
-    only, not causes.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 42 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        metrics: Comma-separated metrics (optional, default
-            "hrv,restingHR,avgSleepingHR,sleepScore,readiness,respiration,spO2,weight")
-        windows: Comma-separated rolling windows in days (optional, default "7,14,42")
-        correlations: Comma-separated pairs "a:b" or "a:b:lag_days", e.g.
-            "hrv:readiness,restingHR:sleepScore:1" (optional)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Per metric with units: the daily values of the last 14 days with trailing means, period
+    statistics, a personal baseline (the 42 days ending at end_date), the latest value vs that
+    baseline (difference, %, z-score), rolling means, the last 7 days vs the 7 before and
+    outliers (|z| >= 2.5). Missing days are never filled in; for physiological metrics a stored 0
+    counts as missing. Small samples are flagged (baseline under 14 values, correlation under 30
+    paired days). Weight adds a 7/14/28-day slope in kg per week. Optional correlations
+    (Pearson, Spearman, with lag) are associations, not causes. One day in context:
+    get_recovery_snapshot. Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -478,12 +452,12 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
         return f"Error: at most {MAX_TREND_METRICS} metrics per call."
 
     fetch_start = (date.fromisoformat(start) - timedelta(days=BASELINE_DAYS)).isoformat()
-    entries, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, end)
+    entries, error = await _fetch_wellness(athlete_id_to_use, fetch_start, end)
     if error:
         return error
     entries = flatten_sport_info(entries)
     in_range = [e for e in entries if start <= str(e.get("id")) <= end]
-    input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
+    input_defs = await _defs(athlete_id_to_use, INPUT_FIELD)
 
     trends = [
         compute_metric_trend(entries, m, windows=window_tuple, baseline_days=BASELINE_DAYS, period_start=start, period_end=end)
@@ -534,39 +508,27 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
 # ----------------------------------------------------------------- nutrition
 @tool("read")
 async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    start_date: str | None = None,
-    end_date: str | None = None,
-    windows: str = "7,14,28",
-    burn_field: str = "GarminTotalCalories",
-    active_field: str = "GarminActiveCalories",
-    balance_field: str = "GarminKcalBalance",
-    include_training_load: bool = True,
-    athlete_id: str | None = None,
-    api_key: str | None = None,
-    output_format: str = "text",
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 27 days before end_date (28 days)")] = None,
+    end_date: EndDate = None,
+    windows: Annotated[str, Field(description="Comma-separated windows in days, 2-365")] = "7,14,28",
+    burn_field: Annotated[str, Field(description="Custom wellness field code of the total daily burn (kcal)")] = "GarminTotalCalories",
+    active_field: Annotated[str, Field(description="Custom wellness field code of the active burn (kcal)")] = "GarminActiveCalories",
+    balance_field: Annotated[
+        str, Field(description="Custom wellness field code of a device balance; where missing, intake minus burn")
+    ] = "GarminKcalBalance",
+    include_training_load: Annotated[bool, Field(description="Add the Intervals.icu training load per day")] = True,
+    athlete_id: AthleteId = None,
+    output_format: OutputFormat = "text",
 ) -> str:
-    """Nutrition, calorie balance and weight trends from the wellness records (read-only)
+    """Use for food intake, calorie balance and weight trend over a period (default the 28 days ending today; read-only).
 
-    Per day: logged kcal, carbohydrates, protein and fat (native Intervals.icu fields),
-    the device's total and active calorie burn and balance (custom wellness fields whose
-    codes are configurable), and weight. Per window (default 7/14/28 days): totals and
-    means over logged days only, how many days have no logged intake, burn mean, balance
-    total/mean on logged days and the weight change. A day without logged intake is
-    never treated as 0 kcal; the device burn is an estimate; a calorie balance is not a
-    measurement of fat change. Optionally the Intervals.icu training load per day is
-    listed alongside.
-
-    Args:
-        start_date: Start date YYYY-MM-DD (optional, default 28 days before end_date)
-        end_date: End date YYYY-MM-DD (optional, default today)
-        windows: Comma-separated windows in days (optional, default "7,14,28")
-        burn_field: Custom wellness field code holding the total daily burn (optional)
-        active_field: Custom wellness field code holding the active burn (optional)
-        balance_field: Custom wellness field code holding a device-computed balance (optional)
-        include_training_load: Append the Intervals.icu training load per day (optional, default True)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        output_format: "text" (default) or "json"
+    Per day: logged kcal, carbohydrates, protein and fat, the device's total and active burn and
+    balance (custom wellness fields, codes configurable) and weight. Per window (default 7/14/28
+    days): intake totals and means over logged days only, days without logged intake, burn mean,
+    balance total and mean on logged days, weight change and slope in kg per week. A day without
+    logged intake is never 0 kcal; the device burn is an estimate; a calorie balance does not
+    measure fat change. Optionally the Intervals.icu training load per day.
+    Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -579,7 +541,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     if isinstance(window_tuple, str):
         return window_tuple
 
-    entries, error = await _fetch_wellness(athlete_id_to_use, api_key, start, end)
+    entries, error = await _fetch_wellness(athlete_id_to_use, start, end)
     if error:
         return error
     summary = nutrition_summary(
@@ -590,7 +552,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     load_errors: list[str] = []
     if include_training_load:
         for activity in await _fetch_activities(
-            athlete_id_to_use, api_key, start, end, fields="id,start_date_local,icu_training_load", errors=load_errors
+            athlete_id_to_use, start, end, fields="id,start_date_local,icu_training_load", errors=load_errors
         ):
             day = str(activity.get("start_date_local", ""))[:10]
             load = activity.get("icu_training_load")

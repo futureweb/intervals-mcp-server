@@ -56,7 +56,7 @@ uv run --locked mypy src tests
 uv run --locked pytest
 ```
 
-CI runs the same three checks on Python 3.12 and 3.13; pylint is advisory. New tools must declare their permission class with `@tool("read" | "write" | "destructive" | "admin")`, be read-only unless they really write, carry a docstring that tells a language model when and how to use them, and come with tests that use synthetic fixtures only (never real athlete data, hostnames or keys).
+CI runs the same three checks on Python 3.12 and 3.13; pylint is advisory. New tools must declare their permission class with `@tool("read" | "write" | "destructive" | "admin")`, be read-only unless they really write, carry a short docstring (at most 900 characters, first sentence: when to use the tool) and a described parameter for every argument (`Annotated[..., Field(description=...)]`, `Literal` enums for fixed values; details in `guides/methods/`), and come with tests that use synthetic fixtures only (never real athlete data, hostnames or keys).
 
 ## Pull request guidelines
 

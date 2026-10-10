@@ -10,7 +10,9 @@ import asyncio
 import difflib
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
@@ -36,6 +38,14 @@ from intervals_mcp_server.utils.power_compare import (
 )
 from intervals_mcp_server.utils.sports import format_start_times, hms, is_indoor, start_times
 from intervals_mcp_server.utils.streams import find_stream
+from intervals_mcp_server.utils.params import (
+    ActivityId,
+    AthleteId,
+    DetailLevel,
+    EndDate,
+    OptionalActivityId,
+    OutputFormat,
+)
 from intervals_mcp_server.utils.validation import resolve_athlete_id
 
 # Import mcp instance from shared module for tool registration
@@ -47,8 +57,8 @@ PACE_SPORTS = ("Run", "TrailRun", "VirtualRun", "Walk", "Hike", "Swim", "OpenWat
 CORE_STREAMS = ("time", "watts", "heartrate", "cadence", "velocity_smooth", "distance", "altitude")
 
 
-async def _get_activity(activity_id: str, api_key: str | None) -> tuple[dict[str, Any] | None, str | None]:
-    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}", api_key=api_key)
+async def _get_activity(activity_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    result = await make_intervals_request(url=f"/activity/{seg(activity_id)}")
     if isinstance(result, dict) and "error" in result:
         return None, f"Error fetching activity details: {result.get('message', 'Unknown error')}"
     activity = result[0] if isinstance(result, list) and result else result
@@ -58,11 +68,11 @@ async def _get_activity(activity_id: str, api_key: str | None) -> tuple[dict[str
 
 
 async def _get_streams(
-    activity_id: str, api_key: str | None, types: list[str] | None
+    activity_id: str, types: list[str] | None
 ) -> tuple[list[dict[str, Any]], str | None]:
     params = {"types": ",".join(types)} if types else None
     result = await make_intervals_request(
-        url=f"/activity/{seg(activity_id)}/streams", api_key=api_key, params=params
+        url=f"/activity/{seg(activity_id)}/streams", params=params
     )
     if isinstance(result, dict) and "error" in result:
         return [], f"Error fetching activity streams: {result.get('message', 'Unknown error')}"
@@ -70,11 +80,11 @@ async def _get_streams(
     return streams, None if streams else f"No stream data found for activity {activity_id}."
 
 
-async def _defs(item_type: str, api_key: str | None, athlete_id: Any) -> dict[str, dict[str, Any]]:
+async def _defs(item_type: str, athlete_id: Any) -> dict[str, dict[str, Any]]:
     athlete = str(athlete_id) if athlete_id else config.athlete_id
     if not athlete:
         return {}
-    return (await get_custom_item_index(athlete_id=athlete, api_key=api_key)).get(item_type, {})
+    return (await get_custom_item_index(athlete_id=athlete)).get(item_type, {})
 
 
 def _activity_header(activity: dict[str, Any]) -> str:
@@ -151,7 +161,7 @@ def _meter_identity(activity: dict[str, Any], gear_items: list[dict[str, Any]]) 
 
 
 async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments
-    athlete_id: str, api_key: str | None, activity_ids: list[str], start_date: str | None,
+    athlete_id: str, activity_ids: list[str], start_date: str | None,
     end_date: str | None, secondary: str,
 ) -> tuple[list[dict[str, Any]], str | None, str]:
     """Activities for the multi-ride comparison (by id - already de-duplicated and capped - or by date range
@@ -159,7 +169,7 @@ async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positiona
     if activity_ids:
         rides = []
         for activity_id in activity_ids:
-            activity, error = await _get_activity(activity_id, api_key)
+            activity, error = await _get_activity(activity_id)
             if error or activity is None:
                 return [], error, ""
             rides.append(activity)
@@ -168,7 +178,7 @@ async def _power_rides(  # pylint: disable=too-many-arguments,too-many-positiona
     if isinstance(span, str):
         return [], span, ""
     result = await make_intervals_request(
-        url=f"/athlete/{athlete_id}/activities", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/activities",
         params={"oldest": span[0], "newest": span[1], "fields": POWER_LIST_FIELDS},
     )
     if isinstance(result, dict) and "error" in result:
@@ -200,13 +210,13 @@ def _fmt_num(value: Any, digits: int = 0, unit: str = "") -> str:
 
 
 async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-    athlete_id: str, api_key: str | None, primary: str, secondary: str, activity_ids: str | None,
+    athlete_id: str, primary: str, secondary: str, activity_ids: str | None,
     start_date: str | None, end_date: str | None, limit: int, output_format: str, detail_level: str,
 ) -> str:
     """Multi-ride mode of compare_power_streams."""
     capped = min(max(limit, 1), MAX_POWER_RIDES)
     ids, dropped, duplicates = cap_ids(activity_ids, capped)
-    rides, error, source = await _power_rides(athlete_id, api_key, ids, start_date, end_date, secondary)
+    rides, error, source = await _power_rides(athlete_id, ids, start_date, end_date, secondary)
     if error:
         return error
     skipped = len(rides) - capped if len(rides) > capped else 0
@@ -214,12 +224,12 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
     source += ids_note(dropped, duplicates, capped)
     if not rides:
         return f"No activities with a '{secondary}' stream found ({source})."
-    gear_items = await get_gear_raw(athlete_id=athlete_id, api_key=api_key)
+    gear_items = await get_gear_raw(athlete_id=athlete_id)
     rows: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     for activity in rides:
         activity_id = str(activity.get("id"))
-        streams, _ = await _get_streams(activity_id, api_key, ["time", primary, secondary])
+        streams, _ = await _get_streams(activity_id, ["time", primary, secondary])
         first, second, time_stream = (find_stream(streams, t) for t in (primary, secondary, "time"))
         if first is None or second is None:
             missing.append({"id": activity_id, "reason": f"no '{primary if first is None else secondary}' stream returned"})
@@ -277,52 +287,37 @@ async def _compare_rides(  # pylint: disable=too-many-arguments,too-many-positio
 
 @tool("read")
 async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
-    activity_id: str | None = None,
-    api_key: str | None = None,
-    primary: str = "watts",
-    secondary: str = "secondary_power",
-    start_index: int | None = None,
-    end_index: int | None = None,
-    output_format: str = "text",
-    activity_ids: str | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    limit: int = 10,
-    detail_level: str = "standard",
-    athlete_id: str | None = None,
+    activity_id: Annotated[OptionalActivityId, Field(
+        description="One ride, e.g. i123456789; omit (or give activity_ids) to compare several rides"
+    )] = None,
+    primary: Annotated[str, Field(description="Stream type of the reference power source")] = "watts",
+    secondary: Annotated[str, Field(description="Stream type of the compared power source")] = "secondary_power",
+    start_index: Annotated[int | None, Field(description="First sample index to compare (one ride only)")] = None,
+    end_index: Annotated[int | None, Field(description="Sample index to stop before (exclusive; one ride only)")] = None,
+    output_format: OutputFormat = "text",
+    activity_ids: Annotated[str | None, Field(
+        description="Comma-separated activity ids to compare as several rides (duplicates ignored, cut to limit)"
+    )] = None,
+    start_date: Annotated[str | None, Field(
+        description="Several rides: first day YYYY-MM-DD; default 179 days before end_date (180 days)"
+    )] = None,
+    end_date: Annotated[EndDate, Field(description="Several rides: last day YYYY-MM-DD; default today")] = None,
+    limit: Annotated[int, Field(description="Several rides: at most this many, newest first, 1-20")] = 10,
+    detail_level: Annotated[DetailLevel, Field(
+        description="Several rides: compact = summary only; standard adds one line per ride; full adds power "
+        "bins and device data per ride"
+    )] = "standard",
+    athlete_id: AthleteId = None,
 ) -> str:
-    """Compare two power streams of an activity sample by sample (e.g. head unit vs. second power meter)
+    """Use to compare two power meters recorded on the same ride (watts vs secondary_power by default), on one ride or across several rides.
 
-    Compares the primary power stream with a second one recorded on the same activity
-    (Intervals.icu stores a second power meter as stream type "secondary_power", shown as
-    "Power2" in power_field_names). Reports the overall offset in W and %, the offset per
-    power band, stable 30 s / 60 s windows only, drift over the ride quarters, a lag estimate,
-    best efforts per duration from each stream and how many samples were excluded as
-    coasting, missing or outliers. No calibration is performed and nothing is written; which
-    physical sensor each stream belongs to must be taken from the device data shown in the
-    header (power meter name/serial), not assumed.
-
-    Without activity_id (or with activity_ids) several rides are compared: the rides of the
-    date range (default 180 days) that carry the second stream, each analysed on its own and
-    summarised per bike and power meter identity with n, median, between-ride SD and range of
-    the offset (overall, per power band, stable windows), drift, lag and outliers. No
-    correction factor is derived.
-
-    Args:
-        activity_id: The Intervals.icu activity ID (one ride)
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        primary: Stream type of the primary power source (default "watts")
-        secondary: Stream type of the second power source (default "secondary_power")
-        start_index: First sample index to compare (one ride only)
-        end_index: Sample index to stop before (one ride only)
-        output_format: "text" (default) or "json"
-        activity_ids: Comma-separated activity IDs to compare as several rides (optional)
-        start_date: Several rides from YYYY-MM-DD (optional, default 180 days before end_date)
-        end_date: Several rides until YYYY-MM-DD (optional, default today)
-        limit: Several rides: at most this many, newest first, 1-20 (default 10)
-        detail_level: Several rides: "compact" (summary only), "standard" (default, plus one line
-            per ride) or "full" (plus bins and device data per ride)
-        athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
+    One ride (activity_id): offset in W and % (secondary - primary), per power band, in stable 30/60
+    s windows, drift over the ride quarters, lag, best efforts of each stream and the samples
+    excluded as coasting, missing or outliers. Several rides (no activity_id, or activity_ids): the
+    rides that carry the second stream (default 180 days to end_date, newest first, limit 10, max
+    20), each compared on its own and summarised per bike and power meter with median,
+    between-ride SD and range. No calibration and no correction factor; sensors are named only
+    from the file's device data. Read-only. Method: intervals://methods/power-meters (get_guide).
     """
     if not activity_id or activity_ids:
         if start_index is not None or end_index is not None:
@@ -332,12 +327,12 @@ async def compare_power_streams(  # pylint: disable=too-many-arguments,too-many-
         athlete, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
         if error_msg:
             return error_msg
-        return await _compare_rides(athlete, api_key, primary, secondary, activity_ids, start_date, end_date,
+        return await _compare_rides(athlete, primary, secondary, activity_ids, start_date, end_date,
                                     limit, output_format, detail_level)
-    activity, error = await _get_activity(activity_id, api_key)
+    activity, error = await _get_activity(activity_id)
     if error or activity is None:
         return error or "Error"
-    streams, error = await _get_streams(activity_id, api_key, ["time", primary, secondary])
+    streams, error = await _get_streams(activity_id, ["time", primary, secondary])
     if error:
         return error
     first, second, time_stream = (find_stream(streams, t) for t in (primary, secondary, "time"))
@@ -409,15 +404,15 @@ def _threshold_context(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _get_event(athlete_id: str, event_id: Any, api_key: str | None) -> dict[str, Any] | None:
+async def _get_event(athlete_id: str, event_id: Any) -> dict[str, Any] | None:
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", api_key=api_key, params={"resolve": "true"}
+        url=f"/athlete/{seg(athlete_id)}/events/{seg(event_id)}", params={"resolve": "true"}
     )
     return result if isinstance(result, dict) and "error" not in result else None
 
 
 async def _match_candidates(  # pylint: disable=too-many-locals
-    athlete_id: str, activity: dict[str, Any], api_key: str | None
+    athlete_id: str, activity: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Read-only suggestion of planned workouts that could belong to an unpaired activity.
 
@@ -431,7 +426,7 @@ async def _match_candidates(  # pylint: disable=too-many-locals
     except ValueError:
         return []
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events", api_key=api_key,
+        url=f"/athlete/{seg(athlete_id)}/events",
         params={"oldest": start, "newest": end, "category": "WORKOUT"},
     )
     if not isinstance(result, list):
@@ -477,81 +472,50 @@ def _stream_types_for_execution(activity: dict[str, Any], stream_defs: dict[str,
 
 @tool("read")
 async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
-    activity_id: str,
-    api_key: str | None = None,
-    event_id: str | None = None,
-    planned_workout_doc: dict[str, Any] | None = None,
-    suggest_matches: bool = True,
-    output_format: str = "text",
-    detail_level: str = "standard",
-    duration_tolerance_pct: float | None = None,
-    start_tolerance_s: float | None = None,
-    pause_tolerance_s: float | None = None,
+    activity_id: ActivityId,
+    event_id: Annotated[str | None, Field(
+        description="Planned workout event to compare against; default the event paired with the activity"
+    )] = None,
+    planned_workout_doc: Annotated[dict[str, Any] | None, Field(
+        description='Workout document {"steps": [...]} (format of add_or_update_event), e.g. when the event was deleted'
+    )] = None,
+    suggest_matches: Annotated[bool, Field(
+        description="Unpaired activity without plan: list candidate events of the same days (read-only)"
+    )] = True,
+    output_format: OutputFormat = "text",
+    detail_level: Annotated[DetailLevel, Field(
+        description="compact = one line per step plus summary; standard; full adds counter and other-sport "
+        "custom streams"
+    )] = "standard",
+    duration_tolerance_pct: Annotated[float | None, Field(
+        description="Step length deviation in % of the step (at least 30 s) before it is split or flagged; default 10"
+    )] = None,
+    start_tolerance_s: Annotated[float | None, Field(
+        description="Flag steps starting further than this from the plan timeline, seconds; default 120"
+    )] = None,
+    pause_tolerance_s: Annotated[float | None, Field(
+        description="Recording pause per step that is not flagged, seconds; default 60"
+    )] = None,
 ) -> str:
-    """Compare a planned workout with how it was actually executed (or analyse the intervals alone)
+    """Use to check how a planned workout was executed, or without a plan to evaluate each detected interval of one activity.
 
-    Uses, in this order, the given planned_workout_doc, the given event_id, or the event
-    paired with the activity, together with the intervals Intervals.icu detected. Planned
-    steps (repeats expanded) are aligned with the actual intervals by order, duration (or
-    distance) and target intensity (never by interval names); a step may also match any
-    number of consecutive intervals of about the same intensity (an effort split by laps,
-    e.g. 1 km device auto-laps, or a stop). Lap presses are kept as step boundaries. With
-    device auto-laps (most laps of one distance or duration) a step boundary inside a lap is
-    placed where the intensity changes, a step without a lap of its own between two matched
-    steps is found at its two intensity changes, and an overrun is reported as longer than
-    planned; a boundary the samples cannot place is kept and the durations there are not
-    judged. A caveat line and JSON alignment_confidence (high / medium / low) with notes say
-    how far the per-step results can be trusted. Open-ended targets (top zone, a %/W range
-    with a start only) are lower bounds. Steps in the recovery zone or between two clearly
-    harder steps count as rest (no length limit), easy aerobic steps as work. Steps without
-    duration (distance, lap button) restart the plan clock at their actual end. Planned
-    steps are capped at their planned duration: when an interval is longer than
-    its step (beyond the tolerance), it is split logically (analysis only, nothing on
-    Intervals.icu changes); the planned part is evaluated against the plan from the samples
-    and the remainder is reported separately. For each step: planned vs actual (moving)
-    duration, the target range (resolved to W, bpm or pace), the actual average, below/in/
-    above target with the offset from the exact range, time within the target range (±5%),
-    HR start/end, the HR drop in the first minute after work steps, cadence, power/speed
-    fade, Pw:HR drift for work steps of 10 min or more (Intervals.icu decoupling sign:
-    positive = HR rose relative to power), the change of every custom stream
-    (e.g. stamina; clock counters and other-sport streams are left out) and notes on clear
-    deviations (short, too long, off target, paused, shifted). The Intervals.icu interval
-    type is kept and shown next to the planned step type when they differ. Everything after
-    the end of the last planned step (e.g. a cool-down continued for the ride home, extra
-    sprints) is reported as additional training with its own metrics, kJ share, estimated
-    load and the extra efforts it contains, and is not counted against the plan; riding
-    before the first step is reported the same way. Without a plan the same metrics are
-    reported per detected interval; for an unpaired activity up to three planned workouts
-    of the same days are suggested (read-only, nothing is paired or changed). The content
-    of a deleted event is never reconstructed; pass planned_workout_doc instead.
-
-    Args:
-        activity_id: The Intervals.icu activity ID
-        api_key: The Intervals.icu API key (optional, will use API_KEY from .env if not provided)
-        event_id: Planned workout (event) to compare against (optional; default: the event
-            paired with the activity, if any)
-        planned_workout_doc: Workout document with "steps" (same format as add_or_update_event)
-            to compare against, e.g. when the calendar event no longer exists (optional)
-        suggest_matches: For unpaired activities without a plan, list candidate events of the
-            same days as a read-only suggestion (optional, default True)
-        output_format: "text" (default) or "json"
-        detail_level: "compact" (one line per step plus the summary), "standard" (default) or
-            "full" (also counter and other-sport custom streams)
-        duration_tolerance_pct: How much longer/shorter (in % of the step, at least 30 s) a step
-            may be before it is split or flagged as short (optional, default 10)
-        start_tolerance_s: Steps starting more than this many seconds away from the plan
-            timeline are flagged (optional, default 120)
-        pause_tolerance_s: Recording pauses inside a step up to this many seconds are not
-            flagged (optional, default 60); durations are always compared on moving time
+    The plan comes from planned_workout_doc, event_id or the event paired with the activity.
+    Planned steps (repeats expanded) are aligned with the intervals by order, duration or distance
+    and target intensity, never by names; laps that split one effort are merged. Per step: planned
+    vs actual moving time, target (W, bpm or pace) vs actual, time in target, HR response, cadence,
+    fade, Pw:HR drift (work steps of 10 min or more) and custom stream changes, with deviation notes
+    and an alignment confidence. Time past a step's plan and training after the plan are reported
+    apart. Unpaired: up to three candidate events, nothing is paired. Read-only. Method:
+    intervals://methods/execution (get_guide).
     """
     tolerances = tolerances_from_args(duration_tolerance_pct, start_tolerance_s, pause_tolerance_s, detail_level)
     if isinstance(tolerances, str):
         return tolerances
-    activity, error = await _get_activity(activity_id, api_key)
+    activity, error = await _get_activity(activity_id)
     if error or activity is None:
         return error or "Error"
     athlete_id = str(activity.get("icu_athlete_id") or config.athlete_id or "")
-    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals", api_key=api_key)
+    intervals_result = await make_intervals_request(url=f"/activity/{seg(activity_id)}/intervals")
     intervals: list[dict[str, Any]] = []
     load_errors: list[str] = []  # API errors are reported, never shown as missing data (API-7)
     if isinstance(intervals_result, dict) and "error" not in intervals_result:
@@ -559,9 +523,9 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     elif isinstance(intervals_result, dict):
         load_errors.append(f"intervals could not be loaded: {intervals_result.get('message', 'Unknown error')}")
 
-    stream_defs = await _defs(ACTIVITY_STREAM, api_key, athlete_id)
-    field_defs = await _defs(ACTIVITY_FIELD, api_key, athlete_id)
-    streams, streams_error = await _get_streams(activity_id, api_key, _stream_types_for_execution(activity, stream_defs))
+    stream_defs = await _defs(ACTIVITY_STREAM, athlete_id)
+    field_defs = await _defs(ACTIVITY_FIELD, athlete_id)
+    streams, streams_error = await _get_streams(activity_id, _stream_types_for_execution(activity, stream_defs))
     if streams_error and streams_error.startswith("Error"):
         load_errors.append(streams_error)
 
@@ -573,14 +537,14 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
         plan_source = "workout document provided by the caller"
     paired = event_id or activity.get("paired_event_id")
     if steps is None and paired and athlete_id:
-        event = await _get_event(athlete_id, paired, api_key)
+        event = await _get_event(athlete_id, paired)
         steps = ((event or {}).get("workout_doc") or {}).get("steps") if event else None
         if event:
             plan_source = f"event {event.get('id')} ('{event.get('name')}', {str(event.get('start_date_local', ''))[:10]})"
     planned = plan_steps(steps, _threshold_context(activity)) if isinstance(steps, list) else []
     candidates: list[dict[str, Any]] = []
     if not planned and not paired and suggest_matches and athlete_id:
-        candidates = await _match_candidates(athlete_id, activity, api_key)
+        candidates = await _match_candidates(athlete_id, activity)
 
     doc = planned_workout_doc if isinstance(planned_workout_doc, dict) else ((event or {}).get("workout_doc") or {})
     context = {**_threshold_context(activity), "activity_type": activity.get("type"), "stream_defs": stream_defs,
@@ -589,7 +553,7 @@ async def analyze_workout_execution(  # pylint: disable=too-many-locals,too-many
     result = await asyncio.to_thread(analyze, planned, intervals, streams, tolerances=tolerances, context=context)
     pace_based = str(activity.get("type")) in PACE_SPORTS or (event or {}).get("target") == "PACE"
 
-    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, api_key, activity.get("type")))
+    assigned = assigned_codes(field_defs, await assigned_field_ids(athlete_id, activity.get("type")))
     device_lines = format_custom_field_lines(activity, field_defs, prefix="", only=assigned)
     header = f"Workout execution for {_activity_header(activity)}"
     if planned:
