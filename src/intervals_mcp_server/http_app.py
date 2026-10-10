@@ -13,6 +13,7 @@ When the built-in OAuth server is enabled it also adds what the MCP SDK does not
 * protected resource metadata listing the permission scopes,
 * an ``iss`` parameter on every authorization response of ``/authorize`` (also the error
   redirects produced by the SDK), so clients can use a stable redirect URI,
+* ``application/x-www-form-urlencoded`` bodies only at ``/token`` and ``/revoke``,
 * verification of ``private_key_jwt`` client assertions at ``/token`` and ``/revoke``
   (and, by default, refusal of token requests without one from clients whose metadata
   document declares ``private_key_jwt``),
@@ -40,6 +41,7 @@ from intervals_mcp_server.auth_clients import (
     ASSERTION_ALGORITHMS,
     ClientAssertionMiddleware,
     ClientAssertionVerifier,
+    UrlencodedFormMiddleware,
 )
 
 __all__ = ["HTTP_TRANSPORTS", "authorization_server_metadata", "build_http_app"]
@@ -226,6 +228,9 @@ def _apply_oauth(app: Starlette, provider: SingleUserOAuthProvider, settings: Au
             lambda inner: ClientAssertionMiddleware(inner, verifier, require_declared=config.require_private_key_jwt),
         )
         _wrap_route(routes, "/revoke", lambda inner: ClientAssertionMiddleware(inner, verifier))
+    # Outermost: RFC 6749 bodies only, so every layer below reads the same fields.
+    for path in ("/token", "/revoke"):
+        _wrap_route(routes, path, UrlencodedFormMiddleware)
 
 
 def build_http_app(

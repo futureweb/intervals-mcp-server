@@ -56,10 +56,12 @@ Environment variables (all optional unless noted):
 ``OAUTH_STATE_FILE``               JSON file for clients and refresh tokens
 ``OAUTH_ACCESS_TOKEN_TTL`` / ``OAUTH_REFRESH_TOKEN_TTL`` / ``OAUTH_LOGIN_RATE_LIMIT``
 ``OAUTH_LOGIN_GLOBAL_RATE_LIMIT``  failed password / API-key sign-ins from all addresses together
-                                   per window before those sign-ins pause (default 50)
-``OAUTH_REFRESH_REUSE_GRACE``      seconds in which a just-rotated refresh token is still accepted
-                                   (a client retrying after a lost response); later reuse revokes
-                                   the grant (default 120)
+                                   per window before those sign-ins pause (default 500; with TOTP a
+                                   sign-in with a valid code is never paused by it)
+``OAUTH_REFRESH_REUSE_GRACE``      seconds in which a just-rotated refresh token still gets the same
+                                   answer again (a client retrying after a lost response; default 120)
+``OAUTH_REFRESH_REUSE_REVOKE``     revoke the grant when a rotated refresh token is used after the
+                                   grace period (default ``true``; ``false`` only refuses that request)
 
 Access tokens live in memory only; registered clients and refresh tokens are persisted
 (as digests) so a restart does not disconnect clients.  The state file is written in a
@@ -170,7 +172,7 @@ MAX_PENDING_PER_KEY = 20
 MAX_CLIENT_NAME_CHARS = 100
 MAX_REDIRECT_URIS = 10
 MAX_CLIENT_METADATA_BYTES = 8 * 1024
-DEFAULT_LOGIN_GLOBAL_RATE_LIMIT = 50
+DEFAULT_LOGIN_GLOBAL_RATE_LIMIT = 500
 REGISTRATIONS_PER_KEY = 10
 REGISTRATION_WINDOW = 3600
 DEFAULT_REFRESH_REUSE_GRACE = 120
@@ -216,6 +218,16 @@ def reset_request_client_key(token: Token[str]) -> None:
 def request_client_key() -> str:
     """Rate-limit key of the current request's client, ``unknown`` outside a request."""
     return _REQUEST_CLIENT_KEY.get()
+
+
+def _eviction_group(key: str) -> str:
+    """The network a rate-limit key is counted in when tables are full: IPv6 by /48."""
+    if "/" not in key:
+        return key
+    try:
+        return str(ipaddress.IPv6Network(key, strict=False).supernet(new_prefix=48))
+    except ValueError:
+        return key
 
 
 def _one_line(exc: BaseException) -> str:
@@ -307,6 +319,7 @@ class OAuthConfig:  # pylint: disable=too-many-instance-attributes
     login_rate_window: int = LOGIN_RATE_LIMIT_WINDOW
     login_global_rate_limit: int = DEFAULT_LOGIN_GLOBAL_RATE_LIMIT
     refresh_reuse_grace: int = DEFAULT_REFRESH_REUSE_GRACE
+    refresh_reuse_revoke: bool = True
     require_private_key_jwt: bool = True
     login_methods: tuple[str, ...] = ("password",)
     intervals_client_id: str | None = None
@@ -522,6 +535,7 @@ def oauth_config_from_env(environ: Mapping[str, str] | None = None) -> OAuthConf
         login_rate_limit=_env_int(env, "OAUTH_LOGIN_RATE_LIMIT", DEFAULT_LOGIN_RATE_LIMIT),
         login_global_rate_limit=_env_int(env, "OAUTH_LOGIN_GLOBAL_RATE_LIMIT", DEFAULT_LOGIN_GLOBAL_RATE_LIMIT),
         refresh_reuse_grace=_env_int(env, "OAUTH_REFRESH_REUSE_GRACE", DEFAULT_REFRESH_REUSE_GRACE, minimum=0),
+        refresh_reuse_revoke=_env_bool(env, "OAUTH_REFRESH_REUSE_REVOKE", True),
         require_private_key_jwt=_env_bool(env, "OAUTH_REQUIRE_PRIVATE_KEY_JWT", True),
         login_methods=methods,
         intervals_client_id=client_id,
@@ -582,10 +596,30 @@ class _TokenRecord:
 
 @dataclass
 class _RotatedToken:
-    """A refresh token that was exchanged: still accepted for a short grace period."""
+    """A refresh token that was exchanged.
+
+    For the grace period the answer of the exchange (``response``, kept in memory only and
+    dropped when the grace period ends) is returned again to a client that presents the old
+    token once more: a retry after a lost response gets the same tokens, so one grant never
+    forks into several live refresh-token chains.
+    """
 
     record: _TokenRecord
     rotated_at: float
+    successor: str = ""
+    response: OAuthToken | None = None
+
+
+class _AlreadyRotated(Exception):
+    """The refresh token was exchanged by a concurrent request while this one waited."""
+
+
+class _Refused(Exception):
+    """A token request refused inside :meth:`SingleUserOAuthProvider._state_change`.
+
+    The SDK's TokenError is a frozen dataclass and cannot pass through an async context
+    manager (contextlib sets ``__traceback__`` on it); callers turn this into TokenError.
+    """
 
 
 @dataclass
@@ -650,6 +684,14 @@ class _LoginRateLimiter:
     def reset(self, key: str) -> None:
         """Forget the events of *key* (after a successful login)."""
         self._failures.pop(key, None)
+
+    def forget_last(self, key: str) -> None:
+        """Take back the latest event of *key*."""
+        stamps = self._failures.get(key)
+        if stamps:
+            stamps.pop()
+            if not stamps:
+                del self._failures[key]
 
     def __len__(self) -> int:
         return len(self._failures)
@@ -750,11 +792,12 @@ def _refresh_scopes(granted: list[str], requested: list[str] | None) -> list[str
     """Scopes for a refreshed token: the requested subset, but never fewer permission scopes than ``read``.
 
     The SDK accepts any subset of the refresh token's scopes. Dropping every ``intervals:*``
-    scope keeps the grant's own permission scopes instead of producing a bare ``mcp`` token.
+    scope keeps the grant's own permission scopes instead of producing a bare ``mcp`` token,
+    and ``mcp`` itself (required by the transports) always stays.
     """
     if not requested:
         return list(granted)
-    narrowed = [scope for scope in granted if scope in requested]
+    narrowed = [scope for scope in granted if scope in requested or scope == SCOPE]
     if not any(scope.startswith(PERMISSION_SCOPE_PREFIX) for scope in narrowed):
         narrowed += [scope for scope in granted if scope.startswith(PERMISSION_SCOPE_PREFIX)]
     return narrowed or list(granted)
@@ -860,6 +903,9 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             known = record.client_id in self._clients or is_metadata_client_id(record.client_id)
             if known:
                 self._tokens.refresh[digest] = record
+                if is_metadata_client_id(record.client_id):
+                    # Its document is fetched even while unknown client ids use up the budget.
+                    self.metadata_clients.remember(record.client_id)
         logger.info(
             "OAuth state loaded: %d client(s), %d refresh token(s)",
             len(self._clients),
@@ -982,6 +1028,8 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self._tokens.refresh[_digest(refresh)] = _TokenRecord(
             client_id, scopes, now + self._config.refresh_token_ttl, grant_id, resource
         )
+        if is_metadata_client_id(client_id):
+            self.metadata_clients.remember(client_id)
         self._purge_expired_tokens()
         return OAuthToken(
             access_token=access,
@@ -1003,15 +1051,42 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             del store.codes[code]
         for digest in [d for d, rot in store.rotated.items() if rot.record.expires_at <= now]:
             del store.rotated[digest]
+        for rotated in store.rotated.values():
+            if rotated.response is not None and not self._in_grace(rotated):
+                rotated.response = None  # raw tokens only live for the grace period
 
-    def _remember_rotated(self, digest: str, record: _TokenRecord) -> None:
+    def _remember_rotated(self, digest: str, record: _TokenRecord, token: OAuthToken) -> None:
         rotated = self._tokens.rotated
-        rotated[digest] = _RotatedToken(record, self._clock())
+        successor = _digest(token.refresh_token or "")
+        rotated[digest] = _RotatedToken(record, self._clock(), successor, token)
         while len(rotated) > MAX_ROTATED_REFRESH_TOKENS:
             del rotated[next(iter(rotated))]
 
     def _in_grace(self, rotated: _RotatedToken) -> bool:
         return self._clock() - rotated.rotated_at <= self._config.refresh_reuse_grace
+
+    def _grace_answer(self, digest: str, client: OAuthClientInformationFull) -> OAuthToken | None:
+        """The earlier answer for an exchanged refresh token presented again within the grace period.
+
+        None when *digest* was never exchanged; TokenError when it may not be answered again
+        (other client, grace period over, or its successor was already used).
+        """
+        rotated = self._tokens.rotated.get(digest)
+        if rotated is None:
+            return None
+        if (
+            rotated.record.client_id != client.client_id
+            or not self._in_grace(rotated)
+            or rotated.response is None
+            or rotated.successor not in self._tokens.refresh
+        ):
+            raise TokenError("invalid_grant", "refresh token is not valid")
+        logger.info(
+            "Refresh token of client %s presented again within the grace period; same tokens returned",
+            _for_log(client.client_id),
+        )
+        elapsed = int(self._clock() - rotated.rotated_at)
+        return rotated.response.model_copy(update={"expires_in": max(1, (rotated.response.expires_in or 1) - elapsed)})
 
     def _revoke_grant(self, grant_id: str) -> None:
         """Drop every token of a grant (call inside :meth:`_state_change`)."""
@@ -1027,9 +1102,10 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         """Make room in *table* (insertion ordered) for one more entry of *key*.
 
         A key may hold at most *per_key* entries (its oldest is dropped); when the table is
-        full, the oldest entry of the key with the most entries goes, so one address cannot
-        push out another address's sign-in. Without a known address (``unknown``: an app
-        built without the middleware) only the global limit applies.
+        full, the oldest entry of the busiest network goes (IPv6 grouped by /48), so one
+        address or one network cannot push out another address's sign-in. Without a known
+        address (``unknown``: an app built without the middleware) only the global limit
+        applies.
         """
         if key == "unknown":
             per_key = total
@@ -1039,9 +1115,10 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         while len(table) >= total:
             counts: dict[str, int] = {}
             for entry in table.values():
-                counts[entry.key] = counts.get(entry.key, 0) + 1
+                group = _eviction_group(entry.key)
+                counts[group] = counts.get(group, 0) + 1
             busiest = max(counts, key=lambda k: counts[k])
-            del table[next(k for k, entry in table.items() if entry.key == busiest)]
+            del table[next(k for k, entry in table.items() if _eviction_group(entry.key) == busiest)]
 
     def _purge_pending(self) -> None:
         now = self._clock()
@@ -1164,13 +1241,16 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         """Consume the single-use code and issue access + refresh tokens."""
-        async with self._state_change():
-            code = self._tokens.codes.pop(authorization_code.code, None)
-            if code is None or code.client_id != client.client_id:
-                raise TokenError("invalid_grant", "authorization code is not valid")
-            grant_id = secrets.token_urlsafe(16)
-            self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
-            token = self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
+        try:
+            async with self._state_change():
+                code = self._tokens.codes.pop(authorization_code.code, None)
+                if code is None or code.client_id != client.client_id:
+                    raise _Refused("authorization code is not valid")
+                grant_id = secrets.token_urlsafe(16)
+                self._tokens.used_codes[code.code] = (self._clock() + AUTHORIZATION_CODE_TTL, grant_id)
+                token = self._issue_tokens(code.client_id, code.scopes, grant_id, code.resource)
+        except _Refused as exc:
+            raise TokenError("invalid_grant", str(exc)) from None
         logger.info("Issued tokens to client %s", _for_log(client.client_id))
         return token
 
@@ -1191,12 +1271,22 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
             if rotated is None or rotated.record.client_id != client.client_id:
                 return None
             if not self._in_grace(rotated):
+                if not self._config.refresh_reuse_revoke:
+                    logger.warning(
+                        "Refresh token of client %s was used again after it had been exchanged; refused "
+                        "(OAUTH_REFRESH_REUSE_REVOKE=false keeps the grant)",
+                        _for_log(client.client_id),
+                    )
+                    return None
                 logger.warning(
                     "Refresh token of client %s was used again after it had been exchanged; revoking the grant",
                     _for_log(client.client_id),
                 )
                 async with self._state_change():
                     self._revoke_grant(rotated.record.grant_id)
+                return None
+            if rotated.response is None or rotated.successor not in self._tokens.refresh:
+                # Its successor was used already: a stale copy, not a lost response.
                 return None
             record = rotated.record
         elif record.client_id != client.client_id:
@@ -1211,25 +1301,34 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        """Rotate the refresh token and issue a new access token for the same grant."""
+        """Rotate the refresh token and issue a new access token for the same grant.
+
+        A token exchanged moments ago (concurrently, or a retry after a lost response) gets
+        the same answer again within the grace period instead of a second chain.
+        """
         digest = _digest(refresh_token.token)
-        async with self._state_change():
-            record = self._tokens.refresh.pop(digest, None)
-            retry = False
-            if record is None:
-                rotated = self._tokens.rotated.get(digest)
-                if rotated is None or not self._in_grace(rotated):
-                    raise TokenError("invalid_grant", "refresh token is not valid")
-                record, retry = rotated.record, True
-            if record.client_id != client.client_id:
-                raise TokenError("invalid_grant", "refresh token is not valid")
-            if not retry:
-                self._remember_rotated(digest, record)
-            token = self._issue_tokens(
-                record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource
-            )
-        if retry:
-            logger.info("Refresh token of client %s presented again within the grace period", _for_log(client.client_id))
+        answer = self._grace_answer(digest, client)
+        if answer is not None:
+            return answer
+        try:
+            async with self._state_change():
+                record = self._tokens.refresh.get(digest)
+                if record is None:
+                    raise _AlreadyRotated()
+                if record.client_id != client.client_id:
+                    raise _Refused("refresh token is not valid")
+                del self._tokens.refresh[digest]
+                token = self._issue_tokens(
+                    record.client_id, _refresh_scopes(record.scopes, scopes), record.grant_id, record.resource
+                )
+                self._remember_rotated(digest, record, token)
+        except _Refused as exc:
+            raise TokenError("invalid_grant", str(exc)) from None
+        except _AlreadyRotated:
+            answer = self._grace_answer(digest, client)
+            if answer is None:
+                raise TokenError("invalid_grant", "refresh token is not valid") from None
+            return answer
         logger.info("Refreshed tokens for client %s", _for_log(client.client_id))
         return token
 
@@ -1289,14 +1388,37 @@ class SingleUserOAuthProvider(  # pylint: disable=too-many-instance-attributes,t
         return self._rate_limiter.is_blocked(key)
 
     def local_login_blocked(self) -> bool:
-        """True when password / API-key sign-ins failed too often across all addresses."""
-        return self._global_failures.is_blocked("*")
+        """True when password / API-key sign-ins failed too often across all addresses.
+
+        With TOTP the global budget does not pause sign-ins: without the code a password
+        guess cannot succeed anyway, and the athlete must not be locked out by others.
+        """
+        return self._global_failures.is_blocked("*") and not self.totp_required
 
     def record_login_failure(self, key: str, local: bool = False) -> None:
         """Count a failed login for *key*; *local* failures (password, API key) also count globally."""
         self._rate_limiter.record_failure(key)
         if local:
             self._global_failures.record_failure("*")
+
+    def begin_local_login(self, key: str) -> str | None:
+        """Check the limits and count a password / API-key attempt in one step.
+
+        The attempt is counted before the (threaded) password check, so concurrent requests
+        cannot all pass the check first. Returns why the attempt is refused, or None.
+        :meth:`local_login_succeeded` takes the count back.
+        """
+        if self._rate_limiter.is_blocked(key):
+            return "address"
+        if self.local_login_blocked():
+            return "global"
+        self.record_login_failure(key, local=True)
+        return None
+
+    def local_login_succeeded(self, key: str) -> None:
+        """Take back the attempt counted by :meth:`begin_local_login` after a successful sign-in."""
+        self._rate_limiter.reset(key)
+        self._global_failures.forget_last("*")
 
     def verify_credentials(self, username: str, password: str) -> bool:
         """Constant-time check of the submitted credentials (CPU heavy with a hash: run it in a thread)."""

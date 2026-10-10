@@ -24,6 +24,7 @@ import secrets
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+import anyio
 import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -52,6 +53,9 @@ CSRF_FIELD = "csrf"
 MAX_FORM_BYTES = 16 * 1024
 MAX_FORM_FIELDS = 50
 _BROWSER_VALUE = re.compile(r"[A-Za-z0-9_-]{32,64}")
+# Worker threads for the password hash: a sign-in flood queues here instead of filling the
+# shared pool that also writes the OAuth state file.
+HASH_THREADS = 4
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -295,6 +299,7 @@ def _redirect(location: str, headers: dict[str, str] | None = None) -> RedirectR
 
 def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None:  # pylint: disable=too-many-statements
     """Register the consent page, the sign-in handlers and the Intervals.icu callback on *mcp*."""
+    hash_limiter = anyio.CapacityLimiter(HASH_THREADS)
 
     def consent_page(request: Request, request_id: str, username: str, error: str | None, status: int) -> Response:
         """The consent page with a form token bound to this browser's consent cookie."""
@@ -364,23 +369,30 @@ def install_routes(mcp: FastMCP[Any], provider: SingleUserOAuthProvider) -> None
             return response
         if action not in ("password", "apikey") or action not in provider.config.login_methods:
             return error_page("This sign-in method is not enabled.", 400)
-        if provider.local_login_blocked():
-            logger.warning("Global sign-in failure limit reached; %s sign-in from %s paused", action, key)
+        # Check and count the attempt before the threaded check (no await in between).
+        refused = provider.begin_local_login(key)
+        if refused is not None:
+            if refused == "global":
+                logger.warning("Global sign-in failure limit reached; %s sign-in from %s paused", action, key)
+            else:
+                logger.warning("Login rate limit reached for %s", key)
             return error_page("Too many failed sign-in attempts. Please try again later.", 429, retry_after)
         username = form.get("username")
         if action == "password":
             # PBKDF2 with 600k iterations takes ~0.3 s: keep it off the event loop.
-            valid = await anyio.to_thread.run_sync(provider.verify_credentials, username, form.get("password"))
+            valid = await anyio.to_thread.run_sync(
+                provider.verify_credentials, username, form.get("password"), limiter=hash_limiter
+            )
         else:
             valid = provider.verify_api_key(form.get("api_key"))
         # Evaluate the second factor even after a wrong first factor (no early exit), but
         # only use up the code when the first factor was right.
         second = provider.verify_second_factor(form.get("totp"), consume=valid)
         if not (valid and second):
-            provider.record_login_failure(key, local=True)
             logger.warning("Failed %s sign-in from %s", action, key)
             message = "Invalid credentials or authenticator code." if provider.totp_required else "Invalid credentials."
             return consent_page(request, request_id, username or provider.config.username, message, 401)
+        provider.local_login_succeeded(key)
         return _redirect(provider.complete_login(request_id, key, granted))
 
     async def intervals_callback(request: Request) -> Response:

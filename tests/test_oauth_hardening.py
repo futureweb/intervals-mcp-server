@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
-from mcp.server.auth.provider import AuthorizationParams, RefreshToken
+from mcp.server.auth.provider import AuthorizationParams, RefreshToken, TokenError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 from starlette.testclient import TestClient
@@ -33,6 +33,7 @@ from intervals_mcp_server.auth_clients import ClientMetadataResolver, allowlist_
 from intervals_mcp_server.http_app import PRM_PATH
 from tests.oauth_helpers import consent_token, submit_consent
 from tests.test_oauth_extensions import (
+    ASSERTION_TYPE,
     CHATGPT_DOC,
     CHATGPT_ID,
     DCR_REDIRECT,
@@ -41,6 +42,7 @@ from tests.test_oauth_extensions import (
     FakeIntervals,
     FakeWeb,
     authorize,
+    client_assertion,
     make_app,
     make_env,
     pkce_pair,
@@ -367,7 +369,7 @@ def test_concurrent_metadata_requests_share_one_fetch():
 
 
 def test_refresh_retry_within_the_grace_period_works(tmp_path):
-    """A client that lost the refresh response can retry with the old token."""
+    """A client that lost the refresh response can retry with the old token and gets the same answer."""
     clock = Clock()
     provider = provider_for(tmp_path, clock)
     registered = dcr_client()
@@ -376,10 +378,66 @@ def test_refresh_retry_within_the_grace_period_works(tmp_path):
     rotated = refresh_with(provider, registered, first.refresh_token)
     clock.now += 30
     retried = refresh_with(provider, registered, first.refresh_token)
-    assert retried is not None and retried.refresh_token not in (rotated.refresh_token, first.refresh_token)
-    # both answers work: the client keeps whichever it received
+    assert retried is not None
+    assert (retried.refresh_token, retried.access_token) == (rotated.refresh_token, rotated.access_token)
+    assert retried.expires_in == rotated.expires_in - 30
     assert refresh_with(provider, registered, rotated.refresh_token) is not None
-    assert refresh_with(provider, registered, retried.refresh_token) is not None
+    # once the successor was used, the old token is not answered again, even within the grace period
+    assert refresh_with(provider, registered, first.refresh_token) is None
+
+
+def test_grace_retries_keep_one_chain(tmp_path):
+    """R24-8: replays within the grace period do not fork the grant into parallel chains."""
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+    answers = [refresh_with(provider, registered, first.refresh_token) for _ in range(20)]
+    assert len({answer.refresh_token for answer in answers}) == 1
+    assert len(provider._tokens.refresh) == 1
+    assert len(json.loads(provider.config.state_file.read_text())["refresh_tokens"]) == 1
+
+
+def test_raw_tokens_are_dropped_after_the_grace_period(tmp_path):
+    clock = Clock()
+    provider = provider_for(tmp_path, clock)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+    refresh_with(provider, registered, first.refresh_token)
+    assert all(rot.response is not None for rot in provider._tokens.rotated.values())
+    clock.now += auth.DEFAULT_REFRESH_REUSE_GRACE + 1
+    provider._purge_expired_tokens()
+    assert all(rot.response is None for rot in provider._tokens.rotated.values())
+
+
+def test_reuse_revocation_can_be_switched_off(tmp_path):
+    """R24-4: OAUTH_REFRESH_REUSE_REVOKE=false refuses a stale token but keeps the live chain."""
+    clock = Clock()
+    provider = provider_for(tmp_path, clock, OAUTH_REFRESH_REUSE_REVOKE="false")
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+    live = refresh_with(provider, registered, first.refresh_token)
+    clock.now += 600
+    assert refresh_with(provider, registered, first.refresh_token) is None
+    assert refresh_with(provider, registered, live.refresh_token) is not None
+
+
+def test_refresh_narrowed_to_a_permission_scope_keeps_mcp(tmp_path):
+    """R24-9: a refresh asking only for intervals:read still gets the mcp scope the transports require."""
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    first = issue_tokens(provider, registered)
+
+    async def narrowed() -> Any:
+        loaded = await provider.load_refresh_token(registered, first.refresh_token)
+        assert loaded is not None
+        return await provider.exchange_refresh_token(registered, loaded, ["intervals:read"])
+
+    assert asyncio.run(narrowed()).scope == "mcp intervals:read"
+    assert auth._refresh_scopes(["mcp", "intervals:read", "intervals:write"], ["intervals:read"]) == ["mcp", "intervals:read"]
 
 
 def test_refresh_reuse_after_the_grace_period_revokes_the_grant(tmp_path):
@@ -791,3 +849,225 @@ def test_apps_without_the_address_middleware_keep_the_global_limits(tmp_path):
     for _ in range(auth.MAX_PENDING_PER_KEY + 5):
         asyncio.run(authorize_unknown())
     assert len(provider._pending) == auth.MAX_PENDING_PER_KEY + 5
+
+
+# --------------------------------------------------------------------------- #
+# Second review of PR #24 (R24-1 .. R24-12)
+# --------------------------------------------------------------------------- #
+
+
+def chatgpt_tokens(client: TestClient) -> dict[str, Any]:
+    """Connect ChatGPT (metadata document + private_key_jwt) and return its tokens."""
+    verifier, challenge = pkce_pair()
+    request_id = request_id_from(authorize(client, CHATGPT_ID, STABLE_REDIRECT, challenge, scope="mcp intervals:read intervals:write"))
+    redirect = submit_consent(client, {"request": request_id, "action": "password", "username": "athlete", "password": PASSWORD,
+                                       "grant": ["read", "write"]})
+    code = parse_qs(urlsplit(redirect.headers["location"]).query)["code"][0]
+    token = client.post("/token", data={"grant_type": "authorization_code", "code": code, "redirect_uri": STABLE_REDIRECT,
+                                        "code_verifier": verifier, "client_id": CHATGPT_ID,
+                                        "client_assertion_type": ASSERTION_TYPE, "client_assertion": client_assertion()})
+    assert token.status_code == 200, token.text
+    return token.json()
+
+
+def signed_refresh(client: TestClient, refresh_token: str) -> Any:
+    return client.post("/token", data={"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": CHATGPT_ID,
+                                       "client_assertion_type": ASSERTION_TYPE, "client_assertion": client_assertion()})
+
+
+def test_token_endpoint_accepts_only_urlencoded_bodies(tmp_path):
+    """R24-1: a multipart body (which the SDK would parse) cannot slip past the assertion check."""
+    _, _, client = make_app(make_env(tmp_path))
+    tokens = chatgpt_tokens(client)
+    form = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "client_id": CHATGPT_ID}
+    assert client.post("/token", data=form).status_code == 401
+    multipart = client.post("/token", data=form, files={"x": ("x", b"")})
+    assert multipart.status_code == 400 and multipart.json()["error"] == "invalid_request"
+    as_json = client.post("/token", json=form)
+    assert as_json.status_code == 400
+    no_type = client.post("/token", content="grant_type=refresh_token", headers={"content-type": ""})
+    assert no_type.status_code == 400
+    revoke = client.post("/revoke", data={"token": tokens["refresh_token"], "client_id": CHATGPT_ID}, files={"x": ("x", b"")})
+    assert revoke.status_code == 400
+    repeated = client.post("/token", content=f"grant_type=refresh_token&refresh_token={tokens['refresh_token']}"
+                           f"&client_id=x&client_id={CHATGPT_ID}", headers={"content-type": "application/x-www-form-urlencoded"})
+    assert repeated.status_code == 400
+    # the legitimate signed refresh still works
+    assert signed_refresh(client, tokens["refresh_token"]).status_code == 200
+
+
+def test_token_endpoint_without_private_key_jwt_also_refuses_multipart(tmp_path):
+    _, _, client = make_app(make_env(tmp_path, OAUTH_PRIVATE_KEY_JWT="false"))
+    response = client.post("/token", data={"grant_type": "refresh_token", "refresh_token": "x", "client_id": "c"},
+                           files={"x": ("x", b"")})
+    assert response.status_code == 400
+
+
+def test_budget_exhaustion_cannot_lock_out_a_client_with_a_grant(tmp_path):
+    """R24-2: random client ids use up the fetch budget right after a restart; ChatGPT still refreshes."""
+    env = make_env(tmp_path)
+    _, _, client = make_app(env)
+    tokens = chatgpt_tokens(client)
+    web = FakeWeb()
+    _, provider, restarted = make_app(env, web=web)  # new process: empty cache, grant from the state file
+    _, challenge = pkce_pair()
+    for i in range(40):
+        authorize(restarted, f"https://chatgpt.com/attacker/{i}.json", STABLE_REDIRECT, challenge)
+    assert sum(1 for url in web.calls if "/attacker/" in url) <= 10  # the budget held the flood back
+    refreshed = signed_refresh(restarted, tokens["refresh_token"])
+    assert refreshed.status_code == 200, refreshed.text
+    assert CHATGPT_ID in web.calls
+    assert provider.metadata_clients.is_known(CHATGPT_ID)
+    # and a brand-new client id still waits for the budget
+    assert not provider.metadata_clients.is_known("https://chatgpt.com/attacker/new.json")
+
+
+def test_exact_pin_refuses_variants_without_fetching(tmp_path):
+    """R24-5: an exact entry admits that URL only, without sub-paths or dot segments."""
+    env = make_env(tmp_path, OAUTH_CLIENT_HOSTS="chatgpt.com/oauth/client.json")
+    _, _, client = make_app(env)
+    tokens = chatgpt_tokens(client)
+    web = FakeWeb()
+    _, provider, restarted = make_app(env, web=web)
+    _, challenge = pkce_pair()
+    for suffix in ("/1", "/../1.json", "/./x", "x", "%2f..%2fx"):
+        response = authorize(restarted, f"https://chatgpt.com/oauth/client.json{suffix}", STABLE_REDIRECT, challenge)
+        assert response.status_code == 400
+    assert web.calls == []
+    assert provider.metadata_clients.is_known(CHATGPT_ID)  # pinned
+    assert signed_refresh(restarted, tokens["refresh_token"]).status_code == 200
+
+
+def test_exact_and_prefix_entries():
+    entries = [normalize_allow_entry("chatgpt.com/oauth/client.json"), normalize_allow_entry("chatgpt.com/connector/oauth/")]
+    assert allowlist_match("chatgpt.com", "/oauth/client.json", entries)
+    assert not allowlist_match("chatgpt.com", "/oauth/client.json/x", entries)
+    assert not allowlist_match("chatgpt.com", "/oauth/client.json/../x", entries)
+    assert allowlist_match("chatgpt.com", "/connector/oauth/abc123", entries)
+    assert not allowlist_match("chatgpt.com", "/connector/oauth/../../evil", entries)
+    assert not allowlist_match("chatgpt.com", "/connector/oauth//x", entries)
+    assert not allowlist_match("chatgpt.com", "/connector/oauthx", entries)
+    for bad in ("chatgpt.com/a/../b", "chatgpt.com/a/./b", "chatgpt.com/a%2fb", "chatgpt.com//a"):
+        with pytest.raises(ValueError):
+            normalize_allow_entry(bad)
+    resolver = ClientMetadataResolver(["chatgpt.com"], "mcp", fetch=FakeWeb())
+    for url in ("https://chatgpt.com/a/../oauth/client.json", "https://chatgpt.com/oauth/%63lient.json", "https://chatgpt.com//x"):
+        assert not resolver.url_allowed(url)
+
+
+def test_dcr_redirect_prefix_entries_are_exact(tmp_path):
+    env = make_env(tmp_path, OAUTH_REDIRECT_HOSTS="claude.ai/api/mcp/auth_callback,chatgpt.com/connector/oauth/")
+    _, _, client = make_app(env)
+
+    def register_status(uri: str) -> int:
+        return client.post("/register", json={"redirect_uris": [uri], "token_endpoint_auth_method": "none"}).status_code
+
+    assert register_status("https://claude.ai/api/mcp/auth_callback") == 201
+    assert register_status("https://claude.ai/api/mcp/auth_callback/x") == 400
+    assert register_status("https://chatgpt.com/connector/oauth/abc") == 201
+    assert register_status("https://chatgpt.com/connector/oauthabc") == 400
+
+
+def test_global_budget_does_not_lock_out_a_sign_in_with_totp(tmp_path):
+    """R24-3: with TOTP, ten attacking addresses cannot pause the athlete's sign-in; without TOTP
+    the (now much larger) global budget still pauses password sign-ins - the documented trade-off."""
+    from intervals_mcp_server.auth_totp import generate_secret, totp  # pylint: disable=import-outside-toplevel
+
+    secret = generate_secret()
+    for with_totp in (True, False):
+        extra = {"OAUTH_LOGIN_GLOBAL_RATE_LIMIT": "50"}
+        if with_totp:
+            extra["OAUTH_TOTP_SECRET"] = secret
+        _, _, client = make_app(make_env(tmp_path / str(with_totp), **extra))
+        _, challenge = pkce_pair()
+        for ip in range(10):
+            attacker = TestClient(client.app, base_url="http://127.0.0.1:8000", follow_redirects=False, client=(f"203.0.113.{ip}", 1))
+            for _ in range(5):
+                rid = request_id_from(authorize(attacker, CHATGPT_ID, STABLE_REDIRECT, challenge))
+                wrong = submit_consent(attacker, {"request": rid, "action": "password", "username": "athlete", "password": "no",
+                                                  "totp": "000000"})
+                assert wrong.status_code == 401
+        athlete = TestClient(client.app, base_url="http://127.0.0.1:8000", follow_redirects=False, client=("198.51.100.7", 1))
+        rid = request_id_from(authorize(athlete, CHATGPT_ID, STABLE_REDIRECT, challenge))
+        form = {"request": rid, "action": "password", "username": "athlete", "password": PASSWORD}
+        if with_totp:
+            form["totp"] = totp(secret, time.time())
+        assert submit_consent(athlete, form).status_code == (302 if with_totp else 429)
+    assert auth.DEFAULT_LOGIN_GLOBAL_RATE_LIMIT == 500
+
+
+def test_concurrent_sign_in_burst_is_counted_before_the_password_check(tmp_path, monkeypatch):
+    """R24-6: a burst from one address gets at most OAUTH_LOGIN_RATE_LIMIT password checks."""
+    _, provider, client = make_app(make_env(tmp_path, OAUTH_LOGIN_RATE_LIMIT="5"))
+    _, challenge = pkce_pair()
+    request_id = request_id_from(authorize(client, CHATGPT_ID, STABLE_REDIRECT, challenge))
+    checks: list[int] = []
+
+    def slow_check(_username: str, _password: str) -> bool:
+        checks.append(1)
+        time.sleep(0.05)
+        return False
+
+    monkeypatch.setattr(provider, "verify_credentials", slow_check)
+
+    async def burst() -> list[int]:
+        transport = httpx.ASGITransport(app=client.app, client=("203.0.113.5", 1))
+        async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as http:
+            page = await http.get("/oauth/login", params={"request": request_id})
+            token = page.text.split('name="csrf" value="')[1].split('"')[0]
+            form = {"request": request_id, "action": "password", "username": "athlete", "password": "no", "csrf": token}
+            responses = await asyncio.gather(*(http.post("/oauth/login", data=form) for _ in range(30)))
+            return [r.status_code for r in responses]
+
+    statuses = asyncio.run(burst())
+    assert len(checks) == 5
+    assert statuses.count(429) == 25 and statuses.count(401) == 5
+
+
+def test_pending_flood_from_one_ipv6_48_keeps_the_victim(tmp_path):
+    """R24-7: 500 /64s inside one /48 count as one network when the table is full."""
+    provider = provider_for(tmp_path)
+    registered = dcr_client()
+    asyncio.run(provider.register_client(registered))
+    victim = authorize_as(provider, registered, "2001:db8:aaaa:1::7")
+    for i in range(auth.MAX_PENDING_LOGINS + 20):
+        authorize_as(provider, registered, f"2001:db8:bbbb:{i:x}::1")
+    assert provider.pending_login(victim) is not None
+
+
+def test_version_1_chatgpt_grant_refreshes_through_the_token_endpoint(tmp_path):
+    """R24-12: the production-shaped grant refreshes over HTTP with ChatGPT's assertion after a restart."""
+    state = json.loads(json.dumps(VERSION_1_STATE))
+    entry = next(v for v in state["refresh_tokens"].values() if v["client_id"] == CHATGPT_ID)
+    entry["resource"] = "http://localhost/"
+    write_state(tmp_path, state)
+    web = FakeWeb()
+    _, _, client = make_app(make_env(tmp_path), web=web)
+    _, challenge = pkce_pair()
+    for i in range(40):  # attacker traffic right after the restart
+        authorize(client, f"https://chatgpt.com/attacker/{i}.json", STABLE_REDIRECT, challenge)
+    refreshed = signed_refresh(client, "cimd-refresh-token")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["scope"] == "mcp intervals:read intervals:write"
+    assert signed_refresh(client, refreshed.json()["refresh_token"]).status_code == 200
+
+
+def test_refused_token_requests_inside_a_state_change_are_oauth_errors(tmp_path):
+    """A TokenError raised while the state lock is held must reach the SDK as TokenError (400), not 500."""
+    provider = provider_for(tmp_path)
+    registered, other = dcr_client("c1"), dcr_client("c2")
+    for item in (registered, other):
+        asyncio.run(provider.register_client(item))
+    request_id = authorize_as(provider, registered, "198.51.100.1")
+    code = parse_qs(urlsplit(provider.complete_login(request_id, "198.51.100.1")).query)["code"][0]
+    loaded = asyncio.run(provider.load_authorization_code(registered, code))
+    assert loaded is not None
+    with pytest.raises(TokenError):
+        asyncio.run(provider.exchange_authorization_code(other, loaded))
+    asyncio.run(provider.exchange_authorization_code(registered, loaded))
+    with pytest.raises(TokenError):  # the same code a second time (concurrent double exchange)
+        asyncio.run(provider.exchange_authorization_code(registered, loaded))
+    first = issue_tokens(provider, registered)
+    stolen = RefreshToken(token=first.refresh_token, client_id="c2", scopes=["mcp"], expires_at=None)
+    with pytest.raises(TokenError):
+        asyncio.run(provider.exchange_refresh_token(other, stolen, ["mcp"]))

@@ -6,16 +6,20 @@
   checks that its ``client_id`` equals the URL and only accepts the ``redirect_uris``
   listed there.  ChatGPT identifies itself as ``https://chatgpt.com/oauth/client.json``.
   Documents are only fetched from an allowlist of hosts or exact document URLs (no SSRF
-  to arbitrary URLs, no query strings), without redirects, with a size limit and a short
-  timeout, and cached in a bounded cache; cache misses share a global fetch budget, and a
-  known document is served a while longer when its host is unreachable.  The redirect URIs
-  of a document must stay on the document's host, another allowlisted host or loopback.
+  to arbitrary URLs, no query strings, no dot segments), without redirects, with a size
+  limit and a short timeout, and cached in a bounded cache.  Fetches of unknown client ids
+  share a global budget; client ids that are pinned, were accepted before or hold a grant
+  are never held back by it, and their last good document is served a while longer when
+  their host is unreachable.  The redirect URIs of a document must stay on the document's
+  host, another allowlisted host or loopback.
 
 * **private_key_jwt client authentication (RFC 7523).**  A CIMD client may authenticate
   at the token endpoint with a JWT signed by a key from the ``jwks_uri`` of its metadata
   document.  :class:`ClientAssertionMiddleware` verifies such an assertion before the
   MCP SDK's token handler runs (which only knows client secrets) and hands the request
-  on as a public-client request.  A token request without an assertion is refused when
+  on as a public-client request.  Only ``application/x-www-form-urlencoded`` bodies are
+  accepted (RFC 6749), so the middleware and the SDK always read the same fields.  A
+  token request without an assertion is refused when
   the client's document declares ``private_key_jwt`` (``OAUTH_REQUIRE_PRIVATE_KEY_JWT``,
   default on); other requests without an assertion are passed through unchanged and
   PKCE still protects them.
@@ -45,6 +49,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 __all__ = [
     "ASSERTION_TYPE",
     "ClientAssertionMiddleware",
+    "UrlencodedFormMiddleware",
     "ClientAssertionVerifier",
     "ClientMetadataResolver",
     "allowlist_match",
@@ -71,9 +76,10 @@ MAX_CLIENT_ID_URL_CHARS = 512
 # Bounded caches: unauthenticated /authorize and /token requests choose the client id.
 MAX_CACHED_DOCUMENTS = 256
 MAX_CACHED_JWKS = 64
-# Cache misses (outbound fetches) allowed per window across all client ids.
-FETCH_BUDGET = 30
+# Fetches of unknown client ids allowed per window across all of them (known ids are exempt).
+FETCH_BUDGET = 10
 FETCH_BUDGET_WINDOW = 60
+MAX_KNOWN_CLIENT_IDS = 256
 # How long a known document is still served while its host cannot be reached.
 MAX_STALE_SECONDS = 24 * 3600
 
@@ -93,12 +99,24 @@ def is_metadata_client_id(client_id: str) -> bool:
     return client_id.startswith("https://")
 
 
+def clean_path(path: str) -> bool:
+    """True for a path without dot segments, empty segments or percent-encoding.
+
+    httpx (and browsers) resolve ``/a/../b`` to ``/b``, so a path is only compared with an
+    allowlist entry when it is already in its final form.
+    """
+    if "%" in path or "//" in path or "\\" in path:
+        return False
+    return not any(segment in (".", "..") for segment in path.split("/"))
+
+
 def normalize_allow_entry(entry: str) -> str:
     """``Host`` or ``host/path`` of an allowlist entry (host lower-cased, path kept as is).
 
-    ``chatgpt.com`` allows every path on the host, ``chatgpt.com/oauth/client.json`` only that
-    path (and paths below it). A leading ``https://`` is ignored. Raises ValueError for
-    entries with a query string, a fragment or without a host.
+    ``chatgpt.com`` allows every path on the host, ``chatgpt.com/oauth/client.json`` exactly
+    that path, and an entry ending in ``/`` (``chatgpt.com/connector/oauth/``) every path below
+    it. A leading ``https://`` is ignored. Raises ValueError for entries with a query string, a
+    fragment, dot segments, percent-encoding or without a host.
     """
     text = entry.strip()
     if text.lower().startswith("https://"):
@@ -107,11 +125,18 @@ def normalize_allow_entry(entry: str) -> str:
     host = host.strip().lower()
     if not host or "?" in text or "#" in text or any(ch.isspace() for ch in text) or "@" in host:
         raise ValueError(f"invalid allowlist entry {entry!r}: use host or host/path")
+    if sep and not clean_path("/" + path):
+        raise ValueError(f"invalid allowlist entry {entry!r}: no '.', '..', '//' or '%' in the path")
     return f"{host}/{path}" if sep else host
 
 
 def allowlist_match(host: str, path: str, entries: Iterable[str]) -> bool:
-    """True when *host* and *path* match an entry from :func:`normalize_allow_entry`."""
+    """True when *host* and *path* match an entry from :func:`normalize_allow_entry`.
+
+    A ``host/path`` entry matches that exact path; one ending in ``/`` matches the paths
+    below it. Paths with dot segments, empty segments or percent-encoding never match a
+    path entry.
+    """
     host = host.lower()
     for entry in entries:
         entry_host, sep, entry_path = entry.partition("/")
@@ -119,10 +144,17 @@ def allowlist_match(host: str, path: str, entries: Iterable[str]) -> bool:
             continue
         if not sep:
             return True
-        prefix = "/" + entry_path.rstrip("/")
-        if prefix == "/" or path == prefix or path.startswith(prefix + "/"):
+        if not clean_path(path):
+            continue
+        wanted = "/" + entry_path
+        if path == wanted or (wanted.endswith("/") and path.startswith(wanted)):
             return True
     return False
+
+
+def pinned_urls(entries: Iterable[str]) -> list[str]:
+    """The exact client-id URLs of an allowlist (``host/path`` entries not ending in ``/``)."""
+    return [f"https://{entry}" for entry in entries if "/" in entry and not entry.endswith("/")]
 
 
 @functools.lru_cache(maxsize=1)
@@ -194,6 +226,24 @@ class ClientMetadataResolver:  # pylint: disable=too-many-instance-attributes
         self._cache: OrderedDict[str, _CachedDocument] = OrderedDict()
         self._inflight: dict[str, anyio.Event] = {}
         self._fetches: list[float] = []
+        # Client ids that are never held back by the fetch budget: pinned in the allowlist,
+        # accepted before, or holding a grant (registered by the provider).
+        self._known: OrderedDict[str, None] = OrderedDict()
+        for url in pinned_urls(self._entries):
+            self.remember(url)
+
+    def remember(self, client_id: str) -> None:
+        """Mark *client_id* as known: its document is fetched even when the budget is used up."""
+        if not self.url_allowed(client_id):
+            return
+        self._known[client_id] = None
+        self._known.move_to_end(client_id)
+        while len(self._known) > MAX_KNOWN_CLIENT_IDS:
+            self._known.popitem(last=False)
+
+    def is_known(self, client_id: str) -> bool:
+        """True for a pinned client id, one accepted before or one that holds a grant."""
+        return client_id in self._known
 
     @property
     def enabled(self) -> bool:
@@ -214,6 +264,8 @@ class ClientMetadataResolver:  # pylint: disable=too-many-instance-attributes
         """Shape and allowlist check of a metadata URL (no network access)."""
         if len(url) > MAX_CLIENT_ID_URL_CHARS or not url.isascii() or not url.isprintable() or " " in url:
             return False
+        if "%" in url or "\\" in url:
+            return False
         try:
             parts = urlsplit(url)
             port = parts.port
@@ -228,6 +280,7 @@ class ClientMetadataResolver:  # pylint: disable=too-many-instance-attributes
             and not parts.query
             and not parts.fragment
             and parts.path not in ("", "/")
+            and clean_path(parts.path)
             and allowlist_match(parts.hostname or "", parts.path, self._entries)
         )
 
@@ -257,7 +310,7 @@ class ClientMetadataResolver:  # pylint: disable=too-many-instance-attributes
             cached = self._cache.get(client_id)
             return cached.client if cached else None
         stale = cached if cached and cached.client and now - cached.expires_at < MAX_STALE_SECONDS else None
-        if not self._take_fetch_budget(now):
+        if not self.is_known(client_id) and not self._take_fetch_budget(now):
             logger.warning("Client metadata fetch budget exhausted; %s not fetched", log_safe(client_id))
             return stale.client if stale else None
         event = anyio.Event()
@@ -307,6 +360,7 @@ class ClientMetadataResolver:  # pylint: disable=too-many-instance-attributes
             transient = status >= 500 or status == 429
             return _CachedDocument(None, self._clock() + NEGATIVE_CACHE_SECONDS, transient=transient)
         logger.info("Client metadata document %s accepted (%s)", log_safe(url), log_safe(client.client_name if client else ""))
+        self.remember(url)
         method = json.loads(body).get("token_endpoint_auth_method")
         return _CachedDocument(
             client, self._clock() + _cache_seconds(headers), jwks_uri, method if isinstance(method, str) else None
@@ -499,6 +553,9 @@ class ClientAssertionMiddleware:  # pylint: disable=too-few-public-methods
         if scope["type"] != "http" or scope.get("method") != "POST":
             await self.app(scope, receive, send)
             return
+        if not is_urlencoded(scope):
+            await _json_error(send, 400, "invalid_request", "the request body must be application/x-www-form-urlencoded")
+            return
         body = b""
         more = True
         while more:
@@ -511,6 +568,9 @@ class ClientAssertionMiddleware:  # pylint: disable=too-few-public-methods
                 await _json_error(send, 413, "invalid_request", "request body too large")
                 return
         fields = parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)
+        if _repeated(fields):
+            await _json_error(send, 400, "invalid_request", "request parameters must not be repeated")
+            return
         form = dict(fields)
         if form.get("client_assertion_type") == ASSERTION_TYPE or "client_assertion" in form:
             if form.get("client_assertion_type") != ASSERTION_TYPE or not form.get("client_assertion"):
@@ -541,6 +601,54 @@ class ClientAssertionMiddleware:  # pylint: disable=too-few-public-methods
 
     async def _assertion_required(self, client_id: str) -> bool:
         return is_metadata_client_id(client_id) and await self.verifier.requires_assertion(client_id)
+
+
+_SINGLE_PARAMETERS = (
+    "client_id",
+    "client_secret",
+    "client_assertion",
+    "client_assertion_type",
+    "grant_type",
+    "code",
+    "code_verifier",
+    "redirect_uri",
+    "refresh_token",
+    "scope",
+    "token",
+    "token_type_hint",
+)
+
+
+def _repeated(fields: list[tuple[str, str]]) -> bool:
+    """RFC 6749 3.2: request parameters must not be included more than once."""
+    names = [name for name, _ in fields if name in _SINGLE_PARAMETERS]
+    return len(names) != len(set(names))
+
+
+def is_urlencoded(scope: Scope) -> bool:
+    """True when the request declares an ``application/x-www-form-urlencoded`` body."""
+    for name, value in scope.get("headers", []):
+        if name.lower() == b"content-type":
+            media = value.decode("latin-1").split(";", 1)[0].strip().lower()
+            return media == "application/x-www-form-urlencoded"
+    return False
+
+
+class UrlencodedFormMiddleware:  # pylint: disable=too-few-public-methods
+    """Refuse POST bodies that are not ``application/x-www-form-urlencoded`` (``/token``, ``/revoke``).
+
+    RFC 6749 requires this encoding. The SDK's handlers would also parse ``multipart/form-data``,
+    which the assertion check above does not read: refusing it keeps both on the same fields.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("method") == "POST" and not is_urlencoded(scope):
+            await _json_error(send, 400, "invalid_request", "the request body must be application/x-www-form-urlencoded")
+            return
+        await self.app(scope, receive, send)
 
 
 def _replay(body: bytes, original: Receive) -> Receive:
