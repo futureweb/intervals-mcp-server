@@ -31,6 +31,8 @@ from intervals_mcp_server.mcp_instance import tool
 
 config = get_config()
 
+COMPLETENESS_NAMES = 15  # names per group in the line on today's missing usual fields
+
 
 @tool("read")
 async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branches
@@ -49,7 +51,8 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     athlete's custom item definitions.
 
     When the range includes today, a line names the usual fields (present on 80 % of the 14
-    previous days) that today's record does not have yet: not yet available, not normal.
+    previous days) that today's record does not have yet, night/morning values apart from day
+    totals: not yet available, not normal.
 
     Args:
         athlete_id: The Intervals.icu athlete ID (optional, will use ATHLETE_ID from .env if not provided)
@@ -111,7 +114,7 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
         # Display names of the missing custom fields (the definitions are cached per athlete).
         index = await get_custom_item_index(athlete_id=athlete_id_to_use, api_key=api_key)
         completeness = today_completeness(fetched, today, index.get(INPUT_FIELD))
-    today_line = completeness_line(completeness)
+    today_line = completeness_line(completeness, COMPLETENESS_NAMES, " (all: get_recovery_snapshot detail_level=full)")
 
     if not entries:
         return (

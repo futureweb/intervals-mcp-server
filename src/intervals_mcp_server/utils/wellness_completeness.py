@@ -7,12 +7,18 @@ respiration, SpO2, custom fields written by a sync bridge ...) arrive later in t
 value must be read as "not yet available", never as normal or 0.
 
 ``today_completeness`` compares today's record with the fields usually present: those with a
-value on at least 80 % of the 14 days before today. Null, NaN, empty text and a stored 0 are no
-value (a stored 0 is a placeholder, as everywhere in this project). Metadata and the values
-Intervals.icu computes itself (ctl, atl, ramp rate ...) are not checked. The tools load the 14
-days by widening the start of their wellness request (``completeness_start``).
+value on at least 80 % of the 14 days before today. Null, NaN and empty text are no value; a
+stored 0 is a placeholder (as everywhere in this project) except for signed fields, where 0 is
+a real value: a field with a negative value in those 14 days, or whose code, name or description
+says deviation, delta or change (e.g. a skin temperature deviation of 0.0 °C). Metadata and the
+values Intervals.icu computes itself (ctl, atl, ramp rate ...) are not checked. The missing fields
+are split into night/morning values (late when missing in the morning; values of the night such as
+sleep, HRV or skin temperature first) and day totals (steps, calories ..., normally complete in
+the evening). The tools load the 14 days by widening the start
+of their wellness request (``completeness_start``).
 """
 
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -21,6 +27,8 @@ from intervals_mcp_server.utils.dates import athlete_local_time
 
 REFERENCE_DAYS = 14
 USUAL_SHARE = 0.8
+NIGHT_MORNING = "night_morning"
+DAY_TOTAL = "day_total"
 
 # Not checked: metadata, flags and the values Intervals.icu computes itself.
 NOT_CHECKED = frozenset({
@@ -42,23 +50,34 @@ DAY_TOTAL_FIELDS: dict[str, str] = {
     "carbohydrates": "carbohydrates", "protein": "protein", "fatTotal": "fat",
     "hydrationVolume": "hydration volume", "hydration": "hydration score",
 }
+# Custom fields that add up over the day (by code, name or units), unless they belong to the night or are goals.
+_DAY_TOTAL_WORDS = re.compile(r"calorie|kcal|steps|floors|intensity|active|sweat|hydration|drain|stress ?av", re.IGNORECASE)
+_NOT_DAY_TOTAL_WORDS = re.compile(r"sleep|night|morning|goal", re.IGNORECASE)
+# Custom values of the night (listed before other night/morning values such as scores or predictions).
+_OVERNIGHT_WORDS = re.compile(r"sleep|night|hrv|skin|temp|spo2|respirat|readiness|resting|battery|recovery", re.IGNORECASE)
+# Signed quantities, where a stored 0 is a real value.
+_SIGNED_CODE = re.compile(r"deviation|delta|change", re.IGNORECASE)
+_SIGNED_WORDS = re.compile(r"\b(deviation|delta|change)\b", re.IGNORECASE)
 NOTE = (
     "The missing_usual_fields are not yet available today: treat them as missing, not as normal or 0; "
-    "they usually arrive later in the day."
+    "night_morning values usually arrive later in the morning or day, day_total values are normally "
+    "complete in the evening."
 )
 NO_HISTORY_NOTE = (
     f"No field has values on {USUAL_SHARE:.0%} of the {REFERENCE_DAYS} days before today; completeness unknown."
 )
+TREAT = "Treat them as missing, not as normal; they usually arrive later in the day."
 
 
-def has_value(value: Any) -> bool:
-    """True for a stored value; null, NaN, empty text or lists and a stored 0 are no value."""
+def has_value(value: Any, zero_is_value: bool = False) -> bool:
+    """True for a stored value; null, NaN, empty text or lists are no value, nor is a stored 0
+    unless *zero_is_value* (signed fields)."""
     if is_missing(value):
         return False
     if isinstance(value, bool):
         return True
     if isinstance(value, (int, float)):
-        return value != 0
+        return zero_is_value or value != 0
     if isinstance(value, (str, list, dict)):
         return bool(value.strip() if isinstance(value, str) else value)
     return True
@@ -93,18 +112,43 @@ def field_name(code: str, field_definitions: CustomFieldDefs | None = None) -> s
     return str(definition.get("name") or MORNING_FIELDS.get(code) or DAY_TOTAL_FIELDS.get(code) or code)
 
 
+def field_group(code: str, field_definitions: CustomFieldDefs | None = None) -> str:
+    """NIGHT_MORNING or DAY_TOTAL (a value that adds up over the day, e.g. steps or calories)."""
+    if code in DAY_TOTAL_FIELDS:
+        return DAY_TOTAL
+    if code in MORNING_FIELDS:
+        return NIGHT_MORNING
+    definition = (field_definitions or {}).get(code) or {}
+    text = " ".join(str(part) for part in (code, definition.get("name"), definition.get("units")) if part)
+    return DAY_TOTAL if _DAY_TOTAL_WORDS.search(text) and not _NOT_DAY_TOTAL_WORDS.search(text) else NIGHT_MORNING
+
+
+def _signed(code: str, values: list[Any], definition: dict[str, Any]) -> bool:
+    """A signed quantity: a negative value in the window, or deviation/delta/change in code, name or description."""
+    if any(isinstance(v, (int, float)) and not isinstance(v, bool) and v < 0 for v in values):
+        return True
+    words = " ".join(str(definition.get(key) or "") for key in ("name", "description"))
+    return bool(_SIGNED_CODE.search(code) or _SIGNED_WORDS.search(words))
+
+
+def _overnight(code: str, definition: dict[str, Any]) -> bool:
+    return bool(_OVERNIGHT_WORDS.search(f"{code} {definition.get('name') or ''}"))
+
+
 def _ordered(fields: set[str], field_definitions: CustomFieldDefs, seen: list[str]) -> list[str]:
-    """Night/morning fields first, then custom fields (definition order), then day totals."""
+    """Night/morning before day totals; native fields, then custom fields (values of the night first,
+    then definition order)."""
     defined = {code: index for index, code in enumerate(field_definitions)}
     first_seen = {code: index for index, code in enumerate(seen)}
     custom = sorted(
         (code for code in fields if not is_native(code)),
-        key=lambda code: (defined.get(code, len(defined)), first_seen.get(code, len(first_seen)), code),
+        key=lambda code: (
+            not _overnight(code, field_definitions.get(code) or {}), defined.get(code, len(defined)),
+            first_seen.get(code, len(first_seen)), code,
+        ),
     )
-    return (
-        [code for code in MORNING_FIELDS if code in fields] + custom
-        + [code for code in DAY_TOTAL_FIELDS if code in fields]
-    )
+    ordered = [code for code in MORNING_FIELDS if code in fields] + custom + [code for code in DAY_TOTAL_FIELDS if code in fields]
+    return sorted(ordered, key=lambda code: field_group(code, field_definitions) == DAY_TOTAL)  # stable
 
 
 def today_completeness(
@@ -115,21 +159,24 @@ def today_completeness(
     *entries* must hold the records of today and the 14 days before it with all fields (others are
     ignored). Returns the date, whether today's record exists, its ``updated`` time (as stored and
     in the athlete's local time), how many fields are usual, the usual fields still missing today
-    (code and display name, night/morning values first) and a note.
+    (code, display name and group: night_morning or day_total) and a note.
     """
+    defs = field_definitions or {}
     by_day = {_day(entry): entry for entry in entries if isinstance(entry, dict) and _day(entry)}
-    counts: dict[str, int] = {}
-    seen: list[str] = []
+    window: dict[str, list[Any]] = {}
     for offset in range(1, REFERENCE_DAYS + 1):
         for key, value in (by_day.get((today - timedelta(days=offset)).isoformat()) or {}).items():
-            if key in NOT_CHECKED or not has_value(value):
-                continue
-            if key not in counts:
-                seen.append(key)
-            counts[key] = counts.get(key, 0) + 1
-    usual = {key for key, count in counts.items() if count >= USUAL_SHARE * REFERENCE_DAYS}
+            if key not in NOT_CHECKED:
+                window.setdefault(key, []).append(value)
+    signed = {key for key, values in window.items() if _signed(key, values, defs.get(key) or {})}
+    usual = {
+        key for key, values in window.items()
+        if sum(has_value(v, key in signed) for v in values) >= USUAL_SHARE * REFERENCE_DAYS
+    }
     record = by_day.get(today.isoformat())
-    missing = _ordered({key for key in usual if not has_value((record or {}).get(key))}, field_definitions or {}, seen)
+    missing = _ordered(
+        {key for key in usual if not has_value((record or {}).get(key), key in signed)}, defs, list(window)
+    )
     moment = _parse_time(record.get("updated")) if record else None
     return {
         "date": today.isoformat(),
@@ -138,7 +185,9 @@ def today_completeness(
         "updated_local": athlete_local_time(moment).isoformat(timespec="minutes") if moment else None,
         "reference_days": REFERENCE_DAYS,
         "usual_fields": len(usual),
-        "missing_usual_fields": [{"field": code, "name": field_name(code, field_definitions)} for code in missing],
+        "missing_usual_fields": [
+            {"field": code, "name": field_name(code, defs), "group": field_group(code, defs)} for code in missing
+        ],
         "note": NOTE if missing else (None if usual else NO_HISTORY_NOTE),
     }
 
@@ -155,26 +204,35 @@ def _clock(updated_local: str | None, day: str) -> str | None:
     return moment.strftime("%H:%M") if moment.date().isoformat() == day else moment.strftime("%Y-%m-%d %H:%M")
 
 
-def completeness_line(info: dict[str, Any] | None, max_names: int | None = None, more_hint: str = "") -> str | None:
-    """One line naming today's missing usual fields; None when nothing is missing.
+def _listed(names: list[str], max_names: int | None, more_hint: str) -> str:
+    shown = names if max_names is None else names[:max_names]
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f" and {rest} more{more_hint}" if rest else "")
 
-    At most *max_names* names are listed (all by default); *more_hint* follows the count of the rest.
+
+def completeness_line(info: dict[str, Any] | None, max_names: int | None = None, more_hint: str = "") -> str | None:
+    """One or two lines naming today's missing usual fields; None when nothing is missing.
+
+    Night/morning values come first, day totals (normally complete in the evening) on a second
+    line. At most *max_names* names per group are listed (all by default); *more_hint* follows the
+    count of the rest.
     """
     if not info:
         return None
     if info.get("error"):
         return f"Today {info['date']}: completeness not checked ({info['error']})."
-    names = [item["name"] for item in info.get("missing_usual_fields") or []]
-    if not names:
+    missing = info.get("missing_usual_fields") or []
+    morning = [item["name"] for item in missing if item.get("group") != DAY_TOTAL]
+    totals = [item["name"] for item in missing if item.get("group") == DAY_TOTAL]
+    if not morning and not totals:
         return None
-    shown = names if max_names is None else names[:max_names]
-    listed = ", ".join(shown) + (f" and {len(names) - len(shown)} more{more_hint}" if len(names) > len(shown) else "")
     if not info.get("exists"):
         head = f"Today {info['date']} has no wellness record yet"
     else:
         clock = _clock(info.get("updated_local"), info["date"])
         head = f"Today {info['date']} is incomplete" + (f" (last updated {clock} local)" if clock else "")
-    return (
-        f"{head}: not yet available: {listed}. Treat them as missing, not as normal; "
-        "they usually arrive later in the day."
-    )
+    totals_text = f"day totals not yet available (normally complete in the evening): {_listed(totals, max_names, more_hint)}"
+    if not morning:
+        return f"{head}: {totals_text}. {TREAT}"
+    line = f"{head}: night/morning values not yet available: {_listed(morning, max_names, more_hint)}. {TREAT}"
+    return line + (f"\nD{totals_text[1:]}." if totals else "")

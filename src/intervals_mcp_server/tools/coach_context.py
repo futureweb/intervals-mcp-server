@@ -64,7 +64,7 @@ BASELINE_DAYS = 42
 RECOVERY_METRICS = (("hrv", "HRV", "ms"), ("restingHR", "resting HR", "bpm"), ("sleepSecs", "sleep", "h"))
 PLAN_DAYS = 7
 RACE_LOOKAHEAD_DAYS = 42
-COMPLETENESS_NAMES = 8  # names of today's missing usual fields in the text (JSON lists all)
+COMPLETENESS_NAMES = 6  # names per group of today's missing usual fields in the text (JSON lists all)
 
 
 RECENT_DAYS = 7

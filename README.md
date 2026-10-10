@@ -154,7 +154,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per moving hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name (device-file zeros treated as placeholders); per sport family, and within it per duration and intensity, with sample sizes, logging coverage and Spearman correlations from 8 sessions; no targets |
-| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet; subjective scores |
+| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet (night/morning values apart from day totals); subjective scores |
 
 **Athlete, gear, calendar and workouts**
 

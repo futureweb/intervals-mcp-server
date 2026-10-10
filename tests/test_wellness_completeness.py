@@ -44,9 +44,10 @@ from tests.sample_data import (  # pylint: disable=wrong-import-position
 TODAY = date(2026, 10, 10)
 DEFS = index_custom_items(COMPLETENESS_ITEMS)[INPUT_FIELD]
 MORNING_LINE = (
-    "Today 2026-10-10 is incomplete (last updated 09:46 local): not yet available: sleeping HR, respiration, SpO2, "
-    "Garmin Deep Sleep, Garmin Skin Temperature Deviation, Garmin Sleep Stress Avg, Garmin Morning Training Readiness, "
-    "floors climbed. Treat them as missing, not as normal; they usually arrive later in the day."
+    "Today 2026-10-10 is incomplete (last updated 09:46 local): night/morning values not yet available: sleeping HR, "
+    "respiration, SpO2, Garmin Deep Sleep, Garmin Skin Temperature Deviation, Garmin Sleep Stress Avg, Garmin Morning "
+    "Training Readiness. Treat them as missing, not as normal; they usually arrive later in the day.\n"
+    "Day totals not yet available (normally complete in the evening): Garmin Total Calories, floors climbed."
 )
 
 
@@ -117,15 +118,32 @@ def test_incomplete_morning_record(monkeypatch):
     assert info["updated"] == "2026-10-10T07:46:01.604+00:00" and info["updated_local"] == "2026-10-10T09:46+02:00"
     assert _codes(info) == [
         "avgSleepingHR", "respiration", "spO2", "GarminSleepDeepMinutes", "GarminSkinTempDeviationC",
-        "GarminSleepStressAvg", "GarminTrainingReadiness", "floorsClimbed",
+        "GarminSleepStressAvg", "GarminTrainingReadiness", "GarminTotalCalories", "floorsClimbed",
     ]
-    assert info["missing_usual_fields"][3] == {"field": "GarminSleepDeepMinutes", "name": "Garmin Deep Sleep"}
+    assert info["missing_usual_fields"][3] == {"field": "GarminSleepDeepMinutes", "name": "Garmin Deep Sleep", "group": "night_morning"}
+    assert [item["group"] for item in info["missing_usual_fields"][-2:]] == ["day_total", "day_total"]
     assert "not as normal or 0" in info["note"] and info["reference_days"] == 14
     assert completeness_line(info) == MORNING_LINE
-    assert completeness_line(info, 3, " (see JSON)").startswith(
-        "Today 2026-10-10 is incomplete (last updated 09:46 local): not yet available: sleeping HR, respiration, "
-        "SpO2 and 5 more (see JSON). Treat them as missing"
+    assert completeness_line(info, 3, " (see JSON)") == (
+        "Today 2026-10-10 is incomplete (last updated 09:46 local): night/morning values not yet available: sleeping HR, "
+        "respiration, SpO2 and 4 more (see JSON). Treat them as missing, not as normal; they usually arrive later in the day.\n"
+        "Day totals not yet available (normally complete in the evening): Garmin Total Calories, floors climbed."
     )
+    # Only day totals missing (evening case): one line.
+    evening = today_completeness(completeness_wellness(dict(completeness_day("2026-10-10", 30), steps=None)), TODAY, DEFS)
+    assert completeness_line(evening) == (
+        "Today 2026-10-10 is incomplete (last updated 22:21 local): day totals not yet available (normally complete in "
+        "the evening): steps. Treat them as missing, not as normal; they usually arrive later in the day."
+    )
+    # Values of the night come before other night/morning values (scores, predictions), whatever the definition order.
+    entries = completeness_wellness()
+    for entry in entries[:-1]:
+        entry["GarminEnduranceScore"] = 7000
+    defs = {"GarminEnduranceScore": {"name": "Garmin Endurance Score"}, **DEFS}
+    assert _codes(today_completeness(entries, TODAY, defs))[3:8] == [
+        "GarminSleepDeepMinutes", "GarminSkinTempDeviationC", "GarminSleepStressAvg", "GarminTrainingReadiness",
+        "GarminEnduranceScore",
+    ]
     # Without definitions the custom fields keep their codes.
     assert _codes(today_completeness(completeness_wellness(), TODAY)) == _codes(info)
     assert today_completeness(completeness_wellness(), TODAY)["missing_usual_fields"][3]["name"] == "GarminSleepDeepMinutes"
@@ -147,11 +165,13 @@ def test_missing_record_lists_every_usual_field(monkeypatch):
     assert _codes(info) == [
         "restingHR", "hrv", "avgSleepingHR", "sleepSecs", "sleepScore", "respiration", "spO2",
         "GarminSleepDeepMinutes", "GarminSkinTempDeviationC", "GarminSleepStressAvg", "GarminTrainingReadiness",
-        "BodyBatteryMax", "steps", "floorsClimbed",
+        "BodyBatteryMax", "GarminTotalCalories", "steps", "floorsClimbed",
     ]
     line = completeness_line(info)
     assert line is not None
-    assert line.startswith("Today 2026-10-10 has no wellness record yet: not yet available: resting HR, HRV, sleeping HR")
+    assert line.startswith(
+        "Today 2026-10-10 has no wellness record yet: night/morning values not yet available: resting HR, HRV, sleeping HR"
+    )
 
 
 def test_stored_zero_is_a_placeholder(monkeypatch):
@@ -160,13 +180,31 @@ def test_stored_zero_is_a_placeholder(monkeypatch):
     info = today_completeness(completeness_wellness(_today(avgSleepingHR=0, GarminSleepStressAvg=0.0, hrv=0)), TODAY, DEFS)
     assert {"avgSleepingHR", "GarminSleepStressAvg", "hrv"} <= set(_codes(info))
     assert "kcalConsumed" not in _codes(info)  # 0 on every previous day: never usual
-    # The live case: skin temperature deviation stored as 0 on 4 of the 14 days is present on 71 % only.
-    entries = completeness_wellness()
-    for entry in entries[-14:-10]:
-        entry["GarminSkinTempDeviationC"] = 0
-    assert "GarminSkinTempDeviationC" not in _codes(today_completeness(entries, TODAY, DEFS))
     assert not has_value(0) and not has_value(0.0) and not has_value(float("nan")) and not has_value("NaN")
     assert not has_value(" ") and not has_value([]) and has_value(-0.1) and has_value("Planned") and has_value(False)
+    assert has_value(0, zero_is_value=True) and not has_value(None, zero_is_value=True)
+
+
+def test_zero_is_a_value_for_signed_fields(monkeypatch):
+    """Signed fields (a negative value in the 14 days, or deviation/delta/change) count a stored 0 as a value."""
+    _now(monkeypatch)
+    entries = completeness_wellness()
+    for offset, entry in enumerate(reversed(entries[:-1]), start=1):  # offset 1 = yesterday
+        zero = 10 < offset <= 14  # 4 of the 14 days
+        if zero:
+            entry["GarminSkinTempDeviationC"] = 0.0  # the live case: 0.0 °C on 4 days, negative on others
+        entry["GarminSleepAwakeMinutes"] = 0 if zero else 5.0  # unsigned: the zeros are placeholders
+        entry["WeightDelta"] = 0 if zero else 0.3  # signed by its code
+        entry["ReadinessTrend"] = 0 if zero else 2.0  # signed by its description
+    defs = {**DEFS, "ReadinessTrend": {"name": "Readiness Trend", "description": "Change against the day before"}}
+    codes = _codes(today_completeness(entries, TODAY, defs))
+    assert {"GarminSkinTempDeviationC", "WeightDelta", "ReadinessTrend"} <= set(codes)
+    assert "GarminSleepAwakeMinutes" not in codes  # 10 of 14 days with a value
+    assert "ReadinessTrend" not in _codes(today_completeness(entries, TODAY, DEFS))  # no description: unsigned
+    # A 0.0 deviation today is a value, not a missing field.
+    entries[-1] = _today(GarminSkinTempDeviationC=0.0, WeightDelta=0)
+    codes = _codes(today_completeness(entries, TODAY, defs))
+    assert "GarminSkinTempDeviationC" not in codes and "WeightDelta" not in codes
 
 
 def test_rarely_present_fields_are_not_listed(monkeypatch):
@@ -198,7 +236,7 @@ def test_local_update_time_around_midnight(monkeypatch):
     text = asyncio.run(get_wellness_data(start_date="2026-10-10"))
     assert _wellness_requests(sent) == [{"oldest": "2026-09-26", "newest": "2026-10-10"}]
     assert text.startswith("No wellness data found for athlete i1 in the specified date range.\n\n"
-                           "Today 2026-10-10 has no wellness record yet: not yet available: resting HR, HRV")
+                           "Today 2026-10-10 has no wellness record yet: night/morning values not yet available: resting HR")
 
 
 # ------------------------------------------------------------------ get_wellness_data
@@ -242,7 +280,8 @@ def test_recovery_snapshot_today_line_json_and_requests(monkeypatch):
     sent = _api(monkeypatch, completeness_wellness())
     text = asyncio.run(get_recovery_snapshot())
     lines = text.splitlines()
-    assert lines[2] == MORNING_LINE and lines[3] == ""
+    assert lines[2:4] == MORNING_LINE.splitlines() and lines[4] == ""
+    assert "2026-10-10 (today, preliminary) | updated 2026-10-10T07:46:01.604+00:00" in text
     assert [line.split(" ")[0] for line in lines if line[:4] == "2026" and " | updated" in line] == [
         "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10"]
     # Same number of requests as before: the first wellness request starts 14 days before today.
@@ -251,22 +290,37 @@ def test_recovery_snapshot_today_line_json_and_requests(monkeypatch):
     payload = json.loads(asyncio.run(get_recovery_snapshot(output_format="json")))
     completeness = payload["today_completeness"]
     assert completeness["updated_local"] == "2026-10-10T09:46+02:00" and completeness["exists"] is True
-    assert completeness["missing_usual_fields"][0] == {"field": "avgSleepingHR", "name": "sleeping HR"}
+    assert completeness["missing_usual_fields"][0] == {"field": "avgSleepingHR", "name": "sleeping HR", "group": "night_morning"}
     assert [day["date"] for day in payload["days"]] == ["2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10"]
+    assert [day["preliminary"] for day in payload["days"]] == [False, False, False, True]
     past = json.loads(asyncio.run(get_recovery_snapshot(date_str="2026-10-09", output_format="json")))
-    assert past["today_completeness"] is None
+    assert past["today_completeness"] is None and not any(day["preliminary"] for day in past["days"])
     assert _wellness_requests(sent)[-2] == {"oldest": "2026-10-06", "newest": "2026-10-09"}
 
 
+def test_recovery_snapshot_labels_only_the_athletes_today(monkeypatch):
+    """A past date_str is not "(today, preliminary)"; the athlete's today is, also around midnight."""
+    _now(monkeypatch, utc="2026-10-09T22:30:00+00:00")  # 00:30 on 2026-10-10 in Vienna
+    _api(monkeypatch, completeness_wellness())
+    past = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1))
+    assert "(today, preliminary)" not in past and "\n2026-10-09 | updated 2026-10-09T20:21:13.526+00:00 | locked no" in past
+    assert "Today 2026-10-10" not in past
+    today = asyncio.run(get_recovery_snapshot(days_back=1))
+    assert "\n2026-10-10 (today, preliminary) | updated" in today and "\n2026-10-09 | updated" in today
+
+
 def test_recovery_snapshot_caps_names_by_detail_level(monkeypatch):
-    """compact lists 10 names, full all of them."""
+    """compact lists 8 names per group, full all of them."""
     _now(monkeypatch)
-    _api(monkeypatch, completeness_wellness(None))  # 14 usual fields missing
+    _api(monkeypatch, completeness_wellness(None))  # 15 usual fields missing
     compact = asyncio.run(get_recovery_snapshot(detail_level="compact"))
-    assert "Today 2026-10-10 has no wellness record yet: not yet available: resting HR, HRV, sleeping HR" in compact
-    assert "Garmin Sleep Stress Avg and 4 more (all with detail_level=full). Treat them" in compact
+    assert (
+        "Today 2026-10-10 has no wellness record yet: night/morning values not yet available: resting HR, HRV, sleeping HR, "
+        "sleep duration, sleep score, respiration, SpO2, Garmin Deep Sleep and 4 more (all with detail_level=full). Treat them"
+    ) in compact
+    assert "\nDay totals not yet available (normally complete in the evening): Garmin Total Calories, steps, floors climbed.\n" in compact
     full = asyncio.run(get_recovery_snapshot(detail_level="full"))
-    assert "Body Battery Max, steps, floors climbed. Treat them as missing" in full
+    assert "Garmin Morning Training Readiness, Body Battery Max. Treat them as missing" in full
 
 
 def test_recovery_baselines_leave_out_todays_missing_values(monkeypatch):
@@ -293,19 +347,24 @@ def test_coach_context_today_line_and_one_extra_request(monkeypatch):
     line = next(line for line in text.splitlines() if line.startswith("Today "))
     # No definitions cached: custom fields keep their codes (the context makes no request for names).
     assert line == (
-        "Today 2026-10-10 is incomplete (last updated 09:46 local): not yet available: sleeping HR, respiration, SpO2, "
-        "GarminSleepDeepMinutes, GarminSkinTempDeviationC, GarminSleepStressAvg, GarminTrainingReadiness, "
-        "floors climbed. Treat them as missing, not as normal; they usually arrive later in the day."
+        "Today 2026-10-10 is incomplete (last updated 09:46 local): night/morning values not yet available: sleeping HR, "
+        "respiration, SpO2, GarminSleepDeepMinutes, GarminSkinTempDeviationC, GarminSleepStressAvg and 1 more (see "
+        "get_recovery_snapshot). Treat them as missing, not as normal; they usually arrive later in the day."
     )
     rows = text.splitlines()
     assert rows[rows.index(line) - 1].startswith("Recovery markers")
+    assert rows[rows.index(line) + 1] == (
+        "Day totals not yet available (normally complete in the evening): GarminTotalCalories, floors climbed."
+    )
+    assert rows[rows.index(line) + 2].startswith("Durability 28 d")
     assert [r.url.path.rsplit("/", 1)[-1] for r in sent] == ["activities", "wellness", "events", "wellness"]
     assert _wellness_requests(sent)[1] == {"oldest": "2026-09-26", "newest": "2026-10-10"}  # all fields
     assert "fields" in _wellness_requests(sent)[0]
     asyncio.run(get_recovery_snapshot())  # caches the definitions
     sent.clear()
     payload = json.loads(asyncio.run(get_coach_context(output_format="json")))
-    assert payload["today_completeness"]["missing_usual_fields"][3] == {"field": "GarminSleepDeepMinutes", "name": "Garmin Deep Sleep"}
+    assert payload["today_completeness"]["missing_usual_fields"][3] == {
+        "field": "GarminSleepDeepMinutes", "name": "Garmin Deep Sleep", "group": "night_morning"}
     assert len(sent) == 4
     sent.clear()
     past = json.loads(asyncio.run(get_coach_context(end_date="2026-10-09", output_format="json")))

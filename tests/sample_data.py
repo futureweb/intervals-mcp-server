@@ -666,6 +666,8 @@ COMPLETENESS_ITEMS = CUSTOM_ITEMS_DATA + [
      "content": {"code": "GarminTrainingReadiness", "type": "numeric"}},
     {"id": 43, "type": "INPUT_FIELD", "name": "Body Battery Max", "content": {"code": "BodyBatteryMax", "type": "numeric"}},
     {"id": 44, "type": "INPUT_FIELD", "name": "Garmin Cycling VO2max", "content": {"code": "GarminVO2MaxCycling", "type": "numeric"}},
+    {"id": 45, "type": "INPUT_FIELD", "name": "Garmin Total Calories",
+     "content": {"code": "GarminTotalCalories", "type": "numeric", "units": "kcal"}},
 ]
 COMPLETENESS_TODAY_RECORD = {
     "id": COMPLETENESS_TODAY, "updated": "2026-10-10T07:46:01.604+00:00", "ctl": 63.7, "atl": 64.1, "rampRate": 2.6,
@@ -684,7 +686,7 @@ def completeness_day(day: str, index: int) -> dict[str, Any]:
         "avgSleepingHR": 52.0, "respiration": 14.5, "spO2": 95.0, "steps": 6000 + index, "floorsClimbed": 8,
         "kcalConsumed": 0,  # never logged: a stored 0 placeholder, so not a usual field
         "BodyBatteryMax": 80, "GarminSleepDeepMinutes": 80.0, "GarminSkinTempDeviationC": (-0.2, -0.1, 0.1)[index % 3],
-        "GarminSleepStressAvg": 20.0, "GarminTrainingReadiness": 70.0,
+        "GarminSleepStressAvg": 20.0, "GarminTrainingReadiness": 70.0, "GarminTotalCalories": 2700.0 + index,
         "GarminVO2MaxCycling": 55.0 if index % 5 == 0 else None,  # rarely present
     }
 

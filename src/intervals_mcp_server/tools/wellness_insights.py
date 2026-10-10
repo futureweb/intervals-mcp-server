@@ -182,8 +182,8 @@ def _subjective_line(entry: dict[str, Any]) -> str | None:
 
 SNAPSHOT_LEVELS = ("compact", "standard", "full")
 STANDARD_CUSTOM_LIMIT = 20
-# Names of today's missing usual fields listed per detail level (JSON lists all).
-COMPLETENESS_NAMES = {"compact": 10, "standard": 20, "full": None}
+# Names of today's missing usual fields listed per group and detail level (JSON lists all).
+COMPLETENESS_NAMES = {"compact": 8, "standard": 15, "full": None}
 
 
 def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs, limit: int | None = None) -> str | None:
@@ -265,6 +265,7 @@ def _event_line(event: dict[str, Any]) -> str:
 def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     target: str, entries: list[dict[str, Any]], input_defs: CustomFieldDefs, baselines: list[dict[str, Any]],
     activities: list[dict[str, Any]], events: list[dict[str, Any]], completeness: dict[str, Any] | None = None,
+    today: str | None = None,
 ) -> dict[str, Any]:
     days = []
     for entry in entries:
@@ -274,7 +275,7 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
         day["subjective"] = {k: entry.get(k) for k in SUBJECTIVE_FIELDS if entry.get(k) is not None}
         day["custom"] = {code: entry[code] for code in input_defs if code in entry and not is_missing(entry[code])}
         day["missing"] = [key for key, _, _, _ in SNAPSHOT_FIELDS if is_missing(entry.get(key))]
-        day["preliminary"] = entry.get("id") == target
+        day["preliminary"] = entry.get("id") == today
         days.append(day)
     return {
         "date": target, "today_completeness": completeness, "days": days, "baselines": baselines,
@@ -303,8 +304,9 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     median, SD and the latest value's deviation) for the selected metrics; the activities
     of those days with their loads and device fields; and the planned events of the day.
     The current day's aggregates (steps, calories) can still be incomplete and are flagged
-    as preliminary; for today a line (JSON today_completeness) names the usual fields (present
-    on 80 % of the 14 previous days) not yet in today's record: not yet available, not normal.
+    as preliminary (only when the day is today); for today a line (JSON today_completeness)
+    names the usual fields (present on 80 % of the 14 previous days) not yet in today's record,
+    night/morning values apart from day totals: not yet available, not normal.
     No readiness verdict is computed.
 
     Args:
@@ -336,7 +338,8 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     baseline_start = (date.fromisoformat(target) - timedelta(days=BASELINE_DAYS + days_back)).isoformat()
     metrics = _split(baseline_metrics)
     # Today's completeness needs the 14 days before today: widen the same request.
-    check_today = target == get_default_end_date()
+    today = get_default_end_date()
+    check_today = target == today
     fetch_start = min(start, completeness_start(date.fromisoformat(target)).isoformat()) if check_today else start
 
     fetched, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, target)
@@ -365,7 +368,7 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         for trend in baselines:
             trend.pop("series", None)
         return json.dumps(
-            {**_snapshot_json(target, entries, input_defs, baselines, activities, events, completeness),
+            {**_snapshot_json(target, entries, input_defs, baselines, activities, events, completeness, today),
              "load_errors": load_errors},
             ensure_ascii=False,
         )
@@ -383,7 +386,7 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     for offset in range(days_back, -1, -1):
         day = (date.fromisoformat(target) - timedelta(days=offset)).isoformat()
         entry = by_date.get(day)
-        tag = " (today, preliminary)" if day == target else ""
+        tag = " (today, preliminary)" if day == today else ""
         if entry is None:
             lines.append(f"{day}{tag}: no wellness record")
             continue
