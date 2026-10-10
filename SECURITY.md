@@ -19,8 +19,9 @@ the upstream project should be reported there as well.
   that opened it, client metadata documents only from allowlisted hosts or document URLs, redirect
   URIs of registered clients only on allowlisted hosts or path prefixes (no query strings), RFC 9207
   `iss`, audience-bound tokens, rotating refresh tokens with reuse detection, `private_key_jwt`
-  required for clients that declare it (ChatGPT), urlencoded token requests only. The Intervals.icu token is used for the identity check only
-  and never stored. See `docs/REMOTE_ACCESS.md`.
+  required for clients that declare it (ChatGPT), urlencoded token requests only. In the default
+  single-user mode the Intervals.icu token is used for the identity check only and never stored
+  (multi-user mode: see below). See `docs/REMOTE_ACCESS.md`.
 - Behind a proxy that is not on 127.0.0.1, set `FORWARDED_ALLOW_IPS` to the proxy's address so the
   sign-in rate limits see the real client addresses.
 - Keep OAuth secrets out of the proxy's access log (the Intervals.icu callback carries a short-lived
@@ -32,8 +33,32 @@ the upstream project should be reported there as well.
 - Optionally restrict a transitional legacy path to the published OpenAI egress ranges
   (`https://openai.com/chatgpt-connectors.json`) at the proxy.
 - Keep `MCP_PERMISSIONS` minimal; write, destructive and admin classes stay hidden unless enabled.
-- One Intervals.icu API key serves every client of the server: never share a deployment between
-  athletes without a multi-tenant design.
+- In the default single-user mode one Intervals.icu API key serves every client of the server:
+  never put other athletes on `OAUTH_ALLOWED_ATHLETES` (they would see the owner's data). To share
+  a deployment use the multi-user mode (`MCP_TENANCY=multi`, threat model below).
+
+## Multi-user mode threat model
+
+With `MCP_TENANCY=multi` several athletes use one deployment. What protects them from each other:
+
+| Threat | Mitigation |
+| --- | --- |
+| A connection reads another athlete's data by naming their id (`athlete_id` argument, prompt injection) | The tool guard allows only the connection's own athlete (`0`/`i0` are aliases of it) and refuses anything else before a request; the API client refuses every path outside `/athlete/<own id>/...` and `/activity/<id>/...` and every activity whose `icu_athlete_id` is another athlete's. |
+| A friend's request reaches Intervals.icu with the owner's API key | The credential comes from the MCP access token of the request (context variable), never from tool arguments; athlete grants carry the athlete's own OAuth token (Bearer). The API key is only used for grants of the owner: the password / API-key sign-in, an Intervals.icu sign-in as `ATHLETE_ID`, or connections from the single-user mode. A request without a connection credential is refused (fail closed, also for an unknown `MCP_TENANCY` value at runtime). Explicit API keys passed to the client are refused. |
+| One athlete's data in another's answer via caches | Cache keys carry the connection's partition (the grant id, not a digest of a token); the owner's API key keeps its own partition. Cookies are never stored by the shared HTTP client. |
+| Session confusion | The SDK binds a session to the token's subject, which is the grant id: another connection's session id is answered with 404. |
+| Stolen state file | Tokens are sealed with AES-256-GCM (key in `OAUTH_TOKEN_KEY` / a 0600 `OAUTH_TOKEN_KEY_FILE`, never in the file) and bound to grant and athlete; refresh tokens are stored as SHA-256 digests. With the file *and* the key an attacker can use every stored token within its scopes until the athlete revokes the app at Intervals.icu. Keep the key out of backups of the state file. |
+| Excessive permissions | The Intervals.icu scopes requested follow the permission classes chosen on the consent page; a request outside the connection's scopes is refused with a "reconnect and allow" message. `INTERVALS_OAUTH_EXCLUDE_AREAS` removes areas (e.g. `CHATS`, which would also allow reading private chats). |
+| Old releases or a switch back to single-user mode serving friends with the owner's key | The multi-user state file is format 2, which older releases refuse to read. In the single-user mode only the owner's connections are loaded; other athletes' connections and tokens are removed at the next write. |
+| Unwanted sign-ins | Only athletes on `OAUTH_ALLOWED_ATHLETES`; `*` needs `OAUTH_ALLOW_ANY_ATHLETE=true`. Removing an athlete from the list makes their connections unusable at the next start. |
+| One athlete exhausts the shared Intervals.icu app limit | Daily soft budget per athlete (`MCP_ATHLETE_DAILY_REQUESTS`) and a shared 15-minute budget (`MCP_APP_REQUESTS_PER_15MIN`), plus the per-call limits. |
+| Tokens in logs or answers | Tokens and keys are never logged; error texts from Intervals.icu are redacted; `get_server_status` shows only the calling connection (no other athletes, no allowlist). |
+
+Not covered: the operator (and anyone controlling the host) can read the logs (athlete ids, tool
+names, request paths, errors) and, with the key, the stored tokens; friends must trust the
+operator. A compromised MCP client of one athlete can act within that athlete's grant. Deleting a
+connection removes the token from the server; it stays valid at Intervals.icu until the athlete
+revokes the app there.
 
 ## Supported versions
 

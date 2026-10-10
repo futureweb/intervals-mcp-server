@@ -16,8 +16,10 @@ Intervals.icu cannot be the authorization server of an MCP client itself (it has
 discovery metadata, no PKCE and no client registration). This server therefore issues
 its own tokens to the MCP client and lets you prove who you are by signing in at
 Intervals.icu. Only the athletes in `OAUTH_ALLOWED_ATHLETES` (default: `ATHLETE_ID`)
-are accepted. The Intervals.icu token is used for that check only; it is never stored
-and never given to the MCP client.
+are accepted. In the default single-user mode the Intervals.icu token is used for that
+check only; it is never stored and never given to the MCP client. The optional
+[multi-user mode](#5-multi-user-mode-sharing-the-server) instead keeps each athlete's token
+(encrypted) and uses it for that athlete's data.
 
 ## What you get
 
@@ -99,6 +101,7 @@ instead) use the API-key or password sign-in: no app is needed for those.
 | `OAUTH_LOGIN_RATE_LIMIT` | Failed sign-ins per client address (IPv4 address, IPv6 /64) per 15 minutes before `429`, default 5. |
 | `OAUTH_LOGIN_GLOBAL_RATE_LIMIT` | Failed password / API-key sign-ins from all addresses together per 15 minutes before those sign-ins pause, default 500. Trade-off: it limits distributed guessing of a weak password, but enough attacking addresses (default: 100) can pause the athlete's own password sign-in for 15 minutes (existing connections keep working). With `OAUTH_TOTP_SECRET` it never pauses a sign-in, since a guess cannot succeed without the code; with a long random password a high value is fine. The Intervals.icu sign-in is not affected. |
 | `MCP_PERMISSIONS` | Upper limit of what any connection can be granted (default `read`). |
+| `MCP_TENANCY` | `single` (default) or `multi`, see [section 5](#5-multi-user-mode-sharing-the-server). |
 
 Minimal configuration:
 
@@ -197,6 +200,86 @@ other hosts (e.g. a secret-path endpoint without OAuth) go into `FASTMCP_ALLOWED
 
 Claude: Settings → Connectors → *Add custom connector* with the same URL; the flow is the same.
 
+## 5. Multi-user mode (sharing the server)
+
+With `MCP_TENANCY=multi` one deployment serves several athletes, each with their own data:
+
+```
+friend's client  <-- OAuth 2.1 -->  this server  <-- Bearer: the friend's own Intervals.icu token -->  Intervals.icu
+owner's client   <-- OAuth 2.1 -->  this server  <-- API_KEY (only for ATHLETE_ID, only after the owner signed in) -->
+```
+
+* **Sign-in.** Athletes other than the owner can only connect with "Continue with Intervals.icu".
+  The server keeps the access token Intervals.icu returns (and a refresh token and expiry, should
+  Intervals.icu ever issue them; currently its tokens do not expire) in the grant record of the
+  state file, sealed with AES-256-GCM and bound to the grant and athlete. The password and API-key
+  sign-ins are the owner's and need `ATHLETE_ID` and `API_KEY`; when the owner signs in with
+  Intervals.icu, the server's `API_KEY` is used and the owner's token is not kept.
+* **Per request.** The MCP access token of each request selects the connection's credential (a
+  context variable, never a tool argument). `athlete_id` arguments may only name the connection's
+  own athlete (`0` / `i0` are aliases of it); other ids are refused before any request. The API
+  client additionally refuses every path outside `/athlete/<own id>/…` and `/activity/<id>/…`,
+  checks that a fetched activity belongs to the athlete, and refuses a request whose Intervals.icu
+  scope the connection was not granted, with a message that says which permission to allow when
+  reconnecting. Caches are partitioned per connection; the per-call request budget stays, and the
+  OAuth-token connections get a daily budget per athlete and a shared 15-minute budget.
+* **Scopes.** The scope requested at Intervals.icu follows the permission classes chosen on the
+  consent page: `read` → `ACTIVITY:READ,WELLNESS:READ,CALENDAR:READ,LIBRARY:READ,SETTINGS:READ,CHATS:READ`;
+  `write` adds `ACTIVITY`, `WELLNESS`, `CALENDAR`, `LIBRARY` and `CHATS` `:WRITE`; `destructive` adds
+  `CALENDAR`, `LIBRARY` and `SETTINGS` `:WRITE`; `admin` adds `CALENDAR` and `SETTINGS` `:WRITE`
+  (`WRITE` implies `READ`). `INTERVALS_OAUTH_EXCLUDE_AREAS=CHATS` never asks for an area (activity
+  comments then answer with a "permission missing" message: `CHATS:READ` would also allow reading
+  private chats, which this server never does). Intervals.icu applies an athlete's latest sign-in
+  scopes to all of their tokens, so the server updates the scopes of the athlete's other
+  connections at each sign-in.
+* **Lifecycle.** A token Intervals.icu rejects (401/403) gives a "disconnect and reconnect" message.
+  Revoking a connection (`/revoke`, the client's "disconnect", refresh token reuse, retention)
+  deletes its stored token. Grants without a live refresh token are dropped with their token.
+
+| Variable | Meaning |
+| --- | --- |
+| `MCP_TENANCY` | `multi` enables the mode; needs `MCP_AUTH=oauth`, a network transport and `OAUTH_LOGIN` with `intervals`. |
+| `OAUTH_TOKEN_KEY` | Base64 key(s) of 32 bytes (`futureweb-intervals-mcp token-key`), comma-separated: the first encrypts, all decrypt (key rotation). The server refuses to start in multi-user mode without a key. |
+| `OAUTH_TOKEN_KEY_FILE` | Alternative: a file with the key(s), one per line; it must not be readable by group or others (`chmod 600`). `futureweb-intervals-mcp token-key --file <path>` creates one. |
+| `OAUTH_ALLOWED_ATHLETES` | The owner plus the friends. `*` (any Intervals.icu athlete) is only accepted together with `OAUTH_ALLOW_ANY_ATHLETE=true`: then anyone with an Intervals.icu account can store a token on your server and use the shared request budget. |
+| `OAUTH_TOKEN_RETENTION_DAYS` | Drop an athlete's connection and token after this many days without use (default `0` = only the refresh token lifetime, `OAUTH_REFRESH_TOKEN_TTL`, applies). |
+| `INTERVALS_OAUTH_EXCLUDE_AREAS` | Scope areas never requested, e.g. `CHATS`. |
+| `MCP_ATHLETE_DAILY_REQUESTS` | Soft budget of Intervals.icu requests per athlete and UTC day (default `1000`, `0` = off). |
+| `MCP_APP_REQUESTS_PER_15MIN` | Budget of all OAuth-token connections together per 15 minutes (default `2000`, `0` = off). The Intervals.icu app limit is shared by every athlete. |
+
+```bash
+futureweb-intervals-mcp token-key --file /etc/intervals-mcp/token.key
+MCP_TENANCY=multi
+OAUTH_TOKEN_KEY_FILE=/etc/intervals-mcp/token.key
+OAUTH_LOGIN=intervals,password
+OAUTH_ALLOWED_ATHLETES=i123456,i234567,i345678
+ATHLETE_ID=i123456
+API_KEY=...                   # the owner's key, used only for the owner's own connections
+# ATHLETE_TIMEZONE unset: each athlete's Intervals.icu time zone is used
+```
+
+**Switching modes.** The state file of the single-user mode (format 1) is read as is: its
+connections become the owner's (`ATHLETE_ID`, `API_KEY`), so your existing ChatGPT or Claude
+connection keeps working. If anyone else ever connected in the single-user mode, remove those
+connections first (`futureweb-intervals-mcp grants remove --legacy`; you then reconnect once);
+`--doctor` reminds you. In the multi-user mode the file is written as format 2, which older
+releases refuse to read instead of serving other athletes' connections with your API key. Back
+in the single-user mode, only your own connections are kept; the others and their tokens are
+removed at the next write.
+
+**Managing connections.**
+
+```bash
+futureweb-intervals-mcp grants list            # athlete, kind, client, created, last used, token stored (never the token)
+futureweb-intervals-mcp grants remove i234567  # all connections and tokens of an athlete
+futureweb-intervals-mcp grants remove --grant <id>
+futureweb-intervals-mcp grants prune --days 60 # athlete connections unused for 60 days
+```
+
+Run the commands with the server's environment (`OAUTH_STATE_FILE`), e.g. `docker exec` in the
+container. They lock the state file (`<state file>.lock`); a running server notices the change and
+drops the removed connections at its next request.
+
 ## What happens on the wire
 
 1. The client calls `/mcp`, gets `401` with `WWW-Authenticate: Bearer resource_metadata=...`
@@ -238,7 +321,10 @@ an attacker with hundreds of separate networks still can.
 * **Switch from password to Intervals.icu sign-in:** set the client id/secret and
   `OAUTH_LOGIN=intervals`, restart. Existing connections keep working; the next sign-in uses
   Intervals.icu.
-* **Revoke a connection:** `POST /revoke`, or delete the state file to cut off all.
+* **Revoke a connection:** `POST /revoke`, `futureweb-intervals-mcp grants remove`, or delete the
+  state file to cut off all. A change of the state file by another process is picked up by the
+  running server before its next request or write; it never overwrites such a change. Writers lock
+  `<state file>.lock` (created next to the state file).
 * **Logs:** the server's log lines contain client ids, athlete ids and events, never
   passwords, codes or tokens; client-supplied values are escaped and shortened. uvicorn's
   access log keeps query parameter names but not their values. The reverse proxy's access
@@ -249,13 +335,17 @@ an attacker with hundreds of separate networks still can.
 
 ## Security model
 
-Data access uses the one Intervals.icu API key of the deployment, so this is a
-single-athlete server: the allowlist decides who may connect, and the consent page decides
+In the single-user mode data access uses the one Intervals.icu API key of the deployment, so
+this is a single-athlete server: the allowlist decides who may connect, and the consent page decides
 which permission classes each connection gets, never more than `MCP_PERMISSIONS`. A refresh
 can only narrow a connection's classes, and every tool call is checked against them. The
 classes are a server-side guard for the tools; they cannot make an API key with full
 account access safe against a compromised host. With the Intervals.icu
 sign-in there is no extra password to leak; with the password sign-in it must be as strong
-as the API key itself. Multiple athletes need separate deployments. A future multi-athlete
-mode would use each athlete's own Intervals.icu OAuth token for data access instead of a
-shared API key.
+as the API key itself. Everyone on the allowlist sees the owner's data, so to share a server
+use the multi-user mode (section 5): each connection then uses the connecting athlete's own
+Intervals.icu token, the API key only serves the owner after the owner signed in, and an
+athlete id other than the connection's own is refused before any request. The stored tokens are
+encrypted with a key outside the state file; anyone with both the state file and the key (or
+control of the running server) can act as every connected athlete within their granted scopes.
+See [SECURITY.md](../SECURITY.md) for the threat model.

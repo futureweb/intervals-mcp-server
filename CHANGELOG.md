@@ -6,6 +6,56 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added (multi-user mode)
+- Optional multi-user mode `MCP_TENANCY=multi` (default `single`: unchanged). Each connection
+  uses its own Intervals.icu credential: athletes other than the owner sign in with "Continue with
+  Intervals.icu" and their access token (plus refresh token and expiry, should Intervals.icu issue
+  them) is stored in the grant record of the OAuth state file, sealed with AES-256-GCM and bound to
+  grant and athlete (`OAUTH_TOKEN_KEY` or a 0600 `OAUTH_TOKEN_KEY_FILE`, several keys for rotation;
+  the server refuses to start in multi-user mode without one). `API_KEY` is only used for the owner
+  (`ATHLETE_ID`) after the owner signed in (password, API key or Intervals.icu as the owner).
+  The credential is selected from the MCP access token of each request (context variable), never
+  from tool arguments; a request without one is refused.
+- Isolation: `athlete_id` arguments may only name the connection's own athlete (`0`/`i0` are
+  aliases); other ids are refused before any request. The API client refuses paths of other
+  athletes and outside `/athlete/<own>/...` and `/activity/<id>/...`, refuses an activity of another
+  athlete, never stores cookies, and caches are partitioned per connection (grant id). Streamable
+  HTTP / SSE sessions are bound to the grant (token subject).
+- Intervals.icu scopes follow the permission classes granted on the consent page (`read`: ACTIVITY,
+  WELLNESS, CALENDAR, LIBRARY, SETTINGS and CHATS read; `write`/`destructive`/`admin` add the write
+  scopes their tools need); a request outside the connection's scopes is refused with a "reconnect
+  and allow" message; `INTERVALS_OAUTH_EXCLUDE_AREAS` drops areas. A new sign-in updates the scopes
+  of the athlete's other connections (Intervals.icu applies the latest scopes to all tokens).
+- Lifecycle: a token rejected by Intervals.icu (401/403) answers with a reconnect message; revoking a
+  connection deletes its stored token; `OAUTH_TOKEN_RETENTION_DAYS` drops tokens unused for N days;
+  a standard OAuth refresh is used if Intervals.icu ever issues refresh tokens.
+- `futureweb-intervals-mcp grants list|remove <athlete>|remove --grant <id>|remove --legacy|prune --days N`
+  (no tokens shown or decrypted; a running server picks up the change) and
+  `futureweb-intervals-mcp token-key [--file <path>]`; also as `python -m intervals_mcp_server.auth`.
+- `OAUTH_ALLOWED_ATHLETES=*` is accepted in multi-user mode only with `OAUTH_ALLOW_ANY_ATHLETE=true`.
+- Request budgets for OAuth-token connections: `MCP_ATHLETE_DAILY_REQUESTS` (default 1000 per
+  athlete and UTC day) and `MCP_APP_REQUESTS_PER_15MIN` (default 2000 for all athletes together),
+  on top of the per-call budget.
+- `get_server_status` shows the tenancy mode and, in multi-user mode, only the calling connection
+  (athlete, credential kind, Intervals.icu scopes, requests today). `--doctor` validates the
+  multi-user settings (key, sign-in, transport, budgets), warns about connections from the
+  single-user mode that will be served as the owner, unreadable stored tokens, `ATHLETE_TIMEZONE`
+  and `*`, and prints the number of connected athletes.
+- State file format 2 in multi-user mode (adds `grants`); older releases refuse it. Format 1 files
+  load unchanged: their connections become the owner's, so the existing ChatGPT connection keeps
+  working in both modes. `INTERVALS_OAUTH_BASE_URL` overrides the Intervals.icu OAuth endpoints (tests).
+- Docs: README "Sharing the server with friends", `docs/REMOTE_ACCESS.md` section 5, multi-user
+  threat model in `SECURITY.md`, `.env.example`.
+
+### Changed (multi-user mode, also visible in the single-user mode)
+- The OAuth state file is written under an advisory lock (`<state file>.lock`, created next to it),
+  and a change by another process (the `grants` CLI, a restore) is reloaded before the next request
+  instead of being overwritten. The single-user format (version 1) is unchanged.
+- `OAUTH_ALLOWED_ATHLETES=*` is refused in the single-user mode (it never matched an athlete there).
+  The startup log and `--doctor` warn when the single-user allowlist names other athletes than
+  `ATHLETE_ID`, since they would see the owner's data.
+- `get_server_status` (JSON) has a `tenancy` field.
+
 ### Added (stage 3B: write safety)
 - `dry_run` (default false, so nothing changes for existing calls) on every create/update tool
   that did not have it: `add_or_update_event`, `add_or_update_note`, `add_events_bulk`,
