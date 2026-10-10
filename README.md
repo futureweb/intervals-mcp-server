@@ -101,8 +101,17 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 
 ## Tools
 
-66 tools; 51 of them only read. Write tools are marked ✎ (`write`), ✖ (`destructive`) or
-⚙ (`admin`) and are hidden unless their class is enabled. Most tools accept `output_format="json"`.
+67 tools; 52 of them only read. Write tools are marked ✎ (`write`), ✖ (`destructive`) or
+⚙ (`admin`) and are hidden unless their class is enabled. Most tools accept `output_format="json"`
+and `detail_level` (`compact` first). Tools never take an API key: credentials come only from
+the server environment.
+
+The catalogue is kept small for the AI client: short descriptions that say when to use a tool,
+a description and (where the values are fixed) an enum for every parameter, and text results
+without a duplicate structured copy. Method details and the workout format live in MCP resources
+(`intervals://methods/<topic>`, `intervals://workout-syntax`) and in `get_guide(topic)` for clients
+that only call tools. `tools/list` is about 22.6k tokens at `MCP_PERMISSIONS=read,write`
+(was 42.0k; cl100k); see [Tool sets](#tool-sets) for a smaller set.
 
 **Activity analysis**
 
@@ -154,7 +163,7 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per moving hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name (device-file zeros treated as placeholders); per sport family, and within it per duration and intensity, with sample sizes, logging coverage and Spearman correlations from 8 sessions; no targets |
-| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet (night/morning values apart from day totals); subjective scores |
+| `get_wellness_data`, `update_wellness` ✎ | Daily records (`include_all_fields` adds every custom wellness field), with a line naming the usual fields today's record does not have yet (night/morning values, daily metrics such as VO2max or endurance score, and day totals apart); subjective scores |
 
 **Athlete, gear, calendar and workouts**
 
@@ -173,13 +182,41 @@ correctly: [docs/GARMIN_BRIDGE.md](docs/GARMIN_BRIDGE.md).
 | Tool | What it does |
 | --- | --- |
 | `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions |
-| `get_server_status` | Version, enabled permissions, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
+| `get_server_status` | Version, enabled permissions, tool set, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
+| `get_guide` | Usage guide, workout syntax and method guides (the resources below) for clients that only call tools |
 
 **Prompts:** `recovery_check`, `workout_deep_dive`, `weekly_training_review`,
 `training_load_review`, `performance_progression`, `long_ride_climbing_analysis`,
-`nutrition_weight_trend`, `power_meter_comparison`, `workout_planning_validation`.
-**Resources:** `intervals://guide` (how to use the tools), `intervals://custom-items` (your
-custom item definitions).
+`nutrition_weight_trend`, `power_meter_comparison`, `workout_planning_validation`, `race_week`
+(taper and form on race day, fueling plan from history, weather, logistics), `fueling_review`,
+`plan_health_check` (load projection and what-if scenario of the planned weeks) and
+`coach_handoff` (compact summary for another coach or session).
+**Resources:** `intervals://guide` (how to use the tools), `intervals://workout-syntax` (the
+structured workout format), `intervals://methods/<topic>` (how an analysis works: activity-data,
+execution, climbs, power-meters, load, intensity, durability, summary, comparisons, fatigue,
+wellness, fueling), `intervals://custom-items` (your custom item definitions).
+The server also sends short instructions in the MCP `initialize` answer (start with
+`get_coach_context` or `get_activity_report`, compact first, missing values are not normal,
+writes only on request after a preview).
+
+### Tool sets
+
+`MCP_TOOLSET=full` (default) registers every tool of the enabled permission classes.
+`MCP_TOOLSET=core` registers a curated set for clients with a small tool budget (about 8.1k tokens
+at `MCP_PERMISSIONS=read,write`); `MCP_PERMISSIONS` still applies inside the set:
+
+| Purpose | Core tools |
+| --- | --- |
+| Orientation | `get_server_status`, `get_guide` |
+| Weekly review, load and plan | `get_coach_context`, `get_training_summary`, `get_load_projection`, `get_events` |
+| One activity | `get_activities`, `get_activity_report`, `get_activity_details`, `get_activity_intervals`, `get_best_efforts`, `get_fueling_analysis` |
+| Recovery | `get_recovery_snapshot`, `get_wellness_data` |
+| Planning | `get_sport_settings`, `validate_workout` |
+| Writes (`write` class) | `add_or_update_event` ✎, `update_wellness` ✎, `update_activity` ✎ |
+
+`get_server_status` and `--doctor` show the active tool set and how many tools it leaves out.
+After a server update that changes tools or tool sets, refresh the tool list in the client
+(ChatGPT: the connector's refresh in the app settings; Claude: reconnect the connector).
 
 **Output conventions:** start times are shown local with the timezone name when Intervals.icu
 stores one, otherwise with the UTC offset derived from the local and UTC start, plus UTC; run,
@@ -273,6 +310,7 @@ Environment variables; a `.env` file in the working directory is loaded automati
 | `API_KEY` | – | Intervals.icu API key (required) |
 | `ATHLETE_ID` | – | Athlete ID, `i123456` or `123456` (required) |
 | `MCP_PERMISSIONS` | `read` | Enabled tool classes, e.g. `read,write` or `all` |
+| `MCP_TOOLSET` | `full` | `full` (every tool of the enabled classes) or `core` (curated set, see [Tool sets](#tool-sets)) |
 | `CUSTOM_UNITS_OVERRIDES` | – | Display units per custom item code, e.g. `Stamina=%,RecoveryTime=h` |
 | `CUSTOM_AGGREGATE_OVERRIDES` | – | Aggregation per custom field code in summaries (`sum`, `device_load_sum`, `trend`, `mean`, `none`), e.g. `TrainingLoad=device_load_sum` |
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, `http` or `http+sse` (`/mcp` and `/sse` in one process) |
