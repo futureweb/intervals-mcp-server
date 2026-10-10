@@ -10,6 +10,7 @@ violation and fails the test, like any Basic-auth (API key) request for a non-ow
 import asyncio
 import base64
 import json
+import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,10 +28,12 @@ from intervals_mcp_server import auth
 from intervals_mcp_server.api import client as api_client
 from intervals_mcp_server.auth import CredentialError, LoginError, SingleUserOAuthProvider, oauth_config_from_env, oauth_from_env
 from intervals_mcp_server.auth_grants import grant_context, grants_main
+from intervals_mcp_server.auth_totp import generate_secret
 from intervals_mcp_server.mcp_instance import mcp
 from intervals_mcp_server.tenancy import (
     BUDGETS,
     Credential,
+    RequestBudgets,
     athlete_argument,
     intervals_scopes_for,
     required_scope,
@@ -51,6 +54,7 @@ TAGS = {OWNER: "OWNERDATA", ALPHA: "ALPHADATA", BRAVO: "BRAVODATA"}
 ISSUER = "https://intervals-mcp.example.com"
 REDIRECT = "https://chatgpt.com/connector/oauth/test-callback"
 KEY = generate_key()
+TOTP = generate_secret()
 
 
 def multi_env(tmp_path: Path, **extra: str) -> dict[str, str]:
@@ -60,6 +64,7 @@ def multi_env(tmp_path: Path, **extra: str) -> dict[str, str]:
         "MCP_PUBLIC_URL": ISSUER,
         "OAUTH_LOGIN": "intervals,password",
         "OAUTH_PASSWORD": "owner-password-for-tests",
+        "OAUTH_TOTP_SECRET": TOTP,  # the owner's password sign-in needs a second factor in multi-user mode
         "INTERVALS_OAUTH_CLIENT_ID": "1304",
         "INTERVALS_OAUTH_CLIENT_SECRET": "app-secret",
         "OAUTH_ALLOWED_ATHLETES": f"{OWNER},{ALPHA},{BRAVO}",
@@ -83,12 +88,8 @@ class FakeIntervalsOAuth:  # pylint: disable=too-few-public-methods
         self.codes.append(code)
         athlete = code.split(":", 1)[1]
         token = next((t for t, a in TOKENS.items() if a == athlete), f"tok-{athlete}-unused")
-        return {
-            "token_type": "Bearer",
-            "access_token": token,
-            "scope": "ACTIVITY:WRITE,WELLNESS:WRITE,CALENDAR:WRITE,LIBRARY:WRITE,SETTINGS:READ,CHATS:WRITE",
-            "athlete": {"id": athlete.lstrip("i"), "name": "Synthetic"},
-        }
+        # No "scope" in the answer: the server then keeps the scope it requested.
+        return {"token_type": "Bearer", "access_token": token, "athlete": {"id": athlete.lstrip("i"), "name": "Synthetic"}}
 
 
 def make_provider(tmp_path: Path, clock: Any = time.time, **extra: str) -> SingleUserOAuthProvider:
@@ -235,7 +236,7 @@ def multi(tmp_path, monkeypatch, fake_api):
     client = _client(provider)
     tokens = {
         ALPHA: sign_in_intervals(provider, client, ALPHA),
-        BRAVO: sign_in_intervals(provider, client, BRAVO),
+        BRAVO: sign_in_intervals(provider, client, BRAVO, ("read", "write")),
         OWNER: sign_in_password(provider, client),
     }
     return provider, tokens, fake_api
@@ -269,12 +270,13 @@ def credential_of(provider: SingleUserOAuthProvider, access_token: str) -> Crede
 
 
 def test_scopes_follow_the_granted_permission_classes():
-    assert intervals_scopes_for(["read"]) == "ACTIVITY:READ,WELLNESS:READ,CALENDAR:READ,LIBRARY:READ,SETTINGS:READ,CHATS:READ"
-    assert intervals_scopes_for(["read", "write"]) == (
-        "ACTIVITY:WRITE,WELLNESS:WRITE,CALENDAR:WRITE,LIBRARY:WRITE,SETTINGS:READ,CHATS:WRITE"
-    )
-    assert intervals_scopes_for(["read", "write", "destructive", "admin"]).endswith("SETTINGS:WRITE,CHATS:WRITE")
-    assert "CHATS" not in intervals_scopes_for(["read", "write"], exclude_areas=["chats"])
+    # CHATS (activity comments, but also private chats) only on the athlete's explicit choice.
+    assert intervals_scopes_for(["read"]) == "ACTIVITY:READ,WELLNESS:READ,CALENDAR:READ,LIBRARY:READ,SETTINGS:READ"
+    assert intervals_scopes_for(["read"], include_chats=True).endswith("SETTINGS:READ,CHATS:READ")
+    assert intervals_scopes_for(["read", "write"]) == "ACTIVITY:WRITE,WELLNESS:WRITE,CALENDAR:WRITE,LIBRARY:WRITE,SETTINGS:READ"
+    assert intervals_scopes_for(["read", "write"], include_chats=True).endswith(",CHATS:WRITE")
+    assert intervals_scopes_for(["read", "write", "destructive", "admin"]).endswith("LIBRARY:WRITE,SETTINGS:WRITE")
+    assert "CHATS" not in intervals_scopes_for(["read", "write"], exclude_areas=["chats"], include_chats=True)
     assert required_scope("GET", "/athlete/i1/activities") == "ACTIVITY:READ"
     assert required_scope("PUT", "/athlete/i1/wellness/2026-10-01") == "WELLNESS:WRITE"
     assert required_scope("GET", "/athlete/i1/events.csv") == "CALENDAR:READ"
@@ -295,10 +297,17 @@ def test_authorize_url_requests_the_scopes_of_the_consent(tmp_path):
     location, _ = provider.begin_intervals_login(_request(provider, client), ("read", "write"), "k")
     assert parse_qs(urlsplit(location).query)["scope"] == [intervals_scopes_for(["read", "write"])]
     assert location.startswith("https://intervals.icu/oauth/authorize?")
+    # The comments checkbox is ignored unless the server offers it (INTERVALS_OAUTH_OFFER_CHATS).
+    location, _ = provider.begin_intervals_login(_request(provider, client), ("read",), "k", chats=True)
+    assert "CHATS" not in parse_qs(urlsplit(location).query)["scope"][0]
+    offering = make_provider(tmp_path, INTERVALS_OAUTH_OFFER_CHATS="true")
+    client = _client(offering, "c2")
+    location, _ = offering.begin_intervals_login(_request(offering, client), ("read",), "k", chats=True)
+    assert parse_qs(urlsplit(location).query)["scope"][0].endswith(",CHATS:READ")
 
 
 def test_single_user_mode_keeps_the_configured_identity_scope(tmp_path):
-    env = multi_env(tmp_path, MCP_TENANCY="single", INTERVALS_OAUTH_SCOPE="ACTIVITY:READ")
+    env = multi_env(tmp_path, MCP_TENANCY="single", INTERVALS_OAUTH_SCOPE="ACTIVITY:READ", OAUTH_ALLOWED_ATHLETES=OWNER)
     provider = SingleUserOAuthProvider(oauth_config_from_env(env), fetch=FakeWeb())
     client = _client(provider)
     location, _ = provider.begin_intervals_login(_request(provider, client), ("read", "write"), "k")
@@ -331,6 +340,8 @@ def test_missing_intervals_scope_is_refused_before_the_request(multi):
         ({"OAUTH_ALLOWED_ATHLETES": "*"}, "OAUTH_ALLOW_ANY_ATHLETE=true"),
         ({"MCP_TENANCY": "multiple"}, "MCP_TENANCY must be"),
         ({"INTERVALS_OAUTH_EXCLUDE_AREAS": "GEAR"}, "unknown area"),
+        ({"OAUTH_TOTP_SECRET": ""}, "needs OAUTH_TOTP_SECRET"),
+        ({"OAUTH_MAX_GRANTS_PER_ATHLETE": "0"}, "OAUTH_MAX_GRANTS_PER_ATHLETE"),
     ],
 )
 def test_multi_user_configuration_is_validated(tmp_path, extra, message):
@@ -343,6 +354,16 @@ def test_any_athlete_needs_the_explicit_opt_in(tmp_path):
     assert config.allow_any_athlete and config.athlete_allowed("i424242")
     with pytest.raises(ValueError, match="only accepted with MCP_TENANCY=multi"):
         oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES="*", OAUTH_ALLOW_ANY_ATHLETE="true"))
+
+
+def test_single_user_mode_refuses_other_athletes_on_the_allowlist(tmp_path):
+    """R30-2: in the single-user mode every allowed athlete sees the owner's data."""
+    with pytest.raises(ValueError, match="besides ATHLETE_ID"):
+        oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single"))
+    config = oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=f"{OWNER},{ALPHA}",
+                                             OAUTH_OWNER_ACCOUNTS=ALPHA))
+    assert config.owner_accounts == frozenset({"1001"})
+    assert oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER)).allowed_athletes
 
 
 def test_multi_user_mode_requires_oauth(tmp_path):
@@ -598,6 +619,8 @@ def test_daily_budget_per_athlete(multi, monkeypatch):
 def test_shared_window_budget(multi, monkeypatch):
     provider, tokens, _ = multi
     monkeypatch.setenv("MCP_APP_REQUESTS_PER_15MIN", "3")
+    monkeypatch.setenv("MCP_ATHLETE_SHARE_PERCENT", "100")
+    monkeypatch.setenv("MCP_OWNER_RESERVED_PERCENT", "0")
     for athlete in (ALPHA, BRAVO, ALPHA):
         with use_credential(credential_of(provider, tokens[athlete].access_token)):
             assert isinstance(asyncio.run(api_client.make_intervals_request(f"/athlete/{athlete}/wellness")), list)
@@ -699,36 +722,191 @@ def test_grants_cli_lists_and_removes_without_showing_tokens(multi, capsys, monk
     assert not [g for g in json.loads(provider.config.state_file.read_text())["grants"].values() if g["kind"] == "athlete"]
 
 
+def _chatgpt(provider: SingleUserOAuthProvider) -> OAuthClientInformationFull:
+    from tests.test_oauth_extensions import CHATGPT_ID  # pylint: disable=import-outside-toplevel
+
+    client = asyncio.run(provider.get_client(CHATGPT_ID))
+    assert client is not None
+    return client
+
+
 def test_version_1_grant_keeps_working_in_single_user_mode(tmp_path):
     write_state(tmp_path, VERSION_1_STATE)
-    env = multi_env(tmp_path, MCP_TENANCY="single")
+    env = multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER)
     provider = SingleUserOAuthProvider(oauth_config_from_env(env), fetch=FakeWeb())
-    chatgpt = asyncio.run(provider.get_client(VERSION_1_STATE["refresh_tokens"][auth._digest("cimd-refresh-token")]["client_id"]))
-    assert chatgpt is not None
-    assert refresh_with(provider, chatgpt, "cimd-refresh-token") is not None
+    assert refresh_with(provider, _chatgpt(provider), "cimd-refresh-token") is not None
     saved = json.loads(provider.config.state_file.read_text())
     assert saved["version"] == 1 and set(saved) == {"version", "clients", "refresh_tokens"}
+    assert all("athlete_id" not in r for r in saved["refresh_tokens"].values())  # unknown stays unknown
 
 
-def test_version_1_grant_becomes_the_owners_in_multi_user_mode(tmp_path):
+def test_version_1_grants_are_refused_in_multi_user_mode_until_adopted(tmp_path, capsys):
+    """R30-1/R30-2: connections of the single-user mode without a recorded athlete are never the
+    owner's by default; `grants adopt-legacy --owner` adopts them once (also on a running server)."""
     write_state(tmp_path, VERSION_1_STATE)
     provider = make_provider(tmp_path)
-    chatgpt = asyncio.run(provider.get_client(VERSION_1_STATE["refresh_tokens"][auth._digest("cimd-refresh-token")]["client_id"]))
-    assert chatgpt is not None
-    rotated = refresh_with(provider, chatgpt, "cimd-refresh-token")
+    assert refresh_with(provider, _chatgpt(provider), "cimd-refresh-token") is None
+    assert provider.grant_overview()["legacy_grants"] == 2
+    env = {"OAUTH_STATE_FILE": str(provider.config.state_file), "ATHLETE_ID": OWNER}
+    assert grants_main(["adopt-legacy", "--owner"], env) == 0
+    assert "Adopted 2" in capsys.readouterr().out
+    rotated = refresh_with(provider, _chatgpt(provider), "cimd-refresh-token")  # the running server reloads
     assert rotated is not None and rotated.scope == "mcp intervals:read intervals:write"
     credential = credential_of(provider, rotated.access_token)
     assert (credential.athlete_id, credential.kind, credential.secret) == (OWNER, "apikey", OWNER_KEY)
     saved = json.loads(provider.config.state_file.read_text())
-    assert saved["version"] == 2 and saved["grants"] == {} and len(saved["refresh_tokens"]) == 2
-    # Without an owner API key the old grants cannot be served and are not loaded.
+    assert saved["version"] == 2 and {g["kind"] for g in saved["grants"].values()} == {"owner"}
+    assert len(saved["grants"]) == 2 and all(r["athlete_id"] == OWNER for r in saved["refresh_tokens"].values())
+    # Without an owner API key owner grants cannot be served.
     provider = make_provider(tmp_path, OAUTH_LOGIN="intervals", API_KEY="")
     assert not provider._tokens.refresh
 
 
+def test_adopting_before_the_switch_keeps_the_live_grant_working(tmp_path):
+    """The production path: adopt while still in single-user mode, then switch; ChatGPT keeps working."""
+    write_state(tmp_path, VERSION_1_STATE)
+    single = SingleUserOAuthProvider(oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER)),
+                                     fetch=FakeWeb())
+    assert grants_main(["adopt-legacy", "--owner"], {"OAUTH_STATE_FILE": str(tmp_path / "state.json"), "ATHLETE_ID": OWNER}) == 0
+    rotated = refresh_with(single, _chatgpt(single), "cimd-refresh-token")
+    assert rotated is not None
+    saved = json.loads((tmp_path / "state.json").read_text())
+    assert saved["version"] == 1 and all(r["athlete_id"] == OWNER for r in saved["refresh_tokens"].values())
+    multi_provider = make_provider(tmp_path)  # the switch: owner records become owner grants, once
+    again = refresh_with(multi_provider, _chatgpt(multi_provider), rotated.refresh_token)
+    assert again is not None and credential_of(multi_provider, again.access_token).kind == "apikey"
+
+
+def test_single_user_sign_ins_record_the_athlete(tmp_path):
+    """From this release on the single-user mode records who signed in; the owner's connections then
+    become owner grants in multi-user mode without adoption."""
+    single = SingleUserOAuthProvider(
+        oauth_config_from_env(multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER)), fetch=FakeWeb(),
+        intervals_exchange=FakeIntervalsOAuth(),
+    )
+    client = _client(single)
+    by_password = sign_in_password(single, client)
+    by_intervals = sign_in_intervals(single, client, OWNER)
+    records = json.loads(single.config.state_file.read_text())["refresh_tokens"].values()
+    assert sorted((r["athlete_id"], r["method"]) for r in records) == [(OWNER, "intervals"), (OWNER, "password")]
+    multi_provider = make_provider(tmp_path)
+    client = asyncio.run(multi_provider.get_client("c1"))
+    assert client is not None
+    for token in (by_password, by_intervals):
+        rotated = refresh_with(multi_provider, client, token.refresh_token)
+        assert rotated is not None and credential_of(multi_provider, rotated.access_token).kind == "apikey"
+
+
+def test_friend_connected_in_single_mode_is_not_the_owner_after_the_switch(tmp_path, monkeypatch, fake_api):
+    """Reviewer reproduction R30-2: a friend who signed in in single mode (only possible as an owner account
+    now) never gets the owner's API key after the switch to multi-user mode."""
+    single_env = multi_env(tmp_path, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=f"{OWNER},{ALPHA}", OAUTH_OWNER_ACCOUNTS=ALPHA)
+    single = SingleUserOAuthProvider(oauth_config_from_env(single_env), fetch=FakeWeb(), intervals_exchange=FakeIntervalsOAuth())
+    client = _client(single)
+    friend = sign_in_intervals(single, client, ALPHA)
+    for name, value in multi_env(tmp_path, OAUTH_ALLOWED_ATHLETES=f"{OWNER},{ALPHA}").items():
+        monkeypatch.setenv(name, value)
+    multi_provider = make_provider(tmp_path, OAUTH_ALLOWED_ATHLETES=f"{OWNER},{ALPHA}")
+    monkeypatch.setattr(mcp, "credential_source", multi_provider)
+    client = asyncio.run(multi_provider.get_client(client.client_id)) or client
+    assert refresh_with(multi_provider, client, friend.refresh_token) is None
+    assert grants_main(["adopt-legacy", "--owner"], {"OAUTH_STATE_FILE": str(tmp_path / "state.json"), "ATHLETE_ID": OWNER}) == 0
+    assert refresh_with(multi_provider, client, friend.refresh_token) is None  # never adopted as the owner's
+    assert not fake_api.requests
+
+
+@pytest.mark.parametrize("damage", ["delete-record", "grants-empty", "grants-null"])
+def test_missing_grant_record_fails_closed(multi, damage):
+    """Reviewer reproduction R30-1: a format-2 file without the athlete's grant record never turns the
+    connection into the owner's."""
+    provider, tokens, fake = multi
+    path = provider.config.state_file
+    data = json.loads(path.read_text())
+    alpha_grant = credential_of(provider, tokens[ALPHA].access_token).grant_id
+    if damage == "delete-record":
+        del data["grants"][alpha_grant]
+    elif damage == "grants-empty":
+        data["grants"] = {}
+    else:
+        data["grants"] = None
+    time.sleep(0.01)
+    path.write_text(json.dumps(data))
+    if damage == "grants-null":
+        # A damaged file is not loaded (the running server keeps its state, a new start stops with a message).
+        with pytest.raises(ValueError, match="'grants'"):
+            make_provider(path.parent)
+        assert credential_of(provider, tokens[ALPHA].access_token).kind == "bearer"
+        return
+    assert asyncio.run(provider.load_access_token(tokens[ALPHA].access_token)) is None
+    with pytest.raises(CredentialError):
+        credential_of(provider, tokens[ALPHA].access_token)
+    client = asyncio.run(provider.get_client("c1"))
+    assert client is not None and refresh_with(provider, client, tokens[ALPHA].refresh_token) is None
+    restarted = make_provider(path.parent)
+    assert asyncio.run(restarted.get_client("c1")) is not None
+    assert refresh_with(restarted, client, tokens[ALPHA].refresh_token) is None
+    assert not [r for r in fake.requests if r[0] == OWNER]
+
+
+@pytest.mark.usefixtures("fake_api")
+def test_unreadable_client_keeps_the_grant_record(tmp_path, monkeypatch):  # pylint: disable=too-many-locals
+    """Reviewer reproduction R30-1 (no tampering): while a client registration is unreadable its tokens are
+    kept with their grant record; once readable again the friend is still the friend, never the owner."""
+    for name, value in multi_env(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    provider = make_provider(tmp_path)
+    friend_client, owner_client = _client(provider, "friend-dcr"), _client(provider, "owner-dcr")
+    friend = sign_in_intervals(provider, friend_client, ALPHA)
+    path = provider.config.state_file
+    good = json.loads(path.read_text())
+    broken = json.loads(json.dumps(good))
+    broken["clients"]["friend-dcr"]["redirect_uris"] = "not-a-list"
+    path.write_text(json.dumps(broken))
+    restarted = make_provider(tmp_path)
+    sign_in_password(restarted, asyncio.run(restarted.get_client("owner-dcr")) or owner_client)  # any later write
+    after = json.loads(path.read_text())
+    assert ALPHA in {g["athlete_id"] for g in after["grants"].values()}
+    after["clients"]["friend-dcr"] = good["clients"]["friend-dcr"]
+    path.write_text(json.dumps(after))
+    fixed = make_provider(tmp_path)
+    monkeypatch.setattr(mcp, "credential_source", fixed)
+    client = asyncio.run(fixed.get_client("friend-dcr"))
+    assert client is not None
+    rotated = refresh_with(fixed, client, friend.refresh_token)
+    assert rotated is not None
+    credential = credential_of(fixed, rotated.access_token)
+    assert (credential.kind, credential.athlete_id) == ("bearer", ALPHA)
+    text = call_as(fixed, rotated.access_token, "get_activities", {})
+    assert "ALPHADATA" in text and "OWNERDATA" not in text
+
+
+def test_switch_to_single_with_an_unreadable_client_drops_the_friend(tmp_path, monkeypatch):
+    """Reviewer reproduction R30-1 (multi -> single): the friend's token is not written as a single-user token."""
+    for name, value in multi_env(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    provider = make_provider(tmp_path)
+    friend_client, owner_client = _client(provider, "friend-dcr"), _client(provider, "owner-dcr")
+    friend = sign_in_intervals(provider, friend_client, ALPHA)
+    path = provider.config.state_file
+    data = json.loads(path.read_text())
+    good_client = json.loads(json.dumps(data["clients"]["friend-dcr"]))
+    data["clients"]["friend-dcr"]["redirect_uris"] = "not-a-list"
+    path.write_text(json.dumps(data))
+    single_env = multi_env(tmp_path, MCP_TENANCY="single", OAUTH_TOKEN_KEY="", OAUTH_ALLOWED_ATHLETES=OWNER)
+    single = SingleUserOAuthProvider(oauth_config_from_env(single_env), fetch=FakeWeb(), intervals_exchange=FakeIntervalsOAuth())
+    sign_in_password(single, asyncio.run(single.get_client("owner-dcr")) or owner_client)
+    saved = json.loads(path.read_text())
+    assert saved["version"] == 1 and not any(r["client_id"] == "friend-dcr" for r in saved["refresh_tokens"].values())
+    saved["clients"]["friend-dcr"] = good_client
+    path.write_text(json.dumps(saved))
+    single = SingleUserOAuthProvider(oauth_config_from_env(single_env), fetch=FakeWeb(), intervals_exchange=FakeIntervalsOAuth())
+    client = asyncio.run(single.get_client("friend-dcr"))
+    assert client is not None and refresh_with(single, client, friend.refresh_token) is None
+
+
 def test_switching_back_to_single_user_mode_drops_other_athletes(multi):
     provider, tokens, _ = multi
-    env = multi_env(provider.config.state_file.parent, MCP_TENANCY="single")
+    env = multi_env(provider.config.state_file.parent, MCP_TENANCY="single", OAUTH_ALLOWED_ATHLETES=OWNER)
     single = SingleUserOAuthProvider(oauth_config_from_env(env), fetch=FakeWeb())
     assert asyncio.run(single.load_access_token(tokens[ALPHA].access_token)) is None
     client = asyncio.run(single.get_client("c1"))
@@ -738,6 +916,7 @@ def test_switching_back_to_single_user_mode_drops_other_athletes(multi):
     text = single.config.state_file.read_text()
     saved = json.loads(text)
     assert saved["version"] == 1 and "grants" not in saved and len(saved["refresh_tokens"]) == 1
+    assert next(iter(saved["refresh_tokens"].values()))["athlete_id"] == OWNER
     assert "v1." not in text
 
 
@@ -776,12 +955,12 @@ def test_doctor_reports_multi_user_problems(tmp_path, monkeypatch):
     assert any("network transport" in e for e in errors)
 
 
-def test_single_user_doctor_warns_about_other_allowed_athletes(tmp_path):
+def test_single_user_doctor_reports_other_allowed_athletes(tmp_path):
     from intervals_mcp_server.cli import configuration_problems  # pylint: disable=import-outside-toplevel
 
     env = multi_env(tmp_path, MCP_TENANCY="single", MCP_TRANSPORT="streamable-http")
-    _, warnings = configuration_problems(env)
-    assert any("see the owner's data" in w for w in warnings)
+    errors, _ = configuration_problems(env)
+    assert any("sees the owner's data" in e for e in errors)
 
 
 def test_no_token_reaches_the_logs(multi, caplog):
@@ -855,3 +1034,169 @@ def test_main_cli_forwards_the_grants_and_token_key_commands(tmp_path, monkeypat
     assert "No connections" in capsys.readouterr().out
     assert main(["token-key"]) == 0
     assert capsys.readouterr().out.startswith("OAUTH_TOKEN_KEY=")
+
+
+# --------------------------------------------------------------------------- #
+# Review follow-ups: fair share, grant cap, activity ownership, comments, key rotation
+# --------------------------------------------------------------------------- #
+
+
+def test_fair_share_of_the_shared_window(monkeypatch):
+    """R30-3: one athlete takes at most its share of the 15-minute budget, the owner keeps a reserve."""
+    for name in ("MCP_ATHLETE_DAILY_REQUESTS", "MCP_ATHLETE_SHARE_PERCENT", "MCP_OWNER_RESERVED_PERCENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MCP_APP_REQUESTS_PER_15MIN", "100")
+    budgets = RequestBudgets(clock=lambda: 1_760_000_000.0)
+    alpha, bravo, charlie = (Credential(a, "bearer", "t", f"g{a}", None) for a in (ALPHA, BRAVO, "i1003"))
+    owner_token = Credential(OWNER, "bearer", "t", "g0", None, owner=True)
+    assert all(budgets.admit(alpha) is None for _ in range(50))
+    refused = budgets.admit(alpha)
+    assert refused is not None and "for one athlete (50 of the 100" in refused
+    assert all(budgets.admit(bravo) is None for _ in range(30))
+    assert budgets.admit(charlie) is not None and "reserved for the server owner" in (budgets.admit(charlie) or "")
+    assert all(budgets.admit(owner_token) is None for _ in range(20))  # the owner's reserve
+    assert "for all connected athletes together" in (budgets.admit(owner_token) or "")
+
+
+def test_retries_count_against_the_budgets(multi, monkeypatch):
+    provider, tokens, fake = multi
+
+    def busy(_athlete: str, _rest: list[str]) -> Any:
+        raise RuntimeError("unused")
+
+    original = fake.__call__
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/wellness"):
+            fake.requests.append((ALPHA, request.method, request.url.path))
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={"error": "slow down"})
+        return original(request)
+
+    monkeypatch.setattr(api_client, "_get_httpx_client", _client_with(answer))
+    del busy
+    with use_credential(credential_of(provider, tokens[ALPHA].access_token)):
+        result = asyncio.run(api_client.make_intervals_request(f"/athlete/{ALPHA}/wellness"))
+    assert result["status_code"] == 429
+    assert BUDGETS.used_today(ALPHA) == api_client.MAX_ATTEMPTS
+
+
+def _client_with(handler: Any) -> Any:
+    shared = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def get_client() -> httpx.AsyncClient:
+        return shared
+
+    return get_client
+
+
+def test_grants_per_athlete_are_limited(tmp_path):
+    """R30-4: an athlete keeps at most OAUTH_MAX_GRANTS_PER_ATHLETE grants; the least recently used go."""
+    clock = Clock()
+    provider = make_provider(tmp_path, clock=clock, OAUTH_MAX_GRANTS_PER_ATHLETE="3")
+    client = _client(provider)
+    tokens = []
+    for _ in range(5):
+        clock.now += 60
+        tokens.append(sign_in_intervals(provider, client, ALPHA))
+    grants = json.loads(provider.config.state_file.read_text())["grants"]
+    assert len(grants) == 3
+    assert asyncio.run(provider.load_access_token(tokens[0].access_token)) is None
+    assert asyncio.run(provider.load_access_token(tokens[4].access_token)) is not None
+    owner = sign_in_password(provider, client)  # other athletes are not affected
+    assert credential_of(provider, owner.access_token).kind == "apikey"
+
+
+def test_activity_sub_resources_of_another_athlete_are_refused(multi):
+    """R30-5: streams, intervals, messages and writes of another athlete's activity are never requested."""
+    provider, tokens, fake = multi
+    fake.coach_mode = True  # Intervals.icu would answer them (coach token, shared activity)
+    for tool in ("get_activity_streams", "get_activity_intervals", "get_activity_messages"):
+        before = len(fake.requests)
+        text = call_as(provider, tokens[ALPHA].access_token, tool, {"activity_id": "act-BRAVODATA"})
+        sent = [path for _, _, path in fake.requests[before:]]
+        assert sent in ([], ["/activity/act-BRAVODATA"]), (tool, sent)
+        assert "BRAVODATA long ride" not in text
+
+
+def test_own_activity_sub_resources_look_the_owner_up_once(multi):
+    provider, tokens, fake = multi
+    for _ in range(2):
+        call_as(provider, tokens[ALPHA].access_token, "get_activity_intervals", {"activity_id": "act-ALPHADATA"})
+    lookups = [path for _, method, path in fake.requests if path == "/activity/act-ALPHADATA"]
+    assert len(lookups) <= 2  # the tool's own read plus at most one owner lookup, then cached
+    assert any(path.startswith("/activity/act-ALPHADATA/") for _, _, path in fake.requests)
+
+
+def test_activity_comments_need_the_optional_permission(multi):
+    """User decision: CHATS is off by default; the comment tools say how to get it."""
+    provider, tokens, fake = multi
+    before = len(fake.requests)
+    text = call_as(provider, tokens[ALPHA].access_token, "get_activity_messages", {"activity_id": "act-ALPHADATA"})
+    assert "Activity comments" in text and "CHATS:READ" in text and len(fake.requests) == before
+
+
+@pytest.mark.usefixtures("fake_api")
+def test_comments_work_when_offered_and_chosen(tmp_path, monkeypatch):  # pylint: disable=too-many-locals
+    for name, value in multi_env(tmp_path, INTERVALS_OAUTH_OFFER_CHATS="true").items():
+        monkeypatch.setenv(name, value)
+    provider = make_provider(tmp_path, INTERVALS_OAUTH_OFFER_CHATS="true")
+    monkeypatch.setattr(mcp, "credential_source", provider)
+    client = _client(provider)
+    request_id = _request(provider, client)
+    location, browser = provider.begin_intervals_login(request_id, ("read",), "k", chats=True)
+    state = parse_qs(urlsplit(location).query)["state"][0]
+
+    async def with_chats(code: str) -> dict[str, Any]:
+        return {"access_token": "tok-alpha-secret-0001", "scope": parse_qs(urlsplit(location).query)["scope"][0],
+                "athlete": {"id": code.split(":", 1)[1]}}
+
+    provider._intervals_exchange = with_chats
+    token = _exchange(provider, client, asyncio.run(provider.finish_intervals_login(state, browser, f"code:{ALPHA}", None, "k")))
+    assert "CHATS:READ" in (credential_of(provider, token.access_token).intervals_scopes or set())
+    text = call_as(provider, token.access_token, "get_activity_messages", {"activity_id": "act-ALPHADATA"})
+    assert "permission" not in text
+
+
+def test_consent_page_offers_comments_only_when_enabled(tmp_path):
+    from intervals_mcp_server.auth_pages import _consent_body  # pylint: disable=import-outside-toplevel
+
+    for offered in (False, True):
+        provider = make_provider(tmp_path / str(offered), INTERVALS_OAUTH_OFFER_CHATS=str(offered).lower())
+        page = _consent_body(provider, _request(provider, _client(provider)), "athlete", None, "form-token")
+        assert ('name="chats"' in page) is offered
+        assert "revokes the connection on disconnect" in page and "30 days without use" in page
+
+
+def test_key_rotation_reseals_tokens_at_their_next_use(tmp_path):
+    """R30-7: a token opened with an older key is sealed again with the first key."""
+    old_key, new_key = KEY, generate_key()
+    provider = make_provider(tmp_path)
+    token = sign_in_intervals(provider, _client(provider), ALPHA)
+    rotated = make_provider(tmp_path, OAUTH_TOKEN_KEY=f"{new_key},{old_key}")
+    assert rotated.grant_overview()["old_key_tokens"] == 1
+    client = asyncio.run(rotated.get_client("c1"))
+    assert client is not None
+    fresh = refresh_with(rotated, client, token.refresh_token)
+    assert credential_of(rotated, fresh.access_token).secret == "tok-alpha-secret-0001"
+    only_new = make_provider(tmp_path, OAUTH_TOKEN_KEY=new_key)
+    assert only_new.grant_overview() | {"old_key_tokens": 0, "unreadable_tokens": 0} == only_new.grant_overview()
+
+
+def test_status_shows_friends_no_sign_in_details(multi):
+    provider, tokens, _ = multi
+    friend = json.loads(call_as(provider, tokens[ALPHA].access_token, "get_server_status", {"output_format": "json"}))
+    owner = json.loads(call_as(provider, tokens[OWNER].access_token, "get_server_status", {"output_format": "json"}))
+    assert friend["auth"] == {"mode": "oauth"}
+    assert "login" in owner["auth"] and owner["connection"]["credential"].startswith("server API key")
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0, reason="needs root to change file owners")
+def test_cli_run_as_root_keeps_the_owner_of_the_state_file(multi):
+    """R30-8: `docker exec` as root must not hand the state file to root."""
+    provider, _, _ = multi
+    path = provider.config.state_file
+    os.chown(path, 4321, 4321)
+    assert grants_main(["remove", "1002"], {"OAUTH_STATE_FILE": str(path)}) == 0
+    assert (path.stat().st_uid, path.stat().st_gid) == (4321, 4321)
+    lock = path.with_name(path.name + ".lock")
+    assert lock.exists()

@@ -36,11 +36,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from intervals_mcp_server.auth_totp import generate_secret, totp
 from intervals_mcp_server.tenancy import intervals_scopes_for
 from intervals_mcp_server.token_vault import generate_key
 from tests.test_multi_user import ALPHA, BRAVO, OWNER, OWNER_KEY, TAGS, TOKENS, FakeApi
 
 PASSWORD = "owner-password-e2e"
+TOTP_SECRET = generate_secret()  # multi-user mode: the owner's password sign-in needs the second factor
 CLIENT_REDIRECT = "http://127.0.0.1:9/callback"
 
 
@@ -129,6 +131,7 @@ def server(tmp_path, fake_intervals) -> Iterator[dict[str, Any]]:
             "MCP_PERMISSIONS": "read,write",
             "OAUTH_LOGIN": "intervals,password",
             "OAUTH_PASSWORD": PASSWORD,
+            "OAUTH_TOTP_SECRET": TOTP_SECRET,
             "OAUTH_STATE_FILE": str(tmp_path / "state" / "oauth_state.json"),
             "OAUTH_TOKEN_KEY_FILE": str(key_file),
             "OAUTH_ALLOWED_ATHLETES": f"{OWNER},{ALPHA},{BRAVO}",
@@ -190,7 +193,7 @@ def connect(base: str, athlete: str | None, granted: str = "read") -> dict[str, 
         assert csrf is not None
         form = {"request": request_id, "csrf": csrf.group(1), "grant": granted}
         if athlete is None:
-            form.update(action="password", username="athlete", password=PASSWORD)
+            form.update(action="password", username="athlete", password=PASSWORD, totp=totp(TOTP_SECRET, time.time()))
             final = browser.post("/oauth/login", data=form)
         else:
             assert "stores your Intervals.icu access token" in page.text
