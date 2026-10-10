@@ -9,6 +9,19 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (today's wellness completeness)
+- `get_wellness_data`, `get_recovery_snapshot` and `get_coach_context` say when today's wellness
+  record (athlete's time zone) is still incomplete: one line names the usual fields (a value on
+  at least 80 % of the 14 previous days; a stored 0 is a placeholder) that today's record does not
+  have yet, by display name, with the record's last update in local time, e.g. "Today 2026-10-10
+  is incomplete (last updated 09:46 local): not yet available: sleeping HR, respiration, SpO2, …
+  Treat them as missing, not as normal". JSON has `today_completeness` (date, exists,
+  updated_local, missing_usual_fields, note). The wellness request of `get_wellness_data` and
+  `get_recovery_snapshot` starts 14 days before today instead of making a second request;
+  `get_coach_context` makes one extra request for today (custom field names only from cached
+  definitions). Today's missing values stay out of baselines, 7-day means and z-scores.
+- `get_wellness_data` prints its "Wellness Data:" heading once instead of once more per day.
+
 ### Fixed (review findings: writes and API)
 - `delete_events_by_date_range` works in two steps: new `categories` (default `WORKOUT`), `dry_run`
   (default `true`: only lists what matches), `confirm_ids` (required with `dry_run=false`: the ids

@@ -652,3 +652,48 @@ def _fueling_period():
 
 
 FUELING_PERIOD = _fueling_period()
+
+
+# Today's wellness completeness: "today" is 2026-10-10 in Europe/Vienna. The days before have the
+# official sync values, the bridge's custom fields and the native values the bridge writes; this
+# morning's record only has what the official sync delivered right after the watch sync.
+COMPLETENESS_TODAY = "2026-10-10"
+COMPLETENESS_ITEMS = CUSTOM_ITEMS_DATA + [
+    {"id": 40, "type": "INPUT_FIELD", "name": "Garmin Skin Temperature Deviation",
+     "content": {"code": "GarminSkinTempDeviationC", "type": "numeric", "units": "°C"}},
+    {"id": 41, "type": "INPUT_FIELD", "name": "Garmin Sleep Stress Avg", "content": {"code": "GarminSleepStressAvg", "type": "numeric"}},
+    {"id": 42, "type": "INPUT_FIELD", "name": "Garmin Morning Training Readiness",
+     "content": {"code": "GarminTrainingReadiness", "type": "numeric"}},
+    {"id": 43, "type": "INPUT_FIELD", "name": "Body Battery Max", "content": {"code": "BodyBatteryMax", "type": "numeric"}},
+    {"id": 44, "type": "INPUT_FIELD", "name": "Garmin Cycling VO2max", "content": {"code": "GarminVO2MaxCycling", "type": "numeric"}},
+]
+COMPLETENESS_TODAY_RECORD = {
+    "id": COMPLETENESS_TODAY, "updated": "2026-10-10T07:46:01.604+00:00", "ctl": 63.7, "atl": 64.1, "rampRate": 2.6,
+    "ctlLoad": 0.0, "atlLoad": 0.0, "sportInfo": [{"type": "Ride", "eftp": 226.9}], "restingHR": 49, "hrv": 38.0,
+    "sleepSecs": 28080, "sleepScore": 85.0, "avgSleepingHR": None, "respiration": None, "spO2": None,
+    "kcalConsumed": 0, "steps": 257, "locked": None, "tempWeight": False, "BodyBatteryMax": 87,
+}
+
+
+def completeness_day(day: str, index: int) -> dict[str, Any]:
+    """A complete day before today (index 0 = 30 days before today)."""
+    return {
+        "id": day, "updated": f"{day}T20:21:13.526+00:00", "ctl": 60 + index * 0.1, "atl": 62.0, "rampRate": 1.0,
+        "ctlLoad": 0.0, "atlLoad": 0.0, "sportInfo": [{"type": "Ride", "eftp": 226.0}], "locked": False, "tempWeight": False,
+        "restingHR": 48 + index % 3, "hrv": 40.0 + index % 5, "sleepSecs": 27000 + index * 60, "sleepScore": 80.0 + index % 7,
+        "avgSleepingHR": 52.0, "respiration": 14.5, "spO2": 95.0, "steps": 6000 + index, "floorsClimbed": 8,
+        "kcalConsumed": 0,  # never logged: a stored 0 placeholder, so not a usual field
+        "BodyBatteryMax": 80, "GarminSleepDeepMinutes": 80.0, "GarminSkinTempDeviationC": (-0.2, -0.1, 0.1)[index % 3],
+        "GarminSleepStressAvg": 20.0, "GarminTrainingReadiness": 70.0,
+        "GarminVO2MaxCycling": 55.0 if index % 5 == 0 else None,  # rarely present
+    }
+
+
+def completeness_wellness(today: dict[str, Any] | bool | None = True) -> list[dict[str, Any]]:
+    """30 complete days before 2026-10-10 and today's record (True: this morning's, None: none yet)."""
+    from datetime import date, timedelta  # pylint: disable=import-outside-toplevel
+
+    end = date.fromisoformat(COMPLETENESS_TODAY)
+    entries = [completeness_day((end - timedelta(days=30 - i)).isoformat(), i) for i in range(30)]
+    record = COMPLETENESS_TODAY_RECORD if today is True else today
+    return entries + ([dict(record)] if isinstance(record, dict) else [])

@@ -534,6 +534,7 @@ def format_wellness_entry(
     entries: dict[str, Any],
     include_all_fields: bool = False,
     field_definitions: CustomFieldDefs | None = None,
+    header: bool = True,
 ) -> str:
     """Format wellness entry data into a readable string.
 
@@ -556,6 +557,8 @@ def format_wellness_entry(
             sections are appended under an "Other Fields" heading (default False).
         field_definitions: INPUT_FIELD definitions keyed by code, used to label custom
             wellness fields in "Other Fields" with name and units (optional).
+        header: Start with the "Wellness Data:" heading (default True; a list of days has
+            one heading of its own).
 
     Returns:
         A formatted string representation of the wellness entry.
@@ -568,7 +571,7 @@ def format_wellness_entry(
         entries.get("tempWeight")
         entries.get("tempRestingHR")
 
-    lines = ["Wellness Data:"]
+    lines = ["Wellness Data:"] if header else []
     lines.append(f"Date: {entries.get('id', 'N/A')}")
     lines.append("")
 

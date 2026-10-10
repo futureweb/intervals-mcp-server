@@ -14,7 +14,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("intervals_icu_mcp_server")
@@ -58,6 +58,17 @@ def athlete_today() -> date:
     """Today's date in the athlete's time zone (server clock when the zone is unknown)."""
     zone = _zone(active_timezone())
     return datetime.now(zone).date() if zone is not None else date.today()
+
+
+def athlete_local_time(moment: datetime) -> datetime:
+    """A point in time in the athlete's time zone (server local time when the zone is unknown).
+
+    A naive datetime is taken as UTC (Intervals.icu timestamps are UTC).
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    zone = _zone(active_timezone())
+    return moment.astimezone(zone) if zone is not None else moment.astimezone()
 
 
 def set_timezone_resolver(resolver: TimezoneResolver | None) -> None:

@@ -124,12 +124,14 @@ async def fetch_activities(
 
 
 async def fetch_wellness(
-    athlete_id: str, api_key: str | None, start: date, end: date, fields: str
+    athlete_id: str, api_key: str | None, start: date, end: date, fields: str | None
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Wellness records from start to end with the given field selection."""
+    """Wellness records from start to end with the given field selection (None: all fields)."""
+    params = {"oldest": start.isoformat(), "newest": end.isoformat()}
+    if fields is not None:
+        params["fields"] = fields
     result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key,
-        params={"oldest": start.isoformat(), "newest": end.isoformat(), "fields": fields},
+        url=f"/athlete/{seg(athlete_id)}/wellness", api_key=api_key, params=params
     )
     error = _error(result, "wellness data")
     if error:

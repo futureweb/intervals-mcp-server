@@ -26,6 +26,7 @@ from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.formatting import event_type_label
 from intervals_mcp_server.utils.sports import format_local_start, hms
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
+from intervals_mcp_server.utils.wellness_completeness import completeness_line, completeness_start, today_completeness
 from intervals_mcp_server.utils.wellness_stats import (
     compute_correlation,
     compute_metric_trend,
@@ -181,6 +182,8 @@ def _subjective_line(entry: dict[str, Any]) -> str | None:
 
 SNAPSHOT_LEVELS = ("compact", "standard", "full")
 STANDARD_CUSTOM_LIMIT = 20
+# Names of today's missing usual fields listed per detail level (JSON lists all).
+COMPLETENESS_NAMES = {"compact": 10, "standard": 20, "full": None}
 
 
 def _custom_line(entry: dict[str, Any], defs: CustomFieldDefs, limit: int | None = None) -> str | None:
@@ -261,7 +264,7 @@ def _event_line(event: dict[str, Any]) -> str:
 
 def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     target: str, entries: list[dict[str, Any]], input_defs: CustomFieldDefs, baselines: list[dict[str, Any]],
-    activities: list[dict[str, Any]], events: list[dict[str, Any]],
+    activities: list[dict[str, Any]], events: list[dict[str, Any]], completeness: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     days = []
     for entry in entries:
@@ -273,7 +276,10 @@ def _snapshot_json(  # pylint: disable=too-many-arguments,too-many-positional-ar
         day["missing"] = [key for key, _, _, _ in SNAPSHOT_FIELDS if is_missing(entry.get(key))]
         day["preliminary"] = entry.get("id") == target
         days.append(day)
-    return {"date": target, "days": days, "baselines": baselines, "activities": activities, "planned_events": events}
+    return {
+        "date": target, "today_completeness": completeness, "days": days, "baselines": baselines,
+        "activities": activities, "planned_events": events,
+    }
 
 
 @tool("read")
@@ -297,7 +303,9 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     median, SD and the latest value's deviation) for the selected metrics; the activities
     of those days with their loads and device fields; and the planned events of the day.
     The current day's aggregates (steps, calories) can still be incomplete and are flagged
-    as preliminary. No readiness verdict is computed.
+    as preliminary; for today a line (JSON today_completeness) names the usual fields (present
+    on 80 % of the 14 previous days) not yet in today's record: not yet available, not normal.
+    No readiness verdict is computed.
 
     Args:
         date_str: The day in YYYY-MM-DD format (optional, default today)
@@ -327,15 +335,20 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     start = (date.fromisoformat(target) - timedelta(days=days_back)).isoformat()
     baseline_start = (date.fromisoformat(target) - timedelta(days=BASELINE_DAYS + days_back)).isoformat()
     metrics = _split(baseline_metrics)
+    # Today's completeness needs the 14 days before today: widen the same request.
+    check_today = target == get_default_end_date()
+    fetch_start = min(start, completeness_start(date.fromisoformat(target)).isoformat()) if check_today else start
 
-    entries, error = await _fetch_wellness(athlete_id_to_use, api_key, start, target)
+    fetched, error = await _fetch_wellness(athlete_id_to_use, api_key, fetch_start, target)
     if error:
         return error
+    entries = [e for e in fetched if start <= str(e.get("id"))[:10] <= target]
     baseline_entries, _ = await _fetch_wellness(
         athlete_id_to_use, api_key, baseline_start, target, fields="id," + ",".join(metrics)
     )
     input_defs = await _defs(athlete_id_to_use, api_key, INPUT_FIELD)
     field_defs = await _defs(athlete_id_to_use, api_key, ACTIVITY_FIELD)
+    completeness = today_completeness(fetched, date.fromisoformat(target), input_defs) if check_today else None
     load_errors: list[str] = []
     activities = await _fetch_activities(athlete_id_to_use, api_key, start, target, errors=load_errors)
     events_result = await make_intervals_request(
@@ -352,7 +365,8 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         for trend in baselines:
             trend.pop("series", None)
         return json.dumps(
-            {**_snapshot_json(target, entries, input_defs, baselines, activities, events), "load_errors": load_errors},
+            {**_snapshot_json(target, entries, input_defs, baselines, activities, events, completeness),
+             "load_errors": load_errors},
             ensure_ascii=False,
         )
 
@@ -360,8 +374,11 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         f"Recovery snapshot for athlete {athlete_id_to_use}: {target} and {days_back} day(s) before "
         f"(generated {datetime.now().strftime('%Y-%m-%dT%H:%M')} server local time)",
         "Values are reported as stored; today's aggregates (steps, calories, burn) may still be incomplete.",
-        "",
     ]
+    today_line = completeness_line(completeness, COMPLETENESS_NAMES[detail_level], " (all with detail_level=full)")
+    if today_line:
+        lines.append(today_line)
+    lines.append("")
     by_date = {str(e.get("id")): e for e in entries}
     for offset in range(days_back, -1, -1):
         day = (date.fromisoformat(target) - timedelta(days=offset)).isoformat()
