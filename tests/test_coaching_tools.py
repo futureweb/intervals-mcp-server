@@ -430,9 +430,9 @@ def test_get_training_summary_groups(monkeypatch):
     result = asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="week"))
     assert "Training summary for athlete i1, 2026-10-01 to 2026-10-09, grouped by week:" in result
     assert "2026-10-05 (ISO 2026-W41): 3 sessions | 3:57:49 moving (4:08:40 elapsed) | 96.4 km | +800 m" in result
-    # ANA-15: power/HR/pace loads are alternative calculations, not parts of the total
-    assert ("Load (Intervals.icu): total 250; alternative calculations (not parts of the total): "
-            "power-based 220, HR-based 138, pace-based 30") in result
+    # ANA-15 / R26-9: the total takes power, else HR, else pace per activity; the method sums overlap
+    assert ("Load (Intervals.icu): total 250 (per activity power, else HR, else pace); sums per method over the "
+            "activities that have it (overlapping): power 220, HR 138, pace 30") in result
     # API-5: HR zone times arrive as a plain list; sweet spot (overlapping Z3/Z4) is listed apart
     assert "Time in power zones: Z2 24:49, Z4 29:13; sweet spot 20:00 (overlaps Z3/Z4)" in result
     assert "Time in HR zones: Z2 33:20" in result

@@ -196,8 +196,8 @@ def _format_group(  # pylint: disable=too-many-locals,too-many-branches
     lines = [
         f"{name}: {s['sessions']} sessions | {hms(s['moving_time_s'])} moving ({hms(s['elapsed_time_s'])} elapsed) | "
         f"{s['distance_m'] / 1000:.1f} km | +{s['elevation_gain_m']:.0f} m",
-        f"  Load (Intervals.icu): total {s['training_load']:.0f}; alternative calculations (not parts of the total): "
-        f"power-based {s['power_load']:.0f}, HR-based {s['hr_load']:.0f}, pace-based {s['pace_load']:.0f}"
+        f"  Load (Intervals.icu): total {s['training_load']:.0f} (per activity power, else HR, else pace); sums per method "
+        f"over the activities that have it (overlapping): power {s['power_load']:.0f}, HR {s['hr_load']:.0f}, pace {s['pace_load']:.0f}"
         + (f" | time-weighted intensity {s['intensity_time_weighted_pct']}%" if s["intensity_time_weighted_pct"] is not None else ""),
     ]
     if fitness:
@@ -263,8 +263,9 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     """Training totals for a period grouped by week, month, sport, gear or in total (read-only)
 
     Per group: sessions, moving and elapsed time, distance, elevation gain, the
-    Intervals.icu training load with its power-, HR- and pace-based calculations (alternative
-    calculations per activity, not parts of the total), the time-weighted intensity,
+    Intervals.icu training load (per activity the power load, else HR, else pace) with the
+    sums per method over the activities that have it (overlapping, as an activity with power
+    also has an HR load), the time-weighted intensity,
     CTL/ATL/form/ramp at the end of the group's calendar period (week, month; capped at the
     end date), time in power zones (sweet spot listed apart, it overlaps Z3/Z4) and HR
     zones, per-sport and per-gear splits, feel distribution and mean RPE,
