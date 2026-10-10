@@ -81,6 +81,9 @@ jobs:
         run: |
           uv run --no-project --isolated --python 3.12 --with dist/*.whl \
             python -c "import intervals_mcp_server.server as s; print('wheel import ok, tools:', len(s.__all__))"
+          # Data files of the package: the guides (resources, get_guide) and the icons.
+          uv run --no-project --isolated --python 3.12 --with dist/*.whl \
+            python -c "from intervals_mcp_server.guides import GUIDE_TOPICS, guide_text; from intervals_mcp_server.branding import ICON_ROUTES, asset_bytes; assert all(guide_text(t) for t in GUIDE_TOPICS); assert all(asset_bytes(f) for f, _ in ICON_ROUTES.values()); print('guides and icons ok')"
           uv run --no-project --isolated --python 3.12 --with dist/*.whl futureweb-intervals-mcp --version
 
       - name: Upload distributions

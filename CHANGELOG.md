@@ -14,8 +14,10 @@ First public beta of the Futureweb fork. Based on upstream
 #### Stage 3: tool catalogue
 - Tools no longer take an `api_key` argument and it is gone from every input schema: credentials
   come only from the server environment (a tool-level key let a client use another account and
-  would conflict with the planned multi-user mode). Breaking for Python callers that passed
-  `api_key` to a tool function; all other positional and keyword arguments are unchanged.
+  would conflict with the planned multi-user mode). Breaking for Python callers: `api_key` is
+  gone, and in the 45 tool functions where it was not the last parameter the positional arguments
+  after it move one place to the left (call tool functions with keyword arguments; keyword
+  arguments are unchanged). MCP clients are not affected: a stray `api_key` argument is ignored.
 
 #### Review findings
 - OAuth: refreshing a token with a narrower scope (for example only `mcp`) keeps the grant's
@@ -88,9 +90,10 @@ First public beta of the Futureweb fork. Based on upstream
 
 #### Stage 3: tool catalogue
 - `MCP_TOOLSET`: `full` (default, every tool of the enabled classes) or `core`, a curated set of
-  19 tools (orientation, weekly review, one activity, recovery, planning and the three most used
-  writes; 8.1k tokens at `read,write`); `MCP_PERMISSIONS` still applies inside the set.
-  `get_server_status` and `--doctor` show the tool set and how many tools it leaves out.
+  23 tools (orientation, weekly review, one activity, recovery, planning, the three most used
+  writes and the reads that go with them; 9.4k tokens at `read,write`); `MCP_PERMISSIONS` still
+  applies inside the set. `get_server_status` and `--doctor` show the tool set and how many tools
+  it leaves out; descriptions, prompts and guides mark tools outside the set "(full tool set)".
 - Server instructions in the MCP `initialize` answer (about 1.3k characters): start with
   `get_coach_context` or `get_activity_report`, compact first, missing values (today's wellness)
   are not normal, writes only on explicit request after a preview, read the workout syntax first.
@@ -107,6 +110,12 @@ First public beta of the Futureweb fork. Based on upstream
   `ATHLETE_TIMEZONE`, `MCP_TOOLSET`, `OAUTH_REFRESH_REUSE_GRACE` / `_REVOKE`,
   `OAUTH_LOGIN_GLOBAL_RATE_LIMIT` and `OAUTH_REQUIRE_PRIVATE_KEY_JWT` one by one (the server itself
   still falls back to the default for a wrong limit or time zone).
+- Project icon: `serverInfo` carries `websiteUrl` and `icons` (the served PNG/SVG with
+  `MCP_PUBLIC_URL`, else the SVG as a `data:` URI); the HTTP transports serve `/favicon.ico`,
+  `/favicon.png`, `/icon.png`, `/icon.svg` and `/apple-touch-icon.png` without authentication; the
+  sign-in page and the README show the logo (`src/intervals_mcp_server/assets`, `docs/assets`).
+- `tests/conftest.py` blocks every network access but loopback in the test suite (a leak fails
+  the test); `test_get_activities` no longer reaches intervals.icu for the gear catalogue.
 - `tests/test_catalogue.py`: description length, "Use ..." first sentence, a description for
   every parameter, enums for constrained parameters, no `api_key`, no output schema, token budget
   per permission set and tool set, guides and prompts reference existing tools, and an MCP
@@ -346,15 +355,27 @@ First public beta of the Futureweb fork. Based on upstream
 ### Changed
 
 #### Stage 3: tool catalogue
-- `tools/list` is about 42.0k -> 22.6k tokens at `MCP_PERMISSIONS=read,write`
-  (33.6k -> 19.2k read-only, 46.2k -> 24.8k with every class; cl100k): every description is at most 900 characters and
-  its first sentence says when to use the tool; parameters are described in the schema
+- `tools/list` is about 42.0k -> 22.7k tokens at `MCP_PERMISSIONS=read,write`
+  (33.6k -> 19.2k read-only, 46.2k -> 24.9k with every class; cl100k): every description is at
+  most 900 characters and its first sentence says when to use the tool; parameters are described in the schema
   (`Annotated` with `Field(description=...)`) instead of an Args block in the description;
   constrained parameters are enums (`output_format`, `detail_level`, `sort_by`, `group_by`,
   `zone_type`, `zone_basis`, `metric`, `environment`, `category`, `item_type` ...; case-insensitive,
   an empty value means the default) and integer scales carry their range; generated schema titles
   and `null` defaults are dropped; workout_doc fields that Intervals.icu fills itself are hidden
   from the schema (still accepted).
+- `output_format` accepts what the tools always accepted: every value other than `json` means
+  text ("markdown", "table", "plain" ...); `get_activity_streams` maps text to summary and csv to
+  full. `get_guide` accepts the forms the descriptions print (`intervals://methods/load`,
+  `methods/load`, `workout_syntax`, `guide` ...). The workout_doc schema states the MINS_KM /
+  MINS_MILE value format (seconds or decimal minutes; 5.35 is 5:21, not 5:35). `item_type` also
+  offers `FITNESS_TABLE`.
+- `race_week` asks for or confirms the race date instead of assuming the next A race;
+  `get_load_projection(target_date=...)` accepts today (form at the start of race day).
+- `--doctor` and the server use the same parsers for `MCP_TOOL_MAX_REQUESTS`,
+  `MCP_TOOL_TIMEOUT_S` and `MCP_MAX_OUTPUT_CHARS`, so the doctor names the value the server
+  really uses; a non-finite or non-positive limit (e.g. `inf`, which broke every tool call) falls
+  back to the default.
 - Text tools return their text once: no output schema and no `{"result": ...}` structured copy
   of the same text (`structured_output=False` centrally in `@tool`).
 - `intervals://guide` covers the phase-6 tools (`get_long_ride_fatigue_profile`,

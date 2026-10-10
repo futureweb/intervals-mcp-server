@@ -6,6 +6,7 @@ the server module and tool modules without creating cyclic imports.
 """
 
 import inspect
+import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from mcp.types import Tool as MCPTool
 
 from intervals_mcp_server.api.client import setup_api_client
 from intervals_mcp_server.auth import SingleUserOAuthProvider, granted_classes, install_login_routes, oauth_from_env
+from intervals_mcp_server.branding import WEBSITE_URL, install_icon_routes, server_icons
 from intervals_mcp_server.config import PERMISSION_CLASSES, get_config
 from intervals_mcp_server.guides import SERVER_INSTRUCTIONS
 from intervals_mcp_server.tool_guard import guarded
@@ -166,9 +168,11 @@ _oauth = oauth_from_env()
 oauth_provider: SingleUserOAuthProvider | None = _oauth.get("auth_server_provider")
 
 mcp: IntervalsFastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
-    "intervals-icu", instructions=SERVER_INSTRUCTIONS, lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
+    "intervals-icu", instructions=SERVER_INSTRUCTIONS, website_url=WEBSITE_URL, icons=server_icons(os.environ),
+    lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
 )
 mcp.toolset = get_config().toolset
+install_icon_routes(mcp)
 if oauth_provider is not None:
     install_login_routes(mcp, oauth_provider)
 

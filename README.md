@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/icon-futureweb-128.png" alt="Futureweb Intervals MCP icon" width="128" height="128"></p>
+
 # Futureweb Intervals MCP
 
 **Advanced Intervals.icu MCP server for ChatGPT, Claude and every MCP client: Garmin-enriched
@@ -110,7 +112,7 @@ The catalogue is kept small for the AI client: short descriptions that say when 
 a description and (where the values are fixed) an enum for every parameter, and text results
 without a duplicate structured copy. Method details and the workout format live in MCP resources
 (`intervals://methods/<topic>`, `intervals://workout-syntax`) and in `get_guide(topic)` for clients
-that only call tools. `tools/list` is about 22.6k tokens at `MCP_PERMISSIONS=read,write`
+that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=read,write`
 (was 42.0k; cl100k); see [Tool sets](#tool-sets) for a smaller set.
 
 **Activity analysis**
@@ -197,24 +199,27 @@ execution, climbs, power-meters, load, intensity, durability, summary, compariso
 wellness, fueling), `intervals://custom-items` (your custom item definitions).
 The server also sends short instructions in the MCP `initialize` answer (start with
 `get_coach_context` or `get_activity_report`, compact first, missing values are not normal,
-writes only on request after a preview).
+writes only on request after a preview), and its icon and website in `serverInfo`. The HTTP
+transports serve the icon without authentication at `/favicon.ico`, `/favicon.png`, `/icon.png`,
+`/icon.svg` and `/apple-touch-icon.png` (also used on the sign-in page).
 
 ### Tool sets
 
 `MCP_TOOLSET=full` (default) registers every tool of the enabled permission classes.
-`MCP_TOOLSET=core` registers a curated set for clients with a small tool budget (about 8.1k tokens
-at `MCP_PERMISSIONS=read,write`); `MCP_PERMISSIONS` still applies inside the set:
+`MCP_TOOLSET=core` registers a curated set of 23 tools for clients with a small tool budget (about
+9.4k tokens at `MCP_PERMISSIONS=read,write`); `MCP_PERMISSIONS` still applies inside the set:
 
 | Purpose | Core tools |
 | --- | --- |
 | Orientation | `get_server_status`, `get_guide` |
-| Weekly review, load and plan | `get_coach_context`, `get_training_summary`, `get_load_projection`, `get_events` |
+| Weekly review, load and plan | `get_coach_context`, `get_training_summary`, `get_load_projection`, `get_events`, `get_event_by_id`, `get_training_plan` |
 | One activity | `get_activities`, `get_activity_report`, `get_activity_details`, `get_activity_intervals`, `get_best_efforts`, `get_fueling_analysis` |
-| Recovery | `get_recovery_snapshot`, `get_wellness_data` |
-| Planning | `get_sport_settings`, `validate_workout` |
+| Recovery | `get_recovery_snapshot`, `get_wellness_data`, `get_wellness_trends` |
+| Planning | `get_sport_settings`, `validate_workout`, `preview_workout` |
 | Writes (`write` class) | `add_or_update_event` ✎, `update_wellness` ✎, `update_activity` ✎ |
 
-`get_server_status` and `--doctor` show the active tool set and how many tools it leaves out.
+`get_server_status` and `--doctor` show the active tool set and how many tools it leaves out; tool
+descriptions, prompts and guides mark the tools outside the set "(full tool set)".
 After a server update that changes tools or tool sets, refresh the tool list in the client
 (ChatGPT: the connector's refresh in the app settings; Claude: reconnect the connector).
 
