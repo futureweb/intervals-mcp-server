@@ -9,6 +9,29 @@ All notable changes to this project are documented here. The format follows
 First public beta of the Futureweb fork. Based on upstream
 [mvilanova/intervals-mcp-server](https://github.com/mvilanova/intervals-mcp-server) at `cb1fbca`.
 
+### Added (phase 6: plan simulation)
+- `get_load_projection` simulates what-if plans without writing anything (`scenario`): single
+  sessions with a load, or with `duration_min` and `intensity_factor` (load estimated as
+  hours x IF² x 100 and flagged as an estimate), and weekly templates (`weekly`: start, weeks,
+  weekly load or a list per week, or hours with an IF; sessions or weekdays, long day and its
+  share, sport). `calendar` adds them to the planned workouts, replaces the planned workouts
+  inside the scenario's span or ignores the calendar. Scenario and calendar plan are compared
+  day by day (full), per ISO week (load per sport, CTL, ATL, form, ramp) and at the end; the four
+  completed weeks before are summarised for comparison.
+- Target day (`target_date`, default the next RACE_A within 180 days): CTL, ATL and form at the
+  start of the day for the calendar plan and the scenario; with `target_form` (points or percent
+  of CTL) a grid search over the load of the last `taper_days` days (percent of the planned load,
+  or a constant weekly load) that puts the form into the range, with the CTL that goes with it.
+  Assumptions are listed (time constants 42/7 d, sessions done as listed, no illness).
+- Plan statistics per ISO week for the calendar plan and the scenario: sessions, hours, longest
+  session (and its share of the race's planned duration), rest days and monotony; weeks with a
+  CTL ramp above 5-8 per week (Friel 2015), monotony above 2.0 (Foster 1998) or no rest day
+  (Meeusen et al. 2013) are listed as outside the commonly cited range, nothing more. Identical
+  daily loads (monotony undefined, maximal) are flagged too; weeks without durations say "hours n/a".
+- `get_load_projection` reports race days at the start of the day (before the race's own load),
+  like the target day; days, weeks, the end and the lowest form are labelled as end-of-day values
+  (JSON `value_basis`, races `basis`).
+
 ### Security (review findings)
 - OAuth: refreshing a token with a narrower scope (for example only `mcp`) keeps the grant's
   permission scopes; a token without any `intervals:*` scope is read-only and never falls back
