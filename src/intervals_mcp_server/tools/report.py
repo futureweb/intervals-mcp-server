@@ -233,7 +233,10 @@ def _key_findings(  # pylint: disable=too-many-arguments,too-many-positional-arg
 ) -> list[str]:
     """Up to five short findings for the compact report."""
     findings: list[str] = []
-    if execution and planned:
+    skipped = (execution or {}).get("summary", {}).get("plan_skipped")
+    if skipped:  # the plan comparison fell back to the intervals: say so instead of "0/0 steps"
+        findings.append(f"Plan: {skipped}")
+    if execution and planned and not skipped:
         findings.extend(_execution_findings(execution))
     elif intervals:
         main = _main_set_finding(intervals, _num(activity.get("icu_ftp")))

@@ -426,3 +426,57 @@ def test_np_of_sparse_recordings_holds_the_value():
         seconds = list(range(0, 1200, spacing))
         profile = Profile([{"type": "time", "data": seconds}, {"type": "watts", "data": [200.0] * len(seconds)}])
         assert round(profile.normalized_power(0, len(seconds)), 3) == 200.0
+
+
+# ----------------------------------------------------------- final re-check (N6-N8)
+def test_long_plans_with_step_laps_are_never_coarsened():
+    """N6: 100 x (30 s / 30 s) with exact step laps (202 steps) is matched lap by lap, as on main."""
+    plan = [{"duration": 600, "warmup": True, **pw(50, 65)}, {"reps": 100, "steps": [{"duration": 30, **pw(120, 150)}, {"duration": 30, **pw(40, 55)}]},
+            {"duration": 600, "cooldown": True, **pw(50, 60)}]
+    segments = [(600, 0.58 * FTP, None, 120)] + [(30, 1.35 * FTP, None, 165), (30, 0.48 * FTP, None, 130)] * 100 + [(600, 0.55 * FTP, None, 125)]
+    result = run(plan, *build(segments, laps="steps"), RIDE)
+    summary = result["summary"]
+    assert summary["matched"] == 202 and summary["steps_with_deviations"] == 0 and summary["alignment_confidence"] == "high"
+
+
+def test_plan_comparison_fallback_is_visible_in_the_compact_report(monkeypatch, caplog):
+    """N7: when the plan comparison falls back, the compact key finding says so (no "0/0 steps")
+    and the error is logged as a warning."""
+    from intervals_mcp_server.tools.report import _key_findings  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.utils import execution  # pylint: disable=import-outside-toplevel
+
+    def broken(*_args, **_kwargs):
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(execution, "_analyze_plan", broken)
+    streams, intervals = build([(600, 0.58 * FTP, None, 120), (600, 0.92 * FTP, None, 155)], laps="steps")
+    with caplog.at_level("WARNING"):
+        result = run([{"duration": 600, **pw(50, 65)}, {"duration": 600, **pw(90, 95)}], streams, intervals, RIDE)
+    assert "Plan comparison failed (IndexError: list index out of range)" in caplog.text
+    findings = _key_findings({"icu_ftp": FTP}, result, True, intervals, None, None, {}, None)
+    assert findings[0] == "Plan: plan comparison failed (IndexError: list index out of range); intervals shown without the plan"
+    assert not any("0/0 steps" in f for f in findings)
+
+
+def test_device_auto_laps_of_a_planned_step_length_are_still_auto_laps():
+    """N8: Garmin's default 1 km auto-lap on a 5 x (1 km / 400 m) session: the laps run across the
+    step changes, so they are auto-laps (handled, with a caveat), not lap presses; 1 km / 1 km lap
+    presses stay lap presses and keep a real deviation."""
+    plan = [{"distance": 2000, "warmup": True, **pc(70, 78)}, {"reps": 5, "steps": [{"distance": 1000, **pc(100, 105)}, {"distance": 400, **pc(60, 72)}]},
+            {"distance": 2000, "cooldown": True, **pc(70, 78)}]
+    segments = ([(round(2000 / (0.74 * T)), None, 0.74 * T, 135)] + [(round(1000 / (1.025 * T)), None, 1.025 * T, 165),
+                (round(400 / (0.66 * T)), None, 0.66 * T, 145)] * 5 + [(round(2000 / (0.74 * T)), None, 0.74 * T, 140)])
+    result = run(plan, *build(segments), RUN)
+    summary = result["summary"]
+    assert summary["auto_laps"]["lap"] == 1000.0 and summary["alignment_confidence"] in ("medium", "low")
+    assert summary["steps_with_deviations"] == 0 and summary["unmatched_planned"] == 0
+    presses = [{"distance": 1000, "warmup": True, **pc(70, 78)}, {"reps": 6, "steps": [{"distance": 1000, **pc(100, 105)}, {"distance": 1000, "text": "jog"}]},
+               {"distance": 1000, "cooldown": True, **pc(70, 78)}]
+    segments = [(round(1000 / (0.74 * T)), None, 0.74 * T, 135)]
+    for rep in range(6):
+        jog = 600 if rep == 1 else 1000  # the second jog cut to 600 m
+        segments += [(round(1000 / (1.025 * T)), None, 1.025 * T, 165), (round(jog / (0.66 * T)), None, 0.66 * T, 145)]
+    segments.append((round(1000 / (0.74 * T)), None, 0.74 * T, 140))
+    result = run(presses, *build(segments, laps="steps"), RUN)
+    assert result["summary"]["alignment_confidence"] == "high" and result["summary"]["auto_laps"] is None
+    assert any("shorter than planned" in t for t in texts(result["rows"][4]))

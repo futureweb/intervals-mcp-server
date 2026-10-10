@@ -35,6 +35,7 @@ from recorded samples only, time-weighted by the sample spacing.
 # pylint: disable=too-many-lines
 
 import bisect
+import logging
 import statistics
 import time
 from dataclasses import dataclass
@@ -51,6 +52,8 @@ from intervals_mcp_server.utils.streams import (
     rolling_fourth_powers,
 )
 
+logger = logging.getLogger(__name__)
+
 GAP_COST = 0.8
 EDGE_EXTRA_COST = 0.1  # an extra interval before the first / after the last planned step ...
 EDGE_COST_PER_HOUR = 0.6  # ... plus this per hour of its moving time, so a long block is never cheap
@@ -65,6 +68,7 @@ AUTO_LAP_TOLERANCE = 0.03  # laps within +-3 % of the typical lap count as devic
 AUTO_LAP_MIN_SHARE = 0.6  # ... when they hold at least this share of the time (the last lap excluded)
 AUTO_LAP_MIN_LAPS = 4
 CHANGE_MIN_PCT = 3.0  # step targets closer than this are not told apart inside a lap
+LAP_CHANGE_PCT = 20.0  # a lap whose two parts differ this much in intensity runs across a step change
 MIN_BOUNDARY_SHIFT_S = 5.0
 MERGE_PART_MAX_COST = 0.3  # a merged interval may be at most this much further off target than the span
 TARGET_TOLERANCE_PCT = 5.0
@@ -586,14 +590,55 @@ def _spans(intervals: list[dict[str, Any]], profile: Profile) -> list[_Span]:
     return spans
 
 
-def lap_layout(spans: list[_Span], planned: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+def _lap_has_change(profile: Profile, span: _Span, stream: str) -> bool:
+    """Whether the samples of a lap change level clearly inside it (a lap across a step change).
+
+    The best split into two parts of at least 15 s and 10 % of the lap must differ by at
+    least ``LAP_CHANGE_PCT`` of the higher mean.
+    """
+    if span.start is None or span.end is None:
+        return False
+    values = [v for v in (_num(x) for x in profile.values(stream, span.start, span.end)) if v is not None]
+    minimum = max(15, len(values) // 10)
+    if len(values) < 2 * minimum:
+        return False
+    sums = [0.0]
+    for value in values:
+        sums.append(sums[-1] + value)
+    total = sums[-1]
+    for cut in range(minimum, len(values) - minimum + 1):
+        first, second = sums[cut] / cut, (total - sums[cut]) / (len(values) - cut)
+        if abs(first - second) >= LAP_CHANGE_PCT / 100 * max(first, second, 1e-9):
+            return True
+    return False
+
+
+def _laps_follow_steps(spans: list[_Span], layout: dict[str, Any], planned: list[dict[str, Any]], profile: Profile | None) -> bool:
+    """Whether laps of the typical length that equals a planned step length are lap presses.
+
+    Equal-length steps (30/30 s, 3/3 min, 1 km / 1 km, hill repeats) give lap presses of the
+    planned length; device auto-laps of the same length (1 km auto-lap on 1 km repeats) are
+    told apart by their position: auto-laps run across step changes, so the intensity changes
+    clearly inside several of them, lap presses do not.
+    """
+    kinds = [step["target"]["kind"] for step in planned if step.get("target")]
+    stream = STREAM_KEYS[max(set(kinds), key=kinds.count)] if kinds else "watts"
+    if profile is None or not profile.has(stream):
+        return True  # without samples the length decides
+    typical = [s for s in spans[:-1] if _is_auto_lap(s, layout)]
+    changed = sum(1 for s in typical if _lap_has_change(profile, s, stream))
+    return changed < max(2, 0.15 * len(typical))
+
+
+def lap_layout(spans: list[_Span], planned: list[dict[str, Any]] | None = None, profile: Profile | None = None) -> dict[str, Any] | None:
     """Device auto-laps: most laps (the activity's last lap excluded) share one distance or duration.
 
     Returns {"by": "distance"|"time", "lap": typical value, "laps": count} or None when the
     laps follow the workout (lap presses, a structured workout on the device, detected
     efforts). Auto-lap boundaries say nothing about step boundaries. With a plan, laps whose
     typical length equals a planned step duration or distance are lap presses of equal steps
-    (30/30 s, 3/3 min, 1 km / 1 km, hill repeats), not auto-laps.
+    (30/30 s, 3/3 min, 1 km / 1 km, hill repeats) unless the intensity changes inside
+    several of them (``_laps_follow_steps``), which only device auto-laps do.
     """
     full = spans[:-1]
     total = sum(s.active for s in full)
@@ -618,7 +663,8 @@ def lap_layout(spans: list[_Span], planned: list[dict[str, Any]] | None = None) 
         lengths = [step.get("distance") if by == "distance" else (step.get("duration") or step.get("est_duration"))
                    for step in planned or []]
         if any(length and abs(length - best_value) <= best_value * AUTO_LAP_TOLERANCE for length in lengths):
-            return None  # the laps have the length of planned steps: lap presses, not device auto-laps
+            if _laps_follow_steps(spans, layout, planned or [], profile):
+                return None  # laps of the planned step length that follow the steps: lap presses
         return layout
     return None
 
@@ -647,6 +693,12 @@ def _merge_spans(parts: list[_Span], index: int) -> _Span:
     distances = [p.distance for p in parts]
     distance = None if any(d is None for d in distances) else sum(d or 0.0 for d in distances)
     return _Span(index, first.start, last.end, interval["elapsed_time"], interval["moving_time"], interval, distance)
+
+
+def coarsen_limit(steps: int) -> int:
+    """Number of device auto-laps the alignment works with at most: up to 600, fewer for long
+    plans (steps x laps <= 30,000), never below 100 or twice the number of planned steps."""
+    return max(MIN_ALIGN_INTERVALS, 2 * steps, min(MAX_ALIGN_INTERVALS, MAX_ALIGN_CELLS // max(steps, 1)))
 
 
 def _coarsen(spans: list[_Span], limit: int = MAX_ALIGN_INTERVALS) -> tuple[list[_Span], list[list[int]]]:
@@ -843,8 +895,11 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     """
     profile = profile or Profile([])
     original = _spans(intervals, profile)
-    auto_laps = lap_layout(original, planned) is not None
-    spans, groups = _coarsen(original, max(MIN_ALIGN_INTERVALS, min(MAX_ALIGN_INTERVALS, MAX_ALIGN_CELLS // max(len(planned), 1))))
+    auto_laps = lap_layout(original, planned, profile) is not None
+    if auto_laps:  # only device auto-laps are merged; lap presses that follow the plan never are
+        spans, groups = _coarsen(original, coarsen_limit(len(planned)))
+    else:
+        spans, groups = original, [[s.index] for s in original]
     rules = _match_rules(planned, spans, auto_laps)
     n, m = len(planned), len(spans)
     inf = float("inf")
@@ -1807,9 +1862,11 @@ def _alignment_confidence(rows: list[dict[str, Any]], layout: dict[str, Any] | N
     cannot place or planned steps that were not found.
     """
     notes: list[str] = []
-    if layout is None or not (stats["auto_lap_boundaries"] or any(not r.get("metrics") for r in rows if r.get("planned"))):
+    if layout is None or not (stats["auto_lap_boundaries"] or stats.get("coarsened") or any(not r.get("metrics") for r in rows if r.get("planned"))):
         return {"auto_laps": None if layout is None else {"by": layout["by"], "lap": layout["lap"], "laps": layout["laps"]},
                 "alignment_confidence": "high", "alignment_notes": notes}
+    if stats.get("coarsened"):
+        notes.append("very many laps: adjacent auto-laps were merged pairwise for the matching (boundaries refined on the samples)")
     if stats["moved"]:
         notes.append(f"{stats['moved']} step boundary(ies) set inside auto-laps")
     if stats["carved"]:
@@ -1853,10 +1910,12 @@ def analyze(
         try:
             result = _analyze_plan(planned, intervals, profile, tol, ftp=ftp, hidden=hidden)
         except AlignmentBudgetExceeded as exc:
+            logger.warning("Plan comparison skipped: %s", exc)
             result = _analyze_without_plan(intervals, profile, ftp, hidden)
             result["summary"]["plan_skipped"] = f"plan comparison skipped: {exc}"
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # Never let one unusual activity break the whole tool: report the intervals instead.
+            logger.warning("Plan comparison failed (%s: %s); falling back to the interval analysis", type(exc).__name__, exc)
             result = _analyze_without_plan(intervals, profile, ftp, hidden)
             result["summary"]["plan_skipped"] = f"plan comparison failed ({type(exc).__name__}: {exc}); intervals shown without the plan"
     else:
@@ -1874,8 +1933,9 @@ def _analyze_plan(  # pylint: disable=too-many-locals,too-many-statements,too-ma
     """The planned-workout part of ``analyze``: alignment, step rows, blocks and summary."""
     spans = _spans(intervals, profile)
     alignment = align_spans(planned, intervals, profile)
-    layout = lap_layout(spans, planned)
+    layout = lap_layout(spans, planned, profile)
     segments, boundary_stats = _step_segments(planned, alignment, spans, profile, layout)
+    boundary_stats["coarsened"] = layout is not None and len(spans) > coarsen_limit(len(planned))
     matched = [(p, idx) for p, idx in alignment if p is not None and idx]
     first_matched = matched[0][1][0] if matched else None
     last_matched = matched[-1][1][-1] if matched else None
