@@ -57,7 +57,7 @@ def test_cli_doctor_lists_every_problem(tmp_path):
 
 
 def test_cli_doctor_checks_limits_time_zone_tool_set_and_oauth_tuning():
-    """Stage 3: every new setting is validated on its own; the server would fall back to a default."""
+    """Stage 3: every new setting is validated on its own, naming the value the server really uses."""
     result = run_cli(
         "--doctor", MCP_TOOL_MAX_REQUESTS="abc", MCP_TOOL_TIMEOUT_S="-1", MCP_MAX_OUTPUT_CHARS="500",
         ATHLETE_TIMEZONE="Mars/Olympus", MCP_TOOLSET="tiny", OAUTH_REFRESH_REUSE_GRACE="-5",
@@ -66,11 +66,11 @@ def test_cli_doctor_checks_limits_time_zone_tool_set_and_oauth_tuning():
     assert result.returncode == 1, result.stdout + result.stderr
     out = result.stdout
     for fragment in (
-        "MCP_TOOL_MAX_REQUESTS must be a positive integer, got 'abc' (the server would use the default 300)",
-        "MCP_TOOL_TIMEOUT_S must be a positive number, got '-1'",
-        "ATHLETE_TIMEZONE must be an IANA time zone such as Europe/Vienna or 'server', got 'Mars/Olympus'",
+        "MCP_TOOL_MAX_REQUESTS must be a positive whole number, got 'abc'; the server uses the default 300",
+        "MCP_TOOL_TIMEOUT_S must be a positive number, got '-1'; the server uses the default 120",
+        "ATHLETE_TIMEZONE must be an IANA time zone such as Europe/Vienna or 'server', got 'Mars/Olympus'; the server uses the server clock",
         "MCP_TOOLSET must be one of full, core, got 'tiny'",
-        "warning: MCP_MAX_OUTPUT_CHARS=500 is below the minimum; 2000 is used",
+        "warning: MCP_MAX_OUTPUT_CHARS=500 is below the minimum; the server uses 2000",
         "warning: OAUTH_REFRESH_REUSE_GRACE must be an integer >= 0, got '-5' (ignored without MCP_AUTH=oauth)",
         "warning: OAUTH_REFRESH_REUSE_REVOKE must be true or false",
         "warning: OAUTH_LOGIN_GLOBAL_RATE_LIMIT must be a positive integer, got '0'",
@@ -79,10 +79,32 @@ def test_cli_doctor_checks_limits_time_zone_tool_set_and_oauth_tuning():
         assert fragment in out, fragment
     assert out.count("MCP_TOOLSET must be one of") == 1
     assert "Traceback" not in out + result.stderr
-    good = run_cli("--doctor", MCP_TOOL_MAX_REQUESTS="50", MCP_TOOL_TIMEOUT_S="30.5", MCP_MAX_OUTPUT_CHARS="20000",
+    odd = run_cli("--doctor", MCP_TOOL_MAX_REQUESTS="inf", MCP_TOOL_TIMEOUT_S="nan", MCP_MAX_OUTPUT_CHARS="-5")
+    assert odd.returncode == 1
+    assert "MCP_TOOL_MAX_REQUESTS must be a positive whole number, got 'inf'; the server uses the default 300" in odd.stdout
+    assert "MCP_TOOL_TIMEOUT_S must be a positive number, got 'nan'; the server uses the default 120" in odd.stdout
+    assert "MCP_MAX_OUTPUT_CHARS must be a positive whole number, got '-5'; the server uses the minimum 2000" in odd.stdout
+    good = run_cli("--doctor", MCP_TOOL_MAX_REQUESTS="50.5", MCP_TOOL_TIMEOUT_S="30.5", MCP_MAX_OUTPUT_CHARS="20000",
                    ATHLETE_TIMEZONE="Europe/Vienna", MCP_TOOLSET="core")
     assert good.returncode == 0, good.stdout + good.stderr
+    assert "warning: MCP_TOOL_MAX_REQUESTS=50.5 is not a whole number; the server uses 50" in good.stdout
     assert "tool set core (MCP_TOOLSET)" in good.stdout and "must be" not in good.stdout
+
+
+def test_limits_at_runtime_match_the_doctor(monkeypatch):
+    """The server applies the same fallbacks the doctor names; inf or nan never break a tool call."""
+    from intervals_mcp_server.api.client import call_limits  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tool_guard import max_output_chars  # pylint: disable=import-outside-toplevel
+
+    for raw, expected in (("inf", 300), ("nan", 300), ("-3", 300), ("0.5", 300), ("50.5", 50), ("40", 40), ("", 300)):
+        monkeypatch.setenv("MCP_TOOL_MAX_REQUESTS", raw)
+        monkeypatch.setenv("MCP_TOOL_TIMEOUT_S", "inf" if raw == "inf" else "15")
+        with call_limits() as limits:
+            assert limits.max_requests == expected, raw
+            assert limits.timeout_s == (120.0 if raw == "inf" else 15.0)
+    for raw, expected in (("-5", 2000), ("0", 2000), ("500", 2000), ("abc", 100_000), ("1e5", 100_000), ("30000", 30_000)):
+        monkeypatch.setenv("MCP_MAX_OUTPUT_CHARS", raw)
+        assert max_output_chars() == expected, raw
 
 
 def test_cli_start_reports_a_configuration_error_in_one_line(tmp_path):

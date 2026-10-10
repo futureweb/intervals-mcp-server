@@ -29,6 +29,8 @@ __all__ = [
     "StartDate",
     "ThresholdAs",
     "lower_choice",
+    "output_choice",
+    "stream_output_choice",
     "upper_choice",
 ]
 
@@ -39,6 +41,32 @@ def lower_choice(value: Any) -> Any:
         value = value.strip().lower()
         if not value:
             raise PydanticUseDefault()
+    return value
+
+
+def output_choice(value: Any) -> Any:
+    """text or json: json (also application/json) stays json, any other text means text.
+
+    The tools always treated every value other than json as text ("markdown", "table", "plain" ...);
+    a client with an old or guessed value keeps getting text instead of a validation error.
+    """
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if not value:
+            raise PydanticUseDefault()
+        return "json" if value in ("json", "application/json") else "text"
+    return value
+
+
+def stream_output_choice(value: Any) -> Any:
+    """summary / full / json of get_activity_streams, with the usual synonyms (text = summary, csv = full)."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if not value:
+            raise PydanticUseDefault()
+        aliases = {"text": "summary", "plain": "summary", "markdown": "summary", "md": "summary", "txt": "summary",
+                   "csv": "full", "table": "full", "application/json": "json"}
+        return aliases.get(value, value)
     return value
 
 
@@ -65,7 +93,7 @@ GearId = Annotated[str | None, Field(description="Only activities on this gear i
 
 OutputFormat = Annotated[
     Literal["text", "json"],
-    BeforeValidator(lower_choice),
+    BeforeValidator(output_choice),
     Field(description="json = machine-readable, all fields"),
 ]
 DetailLevel = Annotated[

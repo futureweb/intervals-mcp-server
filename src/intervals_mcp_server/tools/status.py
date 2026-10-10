@@ -286,18 +286,26 @@ def workout_planning_validation(start_date: str = "") -> str:
 @mcp.prompt()
 def race_week(race_date: str = "", race_name: str = "") -> str:
     """Race-week check: taper and form on race day, remaining sessions, fueling plan from history, weather, logistics."""
-    race = (race_name or "the race") + (f" on {race_date}" if race_date else "")
-    target = (
-        f"target_date='{race_date}'"
-        if race_date
-        else "no target_date (the next RACE_A event; get_events(categories='RACE_A,RACE_B,RACE_C') finds the race)"
-    )
+    race = race_name or "the race"
+    if race_date:
+        calendar = (
+            f"1) Calendar: check with get_events(categories='RACE_A,RACE_B,RACE_C') that {race} is on {race_date} "
+            "(the date must be YYYY-MM-DD; ask if it is unclear) and list the remaining workouts until then. "
+        )
+        target = f"target_date='{race_date}'"
+    else:
+        calendar = (
+            "1) Race date: none was given. List the races of the coming weeks with get_events(categories="
+            "'RACE_A,RACE_B,RACE_C') and ask the athlete which race and date is meant before going on; do not assume "
+            "the next A race. Then list the remaining workouts until the race. "
+        )
+        target = "target_date='<the confirmed race date, YYYY-MM-DD>'"
     return (
-        f"Act as an endurance coach preparing race week for {race}. "
-        "1) Calendar: get_events from today to the race day for the race and the remaining workouts. "
-        f"2) Taper and form: get_load_projection({target}, detail_level='compact') for CTL, ATL and form at the "
-        "start of race day; add target_form (e.g. '5,15' or '5%,20%') only if the athlete names a target range, to "
-        "see how the load of the last taper_days days would have to change. Nothing is written. "
+        f"Act as an endurance coach preparing race week for {race}. " + calendar
+        + f"2) Taper and form: get_load_projection({target}, detail_level='compact') for CTL, ATL and form at the "
+        "start of race day (on race day itself target_date is today); add target_form (e.g. '5,15' or '5%,20%') only "
+        "if the athlete names a target range, to see how the load of the last taper_days days would have to change. "
+        "Nothing is written. "
         "3) Recovery: get_recovery_snapshot(detail_level='compact'); today's wellness may still be incomplete. "
         "4) Fueling plan: get_fueling_analysis in period mode (start_date about 180 days back, sport_types of the "
         "race) for the carbohydrate, fluid and sodium intake per hour the athlete has actually used on long "
@@ -305,8 +313,8 @@ def race_week(race_date: str = "", race_name: str = "") -> str:
         "5) Weather: this server has no forecast; ask the athlete for it or use one they provide. A previous "
         "edition or the same course (get_activity_report(activity_id, include_route_history=true)) shows past "
         "conditions and pacing. "
-        "6) Logistics checklist: bike/shoes and their maintenance reminders (get_gear_details), food and bottles, "
-        "start time and warm-up, travel, sleep, documents. "
+        "6) Logistics checklist: bike/shoes and their maintenance reminders (get_gear_list, then get_gear_details), "
+        "food and bottles, start time and warm-up, travel, sleep, documents. "
         "Answer with form on race day, which remaining sessions to keep or shorten, the fueling plan per hour and "
         "the checklist. Calendar changes only after the athlete asks: validate_workout, then add_or_update_event."
         + _NO_DIAGNOSIS

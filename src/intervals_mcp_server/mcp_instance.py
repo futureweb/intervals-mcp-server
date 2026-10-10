@@ -6,14 +6,16 @@ the server module and tool modules without creating cyclic imports.
 """
 
 import inspect
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, TypeVar, cast
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP  # pylint: disable=import-error
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import Icon, ToolAnnotations
+from mcp.types import GetPromptResult, Icon, TextContent, ToolAnnotations
 from mcp.types import Tool as MCPTool
 
 from intervals_mcp_server.api.client import setup_api_client
@@ -33,6 +35,7 @@ __all__ = [
     "compact_schema",
     "disabled_tools",
     "fastmcp_settings_from_env",
+    "mark_outside_toolset",
     "mcp",
     "oauth_provider",
     "tool",
@@ -84,8 +87,12 @@ class IntervalsFastMCP(FastMCP[Any]):
     ``tools/call``.  Without OAuth (stdio, secret path) nothing changes: the server-wide
     ``MCP_PERMISSIONS`` decide which tools exist at all.
 
-    Every tool's input schema is compacted once at registration (:func:`compact_schema`).
+    Every tool's input schema is compacted once at registration (:func:`compact_schema`). With a tool
+    set other than ``full`` the tool names that set leaves out are marked "(full tool set)" in the
+    tool descriptions and prompts (:func:`mark_outside_toolset`).
     """
+
+    toolset: str = "full"
 
     def add_tool(  # pylint: disable=too-many-arguments
         self,
@@ -123,10 +130,24 @@ class IntervalsFastMCP(FastMCP[Any]):
     async def list_tools(self) -> list[Any]:
         """Tools of the classes the current connection was granted."""
         tools = await super().list_tools()
+        if self.toolset != "full":
+            tools = [
+                t.model_copy(update={"description": mark_outside_toolset(t.description, self.toolset)}) if t.description else t
+                for t in tools
+            ]
         allowed = granted_classes(self._token_scopes())
         if allowed is None:
             return tools
         return [t for t in tools if _TOOL_PERMISSIONS.get(t.name, "read") in allowed]
+
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult:
+        """A prompt; tools outside the active tool set are marked in its text."""
+        result = await super().get_prompt(name, arguments)
+        if self.toolset != "full":
+            for message in result.messages:
+                if isinstance(message.content, TextContent):
+                    message.content.text = mark_outside_toolset(message.content.text, self.toolset)
+        return result
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Refuse tools whose permission class the access token does not include."""
@@ -144,9 +165,10 @@ class IntervalsFastMCP(FastMCP[Any]):
 _oauth = oauth_from_env()
 oauth_provider: SingleUserOAuthProvider | None = _oauth.get("auth_server_provider")
 
-mcp: FastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
+mcp: IntervalsFastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
     "intervals-icu", instructions=SERVER_INSTRUCTIONS, lifespan=setup_api_client, **fastmcp_settings_from_env(), **_oauth
 )
+mcp.toolset = get_config().toolset
 if oauth_provider is not None:
     install_login_routes(mcp, oauth_provider)
 
@@ -241,6 +263,7 @@ async def catalogue(permissions: frozenset[str] | set[str], toolset: str = "full
     package (e.g. by tests) are left out.
     """
     server = IntervalsFastMCP("catalogue")
+    server.toolset = toolset
     for name, spec in _TOOL_SPECS.items():
         if (
             spec.permission in permissions and in_toolset(name, toolset)
@@ -248,6 +271,23 @@ async def catalogue(permissions: frozenset[str] | set[str], toolset: str = "full
         ):
             server.add_tool(spec.func, **spec.options)
     return await server.list_tools()
+
+
+@lru_cache(maxsize=8)
+def _outside_pattern(toolset: str, names: frozenset[str]) -> re.Pattern[str] | None:
+    outside = sorted((name for name in names if not in_toolset(name, toolset)), key=len, reverse=True)
+    if not outside:
+        return None
+    return re.compile(r"\b(" + "|".join(map(re.escape, outside)) + r")\b(?! \(full tool set\))")
+
+
+def mark_outside_toolset(text: str, toolset: str) -> str:
+    """Mark every tool of this package that *toolset* leaves out with "(full tool set)" in *text*."""
+    if toolset == "full" or not text:
+        return text
+    names = frozenset(name for name, spec in _TOOL_SPECS.items() if spec.func.__module__.startswith("intervals_mcp_server."))
+    pattern = _outside_pattern(toolset, names)
+    return pattern.sub(r"\1 (full tool set)", text) if pattern else text
 
 
 def tool_permissions() -> dict[str, str]:

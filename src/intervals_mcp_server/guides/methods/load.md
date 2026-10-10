@@ -124,7 +124,8 @@ Parameters:
     and `simulation.sessions` are left out, at `compact` also the week rows (the comparison weeks
     stay); `omitted` lists what was left out.
 - `scenario`: a what-if plan of sessions that are NOT in the calendar (format below).
-- `target_date`: target day YYYY-MM-DD, after today and not after the last possible day. Without
+- `target_date`: target day YYYY-MM-DD, from today (race day: CTL, ATL and form at the start of today,
+  i.e. the end of yesterday; no taper search) to the last possible day. Without
   it, the next RACE_A event after today is the target day when `target_form` or a scenario is
   given.
 - `target_form`: form range wanted at the start of the target day (format below); starts the

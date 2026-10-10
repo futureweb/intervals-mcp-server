@@ -47,8 +47,9 @@ result to the athlete before writing it.
     `{"hr": {"value": 85, "units": "%lthr"}}`, zone `{"hr": {"value": 2, "units": "hr_zone"}}`
   - Pace: % of threshold pace `{"pace": {"value": 80, "units": "%pace"}}`, zone
     `{"pace": {"value": 2, "units": "pace_zone"}}`
-  - Absolute pace: `MINS_KM` / `MINS_MILE` in seconds (335) or decimal minutes (5.583) per km/mile;
-    `SECS_100M`, `SECS_100Y`, `SECS_500M` in seconds:
+  - Absolute pace: `MINS_KM` / `MINS_MILE` in seconds (335) or decimal minutes (5.583) per km/mile,
+    never m.ss (5.35 means 5.35 minutes = 5:21/km, not 5:35); `SECS_100M`, `SECS_100Y`, `SECS_500M`
+    in seconds:
     `{"pace": {"value": 335, "units": "MINS_KM"}}` -> "5:35/km Pace"
   - Cadence: `{"cadence": {"value": 90, "units": "rpm"}}` (`cadence` is accepted as units too)
   - Units must fit the kind (an HR target in `%ftp` is refused). Plausible ranges are checked
@@ -70,8 +71,7 @@ result to the athlete before writing it.
   % values, watts, rpm/bpm, zones (Z2), repeat counts (3x), m:ss, line breaks and the keywords
   ramp / freeride / max effort / hidepower are refused, because Intervals.icu would read them as
   part of the step.
-- Optional on the doc: `target` (AUTO, POWER, HR, PACE: which target the device follows),
-  `pace_units`.
+- Optional on the doc: `target` (AUTO, POWER, HR, PACE: which target the device follows).
 
 ## Native workout text (`description`)
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import math
 import os
 import sys
 from collections.abc import Mapping
@@ -64,21 +63,6 @@ def configuration_problems(environ: Mapping[str, str] | None = None) -> tuple[li
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
-def _number_problem(env: Mapping[str, str], name: str, default: float, *, integer: bool, minimum: float) -> str | None:
-    raw = env.get(name, "").strip()
-    if not raw:
-        return None
-    kind = "a positive integer" if integer else "a positive number"
-    try:
-        value = int(raw) if integer else float(raw)
-    except ValueError:
-        value = None
-    if value is None or math.isnan(value) or value < minimum:
-        shown = int(default) if float(default).is_integer() else default
-        return f"{name} must be {kind}, got {raw!r} (the server would use the default {shown})"
-    return None
-
-
 def _settings_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  # pylint: disable=too-many-locals
     """Limits, time zone, tool set and OAuth fine-tuning, each checked on its own.
 
@@ -88,32 +72,32 @@ def _settings_problems(env: Mapping[str, str]) -> tuple[list[str], list[str]]:  
     # pylint: disable=import-outside-toplevel
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-    from intervals_mcp_server.api.client import DEFAULT_TOOL_MAX_REQUESTS, DEFAULT_TOOL_TIMEOUT_S
+    from intervals_mcp_server.api.client import DEFAULT_TOOL_MAX_REQUESTS, DEFAULT_TOOL_TIMEOUT_S, limit_setting
     from intervals_mcp_server.auth import _env_bool, _env_int  # pylint: disable=protected-access
-    from intervals_mcp_server.tool_guard import DEFAULT_MAX_OUTPUT_CHARS, MIN_MAX_OUTPUT_CHARS
+    from intervals_mcp_server.tool_guard import output_limit_setting
     from intervals_mcp_server.toolsets import parse_toolset
     from intervals_mcp_server.utils.dates import SERVER_CLOCK
 
     errors: list[str] = []
     warnings: list[str] = []
-    for problem in (
-        _number_problem(env, "MCP_TOOL_MAX_REQUESTS", DEFAULT_TOOL_MAX_REQUESTS, integer=True, minimum=1),
-        _number_problem(env, "MCP_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S, integer=False, minimum=1e-9),
-        _number_problem(env, "MCP_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHARS, integer=True, minimum=1),
+    # The same parsers as the server: the message names the value the server really uses.
+    for setting in (
+        limit_setting("MCP_TOOL_MAX_REQUESTS", DEFAULT_TOOL_MAX_REQUESTS, integer=True, environ=env),
+        limit_setting("MCP_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S, integer=False, environ=env),
     ):
-        if problem:
-            errors.append(problem)
-    raw_chars = env.get("MCP_MAX_OUTPUT_CHARS", "").strip()
-    if raw_chars.isdigit() and 0 < int(raw_chars) < MIN_MAX_OUTPUT_CHARS:
-        warnings.append(f"MCP_MAX_OUTPUT_CHARS={raw_chars} is below the minimum; {MIN_MAX_OUTPUT_CHARS} is used")
+        errors.extend([setting.error] if setting.error else [])
+        warnings.extend([setting.warning] if setting.warning else [])
+    _, chars_error, chars_warning = output_limit_setting(env)
+    errors.extend([chars_error] if chars_error else [])
+    warnings.extend([chars_warning] if chars_warning else [])
     zone = env.get("ATHLETE_TIMEZONE", "").strip()
     if zone and zone.lower() not in SERVER_CLOCK:
         try:
             ZoneInfo(zone)
         except (ZoneInfoNotFoundError, ValueError):
             errors.append(
-                f"ATHLETE_TIMEZONE must be an IANA time zone such as Europe/Vienna or 'server', got {zone!r} "
-                "(the server clock would be used)"
+                f"ATHLETE_TIMEZONE must be an IANA time zone such as Europe/Vienna or 'server', got {zone!r}; "
+                "the server uses the server clock"
             )
     try:
         parse_toolset(env.get("MCP_TOOLSET", ""))

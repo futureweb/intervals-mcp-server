@@ -9,15 +9,16 @@ from json import JSONDecodeError
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 import httpx  # pylint: disable=import-error
@@ -61,13 +62,38 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     return min(MAX_RETRY_DELAY_S, 1.5 * (2**attempt))
 
 
-def _env_number(name: str, default: float) -> float:
-    """Positive number from the environment, or the default."""
+class LimitSetting(NamedTuple):
+    """A tool-call limit from the environment: the value the server uses and what is wrong with the setting."""
+
+    value: float
+    error: str | None = None  # the setting is unusable; the default is used
+    warning: str | None = None  # the setting is usable after a correction
+
+
+def _shown(number: float) -> str:
+    return str(int(number)) if float(number).is_integer() else str(number)
+
+
+def limit_setting(name: str, default: float, *, integer: bool, environ: Mapping[str, str] | None = None) -> LimitSetting:
+    """Parse MCP_TOOL_MAX_REQUESTS / MCP_TOOL_TIMEOUT_S like the server does (also used by --doctor).
+
+    Empty: the default. Not a number, not finite (inf, nan) or not positive: the default, with an
+    error. A request limit with decimals is cut to whole requests (with a warning); one below 1
+    after cutting falls back to the default.
+    """
+    raw = (os.environ if environ is None else environ).get(name, "").strip()
+    if not raw:
+        return LimitSetting(default)
+    kind = "a positive whole number" if integer else "a positive number"
     try:
-        value = float(os.environ.get(name, "") or default)
+        value = float(raw)
     except ValueError:
-        return default
-    return value if value > 0 else default
+        value = math.nan
+    if not math.isfinite(value) or value <= 0 or (integer and int(value) < 1):
+        return LimitSetting(default, error=f"{name} must be {kind}, got {raw!r}; the server uses the default {_shown(default)}")
+    if integer and int(value) != value:
+        return LimitSetting(int(value), warning=f"{name}={raw} is not a whole number; the server uses {int(value)}")
+    return LimitSetting(int(value) if integer else value)
 
 
 @dataclass
@@ -113,8 +139,8 @@ def call_limits(max_requests: int | None = None, timeout_s: float | None = None)
         yield current
         return
     limits = CallLimits(
-        max_requests=int(max_requests or _env_number("MCP_TOOL_MAX_REQUESTS", DEFAULT_TOOL_MAX_REQUESTS)),
-        timeout_s=float(timeout_s or _env_number("MCP_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S)),
+        max_requests=int(max_requests or limit_setting("MCP_TOOL_MAX_REQUESTS", DEFAULT_TOOL_MAX_REQUESTS, integer=True).value),
+        timeout_s=float(timeout_s or limit_setting("MCP_TOOL_TIMEOUT_S", DEFAULT_TOOL_TIMEOUT_S, integer=False).value),
         started=time.monotonic(),
     )
     token = _CALL_LIMITS.set(limits)
@@ -288,7 +314,7 @@ def _prepare_request_config(
             "",
             httpx.BasicAuth("", ""),
             {},
-            "API key is required. Set API_KEY env var or pass api_key",
+            "API key is required. Set API_KEY in the server environment",
         )
 
     auth = httpx.BasicAuth("API_KEY", key_to_use)

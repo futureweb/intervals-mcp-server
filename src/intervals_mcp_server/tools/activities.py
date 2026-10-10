@@ -71,6 +71,7 @@ from intervals_mcp_server.utils.params import (
     SportTypes,
     StartDate,
     lower_choice,
+    stream_output_choice,
 )
 from intervals_mcp_server.utils.validation import resolve_athlete_id, resolve_date_params
 from intervals_mcp_server.tool_guard import output_budget
@@ -1108,7 +1109,7 @@ async def get_activity_streams(  # pylint: disable=too-many-arguments,too-many-p
     )] = None,
     output_format: Annotated[
         Literal["summary", "full", "json"],
-        BeforeValidator(lower_choice),
+        BeforeValidator(stream_output_choice),
         Field(description="summary = per-stream units, statistics, preview; full = CSV row per sample; "
               "json = one object with arrays and next_start_index"),
     ] = "summary",

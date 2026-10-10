@@ -30,7 +30,7 @@ from mcp.types import TextContent  # pylint: disable=wrong-import-position
 
 from intervals_mcp_server import server  # noqa: F401  # pylint: disable=wrong-import-position,unused-import
 from intervals_mcp_server.guides import GUIDE_TOPICS, SERVER_INSTRUCTIONS, guide_text, guide_uri  # pylint: disable=wrong-import-position
-from intervals_mcp_server.mcp_instance import catalogue, compact_schema, mcp, tool_permissions  # pylint: disable=wrong-import-position
+from intervals_mcp_server.mcp_instance import catalogue, compact_schema, mark_outside_toolset, mcp, tool_permissions  # pylint: disable=wrong-import-position
 from intervals_mcp_server.tools import guide as guide_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.toolsets import CORE_TOOLS, parse_toolset  # pylint: disable=wrong-import-position
 
@@ -46,9 +46,9 @@ BUDGETS = {
     ("read", "full"): 23_000,
     ("read,write", "full"): 26_500,
     ("all", "full"): 29_000,
-    ("read", "core"): 7_500,
-    ("read,write", "core"): 10_000,
-    ("all", "core"): 10_000,
+    ("read", "core"): 9_000,
+    ("read,write", "core"): 11_000,
+    ("all", "core"): 11_000,
 }
 MAX_DESCRIPTION_CHARS = 900
 # Parameters whose values come from a fixed set wherever they appear.
@@ -149,16 +149,41 @@ def test_schema_compaction_keeps_meaningful_nulls():
 
 
 def test_core_toolset():
-    """The core set exists, has 15-20 tools and respects the permission classes."""
+    """The core set exists, has 15-24 tools and respects the permission classes."""
     defined = {item["name"] for item in _tools("all")}
     assert CORE_TOOLS <= defined, CORE_TOOLS - defined
-    assert 15 <= len(CORE_TOOLS) <= 20
+    assert 15 <= len(CORE_TOOLS) <= 24
     core = {item["name"] for item in _tools("read,write", "core")}
     assert core == {name for name in CORE_TOOLS if tool_permissions()[name] in ("read", "write")}
     assert {item["name"] for item in _tools("read", "core")} == {n for n in CORE_TOOLS if tool_permissions()[n] == "read"}
     assert parse_toolset("") == "full" and parse_toolset(" Core ") == "core"
     with pytest.raises(ValueError, match="MCP_TOOLSET"):
         parse_toolset("tiny")
+
+
+def test_core_toolset_marks_tools_outside_the_set():
+    """In the core set every mention of a tool outside it is marked; the instructions use core tools only."""
+    pattern = re.compile(r"\b(" + "|".join(sorted(tool_permissions(), key=len, reverse=True)) + r")\b( \(full tool set\))?")
+    defined = {item["name"] for item in _tools("all")}
+
+    def unmarked(text: str) -> list[str]:
+        return [m.group(1) for m in pattern.finditer(text) if m.group(1) in defined and m.group(1) not in CORE_TOOLS and not m.group(2)]
+
+    for item in _tools("read,write", "core"):
+        assert not unmarked(item["description"]), (item["name"], unmarked(item["description"]))
+    assert "get_training_load (full tool set)" in next(t for t in _tools("read,write", "core") if t["name"] == "get_coach_context")["description"]
+    assert not unmarked(SERVER_INSTRUCTIONS)
+    for topic in GUIDE_TOPICS:
+        assert not unmarked(mark_outside_toolset(guide_text(topic), "core")), topic
+    assert mark_outside_toolset("see get_durability", "full") == "see get_durability"
+    assert mark_outside_toolset(mark_outside_toolset("get_durability", "core"), "core") == "get_durability (full tool set)"
+    original = mcp.toolset
+    try:
+        mcp.toolset = "core"
+        text = asyncio.run(mcp.get_prompt("performance_progression", {})).messages[0].content.text
+        assert "get_fatigue_resistance (full tool set)" in text and not unmarked(text)
+    finally:
+        mcp.toolset = original
 
 
 def test_core_toolset_registration_and_status_in_a_fresh_process():
@@ -239,12 +264,48 @@ def test_new_prompts():
     for fragment in ("get_load_projection(target_date='2026-10-25'", "get_fueling_analysis", "forecast", "checklist",
                      "Do not state causes"):
         assert fragment in week, fragment
-    assert "next RACE_A" in race_week()
+    undated = race_week()
+    assert "ask the athlete which race and date is meant" in undated and "do not assume the next A race" in undated
+    assert "target_date='<the confirmed race date, YYYY-MM-DD>'" in undated
     assert "get_fueling_analysis(activity_id='i1'" in fueling_review("i1") and "12 weeks" in fueling_review()
     plan = plan_health_check(6)
     assert "get_load_projection(scenario=" in plan and "6 weeks" in plan and "never written" in plan
     handoff = coach_handoff("2026-10-10")
     assert "get_coach_context(detail_level='compact')" in handoff and "end_date='2026-10-10'" in handoff
+
+
+def test_lenient_values_from_older_or_guessing_clients():
+    """R28-1/R28-2/R28-6: output_format synonyms give text, guide topics in URI/path/underscore form work,
+    FITNESS_TABLE is a custom item type."""
+    from pydantic import TypeAdapter  # pylint: disable=import-outside-toplevel
+
+    from intervals_mcp_server.tools.custom_items import CustomItemType  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tools.guide import topic_choice  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.utils.params import OutputFormat, stream_output_choice  # pylint: disable=import-outside-toplevel
+
+    output = TypeAdapter(OutputFormat)
+    for value in ("markdown", "Markdown", "md", "html", "table", "plain", "txt", "text/plain", "summary", "compact", " TEXT "):
+        assert output.validate_python(value) == "text", value
+    for value in ("json", "JSON", " Json ", "application/json"):
+        assert output.validate_python(value) == "json", value
+    assert stream_output_choice("text") == "summary" and stream_output_choice("CSV") == "full"
+    for value, topic in (("intervals://methods/load", "load"), ("methods/load", "load"), ("workout_syntax", "workout-syntax"),
+                         ("Workout Syntax", "workout-syntax"), ("intervals://workout-syntax", "workout-syntax"),
+                         ("intervals://guide", "usage"), ("power_meters", "power-meters"), ("syntax", "workout-syntax"),
+                         ("guide", "usage"), ("/methods/activity_data/", "activity-data")):
+        assert topic_choice(value) == topic, value
+    for value in ("intervals://methods/load", "workout_syntax", "Power Meters"):
+        result = asyncio.run(mcp.call_tool("get_guide", {"topic": value}))
+        assert isinstance(result, list) and result[0].text.startswith("#"), value
+    assert "FITNESS_TABLE" in typing.get_args(CustomItemType)
+
+
+def test_pace_value_format_is_in_the_write_schemas():
+    """R28-3: the MINS_KM/MINS_MILE value format is visible where workouts are written."""
+    tools = {item["name"]: item for item in _tools("all")}
+    for name in ("add_or_update_event", "create_library_workout"):
+        value = tools[name]["inputSchema"]["$defs"]["Value"]["description"]
+        assert "MINS_KM/MINS_MILE: seconds (335 = 5:35/km) or decimal minutes" in value and "5:21" in value, name
 
 
 def test_wire_format_round_trip():

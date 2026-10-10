@@ -7,6 +7,8 @@ Method details: `intervals://methods/<topic>` or `get_guide(topic)`; workout for
 ## 1. Orientation
 - `get_server_status`: version, enabled permission classes, tool set (MCP_TOOLSET), hidden
   tools, API check, custom item counts.
+- With `MCP_TOOLSET=core` only the core tools exist; tools outside the set are marked
+  "(full tool set)" in descriptions, prompts and guides.
 - For a weekly analysis the recommended first call is `get_coach_context` (load, intensity,
   recovery, durability, plan and method in about 2-3k characters). Go to the detail tools below
   only where needed, and ask for `detail_level="compact"` first.

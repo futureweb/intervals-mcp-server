@@ -409,7 +409,7 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
     Rest days count as 0; sessions without a load are counted, not added. Device loads (custom
     fields such as a Garmin training load) are listed apart on their own scale, never added. With
     the default end date and nothing recorded today yet, the windows end yesterday. Reference
-    ranges (ACWR 0.8-1.3, monotony 2.0) are shown with sources as context; small samples are
+    ranges (ACWR 0.8-1.3, monotony > 2.0) are shown with sources as context; small samples are
     flagged; no verdict. Overview: get_coach_context; planned load: get_load_projection.
     Method: intervals://methods/load (get_guide).
     """
@@ -582,23 +582,24 @@ def _what_if_inputs(  # pylint: disable=too-many-arguments,too-many-positional-a
         except ValueError as exc:
             return f"Error: {exc}"
         target = date.fromisoformat(target_date)
-        if not today < target <= last:
-            return f"Error: target_date must lie after today and not after {last.isoformat()}."
+        if not today <= target <= last:
+            return f"Error: target_date must lie from today ({today.isoformat()}) to {last.isoformat()}."
     return {"scenario": parsed, "form_range": form_range, "target": target,
             "active": parsed is not None or form_range is not None or target is not None}
 
 
 def _target_event(events: list[dict[str, Any]], target: date | None, today: date, last: date) -> dict[str, Any] | None:
-    """The target day: the given date (with a race event on it, if any) or the next RACE_A event."""
+    """The target day: the given date (today or later, with a race event on it, if any) or the next RACE_A
+    event after today."""
     races = sorted(
-        ((d, e) for e in events if e.get("category") in RACE_CATEGORIES and (d := activity_day(e)) is not None and today < d <= last),
+        ((d, e) for e in events if e.get("category") in RACE_CATEGORIES and (d := activity_day(e)) is not None and today <= d <= last),
         key=lambda item: item[0],
     )
     if target is not None:
         event = next((e for d, e in races if d == target), None)
         source = "target_date"
     else:
-        found = next(((d, e) for d, e in races if e.get("category") == "RACE_A"), None)
+        found = next(((d, e) for d, e in races if e.get("category") == "RACE_A" and d > today), None)
         if found is None:
             return None
         target, event = found
@@ -1030,7 +1031,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         '"hours"+"intensity_factor", "sessions" or "days"}]}; a list = sessions. Full format: intervals://methods/load'
     )] = None,
     target_date: Annotated[str | None, Field(
-        description="Target day YYYY-MM-DD after today; default the next RACE_A event"
+        description="Target day YYYY-MM-DD, today or later (form at the start of that day); default the next RACE_A event"
     )] = None,
     target_form: Annotated[str | list[float] | None, Field(
         description='Form range at the start of the target day: "5,15" (CTL - ATL) or "5%,20%" (of CTL); starts the '
@@ -1043,7 +1044,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     Starts from Intervals.icu's CTL/ATL at the end of yesterday plus today's completed load;
     planned workouts without a load are reported, not guessed. Returns end values, lowest form,
     highest ramp, ISO weeks with plan statistics, race days, Intervals.icu's own projection, a
-    model check and weeks outside commonly cited ranges (ramp 5-8 CTL/week, monotony 2.0, no rest
+    model check and weeks outside commonly cited ranges (ramp 5-8 CTL/week, monotony > 2.0, no rest
     day). With target_date, target_form or a scenario: the target day (default the next RACE_A)
     at the start of the day; target_form adds a search for the load of the last taper_days that
     reaches it. Arithmetic, not a forecast; no verdict. Method and scenario format:

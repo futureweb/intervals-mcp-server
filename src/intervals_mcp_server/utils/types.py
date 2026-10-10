@@ -127,7 +127,7 @@ def float_to_str(value: float) -> str:
 
 @dataclass
 class Value:
-    """A step target: value, or start and end (a range; a ramp with ramp=true on the step), with units."""
+    """A step target: value, or start and end (a range; a ramp with ramp=true on the step), with units. MINS_KM/MINS_MILE: seconds (335 = 5:35/km) or decimal minutes (5.583; 5.35 would be 5:21, not 5:35); SECS_100M/SECS_100Y/SECS_500M: seconds."""
 
     value: Optional[float] = None
     start: Optional[float] = None
