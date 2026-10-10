@@ -50,11 +50,18 @@ def _patch(monkeypatch, responder) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
     async def fake(url, api_key=None, params=None, method="GET", data=None):
+        if method == "GET" and isinstance(params, dict) and "oldest" in params:
+            return []  # the day's events (duplicate check before a create): none, not recorded
         calls.append({"url": url, "method": method, "data": data})
         return responder(url, method)
 
     monkeypatch.setattr(TARGET, fake)
     return calls
+
+
+def _last_write(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """The last request that is not a GET (the write; a read-back GET follows it)."""
+    return [c for c in calls if c["method"] != "GET"][-1]
 
 
 def test_get_workout_library(monkeypatch):
@@ -105,7 +112,7 @@ def test_create_library_workout_only_passed_fields(monkeypatch):
         )
     )
     assert "Successfully created library workout id: 555" in result
-    post = calls[-1]
+    post = _last_write(calls)
     assert post["method"] == "POST" and post["url"] == "/athlete/i1/workouts"
     assert post["data"] == {
         "name": "Sweet Spot 3x10",
@@ -133,7 +140,7 @@ def test_create_library_workout_with_workout_doc(monkeypatch):
         )
     )
     assert "Successfully created" in result
-    data = calls[-1]["data"]
+    data = _last_write(calls)["data"]
     assert data["folder_id"] == 10  # single folder is used implicitly
     assert data["description"] == str(doc) and data["description"]
     assert data["moving_time"] == 600
@@ -181,7 +188,7 @@ def test_create_library_workout_plan_and_ambiguity(monkeypatch):
 
     calls = _patch(monkeypatch, responder)
     result = asyncio.run(create_library_workout(name="A", sport_type="Run", athlete_id="i1"))
-    assert "Successfully" in result and calls[-1]["data"]["folder_id"] == 10
+    assert "Successfully" in result and _last_write(calls)["data"]["folder_id"] == 10
 
     # Only plans: no implicit target.
     _patch(monkeypatch, lambda url, method: [FOLDERS[1]])
@@ -223,7 +230,7 @@ def test_add_event_from_library_extra_fields_and_id_validation(monkeypatch):
 
     calls = _patch(monkeypatch, responder)
     asyncio.run(add_event_from_library(workout_id="5", date="2026-10-05", athlete_id="i1"))
-    data = calls[-1]["data"]
+    data = _last_write(calls)["data"]
     assert data["target"] == "POWER" and data["sub_type"] == "COMMUTE"
     assert data["carbs_per_hour"] == 60 and "color" not in data
 
@@ -314,7 +321,7 @@ def test_delete_library_workout(monkeypatch):
 
     calls = _patch(monkeypatch, responder)
     result = asyncio.run(delete_library_workout(workout_id="101", athlete_id="i1"))
-    assert result == "Deleted library workout 101 'Sweet Spot 3x10'."
+    assert result == "Deleted library workout 101 'Sweet Spot 3x10' (no sport, folder unknown)."
     assert [(c["url"], c["method"]) for c in calls] == [
         ("/athlete/i1/workouts/101", "GET"),
         ("/athlete/i1/workouts/101", "DELETE"),
@@ -330,12 +337,17 @@ def test_delete_library_workout_errors(monkeypatch):
     assert not calls
 
     result = asyncio.run(delete_library_workout(workout_id="7", athlete_id="i1"))
-    assert result == "No library workout found with id 7."
+    assert result == "No library workout found with id 7; nothing was deleted."
+    assert [c["method"] for c in calls] == ["GET"]
+
+    calls = _patch(monkeypatch, lambda url, method: {"error": True, "status_code": 404, "message": "404 Not Found"})
+    result = asyncio.run(delete_library_workout(workout_id="7", athlete_id="i1"))
+    assert result == "No library workout found with id 7; nothing was deleted."
     assert [c["method"] for c in calls] == ["GET"]
 
     _patch(monkeypatch, lambda url, method: {"error": True, "message": "nope"})
     result = asyncio.run(delete_library_workout(workout_id="7", athlete_id="i1"))
-    assert result == "Error fetching library workout: nope"
+    assert result == "Error fetching library workout: nope. Nothing was deleted."
 
     def responder(url, method):
         return (

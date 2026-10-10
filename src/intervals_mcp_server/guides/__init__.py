@@ -45,8 +45,8 @@ available; do not read it as normal or as a change.
 - Numbers, baselines and cited reference ranges are context, not a verdict or diagnosis; the training \
 decision stays with the athlete and coach.
 - Write tools change the athlete's Intervals.icu account: use them only when the athlete explicitly asks. \
-Preview first where available (validate_workout or preview_workout before add_or_update_event; \
-dry_run before deleting) and show what will change.
+Preview first (validate_workout or preview_workout before add_or_update_event; dry_run=true returns \
+the exact request of a write or range delete) and show what will change; report the read-back.
 - Before writing a workout read the workout syntax: resource intervals://workout-syntax or \
 get_guide(topic="workout-syntax"). Method details: intervals://methods/<topic> or get_guide.
 - Dates are YYYY-MM-DD in the athlete's time zone; athlete_id defaults to the configured athlete."""

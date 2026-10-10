@@ -7,6 +7,7 @@ This module contains tools for retrieving, creating, updating, and deleting athl
 # pylint: disable=too-many-lines
 
 import json
+from dataclasses import dataclass
 from datetime import date
 from typing import Annotated, Any, Literal
 
@@ -20,7 +21,7 @@ from intervals_mcp_server.utils.dates import (
     get_default_future_end_date,
     get_default_start_date,
 )
-from intervals_mcp_server.utils.params import AthleteId, OutputFormat, upper_choice
+from intervals_mcp_server.utils.params import AllowDuplicate, AthleteId, DryRun, OutputFormat, upper_choice
 from intervals_mcp_server.utils.formatting import (
     event_type_label,
     format_event_details,
@@ -40,6 +41,18 @@ from intervals_mcp_server.utils.workout_validation import (
     warnings_note,
     workout_text_for_write,
     write_refusal,
+)
+from intervals_mcp_server.utils.write_safety import (
+    check_duplicates,
+    deletion_row,
+    dry_run_answer,
+    duplicate_check_failed,
+    duplicate_refusal,
+    is_not_found,
+    parse_warnings,
+    sent_shape,
+    stored_summary,
+    verify_write,
 )
 
 # Import mcp instance from shared module for tool registration
@@ -267,25 +280,36 @@ async def get_event_by_id(
 
 
 @tool("destructive")
-async def delete_event(
+async def delete_event(  # pylint: disable=too-many-return-statements
     event_id: Annotated[str, Field(description="Intervals.icu event id to delete")],
     athlete_id: AthleteId = None,
 ) -> str:
     """Use only when the athlete explicitly asks to delete one calendar event (workout, race, note, plan phase ...).
 
-    DELETES the event from Intervals.icu permanently; this cannot be undone. Show the event (get_event_by_id) and get the athlete's confirmation first. Several events of a range: delete_events_by_date_range with its preview.
+    DELETES the event from Intervals.icu permanently; this cannot be undone. Show the event (get_event_by_id) and get the athlete's confirmation first; the answer names what was deleted. Several events of a range: delete_events_by_date_range with its preview.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
     if not event_id:
         return "Error: No event ID provided."
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}", method="DELETE"
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/events/{seg(event_id)}"
+    event = await make_intervals_request(url=url)
+    if is_not_found(event) or (not event and not isinstance(event, list)):
+        return f"Event {event_id} not found; nothing was deleted."
+    if isinstance(event, dict) and "error" in event:
+        return f"Error reading event {event_id} before deleting it: {event.get('message')}. Nothing was deleted."
+    if not isinstance(event, dict):
+        return f"Error: unexpected answer when reading event {event_id}. Nothing was deleted."
+    result = await make_intervals_request(url=url, method="DELETE")
+    if is_not_found(result):
+        return f"Event {event_id} was already gone; nothing was deleted."
     if isinstance(result, dict) and "error" in result:
-        return f"Error deleting event: {result.get('message')}"
-    return json.dumps(result, indent=2)
+        return f"Error deleting event {event_id}: {result.get('message')}. Check with get_event_by_id whether it still exists."
+    row = deletion_row(event)
+    paired = f"paired with activity {row['paired_activity_id']}" if row["paired_activity_id"] else "not paired with an activity"
+    sport = f" {row['type']}" if row["type"] else ""
+    return f"Deleted event {row['id'] or event_id}: {row['date']} {row['category']}{sport} '{row['name'] or 'unnamed'}' ({paired})."
 
 
 def _parse_categories(categories: str | None) -> list[str] | str:
@@ -302,17 +326,6 @@ def _parse_categories(categories: str | None) -> list[str] | str:
     return list(dict.fromkeys(wanted))
 
 
-def _deletion_row(event: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": event.get("id"),
-        "date": str(event.get("start_date_local") or "")[:10],
-        "category": event.get("category"),
-        "type": event.get("type"),
-        "name": event.get("name"),
-        "paired_activity_id": event.get("paired_activity_id"),
-    }
-
-
 def _select_for_deletion(
     events: list[dict[str, Any]], wanted: list[str], start: str, end: str, include_paired: bool
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -327,7 +340,7 @@ def _select_for_deletion(
     for event in events:
         if not isinstance(event, dict) or event.get("id") is None:
             continue
-        row = _deletion_row(event)
+        row = deletion_row(event)
         if event.get("category") not in wanted:
             continue  # the API filter should already have excluded it
         if not start <= row["date"] <= end:
@@ -465,6 +478,13 @@ def _blank(value: str | None) -> bool:
     return value is not None and not value.strip()
 
 
+def _doc_as_dict(workout_doc: Any) -> dict[str, Any] | None:
+    """The workout_doc as a plain dict (it arrives as a WorkoutDoc, from Python callers also as a dict)."""
+    if isinstance(workout_doc, WorkoutDoc):
+        return workout_doc.to_dict()
+    return workout_doc if isinstance(workout_doc, dict) else None
+
+
 @tool("write", overwrites=True)
 async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements,too-many-branches
     workout_type: Annotated[str | None, Field(description="Sport, e.g. Ride, Run, Swim, Walk, Row, WeightTraining; needed for a new workout or race unless the name names exactly one sport")] = None,
@@ -483,10 +503,12 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     ] = None,
     description: Annotated[str | None, Field(description="Text instead of workout_doc: an exercise list or native Intervals.icu workout text, sent as-is; replaces the text")] = None,
     replace_workout: Annotated[bool, Field(description="Allow text or a workout without timed steps to replace a structured workout")] = False,
+    allow_duplicate: AllowDuplicate = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to put a planned workout, race or other event on the calendar or to change one. Writes to Intervals.icu.
 
-    Without event_id a new event is created (name required, date default today, category WORKOUT); with event_id only the passed fields change, a new date keeps the time of day. workout_doc REPLACES the planned workout and is validated first like validate_workout: with errors nothing is written, warnings are listed. Text-only sessions (strength, yoga) go into description. Text never silently replaces a structured workout (replace_workout=true). Read intervals://workout-syntax (get_guide) before writing steps; validate_workout first, then read back with get_event_by_id.
+    Without event_id a new event is created (name required, date default today, category WORKOUT; a duplicate of that day is refused: allow_duplicate); with event_id only the passed fields change, a new date keeps the time of day. workout_doc REPLACES the planned workout and is validated like validate_workout: with errors nothing is written. Text-only sessions (strength, yoga) go into description; text never silently replaces a structured workout (replace_workout). dry_run shows the exact request; the answer reads back what Intervals.icu stored and parsed. Read intervals://workout-syntax (get_guide) before writing steps.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -556,10 +578,11 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     )
     if is_update and not event_data:
         return "Error: nothing to update; pass at least one field to change."
-    answer = await _create_or_update_event_request(
-        athlete_id_to_use, event_data, validated_date, event_id
+    sent = sent_shape(_doc_as_dict(workout_doc) if workout.text is not None else None, text) if text is not None else None
+    return await _write_event(
+        athlete_id_to_use, event_data, event_id,
+        _WriteOptions(validated_date, sent, workout.warnings, allow_duplicate, dry_run, "add_or_update_event"),
     )
-    return answer + (warnings_note(workout.warnings) if answer.startswith("Successfully") else "")
 
 
 @tool("write", overwrites=True)
@@ -571,10 +594,12 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
     athlete_id: AthleteId = None,
     event_id: Annotated[str | None, Field(description="NOTE event to update; omit to create")] = None,
     clear_description: Annotated[bool, Field(description="Empty the note's text on update")] = False,
+    allow_duplicate: AllowDuplicate = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to add or edit a plain text note (category NOTE) on the Intervals.icu calendar. Writes to Intervals.icu.
 
-    Updates are partial: only the passed fields change (renaming keeps text, colour and date); an empty description never wipes the text, clear_description=true does. Only notes can be updated: anything else (a workout, a race) is refused, never turned into a note.
+    Updates are partial: only the passed fields change (renaming keeps text, colour and date); an empty description never wipes the text, clear_description=true does. Only notes can be updated: anything else (a workout, a race) is refused, never turned into a note. A duplicate of that day is refused (allow_duplicate); dry_run shows the request; the answer reads back what was stored.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -615,38 +640,59 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
             )
         if "start_date_local" in event_data:
             event_data["start_date_local"] = str(validated_date) + _time_of_day(existing)
-    return await _create_or_update_event_request(
-        athlete_id_to_use, event_data, validated_date, event_id
+    return await _write_event(
+        athlete_id_to_use, event_data, event_id,
+        _WriteOptions(validated_date, None, [], allow_duplicate, dry_run, "add_or_update_note"),
     )
 
 
-async def _create_or_update_event_request(
-    athlete_id: str,
-    event_data: dict[str, Any],
-    start_date: str | None,
-    event_id: str | None,
+@dataclass(frozen=True)
+class _WriteOptions:
+    """How _write_event checks, sends and reports one event write."""
+
+    start_date: str | None  # day of the event (for the answer)
+    sent: dict[str, Any] | None  # workout sent (write_safety.sent_shape), compared on read-back
+    warnings: list[str]  # validation warnings of the workout
+    allow_duplicate: bool
+    dry_run: bool
+    update_tool: str  # tool named in a duplicate refusal
+
+
+async def _write_event(
+    athlete_id: str, event_data: dict[str, Any], event_id: str | None, options: _WriteOptions
 ) -> str:
-    """Create or update an event via API request.
-
-    Args:
-        athlete_id: The athlete ID.
-        event_data: Prepared event data dictionary.
-        start_date: Start date string for response formatting.
-        event_id: Optional event ID for updates.
-
-    Returns:
-        Formatted response string.
-    """
+    """Create (POST) or update (PUT) one event: duplicate check before a create, dry run, write
+    and read-back of what Intervals.icu stored."""
     url = f"/athlete/{seg(athlete_id)}/events"
     if event_id:
         url += f"/{seg(event_id)}"
-    result = await make_intervals_request(
-        url=url,
-        data=event_data,
-        method="PUT" if event_id else "POST",
-    )
+    extra: dict[str, Any] = {}
+    if not event_id:
+        if options.allow_duplicate:
+            extra["duplicate_check"] = "skipped (allow_duplicate=true)"
+        else:
+            found, error = await check_duplicates(make_intervals_request, athlete_id, [event_data])
+            if error:
+                return duplicate_check_failed(error)
+            if found[0]:
+                return duplicate_refusal(found[0], options.update_tool)
+            extra["duplicate_check"] = f"no event of this category with the same name or workout on {event_data['start_date_local'][:10]}"
+    method = "PUT" if event_id else "POST"
+    if options.dry_run:
+        return dry_run_answer(method, url, event_data, warnings=options.warnings, extra=extra)
+    result = await make_intervals_request(url=url, data=event_data, method=method)
     action = "updated" if event_id else "created"
-    return _handle_event_response(result, action, athlete_id, start_date)
+    answer = _handle_event_response(result, action, athlete_id, options.start_date)
+    if not answer.startswith("Successfully"):
+        return answer
+    answer += warnings_note(options.warnings)
+    written = event_id or (result.get("id") if isinstance(result, dict) else None)
+    if written is None:
+        return answer + "\nRead-back: no event id was returned, so the write could not be verified; check get_events."
+    _, _, text = await verify_write(
+        make_intervals_request, f"/athlete/{seg(athlete_id)}/events/{seg(written)}", event_data, options.sent, f"event {written}"
+    )
+    return f"{answer}\n{text}"
 
 
 _BULK_COMMON_KEYS = {"category", "name", "start_date"}
@@ -660,11 +706,13 @@ _BULK_WORKOUT_KEYS = _BULK_COMMON_KEYS | {
 _BULK_NOTE_KEYS = _BULK_COMMON_KEYS | {"description", "color"}
 
 
-def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> dict[str, Any]:  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
+def _build_bulk_event_entry(  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
+    entry: Any, warnings: list[str] | None = None, sent: list[dict[str, Any] | None] | None = None
+) -> dict[str, Any]:
     """Validate one bulk entry and build the API event body using the shared builders.
 
     All problems of the entry are collected and reported together; validation warnings of its
-    workout are appended to *warnings*.
+    workout are appended to *warnings*, the workout sent (write_safety.sent_shape) to *sent*.
 
     Raises:
         ValueError: If the entry is invalid; the message lists every problem found.
@@ -702,6 +750,8 @@ def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> di
             problems.append("'color' must be a colour name such as green")
         if problems:
             raise ValueError("; ".join(problems))
+        if sent is not None:
+            sent.append(None)
         return _prepare_note_data(str(name), str(description), validated_date, color)
 
     workout_type = entry.get("workout_type")
@@ -711,6 +761,7 @@ def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> di
         problems.append("'description' must be a string")
     raw_doc = entry.get("workout_doc")
     text: str | None = None
+    doc_dict: dict[str, Any] | None = None
     if raw_doc is not None and description:
         problems.append("provide either 'workout_doc' or 'description', not both")
     elif isinstance(raw_doc, dict) and is_blank_workout_doc(raw_doc):
@@ -724,6 +775,7 @@ def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> di
             if workout.problem:
                 problems.append(workout.problem)
             text = workout.text
+            doc_dict = _doc_as_dict(workout_doc)
             if warnings is not None:
                 warnings.extend(workout.warnings)
     amount_error = _check_amounts(entry.get("moving_time"), entry.get("distance"))
@@ -744,20 +796,58 @@ def _build_bulk_event_entry(entry: Any, warnings: list[str] | None = None) -> di
     if description:
         # Native Intervals.icu workout text, sent as-is.
         body["description"] = description
+    if sent is not None:
+        sent.append(sent_shape(doc_dict, body.get("description")) if body.get("description") else None)
     return body
 
 
+def _bulk_answer(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+async def _bulk_read_back(
+    athlete_id: str, created: list[dict[str, Any]], bodies: list[dict[str, Any]], sent: list[dict[str, Any] | None]
+) -> str | None:
+    """Add "stored" and "parse_warnings" to every created row (one GET over their dates);
+    returns an error text when the events could not be read back."""
+    rows = [row for row in created if row["id"] is not None]
+    if not rows:
+        return None
+    days = sorted(str(bodies[row["index"]].get("start_date_local") or "")[:10] for row in rows)
+    result = await make_intervals_request(
+        url=f"/athlete/{seg(athlete_id)}/events", params={"oldest": days[0], "newest": days[-1]}
+    )
+    if isinstance(result, dict) and "error" in result:
+        for row in rows:
+            row.update({"stored": None, "parse_warnings": []})
+        return f"The events were created but could not be verified ({result.get('message')}); check them with get_events."
+    stored = {str(e.get("id")): e for e in result if isinstance(e, dict)} if isinstance(result, list) else {}
+    missing = 0
+    for row in rows:
+        event = stored.get(str(row["id"]))
+        if event is None:
+            missing += 1
+            row.update({"stored": None, "parse_warnings": ["not found when reading the events back"]})
+            continue
+        index = row["index"]
+        row["stored"] = stored_summary(event, sent[index])
+        row["parse_warnings"] = parse_warnings(bodies[index], event, sent[index])
+    return f"{missing} created event(s) were not found when reading back; check get_events." if missing else None
+
+
 @tool("admin")
-async def add_events_bulk(  # pylint: disable=too-many-locals
+async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements,too-many-return-statements
     events: Annotated[
         list[dict[str, Any]],
         Field(description="1-100 entries: name, start_date, category WORKOUT (workout_type required; workout_doc or description, moving_time, distance) or NOTE (description, color). Format: intervals://workout-syntax"),
     ],
     athlete_id: AthleteId = None,
+    allow_duplicate: AllowDuplicate = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to put many planned workouts and/or notes on the calendar at once (e.g. a training block). Writes to Intervals.icu.
 
-    Every entry is validated first (workouts as in validate_workout); if ANY entry is invalid nothing is sent and all errors are returned. Then one bulk request creates all events; existing events are never updated (use add_or_update_event). At most 100 entries. Returns JSON with created (index, id, name, date), errors and created_count.
+    Every entry is validated first (workouts as in validate_workout); if ANY entry is invalid nothing is sent and all errors are returned. Entries duplicating an event of their day or an earlier entry are refused, the others created in one request (allow_duplicate). Existing events are never updated (use add_or_update_event). At most 100 entries; dry_run shows the request. Returns JSON: created (with stored, parse_warnings), refused, errors.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -768,35 +858,65 @@ async def add_events_bulk(  # pylint: disable=too-many-locals
         return f"Error: {len(events)} entries; at most {MAX_BULK_EVENTS} events can be created per call. Split the list."
 
     bodies: list[dict[str, Any]] = []
+    sent: list[dict[str, Any] | None] = []
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     for index, entry in enumerate(events):
         entry_warnings: list[str] = []
         try:
-            bodies.append(_build_bulk_event_entry(entry, entry_warnings))
+            bodies.append(_build_bulk_event_entry(entry, entry_warnings, sent))
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             errors.append({"index": index, "error": str(e)})
         if entry_warnings:
             warnings.append({"index": index, "warnings": entry_warnings})
 
     if errors:
-        return json.dumps(
+        return _bulk_answer(
             {
                 "message": "No events were sent because some entries are invalid.",
                 "created_count": 0,
                 "error_count": len(errors),
                 "created": [],
                 "errors": errors,
-            },
-            indent=2,
+            }
         )
 
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events/bulk",
-        method="POST",
-        params={"upsert": False, "upsertOnUid": False, "updatePlanApplied": False},
-        data=bodies,
-    )
+    refused: list[dict[str, Any]] = []
+    to_send = list(range(len(bodies)))
+    if not allow_duplicate:
+        found, check_error = await check_duplicates(make_intervals_request, athlete_id_to_use, bodies)
+        if check_error:
+            return _bulk_answer(
+                {"message": f"No events were sent: {check_error}. Try again, split the list, or pass allow_duplicate=true "
+                            "to create them without the check.", "created_count": 0, "created": [], "errors": []}
+            )
+        refused = [
+            {"index": index, "name": bodies[index].get("name"), **duplicate}
+            for index, duplicate in enumerate(found) if duplicate
+        ]
+        to_send = [index for index, duplicate in enumerate(found) if not duplicate]
+    refused_note = (
+        f"{len(refused)} entr{'y was' if len(refused) == 1 else 'ies were'} refused because that day already has the "
+        "same event or an earlier entry repeats it (see refused; nothing was written for them; allow_duplicate=true "
+        "creates them anyway)."
+    ) if refused else ""
+    if not to_send:
+        return _bulk_answer(
+            {"message": "No events were sent: every entry duplicates an existing event or an earlier entry. " + refused_note,
+             "created_count": 0, "created": [], "refused": refused, "errors": []}
+        )
+
+    url = f"/athlete/{seg(athlete_id_to_use)}/events/bulk"
+    params = {"upsert": False, "upsertOnUid": False, "updatePlanApplied": False}
+    payload_bodies = [bodies[index] for index in to_send]
+    if dry_run:
+        return dry_run_answer(
+            "POST", url, payload_bodies, params=params,
+            warnings=[f"entry {w['index']}: {text}" for w in warnings for text in w["warnings"]],
+            extra={"entries_sent": to_send, "refused": refused,
+                   "duplicate_check": "skipped (allow_duplicate=true)" if allow_duplicate else "done, one request per day"},
+        )
+    result = await make_intervals_request(url=url, method="POST", params=params, data=payload_bodies)
     if isinstance(result, dict) and "error" in result:
         return (
             f"Error creating events in bulk: {str(result.get('message', 'Unknown error')).rstrip('.')}. "
@@ -805,37 +925,42 @@ async def add_events_bulk(  # pylint: disable=too-many-locals
         )
     returned = result if isinstance(result, list) else []
     created: list[dict[str, Any]] = []
-    for index, body in enumerate(bodies):
-        item = returned[index] if index < len(returned) else {}
+    for position, index in enumerate(to_send):
+        item = returned[position] if position < len(returned) else {}
         if not isinstance(item, dict):
             item = {}
         created.append(
             {
                 "index": index,
                 "id": item.get("id"),
-                "name": item.get("name", body.get("name")),
+                "name": item.get("name", bodies[index].get("name")),
                 "start_date_local": item.get("start_date_local"),
             }
         )
-    if len(returned) != len(bodies):
+    if len(returned) != len(payload_bodies):
         errors.append(
             {
                 "index": None,
-                "error": f"API returned {len(returned)} events for {len(bodies)} sent; ids may be missing. "
+                "error": f"API returned {len(returned)} events for {len(payload_bodies)} sent; ids may be missing. "
                 "Check get_events for the dates before retrying.",
             }
         )
-    return json.dumps(
-        {
-            "created_count": sum(1 for row in created if row["id"] is not None),
-            "sent_count": len(bodies),
-            "error_count": len(errors),
-            "created": created,
-            "errors": errors,
-            "warnings": warnings,
-        },
-        indent=2,
-    )
+    verification = await _bulk_read_back(athlete_id_to_use, created, bodies, sent)
+    created_count = sum(1 for row in created if row["id"] is not None)
+    answer: dict[str, Any] = {
+        "message": f"Created {created_count} of {len(events)} entries. {refused_note}".strip(),
+        "created_count": created_count,
+        "sent_count": len(payload_bodies),
+        "refused_count": len(refused),
+        "error_count": len(errors),
+        "created": created,
+        "refused": refused,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if verification:
+        answer["verification"] = verification
+    return _bulk_answer(answer)
 
 
 PLAN_CATEGORIES = ("PLAN", "TARGET", "RACE_A", "RACE_B", "RACE_C", "SEASON_START")

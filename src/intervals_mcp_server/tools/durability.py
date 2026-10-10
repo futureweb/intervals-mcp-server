@@ -98,9 +98,10 @@ def _family_text(family: str, entry: dict[str, Any], ef: dict[str, Any], thresho
         )
         text += f"\n    sample: {sample_note(entry)}"
     if ef["n"]:
+        days = ef.get("recent_days", 7)
         change = (
-            f", last 7 d mean {fmt(ef['recent_mean'], 2)} (n {ef['recent_n']}), {fmt(ef['change_pct'], 1, ' %', signed=True)}: "
-            f"{ef['direction']}" if ef["direction"] else f", last 7 d n {ef['recent_n']} (too few for a comparison)"
+            f", last {days} d mean {fmt(ef['recent_mean'], 2)} (n {ef['recent_n']}), {fmt(ef['change_pct'], 1, ' %', signed=True)}: "
+            f"{ef['direction']}" if ef["direction"] else f", last {days} d n {ef['recent_n']} (too few for a comparison)"
         )
         gear = f"; {ef['gear_ids']} different bikes/shoes, compare per gear with get_power_hr_efficiency" if ef["gear_ids"] > 1 else ""
         text += (

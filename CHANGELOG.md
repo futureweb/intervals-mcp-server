@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added (stage 3B: write safety)
+- `dry_run` (default false, so nothing changes for existing calls) on every create/update tool
+  that did not have it: `add_or_update_event`, `add_or_update_note`, `add_events_bulk`,
+  `add_event_from_library`, `create_library_workout`, `update_activity`, `update_wellness`,
+  `update_custom_item`, `update_sport_settings`, `add_activity_message`. A dry run runs every
+  check of the real call and returns compact JSON with the exact request (method, path, query
+  parameters, body after all defaults and merges, e.g. the merged custom item content) and the
+  validation result; no write request is made. As a second line of defence the tool guard runs a
+  dry run with read-only requests: the API client refuses every non-GET request during it.
+- Duplicate check before creating events (`add_or_update_event` and `add_or_update_note` without
+  `event_id`, `add_events_bulk`, `add_event_from_library`): the events of each day are read (one
+  GET per distinct day, checked against the request budget) and a create is refused when that day
+  already has an event of the same category with the same name (case/whitespace-insensitive) or
+  the same workout content; the answer names the existing event id and name. `allow_duplicate=true`
+  creates it anyway. `add_events_bulk` decides per entry (also an entry repeating an earlier one of
+  the list): refused entries are listed under `refused`, nothing is written for them, the others
+  are created. When a day cannot be read nothing is written.
+- Read-back after every successful event and library workout write: the stored object is read and
+  the answer reports what Intervals.icu stored and parsed (date/time, name, category, sport,
+  planned duration, load, timed steps parsed vs sent) with parse warnings (steps dropped, merged or
+  added, repeats changed, step duration/distance or target units changed, a target missing, no
+  planned duration, fields stored with another value). Text answers get one "Read-back:" paragraph
+  of at most about 600 characters; `add_events_bulk` adds `stored` and `parse_warnings` per created
+  entry (one GET over the dates). A failed read-back says the write succeeded but is not verified.
+- `delete_event` reads the event first and names what was deleted (id, date, category, sport,
+  name, paired activity or not); `delete_library_workout` and `delete_custom_item` name the
+  deleted object too. A missing id answers "not found; nothing was deleted" instead of an API
+  error, a DELETE answered with 404 says the object was already gone.
+- Requests added per write: creating one event +2 GET (duplicate check, read-back), updating an
+  event or creating a library workout +1 GET (read-back), `add_events_bulk` +1 GET per distinct day
+  +1 GET (read-back), `delete_event` +1 GET; `allow_duplicate=true` skips the duplicate check.
+- Write-safety section in `intervals://guide` (`get_guide`), the workout syntax guide and the
+  README; the server instructions mention dry runs and the read-back.
+
+### Fixed
+- `get_durability`: the recent efficiency-factor mean was labelled "last 7 d" whatever
+  `recent_days` was; the label now shows the configured window (JSON `efficiency.<sport>.recent_days`).
+- `compare_workouts`: a reference activity older than the newest `limit` activities was cut and
+  the pattern silently came from the newest activity. The reference is now fetched by id, always
+  takes one of the `limit` places and is always the pattern.
+- `compare_workouts` with `query`, `end_date` and a reference but no `start_date` listed only the
+  90 days before `end_date` while the note said 365 days before the reference; the listed window is
+  now the one the note names (365 days before the reference up to `end_date`). A name search with a
+  reference and no dates lists that window too instead of the newest search results.
+- `compare_best_efforts` with `activity_ids` de-duplicates the ids and cuts them to `limit` before
+  any request (`cap_ids`/`ids_note`), and says what was dropped.
+- The JSON output of `get_coach_context` and `get_training_summary` follows `detail_level`
+  (compact / standard / full) like the text; it was always the full structure.
+- `get_activities` and `get_wellness_data` with a past `end_date` and no `start_date` asked for a
+  range starting after its end; the default start is now 30 days before the earlier of `end_date`
+  and today.
+
 ## [1.0.0b1] - 2026-10-09
 
 First public beta of the Futureweb fork. Based on upstream

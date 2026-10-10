@@ -18,8 +18,10 @@ from pydantic_core import PydanticUseDefault
 
 __all__ = [
     "ActivityId",
+    "AllowDuplicate",
     "AthleteId",
     "DetailLevel",
+    "DryRun",
     "EndDate",
     "Environment",
     "GearId",
@@ -90,6 +92,9 @@ SportTypes = Annotated[
     str | None, Field(description='Comma-separated activity types, e.g. "Ride,GravelRide"')
 ]
 GearId = Annotated[str | None, Field(description="Only activities on this gear id (get_gear_list)")]
+# Write tools (see utils/write_safety.py and the write safety section of intervals://guide).
+DryRun = Annotated[bool, Field(description="true = check and return the exact request, write nothing")]
+AllowDuplicate = Annotated[bool, Field(description="Create even if that day has the same event (name or workout)")]
 
 OutputFormat = Annotated[
     Literal["text", "json"],

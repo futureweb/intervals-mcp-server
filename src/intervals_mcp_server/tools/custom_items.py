@@ -24,8 +24,9 @@ from intervals_mcp_server.utils.custom_fields import (
     index_custom_items,
 )
 from intervals_mcp_server.utils.formatting import format_custom_item_details
-from intervals_mcp_server.utils.params import AthleteId, upper_choice
+from intervals_mcp_server.utils.params import AthleteId, DryRun, upper_choice
 from intervals_mcp_server.utils.validation import resolve_athlete_id
+from intervals_mcp_server.utils.write_safety import dry_run_answer, is_not_found
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -244,13 +245,15 @@ async def update_custom_item(  # pylint: disable=too-many-arguments,too-many-pos
         Field(description="Keys to change, merged into the current content; null clears a key; " + CONTENT_HINT),
     ] = None,
     visibility: Visibility = None,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to change a custom item in Intervals.icu.
 
     Writes only the fields passed and replaces their values. content is MERGED into the item's
     current content by top-level key: {"aggregate": "SUM"} changes the aggregate and keeps code,
     type, options and formula; a key set to null clears it. A call without any field is refused.
-    The cached definitions are dropped. Returns the updated item.
+    dry_run shows the request (content after the merge). The cached definitions are dropped.
+    Returns the updated item.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -290,6 +293,8 @@ async def update_custom_item(  # pylint: disable=too-many-arguments,too-many-pos
         existing = current.get("content")
         data["content"] = {**(existing if isinstance(existing, dict) else {}), **data["content"]}
 
+    if dry_run:
+        return dry_run_answer("PUT", url, data)
     result = await make_intervals_request(url=url, data=data, method="PUT")
 
     if isinstance(result, dict) and "error" in result:
@@ -303,7 +308,7 @@ async def update_custom_item(  # pylint: disable=too-many-arguments,too-many-pos
 
 
 @tool("destructive")
-async def delete_custom_item(
+async def delete_custom_item(  # pylint: disable=too-many-return-statements
     item_id: Annotated[int, Field(description="Custom item id to delete (get_custom_items)")],
     athlete_id: AthleteId = None,
 ) -> str:
@@ -318,13 +323,18 @@ async def delete_custom_item(
 
     url = f"/athlete/{seg(athlete_id_to_use)}/custom-item/{seg(item_id)}"
     item = await make_intervals_request(url=url)
+    if is_not_found(item):
+        return f"No custom item found with ID {item_id}; nothing was deleted."
     if isinstance(item, dict) and "error" in item:
-        return f"Error reading custom item {item_id}: {item.get('message')}"
+        return f"Error reading custom item {item_id}: {item.get('message')}. Nothing was deleted."
     if not isinstance(item, dict) or not item:
         return f"No custom item found with ID {item_id}; nothing was deleted."
 
     result = await make_intervals_request(url=url, method="DELETE")
 
+    if is_not_found(result):
+        invalidate_custom_items_cache(athlete_id_to_use)
+        return f"Custom item {item_id} was already gone; nothing was deleted."
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting custom item: {result.get('message')}"
 

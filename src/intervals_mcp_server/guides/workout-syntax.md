@@ -101,7 +101,10 @@ It is not validated by this server; prefer a workout_doc for structured workouts
   another day keeps its time of day. `workout_doc` REPLACES the planned workout; `description`
   replaces the event text (an empty string is ignored, never clears it).
 - The workout is validated first (same checks as `validate_workout`): with errors nothing is
-  written; warnings are listed in the answer. Read back with `get_event_by_id`.
+  written; warnings are listed in the answer. A new event is refused when that day already has
+  the same event (`allow_duplicate=true` creates it anyway); `dry_run=true` returns the exact
+  request without writing. After the write the answer reports what Intervals.icu stored and
+  parsed (steps parsed vs sent, parse warnings); details: write safety in `intervals://guide`.
 
 ## add_events_bulk entries
 
@@ -121,9 +124,13 @@ errors are returned); keys that do not apply to an entry's category are rejected
 ]
 ```
 
-The answer is JSON with "created" (input index, event id, name and date as returned), "errors"
-(index and all problems per invalid entry) and "created_count". If the request itself fails, an
-error string is returned and events may have been created.
+Before the bulk request the events of each day are read: an entry whose day already has the same
+event (same category and name, or the same workout), or that repeats an earlier entry, is refused
+and not written (`allow_duplicate=true` skips the check). The answer is JSON with "created" (input
+index, event id, name and date as returned, plus "stored" and "parse_warnings" from the read-back),
+"refused" (index, the existing event or the earlier entry), "errors" (index and all problems per
+invalid entry) and "created_count". If the request itself fails, an error string is returned and
+events may have been created. `dry_run=true` returns the bulk request that would be sent.
 
 ## create_library_workout
 

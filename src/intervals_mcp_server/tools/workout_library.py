@@ -13,7 +13,7 @@ from pydantic import Field
 
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
-from intervals_mcp_server.utils.params import AthleteId, OutputFormat
+from intervals_mcp_server.utils.params import AllowDuplicate, AthleteId, DryRun, OutputFormat
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
 from intervals_mcp_server.utils.validation import (
@@ -22,6 +22,15 @@ from intervals_mcp_server.utils.validation import (
     validate_date,
 )
 from intervals_mcp_server.utils.workout_validation import has_step_lines, warnings_note, workout_text_for_write, write_refusal
+from intervals_mcp_server.utils.write_safety import (
+    check_duplicates,
+    dry_run_answer,
+    duplicate_check_failed,
+    duplicate_refusal,
+    is_not_found,
+    sent_shape,
+    verify_write,
+)
 
 # Import mcp instance from shared module for tool registration
 from intervals_mcp_server.mcp_instance import tool
@@ -196,10 +205,11 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     moving_time: Annotated[int | None, Field(description="Planned moving time in seconds")] = None,
     distance: Annotated[int | None, Field(description="Planned distance in metres")] = None,
     athlete_id: AthleteId = None,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to save a workout template in the workout library. Writes to Intervals.icu.
 
-    The workout_doc is validated like add_or_update_event (with errors nothing is created) and rendered into the workout text; an empty workout_doc is ignored and description is used. Format: intervals://workout-syntax (get_guide). Schedule it with add_event_from_library.
+    The workout_doc is validated like add_or_update_event (with errors nothing is created) and rendered into the workout text; an empty workout_doc is ignored and description is used. Format: intervals://workout-syntax (get_guide). dry_run shows the request; the answer reads back what Intervals.icu stored and parsed. Schedule it with add_event_from_library.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -236,27 +246,34 @@ async def create_library_workout(  # pylint: disable=too-many-arguments,too-many
     if distance is not None:
         workout_data["distance"] = distance
 
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/workouts",
-        data=workout_data,
-        method="POST",
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/workouts"
+    if dry_run:
+        return dry_run_answer("POST", url, workout_data, warnings=workout.warnings)
+    result = await make_intervals_request(url=url, data=workout_data, method="POST")
     if isinstance(result, dict) and "error" in result:
         return f"Error creating library workout: {result.get('message', 'Unknown error')}"
     if isinstance(result, dict) and result.get("id") is not None:
-        return f"Successfully created library workout id: {result.get('id')} in folder {folder_id}" + warnings_note(workout.warnings)
+        answer = f"Successfully created library workout id: {result.get('id')} in folder {folder_id}" + warnings_note(workout.warnings)
+        doc = workout_doc.to_dict() if isinstance(workout_doc, WorkoutDoc) and text is not None else None
+        sent = sent_shape(doc, workout_data.get("description")) if workout_data.get("description") else None
+        _, _, readback = await verify_write(
+            make_intervals_request, f"{url}/{seg(result['id'])}", workout_data, sent, f"library workout {result['id']}"
+        )
+        return f"{answer}\n{readback}"
     return f"No library workout created for athlete {athlete_id_to_use}."
 
 
 @tool("write")
-async def add_event_from_library(  # pylint: disable=too-many-return-statements
+async def add_event_from_library(  # pylint: disable=too-many-locals,too-many-return-statements,too-many-arguments,too-many-positional-arguments
     workout_id: Annotated[str, Field(description="Library workout id (get_workout_library); small numbers such as 1 are normal")],
     date: Annotated[str, Field(description="Day YYYY-MM-DD")],
     athlete_id: AthleteId = None,
+    allow_duplicate: AllowDuplicate = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to schedule a workout from the library on a day. Writes a new WORKOUT event to Intervals.icu.
 
-    Copies the library workout's name, steps, type, duration, distance, tags and planned load. A workout imported from a file (.zwo, .mrc, .erg, .fit) without workout steps in its text is created without steps; the answer says so.
+    Copies the library workout's name, steps, type, duration, distance, tags and planned load; a duplicate of that day is refused (allow_duplicate). A workout imported from a file (.zwo, .mrc, .erg, .fit) without workout steps in its text is created without steps; the answer says so. dry_run shows the request; the answer reads back what was stored.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -282,32 +299,43 @@ async def add_event_from_library(  # pylint: disable=too-many-return-statements
     event_data["category"] = "WORKOUT"
     event_data["start_date_local"] = validated_date + "T00:00:00"
 
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/events",
-        data=event_data,
-        method="POST",
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/events"
+    extra: dict[str, Any] = {"duplicate_check": "skipped (allow_duplicate=true)"}
+    if not allow_duplicate:
+        found, check_error = await check_duplicates(make_intervals_request, athlete_id_to_use, [event_data])
+        if check_error:
+            return duplicate_check_failed(check_error)
+        if found[0]:
+            return duplicate_refusal(found[0])
+        extra["duplicate_check"] = f"no workout with the same name or steps on {validated_date}"
+    steps = (workout.get("workout_doc") or {}).get("steps") if isinstance(workout.get("workout_doc"), dict) else None
+    note = ""
+    if steps and not has_step_lines(str(workout.get("description") or "")):
+        note = (
+            " Note: the library workout's structure is not in its description text (e.g. imported from a "
+            "file), so the event is created WITHOUT steps; check it with get_event_by_id."
+        )
+    if dry_run:
+        return dry_run_answer("POST", url, event_data, warnings=[note.strip()] if note else [], extra=extra)
+    result = await make_intervals_request(url=url, data=event_data, method="POST")
     if isinstance(result, dict) and "error" in result:
         return (
             f"Error creating event from library workout: {result.get('message', 'Unknown error')}"
         )
     if isinstance(result, dict) and result.get("id") is not None:
-        note = ""
-        steps = (workout.get("workout_doc") or {}).get("steps") if isinstance(workout.get("workout_doc"), dict) else None
-        if steps and not has_step_lines(str(workout.get("description") or "")):
-            note = (
-                " Note: the library workout's structure is not in its description text (e.g. imported from a "
-                "file), so the event was created WITHOUT steps; check it with get_event_by_id."
-            )
+        sent = sent_shape(workout.get("workout_doc"), workout.get("description"))
+        _, _, readback = await verify_write(
+            make_intervals_request, f"{url}/{seg(result['id'])}", event_data, sent, f"event {result['id']}"
+        )
         return (
             f"Successfully created event id: {result.get('id')} on {validated_date} "
-            f"from library workout {workout_id}.{note}"
+            f"from library workout {workout_id}.{note}\n{readback}"
         )
     return f"No event created for athlete {athlete_id_to_use}."
 
 
 @tool("destructive")
-async def delete_library_workout(
+async def delete_library_workout(  # pylint: disable=too-many-return-statements
     workout_id: Annotated[str, Field(description="Library workout id (get_workout_library); small numbers such as 1 are normal")],
     athlete_id: AthleteId = None,
 ) -> str:
@@ -323,15 +351,22 @@ async def delete_library_workout(
 
     url = f"/athlete/{seg(athlete_id_to_use)}/workouts/{seg(workout_id)}"
     workout = await make_intervals_request(url=url)
+    if is_not_found(workout) or (isinstance(workout, dict) and not workout):
+        return f"No library workout found with id {workout_id}; nothing was deleted."
     if isinstance(workout, dict) and "error" in workout:
-        return f"Error fetching library workout: {workout.get('message', 'Unknown error')}"
-    if not isinstance(workout, dict) or not workout:
-        return f"No library workout found with id {workout_id}."
+        return f"Error fetching library workout: {workout.get('message', 'Unknown error')}. Nothing was deleted."
+    if not isinstance(workout, dict):
+        return f"No library workout found with id {workout_id}; nothing was deleted."
 
     result = await make_intervals_request(url=url, method="DELETE")
+    if is_not_found(result):
+        return f"Library workout {workout_id} was already gone; nothing was deleted."
     if isinstance(result, dict) and "error" in result:
         return f"Error deleting library workout: {result.get('message', 'Unknown error')}"
-    return f"Deleted library workout {workout_id} '{workout.get('name') or 'unnamed'}'."
+    return (
+        f"Deleted library workout {workout.get('id') or workout_id} '{workout.get('name') or 'unnamed'}' "
+        f"({workout.get('type') or 'no sport'}, folder {workout.get('folder_id') or 'unknown'})."
+    )
 
 
 @tool("read")

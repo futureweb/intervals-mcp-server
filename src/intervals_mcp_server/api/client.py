@@ -126,6 +126,25 @@ class CallLimits:
 
 
 _CALL_LIMITS: ContextVar[CallLimits | None] = ContextVar("intervals_call_limits", default=None)
+# Set while a write tool runs with dry_run=true: every request other than GET is refused here,
+# so a dry run can never write, whatever the tool code does.
+_READ_ONLY: ContextVar[str | None] = ContextVar("intervals_read_only", default=None)
+
+
+@contextmanager
+def read_only_requests(reason: str = "dry run") -> Iterator[None]:
+    """Refuse every non-GET request made inside this block (used for dry runs)."""
+    token = _READ_ONLY.set(reason)
+    try:
+        yield
+    finally:
+        _READ_ONLY.reset(token)
+
+
+def remaining_requests() -> int | None:
+    """Requests the current tool call may still send, or None outside a tool call."""
+    limits = _CALL_LIMITS.get()
+    return None if limits is None else max(0, limits.max_requests - limits.requests)
 
 
 @contextmanager
@@ -411,6 +430,19 @@ def _transport_error(error: Exception, method: str) -> tuple[str, bool]:
     return text, maybe_applied
 
 
+def _refusal(url: str, method: str) -> dict[str, Any] | None:
+    """Error result for a request that must not be sent: an unsafe path, or a write during a dry run."""
+    reason = unsafe_path_reason(url)
+    if reason:
+        logger.warning("Rejected API path built from tool arguments (%s)", reason)
+        return {"error": True, "message": f"Invalid identifier: {reason}. Use the plain id (e.g. i123456789 or 123456)."}
+    read_only = _READ_ONLY.get()
+    if read_only and method != "GET":
+        logger.warning("%s %s refused during a %s", method, url, read_only)
+        return {"error": True, "read_only": True, "message": f"Not sent: {method} requests are refused during a {read_only}; nothing was written."}
+    return None
+
+
 async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-statements,too-many-return-statements
     url: str,
     api_key: str | None = None,
@@ -423,7 +455,8 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
 
     Retries: HTTP 429/5xx for GET/PUT/DELETE, only 429 for POST; transport errors
     (timeouts, dropped connections) only for GET. Inside a tool call the request budget
-    and deadline of the call apply (see call_limits).
+    and deadline of the call apply (see call_limits); during a dry run (read_only_requests)
+    only GET requests are sent.
 
     Args:
         url (str): The API endpoint path (e.g., '/athlete/{id}/activities').
@@ -437,10 +470,9 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
         ({"error": True, "message": ..., "status_code": ... when the API answered}).
     """
     method = method.upper()
-    reason = unsafe_path_reason(url)
-    if reason:
-        logger.warning("Rejected API path built from tool arguments (%s)", reason)
-        return {"error": True, "message": f"Invalid identifier: {reason}. Use the plain id (e.g. i123456789 or 123456)."}
+    not_sent = _refusal(url, method)
+    if not_sent:
+        return not_sent
 
     # Prepare request configuration
     full_url, auth, headers, error_msg = _prepare_request_config(url, api_key, method)

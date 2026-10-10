@@ -15,7 +15,7 @@ from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.formatting import format_wellness_entry
-from intervals_mcp_server.utils.params import AthleteId, EndDate, StartDate
+from intervals_mcp_server.utils.params import AthleteId, DryRun, EndDate, StartDate
 from intervals_mcp_server.utils.validation import (
     resolve_athlete_id,
     resolve_date_params,
@@ -27,6 +27,7 @@ from intervals_mcp_server.utils.wellness_completeness import (
     has_missing_custom_fields,
     today_completeness,
 )
+from intervals_mcp_server.utils.write_safety import dry_run_answer
 from intervals_mcp_server.tool_guard import output_budget
 
 # Import mcp instance from shared module for tool registration
@@ -40,7 +41,7 @@ COMPLETENESS_NAMES = 15  # names per group in the line on today's missing usual 
 @tool("read")
 async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branches
     athlete_id: AthleteId = None,
-    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before today")] = None,
+    start_date: Annotated[StartDate, Field(description="First day YYYY-MM-DD; default 30 days before the earlier of end_date and today")] = None,
     end_date: EndDate = None,
     include_all_fields: Annotated[
         bool, Field(description="Also list every other field, custom wellness fields with name and units")
@@ -151,7 +152,7 @@ _SUBJECTIVE_SCALE_MAX = 4
 
 
 @tool("write", overwrites=True)
-async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
+async def update_wellness(  # pylint: disable=too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-return-statements
     date: Annotated[str, Field(description="Day to update, YYYY-MM-DD")],
     soreness: Annotated[int | None, Field(description="Soreness 1-4: 1=Low, 2=Avg, 3=High, 4=Extreme", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
     fatigue: Annotated[int | None, Field(description="Fatigue 1-4: 1=Low, 2=Avg, 3=High, 4=Extreme", json_schema_extra={"minimum": 1, "maximum": 4})] = None,
@@ -164,6 +165,7 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
     ] = None,
     athlete_id: AthleteId = None,
     clear_comments: Annotated[bool, Field(description="Empty the day's comment (not together with comments)")] = False,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to record or change subjective wellness scores or the comment of one day.
 
@@ -171,9 +173,8 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
     passed are changed; device values (weight, HRV, sleep, resting HR ...) stay untouched. At
     least one field is required. Scales are integers 1-4 as in the Intervals.icu wellness dialog
     (labels per parameter). A scale value once set cannot be cleared through the API (null is
-    ignored, 0 rejected): use the web app, so double-check before writing. comments replaces the
-    existing comment: to append, read it with get_wellness_data and send the combined text.
-    Returns the updated record.
+    ignored, 0 rejected): use the web app, so double-check before writing (dry_run shows the request). comments replaces the existing comment: to append, read it with
+    get_wellness_data and send the combined text. Returns the updated record.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -216,11 +217,10 @@ async def update_wellness(  # pylint: disable=too-many-arguments,too-many-positi
             "stress, mood, motivation, injury or comments."
         )
 
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/wellness/{seg(date)}",
-        method="PUT",
-        data=body,
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/wellness/{seg(date)}"
+    if dry_run:
+        return dry_run_answer("PUT", url, body)
+    result = await make_intervals_request(url=url, method="PUT", data=body)
 
     if isinstance(result, dict) and "error" in result:
         return f"Error updating wellness data: {result.get('message')}"

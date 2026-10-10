@@ -323,7 +323,9 @@ def test_add_or_update_event(monkeypatch):
         "type": "Ride",
     }
 
-    async def fake_post_request(*_args, **_kwargs):
+    async def fake_post_request(*_args, **kwargs):
+        if kwargs.get("method", "GET") == "GET" and kwargs.get("params"):
+            return []  # the day's events (duplicate check): none
         return expected_response
 
     # Patch in both api.client and tools modules to ensure it works
@@ -338,6 +340,7 @@ def test_add_or_update_event(monkeypatch):
     )
     assert "Successfully created event id:" in result
     assert "e123" in result
+    assert "Read-back: Intervals.icu stored 2024-01-15T00:00:00 WORKOUT Ride 'Test Workout'" in result
 
 
 def test_get_activity_messages(monkeypatch):
@@ -1284,10 +1287,16 @@ def test_update_activity_error(monkeypatch):
 
 
 def _bulk_capture(monkeypatch, response):
-    """Patch the events request function and capture the calls."""
+    """Patch the events request function and capture the write calls.
+
+    GETs are not recorded: before the write (duplicate check) the calendar is empty, after it
+    (read-back) the events read back are the *response* of the write.
+    """
     calls: list[dict] = []
 
     async def fake_request(*_args, **kwargs):
+        if kwargs.get("method", "GET") == "GET":
+            return response if calls else []
         calls.append(kwargs)
         return response
 
@@ -1332,11 +1341,12 @@ def test_add_events_bulk_happy_path(monkeypatch):
     assert "Warmup" in body[0]["description"]
     assert body[1]["category"] == "NOTE"
     assert body[1]["description"] == "Full rest"
-    assert result["created"] == [
+    assert [{k: row[k] for k in ("index", "id", "name", "start_date_local")} for row in result["created"]] == [
         {"index": 0, "id": 11, "name": "Easy run", "start_date_local": None},
         {"index": 1, "id": 12, "name": "Rest", "start_date_local": None},
     ]
-    assert result["errors"] == []
+    assert [row["stored"]["id"] for row in result["created"]] == [11, 12]
+    assert result["errors"] == [] and result["refused"] == []
 
 
 def test_add_events_bulk_matches_single_event_body(monkeypatch):
