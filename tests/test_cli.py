@@ -56,6 +56,35 @@ def test_cli_doctor_lists_every_problem(tmp_path):
     assert "Traceback" not in result.stdout + result.stderr
 
 
+def test_cli_doctor_checks_limits_time_zone_tool_set_and_oauth_tuning():
+    """Stage 3: every new setting is validated on its own; the server would fall back to a default."""
+    result = run_cli(
+        "--doctor", MCP_TOOL_MAX_REQUESTS="abc", MCP_TOOL_TIMEOUT_S="-1", MCP_MAX_OUTPUT_CHARS="500",
+        ATHLETE_TIMEZONE="Mars/Olympus", MCP_TOOLSET="tiny", OAUTH_REFRESH_REUSE_GRACE="-5",
+        OAUTH_REFRESH_REUSE_REVOKE="maybe", OAUTH_LOGIN_GLOBAL_RATE_LIMIT="0", OAUTH_REQUIRE_PRIVATE_KEY_JWT="sure",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    out = result.stdout
+    for fragment in (
+        "MCP_TOOL_MAX_REQUESTS must be a positive integer, got 'abc' (the server would use the default 300)",
+        "MCP_TOOL_TIMEOUT_S must be a positive number, got '-1'",
+        "ATHLETE_TIMEZONE must be an IANA time zone such as Europe/Vienna or 'server', got 'Mars/Olympus'",
+        "MCP_TOOLSET must be one of full, core, got 'tiny'",
+        "warning: MCP_MAX_OUTPUT_CHARS=500 is below the minimum; 2000 is used",
+        "warning: OAUTH_REFRESH_REUSE_GRACE must be an integer >= 0, got '-5' (ignored without MCP_AUTH=oauth)",
+        "warning: OAUTH_REFRESH_REUSE_REVOKE must be true or false",
+        "warning: OAUTH_LOGIN_GLOBAL_RATE_LIMIT must be a positive integer, got '0'",
+        "warning: OAUTH_REQUIRE_PRIVATE_KEY_JWT must be true or false",
+    ):
+        assert fragment in out, fragment
+    assert out.count("MCP_TOOLSET must be one of") == 1
+    assert "Traceback" not in out + result.stderr
+    good = run_cli("--doctor", MCP_TOOL_MAX_REQUESTS="50", MCP_TOOL_TIMEOUT_S="30.5", MCP_MAX_OUTPUT_CHARS="20000",
+                   ATHLETE_TIMEZONE="Europe/Vienna", MCP_TOOLSET="core")
+    assert good.returncode == 0, good.stdout + good.stderr
+    assert "tool set core (MCP_TOOLSET)" in good.stdout and "must be" not in good.stdout
+
+
 def test_cli_start_reports_a_configuration_error_in_one_line(tmp_path):
     path = write_state(tmp_path, {"clients": []})
     result = run_cli(MCP_AUTH="oauth", MCP_PUBLIC_URL="https://mcp.example.com", OAUTH_PASSWORD="x", OAUTH_STATE_FILE=str(path))

@@ -33,6 +33,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 # Largest tool result in characters (MCP_MAX_OUTPUT_CHARS). Claude Code's default limit is
 # 25k tokens; MCP clients cut or reject larger results without telling the model.
 DEFAULT_MAX_OUTPUT_CHARS = 100_000
+MIN_MAX_OUTPUT_CHARS = 2_000
 # Size the paging tools (streams, wellness) aim for, so they page before the hard cap.
 OUTPUT_BUDGET_CHARS = 60_000
 
@@ -45,7 +46,7 @@ def max_output_chars() -> int:
         value = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "") or DEFAULT_MAX_OUTPUT_CHARS)
     except ValueError:
         return DEFAULT_MAX_OUTPUT_CHARS
-    return max(value, 2_000)
+    return max(value, MIN_MAX_OUTPUT_CHARS)
 
 
 def output_budget() -> int:
