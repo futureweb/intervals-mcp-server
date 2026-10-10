@@ -27,7 +27,16 @@ from intervals_mcp_server.utils.custom_fields import (
     format_custom_field_lines,
     is_missing,
 )
+from intervals_mcp_server.utils.activity_context import weather_line, weather_summary, wprime_line, wprime_summary
 from intervals_mcp_server.utils.execution import plan_position, plan_steps, planned_step_map, planned_step_text
+from intervals_mcp_server.utils.fueling import activity_fueling, fueling_line
+from intervals_mcp_server.utils.provenance import (
+    STRAVA_STUB_NOTE,
+    freshness,
+    freshness_text,
+    is_strava_stub,
+    source_summary,
+)
 from intervals_mcp_server.utils.sports import cadence_spm, cadence_text, format_local_start, format_start_times, hms, start_times
 from intervals_mcp_server.utils.formatting import (
     format_activity_details,
@@ -75,8 +84,67 @@ DETAIL_LEVELS = ("summary", "compact")
 DETAIL_LEVELS_3 = ("compact", "standard", "full")
 
 
-def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None) -> str:
-    """Token-efficient activity view: key numbers, thresholds, assigned custom fields, data quality."""
+def context_lines(activity: dict[str, Any], defs: CustomFieldDefs, wprime: dict[str, Any] | None = None) -> list[str]:
+    """Fueling line and one line with weather and W′ balance (only what the activity carries).
+
+    ``wprime`` is a precomputed W′ summary (e.g. with the w_bal stream); default from the payload.
+    """
+    lines = []
+    fueling = fueling_line(activity_fueling(activity, defs))
+    if fueling:
+        lines.append(fueling)
+    context = [text for text in (weather_line(weather_summary(activity)),
+                                 wprime_line(wprime if wprime is not None else wprime_summary(activity))) if text]
+    if context:
+        lines.append(" | ".join(context))
+    return lines
+
+
+def compact_context_line(activity: dict[str, Any], defs: CustomFieldDefs, wprime: dict[str, Any] | None = None) -> str | None:
+    """One short line with fueling rates, weather and W′ for compact views (full lines: context_lines)."""
+    figures = activity_fueling(activity, defs)
+    parts = []
+    if figures["carbs_used_g_per_h"] is not None:
+        parts.append(f"carbs used ~{figures['carbs_used_g_per_h']:.0f} g/h (estimate)")
+    status = figures["carbs_ingested_status"]
+    if status == "value" and figures["carbs_ingested_g_per_h"] is not None:
+        parts.append(f"ingested {figures['carbs_ingested_g_per_h']:.0f} g/h")
+    elif status == "zero":
+        parts.append("ingested 0 g stored")
+    elif figures["carbs_used_g"] is not None:
+        parts.append("ingested not logged")
+    for key, label in (("sweat_loss", "sweat"), ("fluid_intake", "fluid")):
+        parts.extend(f"{label} {row['per_hour']:.0f} ml/h" for row in figures[key] if row["per_hour"] is not None)
+    weather = weather_summary(activity)
+    if weather and not weather["indoor"] and weather["temp_c"] is not None:
+        text = f"{weather['temp_c']:.0f} °C"
+        if weather["wind_km_h"] is not None:
+            text += f", wind {weather['wind_km_h']:.0f} km/h" + (f" {weather['wind_from']}" if weather["wind_from"] else "")
+        if weather["headwind_pct"] is not None:
+            text += f", headwind {weather['headwind_pct']:.0f} %"
+        if weather["max_rain_mm_h"]:
+            text += f", rain {weather['max_rain_mm_h']:g} mm/h"
+        parts.append(text)
+    summary = wprime if wprime is not None else wprime_summary(activity)
+    if summary and summary.get("model_mismatch"):
+        parts.append("W′bal below 0 (W′/CP model mismatch)")
+    elif summary and summary.get("min_w_bal_pct") is not None:
+        text = f"W′bal min {summary['min_w_bal_pct']:.0f} %"
+        below = ((summary.get("stream") or {}).get("seconds_below_pct") or {}).get("50")
+        parts.append(text + (f", {hms(below)} below 50 %" if below else ""))
+    return "Context: " + " | ".join(parts) if parts else None
+
+
+def _compact_details(
+    activity: dict[str, Any], defs: CustomFieldDefs, assigned: set[str] | None, wprime: dict[str, Any] | None = None,
+    full_context: bool = False,
+) -> str:
+    """Token-efficient activity view: key numbers, thresholds, fueling, weather and W′, assigned custom fields, data quality.
+
+    ``full_context`` prints the full fueling and weather/W′ lines instead of the one-line summary.
+    """
+    if is_strava_stub(activity):
+        return f"{activity.get('name', 'Unnamed')} ({activity.get('id')}) {format_local_start(activity)}\n{STRAVA_STUB_NOTE}"
     gear = activity.get("_resolved_gear_name") or (activity.get("gear") or {}).get("id") if isinstance(activity.get("gear"), dict) else activity.get("_resolved_gear_name")
     lines = [
         f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_local_start(activity)}",
@@ -93,10 +161,19 @@ def _compact_details(activity: dict[str, Any], defs: CustomFieldDefs, assigned: 
         f"device {activity.get('device_name') or 'unknown'}, power meter {activity.get('power_meter') or 'unknown'}"
         + (f", power fields {', '.join(str(p) for p in activity['power_field_names'])}" if activity.get("power_field_names") else ""),
     ]
+    if full_context:
+        lines.extend(context_lines(activity, defs, wprime))
+    else:
+        line = compact_context_line(activity, defs, wprime)
+        if line:
+            lines.append(line)
     custom = format_custom_field_lines(activity, defs, prefix="", only=assigned)
     if custom:
         lines.append("Custom fields" + (" (assigned to this sport)" if assigned is not None else "") + ": " + "; ".join(custom[:14]) + (" ..." if len(custom) > 14 else ""))
     quality = []
+    if activity.get("source"):
+        info = source_summary(activity)
+        quality.append(info["origin"] or info["label"])
     if activity.get("icu_intervals_edited"):
         quality.append("intervals edited")
     if activity.get("icu_sync_error"):
@@ -619,6 +696,10 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
                     "times": start_times(activity_data),
                     "gear_name": activity_data.get("_resolved_gear_name"),
                     "custom_fields": custom_fields_json(activity_data, custom_field_defs or {}, assigned),
+                    "fueling": activity_fueling(activity_data, custom_field_defs or {}),
+                    "weather": weather_summary(activity_data),
+                    "w_prime": wprime_summary(activity_data),
+                    "provenance": {**source_summary(activity_data), "freshness": freshness(activity_data)},
                     "detail_level": detail_level,
                     "thresholds": {
                         k: activity_data.get(k)
@@ -634,12 +715,20 @@ async def get_activity_details(  # pylint: disable=too-many-arguments,too-many-p
 
     if detail_level == "compact":
         return _compact_details(activity_data, custom_field_defs or {}, assigned)
-    return format_activity_details(
+    view = format_activity_details(
         activity_data,
         custom_field_defs=custom_field_defs,
         include_all_fields=include_all_fields or detail_level == "full",
         assigned=assigned,
     )
+    extra = context_lines(activity_data, custom_field_defs or {})
+    if activity_data.get("source"):
+        extra.append(f"Source: {source_summary(activity_data)['text']}; {freshness_text(freshness(activity_data))}")
+    if is_strava_stub(activity_data):
+        extra.insert(0, STRAVA_STUB_NOTE)
+    if extra:
+        view += "\nFueling, weather, W′ and source:\n" + "\n".join(f"- {line}" for line in extra) + "\n"
+    return view
 
 
 def _interval_stream_metrics(

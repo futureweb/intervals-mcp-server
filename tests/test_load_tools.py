@@ -209,7 +209,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     assert "Today 2026-10-09: completed load 0 + planned, not yet done 100" in result
     assert "Planned workouts: 4 (3 with a planned load, sum 300); 1 without a planned load are not included" in result
     assert "Intervals.icu's own projection" in result
-    assert "Races: 2026-10-18 RACE_A 'Gran Fondo'" in result
+    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo'" in result
     assert "reproduces the stored CTL within 0.00 and ATL within 0.00" in result
     assert "2026-W42 (2026-10-12 to 2026-10-18): load 80 (2 planned, 1 without load)" in result
     payload = json.loads(asyncio.run(get_load_projection(end_date="2026-10-20", output_format="json")))
@@ -221,7 +221,7 @@ def test_get_load_projection_text_and_json(monkeypatch):
     compact = asyncio.run(get_load_projection(detail_level="compact"))
     assert "Weeks (" not in compact and "Lowest projected form" in compact
     full = asyncio.run(get_load_projection(detail_level="full", ctl_days=30))
-    assert "Days: 10-09 load 100" in full and "model CTL 30 d" in full
+    assert "Days (end of day): 10-09 load 100" in full and "model CTL 30 d" in full
 
 
 def test_get_load_projection_validation_and_missing_data(monkeypatch):
@@ -337,7 +337,9 @@ def test_get_coach_context_text_and_json(monkeypatch):
     assert "Coach context for athlete i1 at 2026-10-09 (load windows end 2026-10-08" in result
     assert "Load: 7 d 350 (5 sessions, 3 days with load 0) | 28 d 1400 (350/week) | ratio 1.00 (inside 0.8-1.3)" in result
     assert "Intensity 7 d: " in result and "Intensity 28 d: " in result
-    assert "HRV 7-d mean 35 ms (n 7) vs 42-d" in result and "resting HR 7-d mean 50 bpm" in result
+    # ANA-14: the baseline is the 42 days before the compared 7 days (not pulled towards 35 by them)
+    assert "HRV 7-d mean 35 ms (n 7) vs prior 42-d 42 (n 42): -7.0 ms" in result and "resting HR 7-d mean 50 bpm" in result
+    assert "z vs the week-to-week spread of the prior 90 d; |z| up to about 2 is normal week-to-week variation" in result
     assert "Durability 28 d: cycling decoupling median" in result
     assert "Top sessions 7 d: 10-03 Ride 180 min load 150" in result
     assert "Planned 2026-10-10 to 2026-10-16: 3 workouts, load 200 (1 without planned load)" in result
@@ -350,6 +352,10 @@ def test_get_coach_context_text_and_json(monkeypatch):
     payload = json.loads(asyncio.run(get_coach_context(end_date="2026-10-01", output_format="json")))
     assert payload["plan"] is None and payload["load_end"] == "2026-10-01"
     assert payload["recovery"]["hrv"]["baseline_n"] > 0 and payload["coverage"]["sessions_without_load"] == 4
+    hrv = json.loads(asyncio.run(get_coach_context(output_format="json")))["recovery"]["hrv"]
+    assert hrv["baseline_end"] == "2026-10-02" and hrv["baseline_mean"] == 42.02
+    assert hrv["z"] < 0 and hrv["z_denominator"] < hrv["baseline_sd"]
+    assert abs(hrv["z"]) > abs(hrv["diff"] / hrv["baseline_sd"])  # a 7-day mean varies less than single days
     assert "sessions" not in payload["durability"]["by_sport"]["cycling"]
     assert asyncio.run(get_coach_context(end_date="2026-10-10")).startswith("Error: end_date lies in the future")
 
@@ -413,3 +419,27 @@ def test_new_tools_through_mcp_layer(monkeypatch):
     assert "Acute:chronic ratio 1.00" in text
     result = asyncio.run(mcp.call_tool("get_durability", {"max_temp_c": None, "min_minutes": 45.5}))
     assert "no temperature limit" in json.dumps(result, default=str)
+
+
+def test_recovery_z_is_calibrated_for_weeks_without_change():
+    """R26-3: without a real change |z| > 2 stays rare (the spread of 7-day means over 90 days times
+    sqrt(1 + 7/42)); overlapping means inside 42 days alone gave |z| > 2 in about 13 % of weeks."""
+    import random  # pylint: disable=import-outside-toplevel
+    import statistics  # pylint: disable=import-outside-toplevel
+
+    from intervals_mcp_server.tools.coach_context import _recovery  # pylint: disable=import-outside-toplevel
+
+    rnd = random.Random(3)
+    first = date(2024, 1, 1)
+    value, entries = 0.0, []
+    for offset in range(800):
+        value = 0.5 * value + rnd.gauss(0, 1) * (1 - 0.25) ** 0.5  # AR(1), phi 0.5
+        entries.append({"id": (first + timedelta(days=offset)).isoformat(), "hrv": 60 + 5 * value})
+    zs = []
+    day = first + timedelta(days=100)
+    while day < first + timedelta(days=799):
+        window = [e for e in entries if (day - timedelta(days=97)).isoformat() <= e["id"] <= day.isoformat()]
+        zs.append(_recovery(window, day)["hrv"]["z"])
+        day += timedelta(days=7)
+    share = sum(1 for z in zs if abs(z) > 2) / len(zs)
+    assert len(zs) > 90 and share < 0.12 and 0.7 < statistics.pstdev(zs) < 1.35

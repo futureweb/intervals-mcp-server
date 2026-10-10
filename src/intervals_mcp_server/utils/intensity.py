@@ -114,7 +114,9 @@ def zone_seconds(activity: Activity, basis: str) -> list[float] | None:
     """Seconds per zone (Z1 first) of one basis; None without data or with zero total time.
 
     Power zones come from ``icu_zone_times`` ({id: Z1.., secs}); the sweet-spot bucket (id SS)
-    overlaps Z3/Z4 and is ignored. HR and pace zones are plain lists (index = zone).
+    overlaps Z3/Z4 and is ignored. HR and pace zones are plain lists (index = zone); for pace
+    the grade-adjusted ``gap_zone_times`` are used when the activity says Intervals.icu shows
+    them (``use_gap_zone_times``), as on hilly runs raw pace understates the effort.
     """
     if basis == "power":
         raw = activity.get("icu_zone_times")
@@ -132,6 +134,8 @@ def zone_seconds(activity: Activity, basis: str) -> list[float] | None:
         secs = [by_zone.get(index, 0.0) for index in range(1, max(by_zone) + 1)]
     else:
         raw = activity.get("icu_hr_zone_times" if basis == "hr" else "pace_zone_times")
+        if basis == "pace" and activity.get("use_gap_zone_times") and isinstance(activity.get("gap_zone_times"), list):
+            raw = activity["gap_zone_times"]
         if not isinstance(raw, list) or not raw:
             return None
         secs = [max(num(value) or 0.0, 0.0) for value in raw]

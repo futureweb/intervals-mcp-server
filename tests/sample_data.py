@@ -322,8 +322,8 @@ EXECUTION_ACTIVITY = {
 ACTIVITIES_DATA = [
     {"id": "i10", "name": "Ultimate ride", "type": "Ride", "start_date_local": "2026-10-06T17:36:22", "moving_time": 4861,
      "elapsed_time": 4967, "distance": 40360.0, "total_elevation_gain": 375.0, "icu_training_load": 90, "power_load": 90,
-     "hr_load": 60, "icu_intensity": 80, "gear": {"id": "b1"}, "feel": 3, "icu_rpe": 6, "icu_zone_times": [{"id": "Z2", "secs": 1489}, {"id": "Z4", "secs": 1753}],
-     "icu_hr_zone_times": [{"id": "Z2", "secs": 2000}], "TrainingLoad": 129.5, "AerobicEffect": 3.5,
+     "hr_load": 60, "icu_intensity": 80, "gear": {"id": "b1"}, "feel": 3, "icu_rpe": 6, "icu_zone_times": [{"id": "Z2", "secs": 1489}, {"id": "Z4", "secs": 1753}, {"id": "SS", "secs": 1200}],
+     "icu_hr_zone_times": [0, 2000, 0, 0, 0, 0, 0], "TrainingLoad": 129.5, "AerobicEffect": 3.5,
      "power_meter": "Shimano FC-R9200P"},
     {"id": "i11", "name": "Grail gravel", "type": "GravelRide", "start_date_local": "2026-10-07T12:26:55", "moving_time": 6708,
      "elapsed_time": 7153, "distance": 48000.0, "total_elevation_gain": 375.0, "icu_training_load": 130, "power_load": 130,
@@ -418,3 +418,237 @@ PLAN_EVENTS = [
 LIBRARY_WORKOUT = {"id": 77, "name": "SST 3x12", "type": "Ride", "folder_id": 301129, "moving_time": 4080, "icu_training_load": 70,
                    "description": "- 10m 55%\n3x\n- 12m 90%\n- 4m 50%", "workout_doc": {"steps": EVENT_DATA["workout_doc"]["steps"]}}
 GEAR_WITH_REMINDER = [dict(GEAR_DATA[0], reminders=[{"id": 1, "name": "Chain wax", "distance": 400000, "distance_used": 250000, "percent_used": 62.5, "last_reset": "2026-08-01"}])] + GEAR_DATA[1:]
+
+
+# ---------------------------------------------------------------- phase 6: fatigue, tests, sensors
+LONG_RIDE_THRESHOLDS = (400.0, 600.0)
+LONG_RIDE_PAUSE_S = 300
+
+
+def long_ride_streams(hr_step: float = 10.0, with_pause: bool = True, power: float = 190.0) -> list[dict[str, Any]]:  # pylint: disable=too-many-locals
+    """1 Hz long ride: 10 min warm-up 150 W, 15 min steady, 1 min coasting, 2 min at 300 W (FTP 250),
+    1 min coasting, a 5 min recording pause and 30 min steady with a 120 m climb in its second half.
+
+    Heart rate is 130 bpm before 400 kJ, +hr_step after 400 kJ and +2*hr_step after 600 kJ (cumulative
+    work of the samples), so the matched-power drift per phase is known exactly. Stamina falls by
+    0.01 per second, potential stamina by 0.005.
+    """
+    blocks = [(600, 150.0), (900, power), (60, 0.0), (120, 300.0), (60, 0.0), (1800, power)]
+    names = ("time", "watts", "heartrate", "cadence", "temp", "altitude", "distance", "velocity_smooth")
+    data: dict[str, list[Any]] = {name: [] for name in (*names, "Stamina", "PotentialStamina")}
+    moment, work, distance, altitude, samples = 0, 0.0, 0.0, 500.0, 0
+    for number, (secs, watts) in enumerate(blocks):
+        if with_pause and number == 5:
+            moment += LONG_RIDE_PAUSE_S
+        for k in range(secs):
+            work += watts / 1000
+            climbing = number == 5 and 600 <= k < 1800
+            altitude += 0.1 if climbing else 0.0
+            distance += 4.0
+            data["time"].append(moment)
+            data["watts"].append(watts)
+            data["heartrate"].append(130 + hr_step * sum(1 for t in LONG_RIDE_THRESHOLDS if work >= t))
+            data["cadence"].append(90 if watts > 0 else 0)
+            data["temp"].append(20.0)
+            data["altitude"].append(round(altitude, 2))
+            data["distance"].append(distance)
+            data["velocity_smooth"].append(4.0)
+            data["Stamina"].append(round(100 - samples * 0.01, 2))
+            data["PotentialStamina"].append(round(100 - samples * 0.005, 2))
+            moment += 1
+            samples += 1
+    streams = [{"type": name, "custom": False, "data": data[name]} for name in names]
+    streams += [{"type": "Stamina", "custom": True, "data": data["Stamina"]},
+                {"type": "PotentialStamina", "custom": True, "data": data["PotentialStamina"]}]
+    return streams
+
+
+def long_ride_activity(aid: str, day: str, gear: str = "b1", **extra: Any) -> dict[str, Any]:
+    """Activity payload of a long ride (FTP 250 W, 80 kg, 639 kJ as in long_ride_streams)."""
+    base = {
+        "id": aid, "name": f"Long ride {aid}", "type": "Ride", "start_date_local": f"{day}T08:00:00",
+        "gear": {"id": gear}, "icu_ftp": 250, "icu_weight": 80.0, "icu_joules": 639000, "moving_time": 3540,
+        "elapsed_time": 3840, "trainer": False,
+        "stream_types": ["time", "watts", "heartrate", "cadence", "temp", "altitude", "distance", "velocity_smooth",
+                         "Stamina", "PotentialStamina"],
+    }
+    base.update(extra)
+    return base
+
+
+def submax_streams(test_watts: float = 248.0, after_watts: float = 100.0, before_watts: float = 150.0) -> list[dict[str, Any]]:
+    """1 Hz streams: 15 min before the test, 180 s test (samples 900-1079), then 5 min after.
+
+    HR rises from 120 to 150 bpm during the test and drops by 0.5 bpm per second when the
+    rider eases off afterwards (after_watts below half the target), else it stays at 150.
+    """
+    time, watts, heart = [], [], []
+    for t in range(1380):
+        if t < 900:
+            w, h = before_watts, 120.0
+        elif t < 1080:
+            w, h = test_watts, 120.0 + (t - 900) * 30 / 179
+        else:
+            w = after_watts
+            h = max(100.0, 150.0 - (t - 1079) * 0.5) if after_watts < 123 else 150.0
+        time.append(t)
+        watts.append(w)
+        heart.append(round(h, 1))
+    return [{"type": "time", "data": time}, {"type": "watts", "data": watts}, {"type": "heartrate", "data": heart}]
+
+
+def submax_activity(aid: str, day: str, **test: Any) -> dict[str, Any]:
+    """Activity with an Intervals.icu submax_fatigue_test (power, 180 s, target 246 W); ``test`` overrides fields."""
+    block = {
+        "type": "POWER", "start_index": 900, "end_index": 1080, "end_index_hrrc": 1140, "duration": 180,
+        "average_watts": 248, "average_mps": 0.0, "cv": 5.0, "final_bpm": 150, "hrrc": 28, "target": 246.0,
+        "max_cv_percent": 10, "tolerance_percent": 5, "rpe": 5, "tte_mins": 5, "ignore": False,
+        "efficiency_factor": round(248 / 150, 4),
+    }
+    block.update(test)
+    return {"id": aid, "name": f"SFT {aid}", "type": "Ride", "start_date_local": f"{day}T07:00:00", "gear": {"id": "b1"},
+            "trainer": False, "icu_ftp": 234, "submax_fatigue_test": block}
+
+
+SFT_SPORT_SETTINGS = [
+    {**SPORT_SETTINGS_DATA[0], "sft_type": "POWER", "sft_duration": 180, "sft_max_start_secs": 1800,
+     "sft_target_percent": 105, "sft_tolerance_percent": 5, "sft_max_cv_percent": 10, "sft_ftp": None,
+     "sft_threshold_pace": None},
+]
+
+
+# ---------------------------------------------------- phase 6: data quality, fueling, context
+FUELING_ITEMS = CUSTOM_ITEMS_DATA + [
+    {"id": 30, "type": "ACTIVITY_FIELD", "name": "Fluid intake", "content": {"code": "FluidIntake", "type": "numeric", "units": "L"}},
+    {"id": 31, "type": "ACTIVITY_FIELD", "name": "Sodium", "content": {"code": "SodiumMg", "type": "numeric", "units": "mg"}},
+    {"id": 32, "type": "ACTIVITY_FIELD", "name": "Performance Condition", "updated": "2025-01-01T00:00:00Z",
+     "content": {"code": "PerformanceCondition", "type": "numeric", "fit_session_field": "140.17"}},
+    {"id": 33, "type": "ACTIVITY_FIELD", "name": "Stamina at start",
+     "content": {"code": "Staminaatstart", "type": "numeric", "units": "%", "fit_session_field": "205"}},
+    {"id": 34, "type": "ACTIVITY_FIELD", "name": "Stamina at end",
+     "content": {"code": "Staminaatend", "type": "numeric", "units": "%", "fit_session_field": "206"}},
+    {"id": 35, "type": "ACTIVITY_FIELD", "name": "New Metric", "updated": "2026-10-09T12:00:00Z",
+     "content": {"code": "NewMetric", "type": "numeric", "fit_session_field": "250"}},
+    {"id": 36, "type": "ACTIVITY_STREAM", "name": "Carbs eaten", "content": {"code": "CarbsEaten", "type": "numeric", "units": "g"}},
+]
+FUELING_SPORT_SETTINGS = [dict(SPORT_SETTINGS_DATA[0], activity_field_ids=[2, 3, 5, 32, 33, 34, 35]), SPORT_SETTINGS_DATA[1]]
+
+FUELING_INTERVALS = [
+    {"type": "WORK", "label": "Warmup", "start_index": 0, "end_index": 200, "start_time": 0, "end_time": 200, "elapsed_time": 200,
+     "average_watts": 150, "wbal_start": 20000, "wbal_end": 19800},
+    {"type": "WORK", "label": None, "start_index": 200, "end_index": 300, "start_time": 200, "end_time": 300, "elapsed_time": 100,
+     "average_watts": 330, "wbal_start": 19800, "wbal_end": 9000},
+    {"type": "RECOVERY", "label": None, "start_index": 300, "end_index": 600, "start_time": 300, "end_time": 700, "elapsed_time": 400,
+     "average_watts": 140, "wbal_start": 9000, "wbal_end": 19900},
+    {"type": "WORK", "label": None, "start_index": 600, "end_index": 650, "start_time": 700, "end_time": 750, "elapsed_time": 50,
+     "average_watts": 450, "wbal_start": 19900, "wbal_end": 4000},
+    {"type": "RECOVERY", "label": None, "start_index": 650, "end_index": 1200, "start_time": 750, "end_time": 1300, "elapsed_time": 550,
+     "average_watts": 160, "wbal_start": 4000, "wbal_end": 19500},
+]
+
+FUELING_ACTIVITY: dict[str, Any] = {
+    "id": "i50", "name": "Long ride", "type": "Ride", "icu_athlete_id": "i1",
+    "start_date_local": "2026-10-08T09:00:00", "start_date": "2026-10-08T07:00:00Z",
+    "elapsed_time": 7400, "moving_time": 7200, "icu_recording_time": 7250, "coasting_time": 300,
+    "distance": 60000.0, "total_elevation_gain": 800.0, "icu_ftp": 234, "icu_intensity": 72.0, "icu_training_load": 150,
+    "icu_average_watts": 180, "icu_weighted_avg_watts": 195, "icu_weight": 75.0, "average_heartrate": 140, "max_heartrate": 170,
+    "carbs_used": 300, "carbs_ingested": 120, "calories": 1800, "icu_joules": 1500000,
+    "Sweatloss": 1400.0, "FluidIntake": 1.0, "SodiumMg": 800.0, "PerformanceCondition": 0.0, "Staminaatstart": 100.0,
+    "Staminaatend": 55.0, "EPOC": 150.0,
+    "average_weather_temp": 18.0, "min_weather_temp": 15.0, "max_weather_temp": 21.0, "average_feels_like": 17.0,
+    "min_feels_like": 14.0, "max_feels_like": 20.0, "average_wind_speed": 2.5, "average_wind_gust": 5.0, "prevailing_wind_deg": 225,
+    "headwind_percent": 40.0, "tailwind_percent": 35.0, "average_clouds": 50, "max_rain": 0.5, "max_snow": 0.0,
+    "average_temp": 22.0, "min_temp": 16, "max_temp": 30, "has_weather": True,
+    "icu_w_prime": 20000, "icu_pm_w_prime": 21000, "icu_max_wbal_depletion": 16000, "icu_joules_above_ftp": 40000,
+    "source": "GARMIN_CONNECT", "external_id": "123456789", "strava_id": "987", "file_type": "fit",
+    "created": "2026-10-08T09:05:00Z", "icu_sync_date": "2026-10-08T12:00:00Z", "analyzed": "2026-10-08T12:00:00Z",
+    "recording_stops": [599], "icu_lap_count": 3, "icu_intervals_edited": True, "icu_median_time_delta": 1,
+    "device_name": "Edge 1040", "power_meter": None, "power_field_names": ["power"], "device_watts": True, "has_heartrate": True,
+    "route_id": 77, "stream_types": ["time", "watts", "heartrate", "latlng", "Stamina"],
+    "icu_intervals": FUELING_INTERVALS,
+}
+
+
+def _fueling_streams():
+    """1200 samples, a 100 s recording gap after sample 599; W′bal dips below 50 % twice; HR with gaps and zeros."""
+    time = list(range(600)) + list(range(700, 1300))
+    w_bal = [9000 if 200 <= i < 300 else 4000 if 600 <= i < 650 else 20000 for i in range(1200)]
+    heartrate = [None if i < 30 else 0 if i < 45 else 140 for i in range(1200)]
+    return [
+        {"type": "time", "custom": False, "data": time},
+        {"type": "watts", "custom": False, "data": [200] * 1200},
+        {"type": "heartrate", "custom": False, "data": heartrate},
+        {"type": "latlng", "custom": False, "data": [47.0] * 1200, "data2": [12.0] * 1200},
+        {"type": "Stamina", "custom": True, "data": [100 - i / 30 for i in range(1200)]},
+        {"type": "w_bal", "custom": False, "data": w_bal},
+    ]
+
+
+FUELING_STREAMS = _fueling_streams()
+
+STRAVA_STUB = {"id": "i77", "icu_athlete_id": "i1", "start_date_local": "2026-10-01T10:00:00", "type": "Ride", "name": "Morning Ride",
+               "source": "STRAVA", "_note": "STRAVA activities are not available via the API"}
+
+
+def _listed(aid, day, kind="Ride", **extra):
+    base = {"id": aid, "name": f"{kind} {aid}", "type": kind, "start_date_local": f"{day}T09:00:00", "start_date": f"{day}T07:00:00Z",
+            "elapsed_time": 7000, "moving_time": 6800, "source": "GARMIN_CONNECT", "stream_types": ["time", "watts", "heartrate", "secondary_power", "Stamina"],
+            "PerformanceCondition": 2.0, "Sweatloss": 1000.0}
+    base.update(extra)
+    return base
+
+
+# Recent activities (list with a field selection) for the audit: the reference, three earlier rides
+# with a second power stream and Performance Condition, and a run.
+AUDIT_LIST = [
+    {k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"},
+    _listed("i51", "2026-10-05"), _listed("i52", "2026-10-02"), _listed("i53", "2026-09-28", power_meter="Assioma"),
+    _listed("i54", "2026-09-30", "Run", stream_types=["time", "heartrate"]),
+]
+# A Garmin Connect copy of i50 that Intervals.icu filters as a duplicate (not in the list).
+DUPLICATE_ACTIVITY = {**{k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"}, "id": "i55", "source": "GARMIN_CONNECT",
+                      "external_id": "123456789", "icu_training_load": None, "icu_intervals": []}
+AUDIT_LIST_WITH_UPLOAD = [dict(AUDIT_LIST[0], source="UPLOAD", external_id="123456789_ACTIVITY.fit")] + AUDIT_LIST[1:]
+
+# Activities on route 77 (list with route_id): the reference, two comparable earlier rides, a longer
+# variant, a run on the same route and a later ride.
+ROUTE_LIST = [
+    {k: v for k, v in FUELING_ACTIVITY.items() if k != "icu_intervals"},
+    _listed("i40", "2026-09-20", moving_time=7500, distance=60500.0, total_elevation_gain=790.0, icu_average_watts=170,
+            icu_weighted_avg_watts=185, icu_weight=76.0, average_heartrate=138, average_weather_temp=12.0, headwind_percent=30.0,
+            Staminaatstart=100.0, Staminaatend=60.0),
+    _listed("i41", "2026-08-10", "GravelRide", moving_time=7000, distance=59500.0, total_elevation_gain=820.0, icu_average_watts=190,
+            icu_weighted_avg_watts=200, icu_weight=76.0, average_heartrate=145, average_weather_temp=25.0),
+    _listed("i42", "2026-07-01", moving_time=9000, distance=80000.0, total_elevation_gain=1100.0, icu_average_watts=160),
+    _listed("i43", "2026-06-01", "Run", moving_time=20000, distance=60000.0),
+    _listed("i60", "2026-10-09", moving_time=7100, distance=60000.0),
+]
+
+
+def _fueling_period():
+    """Long sessions with logged, zero and missing intake (period mode of get_fueling_analysis)."""
+    rows = []
+    specs = [  # id, day, type, moving s, IF %, carbs used, ingested, sweat ml
+        ("p1", "2026-09-01", "Ride", 5400, 60.0, 200, 40, 600.0),
+        ("p2", "2026-09-05", "Ride", 9000, 70.0, 350, 150, 1500.0),
+        ("p3", "2026-09-10", "GravelRide", 12600, 78.0, 500, 240, 2500.0),
+        ("p4", "2026-09-15", "Ride", 16200, 72.0, 600, 320, 3000.0),
+        ("p5", "2026-09-20", "Ride", 7200, 88.0, 330, 0, 900.0),
+        ("p6", "2026-09-25", "Ride", 6000, 66.0, 230, None, None),
+        ("p7", "2026-09-26", "Ride", 3000, 90.0, 120, 20, 300.0),
+        ("p8", "2026-09-28", "Run", 6000, 75.0, None, 30, 1200.0),
+    ]
+    for aid, day, kind, moving, intensity, used, ingested, sweat in specs:
+        row: dict[str, Any] = {"id": aid, "name": f"{kind} {aid}", "type": kind, "start_date_local": f"{day}T09:00:00", "moving_time": moving,
+                               "elapsed_time": moving + 100, "icu_intensity": intensity, "calories": moving / 4, "icu_joules": moving * 200}
+        if used is not None:
+            row["carbs_used"] = used
+        if ingested is not None:
+            row["carbs_ingested"] = ingested
+        if sweat is not None:
+            row["Sweatloss"] = sweat
+        rows.append(row)
+    return rows
+
+
+FUELING_PERIOD = _fueling_period()

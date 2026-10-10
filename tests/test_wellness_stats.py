@@ -485,6 +485,32 @@ def test_zeros_are_missing_for_physiology_and_small_samples_are_flagged() -> Non
     assert few["small_sample"] is True and "small sample" in format_correlation(few)
 
 
+def test_stored_zero_is_no_value_in_correlation_weight_and_nutrition() -> None:
+    """
+    ANA-6: the zero rule of the trend statistics also applies to correlations, the weight trend and
+    the nutrition weight change (a stored 0 HRV / weight is a placeholder, not a measurement).
+    """
+    rng = random.Random(1)
+    entries = []
+    for i in range(40):
+        hrv = 60 + rng.gauss(0, 3)
+        entries.append({"id": (date(2026, 8, 1) + timedelta(days=i)).isoformat(), "hrv": hrv,
+                        "restingHR": 50 - (hrv - 60) * 0.5 + rng.gauss(0, 0.5), "weight": 70 + rng.gauss(0, 0.2),
+                        "kcalConsumed": 2500})
+    for i in (5, 12, 20, 33):
+        entries[i]["hrv"] = 0
+    corr = compute_correlation(entries, "hrv", "restingHR")
+    assert corr["n"] == 36 and corr["pearson_r"] < -0.9 and corr["spearman_rho"] < -0.9
+    assert corr["zeros_treated_as_missing"] == 4 and "4 stored 0 treated as missing" in format_correlation(corr)
+    entries[-1]["weight"] = 0
+    weight = weight_trend(entries)
+    assert weight["latest"]["date"] == "2026-09-08" and weight["latest"]["value"] > 69
+    assert abs(weight["windows"][7]["change_kg"]) < 1 and abs(weight["windows"][7]["slope_kg_per_week"]) < 2
+    assert weight["zeros_treated_as_missing"] == 1 and "1 stored 0 treated as missing" in format_weight_trend(weight)
+    nutrition = nutrition_summary(entries)
+    assert nutrition["days"][-1]["weight"] is None and abs(nutrition["windows"][7]["weight_change_kg"]) < 1
+
+
 def test_metric_units() -> None:
     """Native units, custom definition units and eFTP units."""
     assert metric_units("hrv") == "ms" and metric_units("restingHR") == "bpm" and metric_units("respiration") == "breaths/min"

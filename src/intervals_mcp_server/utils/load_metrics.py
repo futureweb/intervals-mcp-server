@@ -482,11 +482,15 @@ def project_fitness(  # pylint: disable=too-many-arguments
 
 
 def intensity_factor(activity: Activity) -> float | None:
-    """Intensity factor as a fraction; Intervals.icu stores ``icu_intensity`` in percent."""
+    """Intensity factor as a fraction; Intervals.icu always stores ``icu_intensity`` in percent.
+
+    A small value (e.g. 2.6 % for a ride with a mostly-zero power meter) stays small and is
+    never read as a fraction (IF 2.6).
+    """
     value = num(activity.get("icu_intensity"))
     if value is None or value <= 0:
         return None
-    return value / 100 if value > 3 else value
+    return value / 100
 
 
 def top_sessions(activities: list[Activity], count: int = TOP_SESSIONS) -> list[dict[str, Any]]:

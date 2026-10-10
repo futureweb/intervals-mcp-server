@@ -82,6 +82,267 @@ First public beta of the Futureweb fork. Based on upstream
 - `get_weekly_summary` works with the athlete alias `0`; interval and stream labels use the custom
   definitions of the activity's owner.
 
+### Fixed (review findings: analytics)
+- `analyze_workout_execution` / `get_activity_report` / `get_activity_intervals` (plan vs
+  execution): a planned step can span any number of consecutive intervals, so runs with device
+  auto-laps (e.g. every 1 km) are no longer pushed to the end of the activity ("before the plan",
+  steps "not executed"); a long unmatched block before or after the plan is no longer cheap
+  (ANA-1). Device auto-laps are recognised (most of the time in laps of one distance or
+  duration): a step boundary inside an auto-lap is placed at the intensity change (least-squares
+  change point between the two targets), a step without a lap of its own between two matched steps
+  is found at its two intensity changes, an overrun of an auto-lapped step is reported as "longer
+  than planned" instead of "before the plan", and the boundary is only moved with that evidence;
+  lap presses are never moved, and an auto-lap boundary the samples cannot place is kept with its
+  durations not judged (ANA-2, second review R26-1/2/5). With auto-laps the text carries a caveat
+  and JSON `alignment_confidence` (high / medium / low) with `alignment_notes` and `auto_laps`
+  (R26-4). Laps of the length of a planned step (30/30 s, 3/3 min, 1 km / 1 km, hill repeats)
+  are lap presses unless the intensity changes clearly inside several of them (device auto-laps
+  of 1 km on 1 km repeats); only device auto-laps are ever merged for the alignment; an internal
+  error or an exhausted time budget of the plan comparison falls back to the interval analysis
+  with a note (also in the compact report) and a logged warning instead of failing the tool.
+  Open-ended targets (top zone, a %/W range with a start only; a start-only zone is that
+  zone) are lower bounds in adherence, time in target and the alignment, shown as "352 W or more";
+  zone watts are floored like the zone table (ANA-3, R26-11). Distance steps are matched and
+  flagged on distance; the plan clock restarts at the actual end of every step without duration,
+  and estimated planned totals are labelled (ANA-12, R26-8). Very many laps are merged pairwise for
+  the alignment and the analysis runs off the event loop (R26-6). Easy aerobic run steps are work; rest = recovery zone
+  (Z1) or a step between two clearly harder steps (ANA-11). A paired event with `"workout_doc":
+  null` (race, note) no longer crashes the analysis (API-6).
+- Pw:HR drift has the Intervals.icu decoupling sign (positive = HR rose relative to power; exact
+  intervals keep Intervals' own value) and the convention is stated (ANA-4).
+- NP of split or merged steps uses the 30 s rolling mean over the whole activity (on a 1 s grid:
+  recording pauses as 0 W, sparser sampling held) and stream speeds are distance / moving time, as Intervals.icu computes
+  interval values (ANA-10, R26-7).
+- `get_activity_report` key finding compares work steps in the unit of their targets (pace, HR or
+  W) instead of labelling pace/HR targets as watts, clearly different targets listed apart (ANA-7,
+  R26-10).
+- `get_best_efforts`: the end index is exclusive; a recording pause right after the window is no
+  longer counted inside it, and the window ends with its last sample (ANA-5).
+- Correlations, the weight trend and the nutrition weight change treat a stored 0 of a
+  physiological metric as no value, like the trend statistics (ANA-6).
+- Power zone watt bounds are floored like Intervals.icu (FTP 234: Z1 <= 128 W, Z2 129-175 W)
+  (ANA-8). `icu_intensity` is always read as percent, so a tiny value is no IF > 1 (ANA-9).
+- `get_coach_context` recovery markers compare the 7-day means with the 42 days before them; z
+  divides by the SD of the 7-day means over the 90 days before (times sqrt(1 + 7/42) for the
+  baseline mean) instead of the SD of single days; |z| up to about 2 is stated as normal variation
+  (ANA-14, R26-3).
+- `get_training_summary`: HR time in zones is reported (plain-list zone times were dropped), the
+  sweet-spot bucket is listed apart from Z1-Z7 (API-5); the load line says that the total takes
+  power, else HR, else pace per activity and that the per-method sums overlap, and CTL/ATL are read
+  at the end of each week or month (ANA-15, R26-9); a missing ATL no longer breaks the text (ANA-16).
+- `get_intensity_distribution` / `get_training_load` / `get_coach_context`: the pace basis uses GAP
+  zone times where Intervals.icu does (`use_gap_zone_times`) (API-18).
+- Robustness and units (ANA-16): `get_recovery_snapshot` with a baseline mean of 0, NaN values in
+  the performance tools, pace of swims per 100 m (execution analysis and best efforts).
+
+### Added (phase 6: data quality, fueling, context)
+- `get_activity_data_audit` (new, read-only): provenance and data quality of one activity - source and
+  file (Garmin Connect sync with the Garmin activity id, upload of a Garmin export, the Garmin
+  Intervals Bridge's upload mode, Strava stubs that the API returns empty), upload delay after the end
+  and analysis time (re-analysed later), custom fields without a value whose definition changed after
+  the last analysis (the API only gives the last change time), filtered
+  duplicates (not in the activity list while a listed activity starts within 2 min, same Garmin
+  activity named), recording stops and gaps, FIT laps vs Intervals.icu intervals and what manual
+  interval edits mean, device and sensor identity (power meter name/serial, battery, estimated power,
+  HR sensor not exposed), streams usual on recent activities of the sport but missing, per-stream
+  coverage (dropouts, zeros, empty streams, streams not returned), the sport's custom fields with
+  value / zero placeholder / no value / absent and the device-file fields the bridge could fill.
+  Without `activity_id`: per-sport coverage of a period (sources, power, HR, GPS, weather, custom
+  streams, expected fields). Three requests for one activity, one for a period.
+- `get_fueling_analysis` (new, read-only): carbs used (Intervals.icu estimate) and ingested in g and
+  g/h, ingested share of used, kcal and kJ, fluid intake, sodium and sweat loss from custom fields
+  found by units and name (no vendor list); a 0 in a device-file field (e.g. a Garmin sweat loss) is a
+  zero placeholder, shown as "0 stored" and left out of totals, differences and statistics; rates per
+  moving hour; intake per hour only when a custom stream carries it. Period mode for sessions of at
+  least `min_minutes`: per sport family, and within each family by duration and intensity bucket,
+  with sample sizes, logging coverage (logged, stored 0, not logged) and Spearman correlations per
+  family with n (computed from 8 sessions with intake logged, never pooled across sports); notes that
+  used vs ingested is no 1:1 energy deficit; no targets.
+- `get_activity_report` and `get_activity_details`: fueling line, weather line (temperature range,
+  feels-like, wind in km/h from the m/s Intervals.icu stores, compass direction, head/tailwind share,
+  clouds, rain in mm/h, device sensor next to the weather) and W′ balance (W′ and power-model W′, max
+  depletion, lowest W′bal; in the report from the `w_bal` stream, requested with the other streams at
+  no extra cost: time below 75/50/25 % of W′, dips below 50 %, the interval that ended lowest). When
+  W′bal falls below 0 (depletion above W′) the ride exceeded the W′/CP model with the FTP and W′ set
+  for it: this is flagged as a model mismatch (`model_mismatch`) and no depletion percentages or
+  threshold times are presented as physiology. Compact views carry one short "Context:" line
+  (carb rates, sweat, temperature, wind, W′bal minimum); standard and full the full lines. JSON
+  sections `fueling`, `weather`, `w_prime`, `provenance`. The report's data-quality notes name the
+  source and freshness, recording stops, manual interval edits, zero placeholders and fields changed
+  after the analysis (compact: short forms, source and edits only in the "Data:" line); Strava stubs
+  get a clear message instead of an empty analysis.
+- `get_activity_report(include_route_history=True)`: earlier activities on the same Intervals.icu
+  route (activity list filtered by `route_id`, the latest 16 activities on the route, plus the route
+  name; two requests; the text says when older activities were not loaded) with
+  time, power, W/kg, HR, weather and start/end pairs such as stamina; rank by moving time and
+  differences to the median of comparable activities (same sport family, distance within 5 %,
+  elevation gain within 10 %).
+- `get_durability(temperature_source=...)`: the heat filter can use the activity's weather or
+  feels-like temperature instead of the device sensor; sessions list device and weather temperature
+  (and feels-like when it drives the filter).
+- Fixed: the activity summary printed the wind speed (stored in m/s) as km/h.
+
+### Added (phase 6: fatigue, tests, sensors)
+- `get_long_ride_fatigue_profile` (new, read-only): fatigue resistance at submaximal power for one ride or
+  the long rides of a period (rides reaching the highest threshold). Steady segments of a power band
+  (default 75-85 % FTP; 30 s rolling power within the band ±20 %, segment mean inside the band, at least
+  `min_segment_secs`, <= 10 % coasting, HR on >= 90 % of the samples, first 10 min and each segment's
+  first 60 s of HR left out, segments cut at the thresholds) are split into phases by work (default
+  750 / 1,500 kJ, `threshold_unit="kj_per_kg"` scales by body mass from the activity or the profile;
+  kJ/kg is always shown) and compared with the phase before the first threshold: HR at matched power,
+  W/bpm, cadence, temperature, Garmin stamina / potential stamina. Each threshold crossing, segment and
+  climb carries the prior work: kJ, kJ/kg, kJ above FTP (as Intervals.icu `icu_joules_above_ftp`), time
+  above FTP and efforts above FTP (30 s power >= FTP for >= 60 s), so easy and hard kJ can be told apart;
+  climbs (from `analyze_climbs`' detection) after `climb_after_hours` are marked with stamina at start
+  and end. Across rides: median, range and n of the changes per phase, rides split by their share of
+  work above FTP (from 4 rides); a row is flagged as a small sample with fewer than 3 rides or when more
+  than half of its rides have small phase samples, and cadence changes of more than 15 rpm between
+  phases (terrain, gearing) are flagged. `activity_ids` are de-duplicated and cut to `limit` before any
+  request; dropped ids are named. Context: the forum threads
+  [Fatigue resistance](https://forum.intervals.icu/t/fatigue-resistance/4396),
+  [Power curve after kj/kg](https://forum.intervals.icu/t/power-curve-after-kj-kg/93688) and
+  [Three ways field data fooled me about durability](https://forum.intervals.icu/t/three-ways-field-data-fooled-me-about-durability-1-350-climbs-33-amateurs/132461)
+  (work above FTP is shown as context, not as a predictor).
+- `get_submax_test_trends` (new, read-only): the submaximal fatigue tests Intervals.icu detects
+  (`submax_fatigue_test` on the activity, sport settings `sft_*`;
+  [announcement](https://forum.intervals.icu/t/automatic-submaximal-fatigue-testing/132525)) over a
+  period with a validity filter: average within the target tolerance (default the test's own), CV
+  within its limit, not ignored and - from the intervals and streams around the test - not part of a
+  longer work interval, not continued after the test window and not preceded by hard riding; a
+  detection inside a regular workout is listed with its reason and never used as a benchmark. HRRc 0
+  without a recovery window counts as not measured; `require_recovery` makes recovery mandatory. Valid
+  tests are trended per sport family and test type - power (W, W/bpm) and pace (m/s, m/s per bpm) tests
+  are never pooled - (HR at the end, efficiency factor, HRRc, HR rise, HR drop in an easy minute after
+  the test) with n, change, slope per week, SD and an ISO week table; differing targets, bikes and
+  indoor/outdoor are pointed out.
+- `compare_power_streams` several-rides mode: without `activity_id` (date range, default 180 days, or
+  `activity_ids`, de-duplicated and cut to `limit` before any request) every ride carrying the second
+  power stream is compared on its own and summarised per bike, indoor/outdoor, primary power meter (from
+  the file's device data or the bike's PowerMeter gear components) and second power source (its field
+  name in the file; the device is not in the activity data, which the output says per ride):
+  n, mean, median, between-ride SD and range of the offset overall, per power band and in stable
+  windows, the within-ride spread, drift between the first and last quarter, lag counts, outlier share
+  and rides far from the group median; power bands and groups with fewer than 3 rides are flagged as
+  small samples; rides with fewer than 10 min of usable pairs are excluded with the reason. No correction factor is derived or applied. New optional parameters `activity_ids`,
+  `start_date`, `end_date`, `limit`, `detail_level`, `athlete_id`.
+
+### Added (phase 6: plan simulation)
+- `get_load_projection` simulates what-if plans without writing anything (`scenario`): single
+  sessions with a load, or with `duration_min` and `intensity_factor` (load estimated as
+  hours x IF² x 100 and flagged as an estimate), and weekly templates (`weekly`: start, weeks,
+  weekly load or a list per week, or hours with an IF; sessions or weekdays, long day and its
+  share, sport). `calendar` adds them to the planned workouts, replaces the planned workouts
+  inside the scenario's span or ignores the calendar. Scenario and calendar plan are compared
+  day by day (full), per ISO week (load per sport, CTL, ATL, form, ramp) and at the end; the four
+  completed weeks before are summarised for comparison.
+- Target day (`target_date`, default the next RACE_A within 180 days): CTL, ATL and form at the
+  start of the day for the calendar plan and the scenario; with `target_form` (points or percent
+  of CTL) a grid search over the load of the last `taper_days` days (percent of the planned load,
+  or a constant weekly load) that puts the form into the range, with the CTL that goes with it.
+  Assumptions are listed (time constants 42/7 d, sessions done as listed, no illness).
+- Plan statistics per ISO week for the calendar plan and the scenario: sessions, hours, longest
+  session (and its share of the race's planned duration), rest days and monotony; weeks with a
+  CTL ramp above 5-8 per week (Friel 2015), monotony above 2.0 (Foster 1998) or no rest day
+  (Meeusen et al. 2013) are listed as outside the commonly cited range, nothing more. Identical
+  daily loads (monotony undefined, maximal) are flagged too; weeks without durations say "hours n/a".
+- `get_load_projection` reports race days at the start of the day (before the race's own load),
+  like the target day; days, weeks, the end and the lowest form are labelled as end-of-day values
+  (JSON `value_basis`, races `basis`).
+
+### Security (review findings)
+- OAuth: refreshing a token with a narrower scope (for example only `mcp`) keeps the grant's
+  permission scopes; a token without any `intervals:*` scope is read-only and never falls back
+  to the server-wide `MCP_PERMISSIONS`.
+- `/register` (dynamic client registration, reachable without credentials) limits `client_name`
+  to 100 printable characters, `redirect_uris` to 10 and the whole metadata to 8 KB; client-supplied
+  values are escaped and clipped in log lines, and the server logs through a plain stream handler
+  instead of the SDK's rich handler (whose rendering time grows quadratically with long tokens).
+- OAuth consent page: the form only accepts a submission from the browser that opened it. The page
+  sets an HttpOnly consent cookie (`__Host-` prefixed on https) and the form carries an HMAC bound
+  to it and to the sign-in request; a POST whose `Origin` or `Sec-Fetch-Site` names another site is
+  refused. Previously another web page could submit the consent (and pick all permissions) in the
+  athlete's browser when the Intervals.icu sign-in was enabled. The pages now send
+  `Referrer-Policy: same-origin` (no form-action CSP, which would block the redirects).
+- The consent form body is limited to 16 KB / 50 fields; `/register` accepts at most 10
+  registrations per client address and hour, and a client in the middle of its consent is no
+  longer evicted from the 50-client table.
+- Pending sign-ins and Intervals.icu sign-ins in progress are capped per client address (IPv4
+  address or IPv6 /64, 20 each), and a full table drops the oldest entry of the busiest address
+  inside the busiest network (IPv6 per /48); a flood of `/authorize` requests from one address or
+  network (also one sharing the athlete's /48) can no longer push out the athlete's own pending
+  sign-in.
+- Client metadata documents: bounded cache (256 documents, rejected ones evicted first), one
+  shared fetch per document, at most 10 fetches per minute for unknown client ids (pinned ids,
+  ids accepted before and ids holding a refresh token - loaded from the state file at startup -
+  are exempt, so random client ids cannot keep ChatGPT's document from being fetched), a known
+  document is kept for up to a day while its host is unreachable, and client ids with a query
+  string, percent-encoding, dot or empty segments, control characters or more than 512
+  characters are refused (an invalid URL gave HTTP 500). A document's redirect URIs must stay on
+  its own host, another allowlisted host or loopback.
+- `OAUTH_CLIENT_HOSTS` and `OAUTH_REDIRECT_HOSTS` accept `host/path` entries (exactly that path)
+  and `host/path/` entries (every path below it) in addition to hosts; redirect URIs of
+  dynamically registered clients may not contain a query string.
+- `/token` and `/revoke` accept only `application/x-www-form-urlencoded` bodies with each
+  parameter once (RFC 6749); a `multipart/form-data` body, which the SDK would have parsed,
+  could otherwise skip the client assertion check.
+- Refresh tokens: a rotated refresh token presented again within `OAUTH_REFRESH_REUSE_GRACE`
+  seconds (default 120) gets the same answer again once that answer is stored (retry after a
+  lost response, concurrent refreshes), so a grant never forks into parallel chains; presented later it revokes the whole
+  grant (RFC 9700 reuse detection; `OAUTH_REFRESH_REUSE_REVOKE=false` only refuses the request).
+  A client whose metadata document declares `private_key_jwt` (ChatGPT) must send its client
+  assertion with every token request (`OAUTH_REQUIRE_PRIVATE_KEY_JWT`, default `true`; verified
+  from the production journal that ChatGPT signs its code and refresh requests). Verified
+  assertions are logged at INFO. A refresh narrowed to permission scopes keeps `mcp`.
+- Sign-in: the PBKDF2 password check runs in a worker thread (its own pool of 4) instead of
+  blocking the event loop for 0.3 s per attempt; an attempt is counted before the check, so a
+  concurrent burst from one address gets no more checks than the limit; failed password /
+  API-key sign-ins also count against a global budget (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`, default
+  500 per 15 minutes; with TOTP it never pauses a sign-in, so others cannot lock the athlete
+  out); the per-address limit groups IPv6 addresses by /64 and its table is bounded; an
+  authenticator code is only used up when the password or API key was right.
+- `get_server_status` no longer tells connected clients the OAuth user name, password source,
+  allowed athletes, state file path, bind address, port or SSE path (a secret path is a
+  credential); `--doctor` on the server still shows them.
+- Logging: uvicorn's access log keeps query parameter names but drops their values (the
+  Intervals.icu callback code, the sign-in request id, SSE session ids); request bodies are no
+  longer logged at DEBUG and Intervals.icu error bodies are shortened; httpx's per-request INFO
+  lines are off unless `FASTMCP_LOG_LEVEL=DEBUG`. The documentation no longer claims that no
+  log contains codes (the reverse proxy's does unless configured, see `docs/REMOTE_ACCESS.md`).
+- Docker base images are pinned by digest (Dependabot updates them).
+
+### Fixed (review findings: operations)
+- OAuth state file: written in a worker thread and only committed to memory once the write
+  succeeded (a full disk no longer loses the refresh token or authorization code of the request,
+  the client can retry); the directory is fsynced after the rename; the server checks at startup
+  that the directory is writable.
+- A state file that cannot be used (not JSON, wrong structure, written by a newer version) stops
+  the server with a one-line error and is never overwritten or moved; entries that the current
+  SDK cannot read are kept in the file unchanged instead of crashing the server. The format stays
+  version 1; existing files load unchanged.
+- New command line front end (`futureweb-intervals-mcp`, also used by
+  `python src/intervals_mcp_server/server.py`): `--version` and `--help` work with a broken
+  configuration, unknown flags are refused, `--doctor` lists every configuration problem
+  (permissions, transport, port range, log level, path settings, OAuth settings, state file)
+  without starting anything, and a configuration error at startup is reported in one line
+  (exit code 2) instead of a traceback. A network transport without `API_KEY` / `ATHLETE_ID`
+  logs a warning.
+- `FASTMCP_PORT` must be 1-65535, `FASTMCP_LOG_LEVEL` a known level and the path settings must
+  start with `/`.
+- `MCP_PUBLIC_URL` with a path: the protected resource metadata is served once, at the path the
+  SDK advertises, with the permission scopes (previously a second document without them was
+  added at the root), and the consent form posts to the prefixed path.
+- An Intervals.icu sign-in whose request was denied or expired while Intervals.icu answered
+  shows the "expired" page instead of HTTP 500.
+- Docker image: runs the `futureweb-intervals-mcp` console script from the installed package
+  (no second copy of the sources), keeps the OAuth state in `/data` (mount a volume), and has a
+  health check for the network transports.
+- Release workflow: the GitHub release is created only after the image was pushed, one run per
+  tag at a time, and the tag must also match `__version__` (a test checks it against
+  `pyproject.toml`).
+- Dependencies: floors raised to the security-updated versions (`mcp>=1.30`, `httpx>=0.28.1`,
+  `starlette>=1.7`, `python-multipart>=0.0.32`), direct imports (`starlette`, `uvicorn`, `anyio`)
+  declared, and the unused `mcp[cli]` extra (typer) dropped.
+
 ### Changed (phase 5: coach test feedback)
 - `get_training_summary` / `get_training_load` device loads: a sport without its own field list
   (e.g. GravelRide) follows the field lists of its sport family (Ride); real non-zero values count

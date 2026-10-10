@@ -15,8 +15,10 @@ Thank you for taking the time to contribute! This is the Futureweb fork of the I
    ```
 3. When working on or manually running the server, use:
    ```bash
-   mcp run src/intervals_mcp_server/server.py
+   uv run futureweb-intervals-mcp            # --doctor checks the configuration first
    ```
+   The MCP Inspector needs the SDK's CLI extra, which is not a project dependency:
+   `uv run --with "mcp[cli]" mcp dev src/intervals_mcp_server/server.py`.
 
 ## Dependency changes
 

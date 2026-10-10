@@ -4,7 +4,9 @@ Server status / diagnostics tool and MCP prompts.
 get_server_status reports the version, enabled permission classes, registered and hidden
 tools, the configured athlete, whether the Intervals.icu API answers with the configured
 key, how many custom items (fields, streams, wellness fields) the account defines and
-which display-unit overrides are active. It never prints the API key.
+which display-unit overrides are active. It never prints the API key. Deployment details
+(bind address and port, SSE path, OAuth user name, password source, allowed athletes and
+the state file) are only part of ``--doctor`` on the server itself, not of the tool's answer.
 """
 
 import json
@@ -34,8 +36,12 @@ def _package_version() -> str:
     return __version__
 
 
-async def server_status(api_key: str | None = None) -> dict[str, Any]:
-    """Collect the status as a dict (shared by the tool and the --doctor CLI flag)."""
+async def server_status(api_key: str | None = None, include_private: bool = False) -> dict[str, Any]:
+    """Collect the status as a dict (shared by the tool and the --doctor CLI flag).
+
+    *include_private* adds what only the operator needs (``--doctor``): bind address, port,
+    SSE path (a secret path is a credential) and the OAuth deployment details.
+    """
     permissions = tool_permissions()
     hidden = disabled_tools()
     registered = {name: cls for name, cls in permissions.items() if name not in hidden}
@@ -48,10 +54,7 @@ async def server_status(api_key: str | None = None) -> dict[str, Any]:
         },
         "tools_hidden": hidden,
         "transport": os.getenv("MCP_TRANSPORT", "stdio"),
-        "host": os.getenv("FASTMCP_HOST", "127.0.0.1"),
-        "port": os.getenv("FASTMCP_PORT", "8000"),
-        "sse_path": os.getenv("FASTMCP_SSE_PATH", "/sse"),
-        "auth": auth_status_from_env(),
+        "auth": auth_status_from_env(include_private=include_private),
         "athlete_id_configured": bool(config.athlete_id),
         "athlete_id": config.athlete_id or None,
         "api_key_configured": bool(config.api_key or api_key),
@@ -60,6 +63,14 @@ async def server_status(api_key: str | None = None) -> dict[str, Any]:
         "api": {"ok": False, "detail": "not checked"},
         "custom_items": {},
     }
+    if include_private:
+        status.update(
+            {
+                "host": os.getenv("FASTMCP_HOST", "127.0.0.1"),
+                "port": os.getenv("FASTMCP_PORT", "8000"),
+                "sse_path": os.getenv("FASTMCP_SSE_PATH", "/sse"),
+            }
+        )
     if not config.athlete_id:
         status["api"] = {"ok": False, "detail": "ATHLETE_ID is not set"}
         return status
@@ -97,15 +108,20 @@ def format_status(status: dict[str, Any]) -> str:
     if status["tools_hidden"]:
         lines.append("  hidden (class not enabled): " + ", ".join(f"{n} [{c}]" for n, c in sorted(status["tools_hidden"].items())))
     auth = status.get("auth") or {}
-    sse_path = status.get("sse_path", "/sse")
-    path_note = "secret path" if sse_path != "/sse" else "default path"
+    where = ""
+    if "host" in status:
+        path_note = "secret path" if status.get("sse_path", "/sse") != "/sse" else "default path"
+        where = f" on {status['host']}:{status['port']}, SSE path {path_note}"
+    athletes = (
+        f", allowed athletes {', '.join(auth.get('allowed_athletes') or []) or 'none'}" if "allowed_athletes" in auth else ""
+    )
     lines.append(
-        f"Transport: {status['transport']} on {status['host']}:{status['port']}, SSE path {path_note}; "
+        f"Transport: {status['transport']}{where}; "
         f"auth mode {auth.get('mode', 'none')}"
         + (
             f" (issuer {auth.get('issuer')}, sign-in {'+'.join(auth.get('login') or [])}"
             f"{' + TOTP' if auth.get('second_factor') == 'totp' else ''}, "
-            f"Intervals.icu app {auth.get('intervals_app')}, allowed athletes {', '.join(auth.get('allowed_athletes') or []) or 'none'})"
+            f"Intervals.icu app {auth.get('intervals_app')}{athletes})"
             if auth.get("mode") == "oauth"
             else " (remote transports need a secret path or OAuth plus a TLS reverse proxy)"
         )
@@ -288,7 +304,8 @@ def usage_guide() -> str:
         "compare_workouts, get_power_hr_efficiency, get_fatigue_resistance, curves.\n"
         "5a. Load and intensity: get_coach_context first (compact weekly overview) then get_training_load (ACWR, monotony, "
         "strain, deload weeks), get_intensity_distribution (three zones, polarization index, hard days), get_durability "
-        "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts).\n"
+        "(decoupling, efficiency factor), get_load_projection (CTL/ATL/form over the planned workouts; with scenario a "
+        "what-if plan that is not written to the calendar, target_date/target_form for the form on race day).\n"
         "6. Planning: get_sport_settings / get_training_zones, get_training_plan, get_workout_library, "
         "validate_workout, then (if the write class is enabled) add_or_update_event.\n"
         "Conventions: times are local (timezone name when stored, else the UTC offset) and UTC; run/walk/hike "

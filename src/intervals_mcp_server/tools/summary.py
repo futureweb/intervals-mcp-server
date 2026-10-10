@@ -64,13 +64,19 @@ def _num(value: Any) -> float:
 
 
 def _zone_secs(activity: dict[str, Any], key: str) -> dict[str, float]:
+    """Seconds per zone id: {"id": "Z1", "secs": n} entries (power) or a plain list by position
+    (HR and pace zone times, Z1 first)."""
     zones = activity.get(key)
     if not isinstance(zones, list):
         return {}
     out: dict[str, float] = {}
-    for zone in zones:
-        if isinstance(zone, dict) and zone.get("id") and isinstance(zone.get("secs"), (int, float)):
-            out[str(zone["id"])] = float(zone["secs"])
+    for position, zone in enumerate(zones, 1):
+        if isinstance(zone, dict):
+            secs = zone.get("secs")
+            if zone.get("id") and isinstance(secs, (int, float)) and not isinstance(secs, bool) and not is_missing(secs):
+                out[str(zone["id"])] = float(secs)
+        elif isinstance(zone, (int, float)) and not isinstance(zone, bool) and not is_missing(zone):
+            out[f"Z{position}"] = float(zone)
     return out
 
 
@@ -93,9 +99,13 @@ def _summarize(  # pylint: disable=too-many-locals
     feel: dict[str, int] = defaultdict(int)
     rpes: list[float] = []
     longest: dict[str, Any] | None = None
+    sweet_spot = 0.0
     for a in activities:
         for key, secs in _zone_secs(a, "icu_zone_times").items():
-            power_tiz[key] += secs
+            if key.upper() == "SS":  # sweet spot overlaps Z3/Z4: kept apart so the zones add up
+                sweet_spot += secs
+            else:
+                power_tiz[key] += secs
         for key, secs in _zone_secs(a, "icu_hr_zone_times").items():
             hr_tiz[key] += secs
         sport = sports[str(a.get("type") or "unknown")]
@@ -128,6 +138,7 @@ def _summarize(  # pylint: disable=too-many-locals
         "pace_load": sum(_num(a.get("pace_load")) for a in activities),
         "intensity_time_weighted_pct": round(weighted, 1) if weighted is not None else None,
         "time_in_power_zones_s": dict(power_tiz),
+        "time_in_sweet_spot_s": sweet_spot,
         "time_in_hr_zones_s": dict(hr_tiz),
         "by_sport": {k: dict(v) for k, v in sports.items()},
         "by_gear": {k: dict(v) for k, v in gears.items()},
@@ -139,6 +150,24 @@ def _summarize(  # pylint: disable=too-many-locals
         "custom_fields": _aggregate_custom(activities, defs, assigned_by_type),
         "custom_field_changes": pair_changes(activities, defs),
     }
+
+
+def _group_end(group_by: str, items: list[dict[str, Any]], end: str) -> str:
+    """Last calendar day of a group (Sunday of the ISO week, last day of the month, else the
+    period end), capped at the period end."""
+    last = max(str(a.get("start_date_local", ""))[:10] for a in items)
+    try:
+        day = date.fromisoformat(last)
+    except ValueError:
+        return end
+    if group_by == "week":
+        day = day + timedelta(days=6 - day.weekday())
+    elif group_by == "month":
+        following = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
+        day = following - timedelta(days=1)
+    else:
+        return end
+    return min(day.isoformat(), end)
 
 
 def _fitness_at(wellness: list[dict[str, Any]], last_day: str) -> dict[str, Any] | None:
@@ -156,17 +185,26 @@ def _fitness_at(wellness: list[dict[str, Any]], last_day: str) -> dict[str, Any]
     }
 
 
+def _one(value: Any) -> str:
+    """One decimal, 'n/a' for a missing value."""
+    return f"{value:.1f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "n/a"
+
+
 def _format_group(  # pylint: disable=too-many-locals,too-many-branches
     name: str, s: dict[str, Any], fitness: dict[str, Any] | None, include_gear: bool, detail_level: str = "standard"
 ) -> str:
     lines = [
         f"{name}: {s['sessions']} sessions | {hms(s['moving_time_s'])} moving ({hms(s['elapsed_time_s'])} elapsed) | "
         f"{s['distance_m'] / 1000:.1f} km | +{s['elevation_gain_m']:.0f} m",
-        f"  Load (Intervals.icu): total {s['training_load']:.0f} = power {s['power_load']:.0f} / HR {s['hr_load']:.0f} / pace {s['pace_load']:.0f}"
+        f"  Load (Intervals.icu): total {s['training_load']:.0f} (per activity power, else HR, else pace); sums per method "
+        f"over the activities that have it (overlapping): power {s['power_load']:.0f}, HR {s['hr_load']:.0f}, pace {s['pace_load']:.0f}"
         + (f" | time-weighted intensity {s['intensity_time_weighted_pct']}%" if s["intensity_time_weighted_pct"] is not None else ""),
     ]
     if fitness:
-        lines.append(f"  End of period ({fitness['date']}): CTL {fitness['ctl']:.1f}, ATL {fitness['atl']:.1f}, form {fitness['form']}, ramp {fitness['ramp_rate']}")
+        lines.append(
+            f"  End of period ({fitness['date']}): CTL {_one(fitness['ctl'])}, ATL {_one(fitness['atl'])}, "
+            f"form {fitness['form'] if fitness['form'] is not None else 'n/a'}, ramp {fitness['ramp_rate'] if fitness['ramp_rate'] is not None else 'n/a'}"
+        )
     if detail_level == "compact":
         lines.append("  " + ", ".join(f"{sport} {int(v['sessions'])}x {hms(v['moving_time'])}" for sport, v in s["by_sport"].items()))
         loads = [format_aggregate(code, agg) for code, agg in s["custom_fields"].items() if agg["policy"] == "device_load_sum"]
@@ -174,7 +212,8 @@ def _format_group(  # pylint: disable=too-many-locals,too-many-branches
             lines.append("  Device loads (separate scale): " + "; ".join(loads))
         return "\n".join(lines)
     if s["time_in_power_zones_s"]:
-        lines.append("  Time in power zones: " + ", ".join(f"{z} {hms(v)}" for z, v in s["time_in_power_zones_s"].items() if v))
+        sweet_spot = f"; sweet spot {hms(s['time_in_sweet_spot_s'])} (overlaps Z3/Z4)" if s.get("time_in_sweet_spot_s") else ""
+        lines.append("  Time in power zones: " + ", ".join(f"{z} {hms(v)}" for z, v in s["time_in_power_zones_s"].items() if v) + sweet_spot)
     if s["time_in_hr_zones_s"]:
         lines.append("  Time in HR zones: " + ", ".join(f"{z} {hms(v)}" for z, v in s["time_in_hr_zones_s"].items() if v))
     for sport, v in s["by_sport"].items():
@@ -224,9 +263,12 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
     """Training totals for a period grouped by week, month, sport, gear or in total (read-only)
 
     Per group: sessions, moving and elapsed time, distance, elevation gain, the
-    Intervals.icu training load split into its power, HR and pace components, the
-    time-weighted intensity, CTL/ATL/form/ramp at the end of the period, time in power
-    and HR zones, per-sport and per-gear splits, feel distribution and mean RPE,
+    Intervals.icu training load (per activity the power load, else HR, else pace) with the
+    sums per method over the activities that have it (overlapping, as an activity with power
+    also has an HR load), the time-weighted intensity,
+    CTL/ATL/form/ramp at the end of the group's calendar period (week, month; capped at the
+    end date), time in power zones (sweet spot listed apart, it overlaps Z3/Z4) and HR
+    zones, per-sport and per-gear splits, feel distribution and mean RPE,
     number of sessions of 3 h or more, the longest session, trainer sessions, and the
     numeric custom activity fields aggregated by a generic policy derived from their
     units, meaning and definition: additive values (kcal, ml, distance, time) are summed,
@@ -303,7 +345,7 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         groups[_group_key(activity, group_by, gear_map)].append(activity)
     rows: list[dict[str, Any]] = []
     for name, items in groups.items():
-        last_day = max(str(a.get("start_date_local", ""))[:10] for a in items)
+        last_day = _group_end(group_by, items, end)
         rows.append({"group": name, "summary": _summarize(items, defs, gear_map, assigned_by_type), "fitness_at_end": _fitness_at(wellness, last_day)})
     overall = _summarize(activities, defs, gear_map, assigned_by_type)
 

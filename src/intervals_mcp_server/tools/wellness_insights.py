@@ -210,12 +210,13 @@ def _baseline_lines(entries: list[dict[str, Any]], metrics: list[str]) -> list[s
             lines.append(f"  {metric}: not enough data ({trend.get('days_with_value', 0)} days with values)")
             continue
         comp = trend.get("latest_vs_baseline") or {}
+        pct = f"{comp['diff_pct']:+.1f}%" if comp.get("diff_pct") is not None else "% n/a"  # baseline mean 0
         seven = (rolling.get(7) or {}).get("latest_mean")
         small = f" [small sample, fewer than {MIN_BASELINE_VALUES} values]" if base.get("n", 0) < MIN_BASELINE_VALUES else ""
         lines.append(
             f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven) if seven is not None else 'n/a'}"
             f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'))}, median {format_value(base.get('median'))}, sd {format_value(base.get('stdev'))} (n {base.get('n')})"
-            + (f" | vs baseline {comp['diff']:+.2f} ({comp['diff_pct']:+.1f}%, z {comp['z']:+.2f})" if comp.get("diff") is not None and comp.get("z") is not None else "")
+            + (f" | vs baseline {comp['diff']:+.2f} ({pct}, z {comp['z']:+.2f})" if comp.get("diff") is not None and comp.get("z") is not None else "")
             + small
         )
     return lines

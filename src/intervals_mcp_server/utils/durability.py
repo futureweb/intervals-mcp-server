@@ -33,6 +33,9 @@ TREND_BAND_PP = 1.0
 MIN_RECENT = 2
 MIN_WINDOW = 3
 SMALL_SAMPLE = 8  # fewer qualifying sessions per sport are flagged "small sample, not reliable"
+# Temperature used by the heat filter: the device sensor (reads body and sun heat as well), the
+# weather Intervals.icu attaches to outdoor activities, or the weather's feels-like temperature.
+TEMPERATURE_SOURCES = {"device": "average_temp", "weather": "average_weather_temp", "feels_like": "average_feels_like"}
 EF_MIN_MOVING_S = 1200
 EF_BAND_PCT = 2.0
 
@@ -65,10 +68,12 @@ def exclusion_reason(  # pylint: disable=too-many-arguments,too-many-return-stat
     max_temp_c: float | None = MAX_TEMP_C,
     environment: str | None = None,
     need: str = "decoupling",
+    temperature_source: str = "device",
 ) -> str | None:
     """First failed quality criterion of a session (keys of REASONS), None when it qualifies.
 
-    A missing temperature (typical indoors) passes the heat check; runs without power skip
+    The heat check uses ``temperature_source`` ("device" sensor, "weather" or "feels_like");
+    a missing temperature (typical indoors) passes it; runs without power skip
     the variability check (pace:HR). ``need`` = "efficiency" requires power and checks the
     efficiency factor instead of the decoupling, without the pause check.
     """
@@ -80,7 +85,7 @@ def exclusion_reason(  # pylint: disable=too-many-arguments,too-many-return-stat
         return "pauses"
     if environment and is_indoor(activity) != (environment == "indoor"):
         return "environment"
-    temp = num(activity.get("average_temp"))
+    temp = num(activity.get(TEMPERATURE_SOURCES.get(temperature_source, "average_temp")))
     if max_temp_c is not None and temp is not None and temp > max_temp_c:
         return "heat"
     heart_rate = num(activity.get("average_heartrate"))
@@ -113,6 +118,8 @@ def _session(activity: Activity) -> dict[str, Any]:
         "decoupling_pct": rnd(num(activity.get("decoupling")), 1),
         "efficiency_factor": rnd(num(activity.get("icu_efficiency_factor")), 3),
         "variability_index": rnd(vi, 2), "avg_temp_c": rnd(num(activity.get("average_temp")), 1),
+        "weather_temp_c": rnd(num(activity.get("average_weather_temp")), 1),
+        "feels_like_c": rnd(num(activity.get("average_feels_like")), 1),
         "indoor": is_indoor(activity), "basis": "power:HR" if vi else "pace:HR",
         "gear_id": _gear_id(activity), "power_meter": activity.get("power_meter") or None,
     }

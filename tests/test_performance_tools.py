@@ -16,6 +16,8 @@ os.environ.setdefault("ATHLETE_ID", "i1")
 
 from intervals_mcp_server.tools import gear as gear_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.tools.performance import (  # pylint: disable=wrong-import-position
+    _band_stats,
+    _num,
     compare_best_efforts,
     compare_workouts,
     find_similar_intervals,
@@ -210,8 +212,36 @@ def test_get_best_efforts_text(monkeypatch):
     run = asyncio.run(get_best_efforts("a2", stream="velocity_smooth", durations=None, distances="1000"))
     assert "Best efforts for activity a2, stream velocity_smooth (count 1):" in run
     assert "  1000 m: #1 4.12 m/s (4:03/km) in 4:03 from 3:20 to 7:23 (samples 200-443)" in run
-    assert run.endswith("API calls: 2")
+    assert run.endswith("API calls: 3")  # + the activity for the sport's pace units
     assert calls[-1][1] == {"stream": "velocity_smooth", "count": 1, "distance": 1000}
+
+
+def test_best_effort_window_ends_before_a_pause_that_follows_it(monkeypatch):
+    """ANA-5: end_index is exclusive; a pause right after the window (e.g. a stop at the summit) is
+    neither counted inside the window nor moves its end."""
+    efforts = {"efforts": [{"start_index": 1500, "end_index": 1800, "average": 300.0, "duration": 300}]}
+    _install_router(monkeypatch, overrides={"/best-efforts": efforts})
+    result = asyncio.run(get_best_efforts("a1", durations="300"))
+    assert "#1 300.0 W from 25:00 to 30:00 (samples 1500-1800)\n" in result and "window spans" not in result
+    payload = json.loads(asyncio.run(get_best_efforts("a1", durations="300", output_format="json")))
+    assert payload["efforts"][0]["end_secs"] == 1800 and payload["efforts"][0]["paused_s_in_window"] == 0
+    # the window that contains the pause still reports it, and ends at the next sample
+    inside = {"efforts": [{"start_index": 1700, "end_index": 1900, "average": 280.0, "duration": 300}]}
+    _install_router(monkeypatch, overrides={"/best-efforts": inside})
+    assert "from 28:20 to 35:00 (samples 1700-1900) [window spans 3:20 of recording pause]" in asyncio.run(
+        get_best_efforts("a1", durations="300")
+    )
+
+
+def test_swim_best_effort_pace_per_100_m_and_nan_values(monkeypatch):
+    """ANA-16: velocity efforts of a swim show pace per 100 m; a bare NaN never becomes a number."""
+    _install_router(monkeypatch, overrides={"/activity/a2$": {"id": "a2", "type": "Swim"}})
+    run = asyncio.run(get_best_efforts("a2", stream="velocity_smooth", durations=None, distances="1000"))
+    assert "(24.3 s/100 m)" in run and "/km" not in run
+    assert _num(float("nan")) is None and _num("NaN") is None and _num(3) == 3.0
+    stats = _band_stats([{"type": "WORK", "moving_time": 600, "average_watts": 200, "average_heartrate": float("nan")}],
+                        [(150, 250)], 300)
+    assert stats == {}
 
 
 def test_get_best_efforts_json_and_query_params(monkeypatch):

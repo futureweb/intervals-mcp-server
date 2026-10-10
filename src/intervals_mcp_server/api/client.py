@@ -437,7 +437,8 @@ async def make_intervals_request(  # pylint: disable=too-many-locals,too-many-st
     async def _send_request(client: httpx.AsyncClient) -> httpx.Response:
         if method in {"POST", "PUT"} and data is not None:
             body = json.dumps(data)
-            logger.debug("Request %s %s body: %s", method, full_url, body)
+            # Bodies hold athlete data: log their size only (SECURITY.md).
+            logger.debug("Request %s %s body: %d bytes", method, full_url, len(body))
             return await client.request(
                 method=method,
                 url=full_url,

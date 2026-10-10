@@ -15,10 +15,20 @@ the upstream project should be reported there as well.
   OAuth (ChatGPT, Claude): sign-in with Intervals.icu restricted to `OAUTH_ALLOWED_ATHLETES` (no extra
   password) or with the Intervals.icu API key / a server password, optionally with a TOTP second
   factor (`OAUTH_TOTP_SECRET`, recommended for public servers without the Intervals.icu sign-in);
-  per-connection permission scopes on a consent page, client metadata documents only from
-  allowlisted hosts, redirect URIs of registered clients only on allowlisted hosts, RFC 9207 `iss`,
-  audience-bound tokens. The Intervals.icu token is used for the identity check only and never stored.
-  See `docs/REMOTE_ACCESS.md`.
+  per-connection permission scopes on a consent page that only accepts submissions from the browser
+  that opened it, client metadata documents only from allowlisted hosts or document URLs, redirect
+  URIs of registered clients only on allowlisted hosts or path prefixes (no query strings), RFC 9207
+  `iss`, audience-bound tokens, rotating refresh tokens with reuse detection, `private_key_jwt`
+  required for clients that declare it (ChatGPT), urlencoded token requests only. The Intervals.icu token is used for the identity check only
+  and never stored. See `docs/REMOTE_ACCESS.md`.
+- Behind a proxy that is not on 127.0.0.1, set `FORWARDED_ALLOW_IPS` to the proxy's address so the
+  sign-in rate limits see the real client addresses.
+- Keep OAuth secrets out of the proxy's access log (the Intervals.icu callback carries a short-lived
+  authorization code in its query string, and the consent POST's `Referer` the sign-in request id)
+  and limit request bodies at the proxy; see `docs/REMOTE_ACCESS.md`, section 3. Until the proxy's
+  log format is changed, its access log keeps containing these values.
+- Use a long random password or the TOTP second factor: the global failed sign-in budget
+  (`OAUTH_LOGIN_GLOBAL_RATE_LIMIT`) is also a lever to pause password sign-ins, which TOTP removes.
 - Optionally restrict a transitional legacy path to the published OpenAI egress ranges
   (`https://openai.com/chatgpt-connectors.json`) at the proxy.
 - Keep `MCP_PERMISSIONS` minimal; write, destructive and admin classes stay hidden unless enabled.
@@ -96,8 +106,10 @@ security depends mostly on how you run it.
 
 ### Never log secrets
 
-- The server does not log request headers or the API key. Keep the log level at `INFO` or lower
-  in production and redact `Authorization` headers and athlete IDs before sharing logs.
+- The server does not log request headers, request bodies or the API key; client-supplied values
+  (client names, metadata URLs) are escaped and shortened, and uvicorn's access log keeps query
+  parameter names but not their values. Keep the log level at `INFO` in production (`DEBUG` adds
+  per-request lines) and redact `Authorization` headers and athlete IDs before sharing logs.
 - Contributors: never add logging of credentials, full request or response bodies, or athlete
   data.
 
@@ -107,7 +119,9 @@ security depends mostly on how you run it.
   that create, update or delete data on Intervals.icu are not exposed unless you opt in
   explicitly. Keep the default unless you need writes, and review what your LLM client may do
   before enabling a write or destructive class (see the README for the available classes).
-- The gate is enforced server-side when tools are registered; a client cannot escalate it.
+- The gate is enforced server-side when tools are registered. With the OAuth server each
+  connection is further limited to the classes granted on the consent page; refreshing a token can
+  only narrow them, and tool calls outside them are refused.
 
 ### Network transports
 

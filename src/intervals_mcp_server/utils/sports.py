@@ -172,6 +172,11 @@ def _numeric(values: Any) -> list[float]:
     return [float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
 
 
+def floor_watts(watts: float) -> int:
+    """Whole watts rounded down, robust against float noise (70 % of 300 W is 210, not 209)."""
+    return math.floor(watts + 1e-9)
+
+
 def zone_ranges(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     kind: str,
     bounds: Any,
@@ -198,8 +203,9 @@ def zone_ranges(  # pylint: disable=too-many-arguments,too-many-positional-argum
             "lower_bound": lower,
         }
         if kind == "power" and isinstance(ftp, (int, float)) and ftp:
-            row["min_watts"] = int(round(lower / 100 * ftp)) + (1 if lower else 0)
-            row["max_watts"] = int(round(upper / 100 * ftp)) if upper < 999 else None
+            # Intervals.icu floors the watt bounds: Z1 <= floor(55 % FTP), Z2 from that + 1 ...
+            row["min_watts"] = floor_watts(lower / 100 * ftp) + (1 if lower else 0)
+            row["max_watts"] = floor_watts(upper / 100 * ftp) if upper < 999 else None
         if kind == "pace" and isinstance(threshold_pace, (int, float)) and threshold_pace:
             low_speed = lower / 100 * threshold_pace
             high_speed = upper / 100 * threshold_pace if upper < 999 else None
@@ -220,7 +226,7 @@ def format_zone_table(  # pylint: disable=too-many-arguments,too-many-positional
     threshold_pace: Any = None,
     pace_units: str | None = "MINS_KM",
 ) -> str:
-    """One-line zone table, e.g. 'Z1 ≤55% (≤129 W), Z2 56-75% (130-176 W), ...'."""
+    """One-line zone table, e.g. 'Z1 ≤55% (0-128 W), Z2 55-75% (129-175 W), ...'."""
     rows = zone_ranges(kind, bounds, names, ftp, threshold_pace, pace_units)
     if not rows:
         return ""
@@ -261,6 +267,14 @@ def sport_family(activity_type: Any) -> str:
         if wanted in (t.lower() for t in types):
             return family
     return wanted or "unknown"
+
+
+DEFAULT_PACE_UNITS = {"swimming": "SECS_100M", "rowing": "SECS_500M"}
+
+
+def default_pace_units(activity_type: Any) -> str:
+    """Pace units for a sport when none are configured: per 100 m for swims, per 500 m for rowing, else min/km."""
+    return DEFAULT_PACE_UNITS.get(sport_family(activity_type), "MINS_KM")
 
 
 def family_types(activity_type: Any) -> list[str]:
