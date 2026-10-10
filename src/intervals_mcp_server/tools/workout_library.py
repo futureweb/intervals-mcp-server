@@ -307,7 +307,7 @@ async def add_event_from_library(  # pylint: disable=too-many-locals,too-many-re
             return duplicate_check_failed(check_error)
         if found[0]:
             return duplicate_refusal(found[0])
-        extra["duplicate_check"] = f"no workout with the same name or steps on {validated_date}"
+        extra["duplicate_check"] = f"no workout of this sport with the same name or steps on {validated_date}"
     steps = (workout.get("workout_doc") or {}).get("steps") if isinstance(workout.get("workout_doc"), dict) else None
     note = ""
     if steps and not has_step_lines(str(workout.get("description") or "")):

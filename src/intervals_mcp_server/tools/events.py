@@ -21,7 +21,7 @@ from intervals_mcp_server.utils.dates import (
     get_default_future_end_date,
     get_default_start_date,
 )
-from intervals_mcp_server.utils.params import AllowDuplicate, AthleteId, DryRun, OutputFormat, upper_choice
+from intervals_mcp_server.utils.params import AllowDuplicate, AthleteId, DryRun, OutputFormat, lower_choice, upper_choice
 from intervals_mcp_server.utils.formatting import (
     event_type_label,
     format_event_details,
@@ -50,7 +50,9 @@ from intervals_mcp_server.utils.write_safety import (
     duplicate_refusal,
     is_not_found,
     parse_warnings,
+    second_sessions,
     sent_shape,
+    short_warnings,
     stored_summary,
     verify_write,
 )
@@ -676,7 +678,7 @@ async def _write_event(
                 return duplicate_check_failed(error)
             if found[0]:
                 return duplicate_refusal(found[0], options.update_tool)
-            extra["duplicate_check"] = f"no event of this category with the same name or workout on {event_data['start_date_local'][:10]}"
+            extra["duplicate_check"] = f"no event of this category and sport with the same name or content on {event_data['start_date_local'][:10]}"
     method = "PUT" if event_id else "POST"
     if options.dry_run:
         return dry_run_answer(method, url, event_data, warnings=options.warnings, extra=extra)
@@ -802,37 +804,53 @@ def _build_bulk_event_entry(  # pylint: disable=too-many-branches,too-many-state
 
 
 def _bulk_answer(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    """Compact JSON (no indentation): 100 entries stay far below the size limit of one result."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 async def _bulk_read_back(
     athlete_id: str, created: list[dict[str, Any]], bodies: list[dict[str, Any]], sent: list[dict[str, Any] | None]
-) -> str | None:
-    """Add "stored" and "parse_warnings" to every created row (one GET over their dates);
-    returns an error text when the events could not be read back."""
-    rows = [row for row in created if row["id"] is not None]
+) -> tuple[dict[int, tuple[dict[str, Any] | None, list[str]]], str | None]:
+    """(index -> (stored summary or None, parse warnings), error text) for the created rows, read
+    with one GET over their dates."""
+    rows = [row for row in created if row.get("id") is not None]
     if not rows:
-        return None
+        return {}, None
     days = sorted(str(bodies[row["index"]].get("start_date_local") or "")[:10] for row in rows)
     result = await make_intervals_request(
         url=f"/athlete/{seg(athlete_id)}/events", params={"oldest": days[0], "newest": days[-1]}
     )
     if isinstance(result, dict) and "error" in result:
-        for row in rows:
-            row.update({"stored": None, "parse_warnings": []})
-        return f"The events were created but could not be verified ({result.get('message')}); check them with get_events."
+        return {}, f"The events were created but could not be verified ({result.get('message')}); check them with get_events."
     stored = {str(e.get("id")): e for e in result if isinstance(e, dict)} if isinstance(result, list) else {}
-    missing = 0
+    found: dict[int, tuple[dict[str, Any] | None, list[str]]] = {}
     for row in rows:
-        event = stored.get(str(row["id"]))
+        index, event = row["index"], stored.get(str(row["id"]))
         if event is None:
-            missing += 1
-            row.update({"stored": None, "parse_warnings": ["not found when reading the events back"]})
-            continue
-        index = row["index"]
-        row["stored"] = stored_summary(event, sent[index])
-        row["parse_warnings"] = parse_warnings(bodies[index], event, sent[index])
-    return f"{missing} created event(s) were not found when reading back; check get_events." if missing else None
+            found[index] = (None, ["not found when reading the events back"])
+        else:
+            found[index] = (stored_summary(event, sent[index]), parse_warnings(bodies[index], event, sent[index]))
+    missing = sum(1 for summary, _ in found.values() if summary is None)
+    return found, (f"{missing} created event(s) were not found when reading back; check get_events." if missing else None)
+
+
+def _created_row(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    index: int, item: dict[str, Any], body: dict[str, Any], notes: list[str],
+    readback: tuple[dict[str, Any] | None, list[str]] | None, full: bool,
+) -> dict[str, Any]:
+    """One created entry: status, id, date, name and short warnings; full adds the stored summary."""
+    row: dict[str, Any] = {
+        "index": index, "status": "created" if item.get("id") is not None else "unknown", "id": item.get("id"),
+        "date": str(item.get("start_date_local") or body.get("start_date_local") or "")[:10],
+        "name": item.get("name", body.get("name")),
+    }
+    stored, parsed = readback if readback is not None else (None, [])
+    warnings = notes + parsed
+    if warnings:
+        row["warnings"] = warnings if full else short_warnings(warnings)
+    if full and stored is not None:
+        row["stored"] = {k: v for k, v in stored.items() if k not in ("id", "name")}
+    return row
 
 
 @tool("admin")
@@ -844,10 +862,15 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
     athlete_id: AthleteId = None,
     allow_duplicate: AllowDuplicate = False,
     dry_run: DryRun = False,
+    detail_level: Annotated[
+        Literal["compact", "full"],
+        BeforeValidator(lower_choice),
+        Field(description="compact = status, id, date, name, short warnings per entry; full adds what was stored"),
+    ] = "compact",
 ) -> str:
     """Use only when the athlete asks to put many planned workouts and/or notes on the calendar at once (e.g. a training block). Writes to Intervals.icu.
 
-    Every entry is validated first (workouts as in validate_workout); if ANY entry is invalid nothing is sent and all errors are returned. Entries duplicating an event of their day or an earlier entry are refused, the others created in one request (allow_duplicate). Existing events are never updated (use add_or_update_event). At most 100 entries; dry_run shows the request. Returns JSON: created (with stored, parse_warnings), refused, errors.
+    Every entry is validated first (workouts as in validate_workout); if ANY entry is invalid nothing is sent and all errors are returned. Entries duplicating an event of their day or repeating an earlier entry exactly are refused, the others created in one request (allow_duplicate). Existing events are never updated (use add_or_update_event). At most 100 entries; dry_run shows the request. Returns JSON: created (status, id, date, name, warnings from the read-back), refused, errors.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -887,17 +910,21 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
         found, check_error = await check_duplicates(make_intervals_request, athlete_id_to_use, bodies)
         if check_error:
             return _bulk_answer(
-                {"message": f"No events were sent: {check_error}. Try again, split the list, or pass allow_duplicate=true "
-                            "to create them without the check.", "created_count": 0, "created": [], "errors": []}
+                {"message": f"No events were sent: the duplicate check could not run: {check_error}. Nothing was "
+                            "written; try again in a moment.", "created_count": 0, "created": [], "errors": []}
             )
         refused = [
-            {"index": index, "name": bodies[index].get("name"), **duplicate}
+            {"index": index, "status": "refused", "date": duplicate["date"], "name": bodies[index].get("name"),
+             **{k: v for k, v in duplicate.items() if k in ("same", "existing_id", "existing_name", "duplicate_of_index")}}
             for index, duplicate in enumerate(found) if duplicate
         ]
         to_send = [index for index, duplicate in enumerate(found) if not duplicate]
+    notes: dict[int, list[str]] = {w["index"]: list(w["warnings"]) for w in warnings}
+    for index, earlier in second_sessions(bodies).items():
+        notes.setdefault(index, []).append(f"same day, sport and name as entry {earlier}: created as a second session")
     refused_note = (
-        f"{len(refused)} entr{'y was' if len(refused) == 1 else 'ies were'} refused because that day already has the "
-        "same event or an earlier entry repeats it (see refused; nothing was written for them; allow_duplicate=true "
+        f"{len(refused)} entr{'y was' if len(refused) == 1 else 'ies were'} refused: that day already has the same "
+        "event, or the list repeats an entry exactly (see refused; nothing was written for them; allow_duplicate=true "
         "creates them anyway)."
     ) if refused else ""
     if not to_send:
@@ -912,9 +939,9 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
     if dry_run:
         return dry_run_answer(
             "POST", url, payload_bodies, params=params,
-            warnings=[f"entry {w['index']}: {text}" for w in warnings for text in w["warnings"]],
+            warnings=[f"entry {index}: {text}" for index in to_send for text in notes.get(index, [])],
             extra={"entries_sent": to_send, "refused": refused,
-                   "duplicate_check": "skipped (allow_duplicate=true)" if allow_duplicate else "done, one request per day"},
+                   "duplicate_check": "skipped (allow_duplicate=true)" if allow_duplicate else "done (one request for the dates)"},
         )
     result = await make_intervals_request(url=url, method="POST", params=params, data=payload_bodies)
     if isinstance(result, dict) and "error" in result:
@@ -923,20 +950,8 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
             "The events may have been partially or fully created; check get_events for the "
             "date range before retrying."
         )
-    returned = result if isinstance(result, list) else []
-    created: list[dict[str, Any]] = []
-    for position, index in enumerate(to_send):
-        item = returned[position] if position < len(returned) else {}
-        if not isinstance(item, dict):
-            item = {}
-        created.append(
-            {
-                "index": index,
-                "id": item.get("id"),
-                "name": item.get("name", bodies[index].get("name")),
-                "start_date_local": item.get("start_date_local"),
-            }
-        )
+    returned = [item if isinstance(item, dict) else {} for item in (result if isinstance(result, list) else [])]
+    items = {index: returned[position] if position < len(returned) else {} for position, index in enumerate(to_send)}
     if len(returned) != len(payload_bodies):
         errors.append(
             {
@@ -945,7 +960,13 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
                 "Check get_events for the dates before retrying.",
             }
         )
-    verification = await _bulk_read_back(athlete_id_to_use, created, bodies, sent)
+    readback, verification = await _bulk_read_back(
+        athlete_id_to_use, [{"index": index, "id": item.get("id")} for index, item in items.items()], bodies, sent
+    )
+    created = [
+        _created_row(index, item, bodies[index], notes.get(index, []), readback.get(index), detail_level == "full")
+        for index, item in items.items()
+    ]
     created_count = sum(1 for row in created if row["id"] is not None)
     answer: dict[str, Any] = {
         "message": f"Created {created_count} of {len(events)} entries. {refused_note}".strip(),
@@ -956,7 +977,6 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
         "created": created,
         "refused": refused,
         "errors": errors,
-        "warnings": warnings,
     }
     if verification:
         answer["verification"] = verification

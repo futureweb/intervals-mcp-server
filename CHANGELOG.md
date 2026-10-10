@@ -9,36 +9,58 @@ All notable changes to this project are documented here. The format follows
 ### Added (stage 3B: write safety)
 - `dry_run` (default false, so nothing changes for existing calls) on every create/update tool
   that did not have it: `add_or_update_event`, `add_or_update_note`, `add_events_bulk`,
-  `add_event_from_library`, `create_library_workout`, `update_activity`, `update_wellness`,
-  `update_custom_item`, `update_sport_settings`, `add_activity_message`. A dry run runs every
+  `add_event_from_library`, `create_library_workout`, `create_custom_item`, `update_activity`,
+  `update_wellness`, `update_custom_item`, `update_sport_settings`, `add_activity_message`. A dry run runs every
   check of the real call and returns compact JSON with the exact request (method, path, query
   parameters, body after all defaults and merges, e.g. the merged custom item content) and the
   validation result; no write request is made. As a second line of defence the tool guard runs a
-  dry run with read-only requests: the API client refuses every non-GET request during it.
+  dry run (also one called from inside another tool) with read-only requests: the API client
+  refuses every non-GET request during it.
 - Duplicate check before creating events (`add_or_update_event` and `add_or_update_note` without
-  `event_id`, `add_events_bulk`, `add_event_from_library`): the events of each day are read (one
-  GET per distinct day, checked against the request budget) and a create is refused when that day
-  already has an event of the same category with the same name (case/whitespace-insensitive) or
-  the same workout content; the answer names the existing event id and name. `allow_duplicate=true`
-  creates it anyway. `add_events_bulk` decides per entry (also an entry repeating an earlier one of
-  the list): refused entries are listed under `refused`, nothing is written for them, the others
-  are created. When a day cannot be read nothing is written.
+  `event_id`, `add_events_bulk`, `add_event_from_library`): the events of the dates are read with
+  one GET over the date range (checked against the request budget) and a create is refused when
+  that day already has an event of the same category and sport with the same name
+  (case/whitespace-insensitive) or the same non-trivial content (at least two step lines or a
+  repeat, or at least two lines of text; a single generic line is never compared, so brick days
+  and AM/PM sessions with different names are created). The answer names the existing event id
+  and name. `allow_duplicate=true` creates it anyway. `add_events_bulk` decides per entry: an
+  entry duplicating an existing event or repeating an earlier entry exactly is listed under
+  `refused` and nothing is written for it; entries with the same day, sport and name but different
+  content are planned double sessions and are created (with a warning). When the events cannot be
+  read nothing is written and the answer asks to try again (it does not suggest skipping the check).
 - Read-back after every successful event and library workout write: the stored object is read and
-  the answer reports what Intervals.icu stored and parsed (date/time, name, category, sport,
-  planned duration, load, timed steps parsed vs sent) with parse warnings (steps dropped, merged or
-  added, repeats changed, step duration/distance or target units changed, a target missing, no
-  planned duration, fields stored with another value). Text answers get one "Read-back:" paragraph
-  of at most about 600 characters; `add_events_bulk` adds `stored` and `parse_warnings` per created
-  entry (one GET over the dates). A failed read-back says the write succeeded but is not verified.
+  the answer reports what Intervals.icu stored and parsed (date and time unless midnight, name,
+  category, sport, planned duration, load, timed steps parsed vs sent) with parse warnings (steps
+  dropped, merged or added, repeats changed, step duration/distance, absolute pace or target units
+  changed, a target missing, no planned duration, fields stored with another value). Absolute
+  paces sent as `MINS_KM`/`MINS_MILE`/`SECS_100M`/`SECS_100Y`/`SECS_500M` and stored in seconds per
+  distance (`secs/km` ...) count as the same unit and are compared in seconds (2 s tolerance);
+  labelled repeat headers such as "Main set 3x" are repeats. Notes, holidays, sick and injured
+  days are read back with date, category, name and text length only. Text answers get one
+  "Read-back:" paragraph of at most about 600 characters. A failed read-back says the write
+  succeeded but is not verified.
 - `delete_event` reads the event first and names what was deleted (id, date, category, sport,
   name, paired activity or not); `delete_library_workout` and `delete_custom_item` name the
   deleted object too. A missing id answers "not found; nothing was deleted" instead of an API
   error, a DELETE answered with 404 says the object was already gone.
-- Requests added per write: creating one event +2 GET (duplicate check, read-back), updating an
-  event or creating a library workout +1 GET (read-back), `add_events_bulk` +1 GET per distinct day
-  +1 GET (read-back), `delete_event` +1 GET; `allow_duplicate=true` skips the duplicate check.
+- `add_events_bulk(detail_level=...)`: `compact` (default) answers compact JSON with status, id,
+  date, name and short warnings per entry, so 100 entries stay far below the output limit; `full`
+  adds what Intervals.icu stored per entry.
+- Requests added per write: creating one event (`add_or_update_event`, `add_or_update_note`,
+  `add_event_from_library`) +2 GET (duplicate check, read-back), updating an event or creating a
+  library workout +1 GET (read-back), `add_events_bulk` +2 GET (duplicate check over the date
+  range, read-back), `delete_event` +1 GET; `allow_duplicate=true` skips the duplicate check.
 - Write-safety section in `intervals://guide` (`get_guide`), the workout syntax guide and the
   README; the server instructions mention dry runs and the read-back.
+
+### Changed
+- `get_coach_context` / `get_training_summary` JSON: with an explicit `detail_level` the JSON has
+  the parts of that level (and a `detail_level` key); without `detail_level` it keeps the previous
+  full structure, so existing JSON consumers see no change. The text default stays `standard`.
+- `add_events_bulk` answers compact JSON; created entries carry `status`, `id`, `date`, `name` and
+  `warnings` (was `start_date_local` from the API answer); validation warnings moved into the
+  entries' `warnings`.
+- `delete_event` answers with a sentence naming the deleted event instead of the raw API JSON.
 
 ### Fixed
 - `get_durability`: the recent efficiency-factor mean was labelled "last 7 d" whatever
@@ -52,8 +74,8 @@ All notable changes to this project are documented here. The format follows
   reference and no dates lists that window too instead of the newest search results.
 - `compare_best_efforts` with `activity_ids` de-duplicates the ids and cuts them to `limit` before
   any request (`cap_ids`/`ids_note`), and says what was dropped.
-- The JSON output of `get_coach_context` and `get_training_summary` follows `detail_level`
-  (compact / standard / full) like the text; it was always the full structure.
+- The JSON output of `get_coach_context` and `get_training_summary` ignored `detail_level`; an
+  explicit `detail_level` (compact / standard / full) now gives the same parts as the text.
 - `get_activities` and `get_wellness_data` with a past `end_date` and no `start_date` asked for a
   range starting after its end; the default start is now 30 days before the earlier of `end_date`
   and today.

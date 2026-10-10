@@ -26,7 +26,7 @@ from intervals_mcp_server.tools import athlete as athlete_module  # noqa: E402
 from intervals_mcp_server.tools import custom_items as custom_items_module  # noqa: E402
 from intervals_mcp_server.tools.activities import add_activity_message, update_activity  # noqa: E402
 from intervals_mcp_server.tools.athlete import update_sport_settings  # noqa: E402
-from intervals_mcp_server.tools.custom_items import delete_custom_item, update_custom_item  # noqa: E402
+from intervals_mcp_server.tools.custom_items import create_custom_item, delete_custom_item, update_custom_item  # noqa: E402
 from intervals_mcp_server.tools.events import (  # noqa: E402
     add_events_bulk,
     add_or_update_event,
@@ -90,15 +90,18 @@ def _writes(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _calendar(day_events: dict[str, list[dict[str, Any]]], stored: dict[str, Any] | None = None, created: Any = None):
-    """Responder: a day's events by date, one stored event by id, *created* for a write."""
+    """Responder: the events of a date range (by their start day; after the write also *stored*),
+    one stored event by id, *created* for a write."""
+    events = [event for listed in day_events.values() for event in listed]
+    written: list[bool] = []
 
     def respond(_url, method, params, _data):
         if method == "GET" and params and "oldest" in params:
-            if params["oldest"] == params["newest"]:
-                return day_events.get(params["oldest"], [])
-            return [e for events in day_events.values() for e in events] + ([stored] if stored else [])
+            pool = events + ([stored] if stored and written else [])
+            return [e for e in pool if params["oldest"] <= str(e.get("start_date_local"))[:10] <= params["newest"]]
         if method == "GET":
             return stored if stored is not None else {}
+        written.append(True)
         return created if created is not None else {"id": 900}
 
     return respond
@@ -168,6 +171,8 @@ DRY_RUNS = [
                  id="update_wellness"),
     pytest.param(lambda: update_custom_item(item_id=5, content={"aggregate": "SUM"}, dry_run=True), "PUT", "/athlete/i1/custom-item/5",
                  id="update_custom_item"),
+    pytest.param(lambda: create_custom_item(name="Gels", item_type="ACTIVITY_FIELD", content={"code": "Gels", "type": "numeric"},
+                                            dry_run=True), "POST", "/athlete/i1/custom-item", id="create_custom_item"),
     pytest.param(lambda: update_sport_settings(sport_type="Ride", ftp=260, dry_run=True), "PUT", "/athlete/i1/sport-settings/7",
                  id="update_sport_settings"),
     pytest.param(lambda: add_activity_message(activity_id="i55", content="Legs heavy", dry_run=True), "POST", "/activity/i55/messages",
@@ -201,7 +206,7 @@ def test_dry_run_bodies_are_the_requests_after_defaults_and_merges(monkeypatch):
     body = event["request"]["body"]
     assert body["category"] == "WORKOUT" and body["type"] == "Ride" and body["start_date_local"] == "2026-10-12T00:00:00"
     assert body["description"] == str(WorkoutDoc.from_dict(STEPS))
-    assert event["duplicate_check"].startswith("no event of this category")
+    assert event["duplicate_check"].startswith("no event of this category and sport")
     note = json.loads(asyncio.run(add_or_update_note(name="Travel", dry_run=True)))
     assert note["request"]["body"]["color"] == "green" and note["request"]["body"]["category"] == "NOTE"
     item = json.loads(asyncio.run(update_custom_item(item_id=5, content={"aggregate": "SUM"}, dry_run=True)))
@@ -220,11 +225,27 @@ def test_dry_run_bodies_are_the_requests_after_defaults_and_merges(monkeypatch):
 def test_dry_run_refusals_are_the_refusals_of_the_real_call(monkeypatch):
     calls = _router(monkeypatch, _calendar({"2026-10-12": [EXISTING_RIDE]}))
     duplicate = asyncio.run(add_or_update_event(name=" sweet  SPOT 3x10 ", workout_type="Ride", start_date="2026-10-12", dry_run=True))
-    assert duplicate.startswith("Error: 2026-10-12 already has a WORKOUT with the same name: event 41 'Sweet Spot 3x10'")
+    assert duplicate.startswith("Error: 2026-10-12 already has a WORKOUT (Ride) with the same name: event 41 'Sweet Spot 3x10'")
     invalid = asyncio.run(add_or_update_event(name="Bad", workout_type="Ride", dry_run=True,
                                               workout_doc=WorkoutDoc.from_dict({"steps": [{"duration": -5, "power": {"value": 50, "units": "%ftp"}}]})))
     assert invalid.startswith("Error: workout_doc is not valid") and invalid.endswith("Nothing was written.")
     assert not _writes(calls)
+
+
+def test_a_nested_dry_run_is_read_only_too(monkeypatch):
+    """R29-10: a write tool called with dry_run=true from inside another tool call cannot write either."""
+    fake = _recording_client(monkeypatch, {"/events": []})
+
+    async def inner(dry_run: bool = False) -> Any:  # pylint: disable=unused-argument
+        return await api_client.make_intervals_request("/athlete/i1/events", method="POST", data={"name": "x"})
+
+    inner_tool = guarded(inner)
+
+    async def outer() -> Any:
+        return await inner_tool(dry_run=True)
+
+    refused = asyncio.run(guarded(outer)())
+    assert refused["read_only"] and not fake.requests
 
 
 def test_the_guard_refuses_writes_during_a_dry_run(monkeypatch):
@@ -259,7 +280,7 @@ def test_range_delete_preview_runs_read_only(monkeypatch):
 def test_create_is_refused_when_the_day_has_the_same_name(monkeypatch):
     calls = _router(monkeypatch, _calendar({"2026-10-12": [EXISTING_RIDE]}))
     answer = asyncio.run(add_or_update_event(name="SWEET spot   3x10", workout_type="Ride", start_date="2026-10-12"))
-    assert "already has a WORKOUT with the same name: event 41 'Sweet Spot 3x10'" in answer
+    assert "already has a WORKOUT (Ride) with the same name: event 41 'Sweet Spot 3x10'" in answer
     assert "allow_duplicate=true" in answer and "event_id=41" in answer
     assert not _writes(calls)
     assert [c["params"] for c in calls] == [{"oldest": "2026-10-12", "newest": "2026-10-12"}]
@@ -271,13 +292,38 @@ def test_create_is_refused_when_the_day_has_the_same_workout(monkeypatch):
     calls = _router(monkeypatch, _calendar({"2026-10-12": [existing]}))
     answer = asyncio.run(add_or_update_event(name="Sweet spot", workout_type="Ride", start_date="2026-10-12",
                                              workout_doc=WorkoutDoc.from_dict(STEPS)))
-    assert "same workout: event 41 'Tuesday session'" in answer and not _writes(calls)
+    assert "same steps: event 41 'Tuesday session'" in answer and not _writes(calls)
     assert workout_signature("intro\n- 10m 55%\n3x\n- 5m 90%") == workout_signature("other intro\n -  10M 55%\n3X\n- 5m 90%")
+    assert workout_signature("Warmup\n- 10m 55%\nMain set 3x\n- 5m 90%").splitlines()[1] == "main set 3x"
+    assert workout_signature("- 45m Z2 HR") == "" and workout_signature("Rest day") == ""  # single generic lines
+
+
+def test_duplicates_need_the_same_sport_and_non_trivial_content(monkeypatch):
+    """R29-3: a brick or double-sport day is not a duplicate; short one-liners with other names are not either."""
+    easy_ride = {"id": 44, "start_date_local": "2026-10-12T06:00:00", "category": "WORKOUT", "type": "Ride",
+                 "name": "Easy", "description": "- 45m Z2 HR"}
+    long_run = {"id": 45, "start_date_local": "2026-10-12T18:00:00", "category": "WORKOUT", "type": "Run",
+                "name": "Long run", "description": "Warmup\n- 10m Z1 HR\n- 60m Z2 HR\nCooldown\n- 5m Z1 HR"}
+    calls = _router(monkeypatch, _calendar({"2026-10-12": [easy_ride, long_run]}, stored={"id": 900}))
+    assert asyncio.run(add_or_update_event(name="Easy", workout_type="Run", start_date="2026-10-12")).startswith("Successfully")
+    same_text = asyncio.run(add_or_update_event(name="Long ride", workout_type="Ride", start_date="2026-10-12",
+                                                description=long_run["description"]))
+    assert same_text.startswith("Successfully")
+    one_liner = asyncio.run(add_or_update_event(name="PM spin", workout_type="Ride", start_date="2026-10-12", description="- 45m Z2 HR"))
+    assert one_liner.startswith("Successfully")
+    assert len(_writes(calls)) == 3
+    refused = asyncio.run(add_or_update_event(name=" easy ", workout_type="Ride", start_date="2026-10-12"))
+    assert "already has a WORKOUT (Ride) with the same name: event 44 'Easy'" in refused
+    run_steps = asyncio.run(add_or_update_event(name="Sunday run", workout_type="Run", start_date="2026-10-12",
+                                                description="Warmup\n- 10m Z1 HR\n- 60m Z2 HR\nCooldown\n- 5m Z1 HR"))
+    assert "already has a WORKOUT (Run) with the same steps: event 45 'Long run'" in run_steps
+    assert len(_writes(calls)) == 3
 
 
 def test_other_categories_days_and_allow_duplicate_are_not_refused(monkeypatch):
     note = {"id": 42, "start_date_local": "2026-10-12T00:00:00", "category": "NOTE", "name": "Sweet Spot 3x10"}
-    calls = _router(monkeypatch, _calendar({"2026-10-12": [note], "2026-10-13": [EXISTING_RIDE]},
+    next_day = {**EXISTING_RIDE, "start_date_local": "2026-10-13T00:00:00"}
+    calls = _router(monkeypatch, _calendar({"2026-10-12": [note], "2026-10-13": [next_day]},
                                            stored={"id": 900, "name": "Sweet Spot 3x10"}))
     assert asyncio.run(add_or_update_event(name="Sweet Spot 3x10", workout_type="Ride", start_date="2026-10-12")).startswith("Successfully")
     assert len(_writes(calls)) == 1
@@ -291,15 +337,19 @@ def test_other_categories_days_and_allow_duplicate_are_not_refused(monkeypatch):
 def test_duplicate_check_failure_writes_nothing(monkeypatch):
     calls = _router(monkeypatch, lambda url, method, params, data: {"error": True, "message": "503 Service Unavailable"} if params else {"id": 1})
     answer = asyncio.run(add_or_update_note(name="Rest", start_date="2026-10-12"))
-    assert answer.startswith("Error: could not read the events of 2026-10-12 to check for duplicates (503 Service Unavailable)")
-    assert "Nothing was written" in answer and not _writes(calls)
+    assert answer == ("Error: the duplicate check could not run: the events of 2026-10-12 could not be read "
+                      "(503 Service Unavailable). Nothing was written; try again in a moment.")
+    assert "allow_duplicate" not in answer and not _writes(calls)  # R29-5: no invitation to skip the check
 
 
 def test_note_and_library_creates_are_checked(monkeypatch):
-    note = {"id": 43, "start_date_local": "2026-10-12T00:00:00", "category": "NOTE", "name": "Travel", "description": "Flight 9:00"}
-    calls = _router(monkeypatch, _calendar({"2026-10-12": [note, EXISTING_RIDE]}))
-    same_text = asyncio.run(add_or_update_note(name="Trip", description="flight  9:00", start_date="2026-10-12"))
-    assert "already has a NOTE with the same workout: event 43" in same_text and "add_or_update_note with event_id=43" in same_text
+    note = {"id": 43, "start_date_local": "2026-10-12T00:00:00", "category": "NOTE", "name": "Travel",
+            "description": "Flight 9:00\nHotel near the station"}
+    calls = _router(monkeypatch, _calendar({"2026-10-12": [note, EXISTING_RIDE]}, stored={"id": 900}))
+    same_text = asyncio.run(add_or_update_note(name="Trip", description="flight  9:00\n hotel near the STATION", start_date="2026-10-12"))
+    assert "already has a NOTE with the same text: event 43" in same_text and "add_or_update_note with event_id=43" in same_text
+    assert not _writes(calls)
+    assert asyncio.run(add_or_update_note(name="Trip", description="Flight 9:00", start_date="2026-10-12")).startswith("Successfully")
 
     def library(url, method, params, data):
         if url.endswith("/workouts/101"):
@@ -308,37 +358,69 @@ def test_note_and_library_creates_are_checked(monkeypatch):
 
     calls = _router(monkeypatch, library)
     answer = asyncio.run(add_event_from_library(workout_id="101", date="2026-10-12"))
-    assert "already has a WORKOUT with the same name: event 41" in answer and not _writes(calls)
+    assert "already has a WORKOUT (Ride) with the same name: event 41" in answer and not _writes(calls)
 
 
 def test_bulk_refuses_duplicate_entries_and_creates_the_others(monkeypatch):
     entries = [
         {"name": "Sweet Spot 3x10", "start_date": "2026-10-12", "workout_type": "Ride"},  # existing event 41
-        {"name": "Easy run", "start_date": "2026-10-13", "workout_type": "Run"},
-        {"name": "easy RUN", "start_date": "2026-10-13", "workout_type": "Run"},  # repeats entry 1
+        {"name": "Easy run", "start_date": "2026-10-13", "workout_type": "Run", "moving_time": 2700},
+        {"name": "easy RUN", "start_date": "2026-10-13", "workout_type": "Run", "moving_time": 2700},  # repeats entry 1 exactly
+        {"name": "Easy run", "start_date": "2026-10-13", "workout_type": "Run", "moving_time": 1800},  # R29-4: a second session
         {"name": "Rest", "start_date": "2026-10-14", "category": "NOTE", "description": "Full rest"},
     ]
-    stored = [{"id": 501, "start_date_local": "2026-10-13T00:00:00", "category": "WORKOUT", "type": "Run", "name": "Easy run"},
-              {"id": 502, "start_date_local": "2026-10-14T00:00:00", "category": "NOTE", "name": "Rest"}]
+    stored = [{"id": 501, "start_date_local": "2026-10-13T00:00:00", "category": "WORKOUT", "type": "Run", "name": "Easy run", "moving_time": 2700},
+              {"id": 502, "start_date_local": "2026-10-13T00:00:00", "category": "WORKOUT", "type": "Run", "name": "Easy run", "moving_time": 1800},
+              {"id": 503, "start_date_local": "2026-10-14T00:00:00", "category": "NOTE", "name": "Rest", "description": "Full rest"}]
 
     def respond(url, method, params, data):
         if method == "GET":
-            if params["oldest"] == params["newest"]:
-                return [EXISTING_RIDE] if params["oldest"] == "2026-10-12" else []
-            return stored
-        return [{"id": 501, "name": "Easy run"}, {"id": 502, "name": "Rest"}]
+            return stored if any(c["method"] == "POST" for c in calls) else [EXISTING_RIDE]
+        return [{"id": 501, "name": "Easy run"}, {"id": 502, "name": "Easy run"}, {"id": 503, "name": "Rest"}]
 
     calls = _router(monkeypatch, respond)
-    payload = json.loads(asyncio.run(add_events_bulk(entries)))
-    day_checks = [c for c in calls if c["method"] == "GET" and c["params"]["oldest"] == c["params"]["newest"]]
-    assert len(day_checks) == 3  # one GET per distinct day
-    assert [body["name"] for body in _writes(calls)[0]["data"]] == ["Easy run", "Rest"]
-    assert [row["index"] for row in payload["created"]] == [1, 3] and payload["created_count"] == 2
+    answer = asyncio.run(add_events_bulk(entries))
+    payload = json.loads(answer)
+    gets = [c["params"] for c in calls if c["method"] == "GET"]
+    # R29-6: one range GET for the duplicate check, one for the read-back of the created events
+    assert gets == [{"oldest": "2026-10-12", "newest": "2026-10-14"}, {"oldest": "2026-10-13", "newest": "2026-10-14"}]
+    assert [body["moving_time"] if "moving_time" in body else None for body in _writes(calls)[0]["data"]] == [2700, 1800, None]
+    assert [row["index"] for row in payload["created"]] == [1, 3, 4] and payload["created_count"] == 3
+    assert payload["created"][0] == {"index": 1, "status": "created", "id": 501, "date": "2026-10-13", "name": "Easy run"}
+    assert payload["created"][1]["warnings"] == ["same day, sport and name as entry 1: created as a second session"]
     refused = {row["index"]: row for row in payload["refused"]}
-    assert refused[0]["existing_id"] == 41 and refused[0]["same"] == "name"
-    assert refused[2]["duplicate_of_index"] == 1
-    assert "Created 2 of 4 entries. 2 entries were refused" in payload["message"]
-    assert payload["created"][0]["stored"]["name"] == "Easy run" and payload["created"][0]["parse_warnings"] == []
+    assert refused[0] == {"index": 0, "status": "refused", "date": "2026-10-12", "name": "Sweet Spot 3x10", "same": "name",
+                          "existing_id": 41, "existing_name": "Sweet Spot 3x10"}
+    assert refused[2]["duplicate_of_index"] == 1 and refused[2]["same"] == "entry"
+    assert "Created 3 of 5 entries. 2 entries were refused" in payload["message"]
+    assert ": " not in answer.split('"message"')[0] and "stored" not in payload["created"][0]  # compact by default
+    calls.clear()
+    full = json.loads(asyncio.run(add_events_bulk(entries, detail_level="full")))
+    assert full["created"][0]["stored"] == {"start_date_local": "2026-10-13T00:00:00", "category": "WORKOUT", "type": "Run",
+                                            "moving_time": 2700, "duration": "45:00", "steps": 0}
+    assert full["created"][2]["stored"] == {"start_date_local": "2026-10-14T00:00:00", "category": "NOTE", "text_chars": 9}
+
+
+def test_bulk_answer_stays_small(monkeypatch):
+    """R29-7: 100 created entries in the compact answer stay far below the output limit."""
+    entries = [{"name": f"Ride {i}", "start_date": f"2027-{1 + i // 28:02d}-{1 + i % 28:02d}", "workout_type": "Ride",
+                "description": "Warmup\n- 10m 55%\n- 40m 70%\nCooldown\n- 10m 50%"} for i in range(100)]
+    created = [{"id": 1000 + i, "name": f"Ride {i}"} for i in range(100)]
+    stored = [{"id": 1000 + i, "start_date_local": f"2027-{1 + i // 28:02d}-{1 + i % 28:02d}T00:00:00", "category": "WORKOUT",
+               "type": "Ride", "name": f"Ride {i}", "moving_time": 3600, "icu_training_load": 50,
+               "workout_doc": {"steps": [{"duration": 600}, {"duration": 2400}, {"duration": 600}]}} for i in range(100)]
+    posted: list[bool] = []
+
+    def respond(url, method, params, data):
+        if method == "GET":
+            return stored if posted else []  # empty calendar before the write, the stored events after it
+        posted.append(True)
+        return created
+
+    _router(monkeypatch, respond)
+    answer = asyncio.run(add_events_bulk(entries))
+    payload = json.loads(answer)
+    assert payload["created_count"] == 100 and len(answer) < 12_000, len(answer)
 
 
 def test_bulk_with_only_duplicates_sends_nothing(monkeypatch):
@@ -349,11 +431,13 @@ def test_bulk_with_only_duplicates_sends_nothing(monkeypatch):
 
 
 def test_bulk_duplicate_check_respects_the_request_budget(monkeypatch):
-    monkeypatch.setenv("MCP_TOOL_MAX_REQUESTS", "5")
+    monkeypatch.setenv("MCP_TOOL_MAX_REQUESTS", "2")  # the check (1) plus the write and the read-back (2) do not fit
     calls = _router(monkeypatch, _calendar({}))
     entries = [{"name": f"Ride {day}", "start_date": f"2026-10-{day:02d}", "workout_type": "Ride"} for day in range(10, 15)]
     payload = json.loads(asyncio.run(add_events_bulk(entries)))
-    assert "the duplicate check needs 5 requests (one per day)" in payload["message"] and not calls
+    assert payload["message"] == ("No events were sent: the duplicate check could not run: this tool call has no requests "
+                                  "left for the duplicate check. Nothing was written; try again in a moment.")
+    assert not calls
 
 
 # ------------------------------------------------------------------ read-back
@@ -365,7 +449,7 @@ def test_read_back_reports_what_was_stored_and_parsed(monkeypatch):
                                              workout_doc=WorkoutDoc.from_dict(STEPS)))
     head, readback = answer.split("\n")
     assert head == "Successfully created event id: 900"
-    assert readback == ("Read-back: Intervals.icu stored 2026-10-12T00:00:00 WORKOUT Ride 'Sweet spot', 1:05:00, load 62, "
+    assert readback == ("Read-back: Intervals.icu stored 2026-10-12 WORKOUT Ride 'Sweet spot', 1:05:00, load 62, "
                         "4 steps parsed (4 sent). Parse warnings: none.")
     assert [c["url"] for c in calls if c["method"] == "GET" and not c["params"]] == ["/athlete/i1/events/900"]
 
@@ -401,6 +485,56 @@ def test_parse_warnings_name_dropped_steps_units_and_missing_duration():
         "no workout steps stored (3 sent): Intervals.icu did not read the text as a workout"]
 
 
+def test_absolute_paces_stored_in_seconds_per_distance_are_not_warnings():
+    """R29-1: Intervals.icu stores "5:35/km Pace" (sent as MINS_KM) as secs/km; other units likewise."""
+    sent = sent_shape({"steps": [
+        {"duration": 600, "pace": {"value": 335, "units": "MINS_KM"}},
+        {"distance": 1000, "pace": {"start": 4.5, "end": 4.6667, "units": "MINS_KM"}},  # decimal minutes
+        {"duration": 300, "pace": {"value": 540, "units": "MINS_MILE"}},
+        {"distance": 400, "pace": {"value": 105, "units": "SECS_100M"}},
+    ]})
+    stored = {"workout_doc": {"steps": [
+        {"duration": 600, "pace": {"value": 335, "units": "secs/km"}},
+        {"distance": 1000, "duration": 275, "pace": {"start": 280, "end": 270, "units": "secs/km"}},  # start/end swapped
+        {"duration": 300, "pace": {"value": 541, "units": "secs/mile"}},  # within 2 s
+        {"distance": 400, "duration": 420, "pace": {"value": 105, "units": "secs/100m"}},
+    ]}, "moving_time": 1595}
+    assert not parse_warnings({}, stored, sent)
+    slower = {"workout_doc": {"steps": [{**stored["workout_doc"]["steps"][0], "pace": {"value": 350, "units": "secs/km"}},
+                                        *stored["workout_doc"]["steps"][1:]]}, "moving_time": 1595}
+    assert parse_warnings({}, slower, sent) == ["step 1: pace 5:35/km sent, 5:50/km stored"]
+    other_units = {"workout_doc": {"steps": [{**stored["workout_doc"]["steps"][0], "pace": {"value": 90, "units": "%pace"}},
+                                             *stored["workout_doc"]["steps"][1:]]}, "moving_time": 1595}
+    assert parse_warnings({}, other_units, sent) == ["step 1: pace target units secs/km sent, %pace stored"]
+
+
+def test_labelled_repeat_headers_are_repeats():
+    """R29-2: "Main set 3x" (the guide's own native-text example) is a repeat header."""
+    text = "Warmup\n- 10m 55%\n\nMain set 3x\n- 10m 90%\n- 5m 55%\n\nCooldown\n- 10m 50%"
+    shape = sent_shape(None, text)
+    assert shape is not None and shape["count"] == 4 and shape["repeats"] == [3]
+    stored = {"moving_time": 4500, "workout_doc": {"steps": [
+        {"duration": 600, "power": {"value": 55, "units": "%ftp"}, "warmup": True},
+        {"reps": 3, "text": "Main set 3x", "duration": 2700, "steps": [{"duration": 600}, {"duration": 300}]},
+        {"duration": 600, "power": {"value": 50, "units": "%ftp"}, "cooldown": True},
+    ]}}
+    assert not parse_warnings({}, stored, shape)
+    assert sent_shape(None, "- 10m 55%\n3x Over-unders\n- 2m 95%\n- 1m 105%")["repeats"] == [3]
+    assert sent_shape(None, "- 10m 55%\n- Squats 5x5 10m\n- 5m 50%")["repeats"] == []  # a step line is never a header
+
+
+def test_notes_are_read_back_without_workout_fields(monkeypatch):
+    """R29-8: date (time only when not midnight), category, name and text length; no duration, load or steps."""
+    stored = {"id": 900, "start_date_local": "2026-10-12T00:00:00", "category": "NOTE", "name": "Travel",
+              "description": "Flight 9:00\n- 5m walk to gate", "workout_doc": {"steps": [{"duration": 300}]}}
+    _router(monkeypatch, _calendar({}, stored=stored))
+    answer = asyncio.run(add_or_update_note(name="Travel", description="Flight 9:00\n- 5m walk to gate", start_date="2026-10-12"))
+    assert answer.split("\n")[1] == "Read-back: Intervals.icu stored 2026-10-12 NOTE 'Travel', text 29 characters. Parse warnings: none."
+    workout = stored_summary({"id": 1, "category": "WORKOUT", "type": "Ride", "name": "Spin", "workout_doc": {"steps": [{"duration": 60}]}})
+    assert read_back_text(workout, [], None, "event 1") == (
+        "Read-back: Intervals.icu stored WORKOUT Ride 'Spin', no planned duration, load n/a, 1 step parsed. Parse warnings: none.")
+
+
 def test_read_back_text_is_compact():
     summary = stored_summary({"id": 1, "start_date_local": "2026-10-12T00:00:00", "category": "WORKOUT", "type": "Ride",
                               "name": "N" * 80, "moving_time": 3600, "icu_training_load": 50}, sent_shape(STEPS))
@@ -425,7 +559,7 @@ def test_updates_and_library_workouts_are_read_back(monkeypatch):
     stored = {"id": 77, "start_date_local": "2026-10-12T07:30:00", "category": "WORKOUT", "type": "Ride", "name": "Renamed"}
     calls = _router(monkeypatch, _calendar({}, stored=stored))
     answer = asyncio.run(add_or_update_event(event_id="77", name="Renamed"))
-    assert "Read-back: Intervals.icu stored 2026-10-12T07:30:00 WORKOUT Ride 'Renamed'" in answer
+    assert "Read-back: Intervals.icu stored 2026-10-12 07:30 WORKOUT Ride 'Renamed'" in answer
     assert not [c for c in calls if c["params"]]  # an update is never checked for duplicates
 
     library = {"id": 555, "name": "Over-unders", "type": "Ride", "folder_id": 10, "moving_time": 3900, "workout_doc": PARSED}
@@ -508,11 +642,12 @@ def test_dry_run_through_an_mcp_tool_call(monkeypatch):
     for name in ("add_or_update_event", "add_events_bulk"):
         assert schema[name]["dry_run"] == {"default": False, "description": schema[name]["dry_run"]["description"], "type": "boolean"}
         assert schema[name]["allow_duplicate"]["type"] == "boolean"
+    assert schema["add_events_bulk"]["detail_level"]["enum"] == ["compact", "full"]
     result = asyncio.run(server.call_tool("add_or_update_event", {
         "name": "Tempo", "workout_type": "Run", "start_date": "2026-10-12", "dry_run": True}))
     payload = json.loads(result[0].text)
     assert payload["request"]["method"] == "POST" and payload["request"]["body"]["name"] == "Tempo"
     refused = asyncio.run(server.call_tool("add_or_update_event", {
         "name": "sweet spot 3x10", "workout_type": "Ride", "start_date": "2026-10-12", "dry_run": True}))
-    assert "already has a WORKOUT with the same name: event 41" in refused[0].text
+    assert "already has a WORKOUT (Ride) with the same name: event 41" in refused[0].text
     assert {method for method, _, _ in fake.requests} == {"GET"}

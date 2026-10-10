@@ -14,7 +14,8 @@ outermost tool call only:
 - runs a tool called with ``dry_run=true`` with read-only requests: the API client refuses
   anything but GET (api.client.read_only_requests), so a dry run can never write.
 
-Nested calls (a tool calling another tool function) pass straight through.
+Nested calls (a tool calling another tool function) pass straight through, except that a nested
+dry run is read-only as well.
 """
 
 import functools
@@ -290,12 +291,13 @@ def guarded(func: F) -> F:
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if _IN_TOOL.get():
-            return await func(*args, **kwargs)
         try:
             bound = signature.bind_partial(*args, **kwargs)
         except TypeError:
             return await func(*args, **kwargs)  # let the function raise its own argument error
+        if _IN_TOOL.get():  # a nested call: only the dry-run guard applies
+            with read_only_requests() if _is_dry_run(signature, bound.arguments) else nullcontext():
+                return await func(*args, **kwargs)
         error = identifier_error(dict(bound.arguments))
         if error:
             return error

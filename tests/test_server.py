@@ -340,7 +340,7 @@ def test_add_or_update_event(monkeypatch):
     )
     assert "Successfully created event id:" in result
     assert "e123" in result
-    assert "Read-back: Intervals.icu stored 2024-01-15T00:00:00 WORKOUT Ride 'Test Workout'" in result
+    assert "Read-back: Intervals.icu stored 2024-01-15 WORKOUT Ride 'Test Workout'" in result
 
 
 def test_get_activity_messages(monkeypatch):
@@ -1341,11 +1341,12 @@ def test_add_events_bulk_happy_path(monkeypatch):
     assert "Warmup" in body[0]["description"]
     assert body[1]["category"] == "NOTE"
     assert body[1]["description"] == "Full rest"
-    assert [{k: row[k] for k in ("index", "id", "name", "start_date_local")} for row in result["created"]] == [
-        {"index": 0, "id": 11, "name": "Easy run", "start_date_local": None},
-        {"index": 1, "id": 12, "name": "Rest", "start_date_local": None},
+    assert [{k: v for k, v in row.items() if k != "warnings"} for row in result["created"]] == [
+        {"index": 0, "status": "created", "id": 11, "date": "2025-01-06", "name": "Easy run"},
+        {"index": 1, "status": "created", "id": 12, "date": "2025-01-07", "name": "Rest"},
     ]
-    assert [row["stored"]["id"] for row in result["created"]] == [11, 12]
+    # The mocked read-back returns the events without their parsed steps: the warning says so.
+    assert result["created"][0]["warnings"] == ["no workout steps stored (1 sent): Intervals.icu did not read the text as a workout"]
     assert result["errors"] == [] and result["refused"] == []
 
 
@@ -1443,7 +1444,7 @@ def test_add_events_bulk_workout_description(monkeypatch):
     )
     assert calls[0]["data"][0]["description"] == "- 10m 60%"
     assert result["created"][0]["name"] == "Server name"
-    assert result["created"][0]["start_date_local"] == "2025-01-06T00:00:00"
+    assert result["created"][0]["date"] == "2025-01-06"
 
 
 def test_add_events_bulk_all_invalid_makes_no_request(monkeypatch):

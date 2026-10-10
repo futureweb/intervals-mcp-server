@@ -182,7 +182,7 @@ async def get_custom_item_by_id(
 
 
 @tool("admin")
-async def create_custom_item(
+async def create_custom_item(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     name: Annotated[str, Field(description="Name of the custom item")],
     item_type: Annotated[CustomItemType, BeforeValidator(upper_choice), Field(description="Kind of custom item")],
     athlete_id: AthleteId = None,
@@ -191,12 +191,14 @@ async def create_custom_item(
         dict[str, Any] | None, Field(description="Configuration object (JSON) of the item; " + CONTENT_HINT)
     ] = None,
     visibility: Visibility = None,
+    dry_run: DryRun = False,
 ) -> str:
     """Use only when the athlete asks to create a custom item (chart, custom field, stream, zones ...) in Intervals.icu.
 
     Creates a new item with name, type and optionally description, content configuration and
-    visibility; nothing existing is changed. The cached definitions are dropped so the other
-    tools see the new item. Returns the created item. Existing items: get_custom_items.
+    visibility; nothing existing is changed (dry_run shows the request). The cached definitions
+    are dropped so the other tools see the new item. Returns the created item. Existing items:
+    get_custom_items.
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -215,11 +217,10 @@ async def create_custom_item(
     if visibility is not None:
         data["visibility"] = visibility
 
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id_to_use)}/custom-item",
-        data=data,
-        method="POST",
-    )
+    url = f"/athlete/{seg(athlete_id_to_use)}/custom-item"
+    if dry_run:
+        return dry_run_answer("POST", url, data)
+    result = await make_intervals_request(url=url, data=data, method="POST")
 
     if isinstance(result, dict) and "error" in result:
         return f"Error creating custom item: {result.get('message')}"

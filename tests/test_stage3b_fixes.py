@@ -114,8 +114,13 @@ def test_compare_best_efforts_ids_are_deduplicated_and_capped_before_any_request
 def test_coach_context_json_follows_detail_level(monkeypatch):
     _load_setup(monkeypatch)
     compact = json.loads(asyncio.run(get_coach_context(output_format="json", detail_level="compact")))
-    standard = json.loads(asyncio.run(get_coach_context(output_format="json")))
+    standard = json.loads(asyncio.run(get_coach_context(output_format="json", detail_level="standard")))
     full = json.loads(asyncio.run(get_coach_context(output_format="json", detail_level="full")))
+    default = json.loads(asyncio.run(get_coach_context(output_format="json")))
+    # R29-11: without an explicit detail_level the JSON keeps the previous full structure.
+    assert set(default) == {"athlete_id", "end", "load_end", "load_end_note", "method", "load", "sports", "fitness", "intensity",
+                            "recovery", "today_completeness", "durability", "efficiency", "top_sessions", "plan", "weeks", "coverage"}
+    assert "drift" in default["intensity"] and len(default["weeks"]) == 4
     assert compact["detail_level"] == "compact" and standard["detail_level"] == "standard"
     for key in ("sports", "top_sessions", "plan", "coverage", "weeks", "references"):
         assert key not in compact, key
@@ -132,9 +137,15 @@ def test_training_summary_json_follows_detail_level(monkeypatch):
     _coaching_router(monkeypatch)
     compact = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json",
                                                           detail_level="compact")))
-    standard = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json")))
+    standard = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json",
+                                                           detail_level="standard")))
     full = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json",
                                                        detail_level="full")))
+    default = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json",
+                                                          include_gear=False)))
+    # R29-11: without an explicit detail_level the JSON keeps all fields, as before.
+    assert "detail_level" not in default and "by_gear" in default["overall"]
+    assert all("reason" in agg for agg in default["overall"]["custom_fields"].values())
     assert compact["detail_level"] == "compact"
     overall = compact["overall"]
     assert "time_in_power_zones_s" not in overall and "custom_fields" not in overall and "by_gear" not in overall
@@ -144,7 +155,7 @@ def test_training_summary_json_follows_detail_level(monkeypatch):
     assert all("reason" not in agg for agg in standard["overall"]["custom_fields"].values())
     assert full["overall"]["custom_fields"] and all("reason" in agg for agg in full["overall"]["custom_fields"].values())
     no_gear = json.loads(asyncio.run(get_training_summary("2026-10-01", "2026-10-09", group_by="total", output_format="json",
-                                                          include_gear=False)))
+                                                          include_gear=False, detail_level="standard")))
     assert "by_gear" not in no_gear["overall"]
 
 

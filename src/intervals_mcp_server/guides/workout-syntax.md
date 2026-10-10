@@ -124,13 +124,15 @@ errors are returned); keys that do not apply to an entry's category are rejected
 ]
 ```
 
-Before the bulk request the events of each day are read: an entry whose day already has the same
-event (same category and name, or the same workout), or that repeats an earlier entry, is refused
-and not written (`allow_duplicate=true` skips the check). The answer is JSON with "created" (input
-index, event id, name and date as returned, plus "stored" and "parse_warnings" from the read-back),
-"refused" (index, the existing event or the earlier entry), "errors" (index and all problems per
-invalid entry) and "created_count". If the request itself fails, an error string is returned and
-events may have been created. `dry_run=true` returns the bulk request that would be sent.
+Before the bulk request the events of the dates are read: an entry whose day already has the same
+event (same category and sport with the same name or the same non-trivial workout), or that
+repeats an earlier entry exactly, is refused and not written (`allow_duplicate=true` skips the
+check); two entries with the same day, sport and name but different content are both created. The
+answer is compact JSON with "created" (input index, status, event id, date, name and short warnings
+from the read-back; `detail_level="full"` adds what was stored), "refused" (index, the existing
+event or the earlier entry), "errors" (index and all problems per invalid entry) and
+"created_count". If the request itself fails, an error string is returned and events may have been
+created. `dry_run=true` returns the bulk request that would be sent.
 
 ## create_library_workout
 

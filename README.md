@@ -153,7 +153,7 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 | `get_durability` | Aerobic decoupling of steady long sessions after a quality filter (excluded sessions per reason), median and count above 5 %, recent vs window with a stability band, efficiency factor trend; qualifying share per sport, fewer than 8 sessions flagged, mixed indoor/outdoor, bikes or power meters pointed out; heat filter on the device sensor or the activity's weather / feels-like temperature (`temperature_source`), sessions list both temperatures |
 | `get_load_projection` | CTL, ATL and form projected over the planned workouts (42/7-day model), missing planned loads reported, race days, Intervals.icu's own projection and a model check for comparison; says prominently when nothing is planned. What-if simulation (`scenario`): sessions or weekly templates that are not in the calendar (load given or estimated as hours x IF² x 100), added to or replacing the plan, compared with the calendar plan; form at a target day or the next RACE_A and a grid search for the load of the last days that reaches a given form range; per-week plan statistics (ramp, monotony, longest session, rest days) with commonly cited ranges and sources. Nothing is written |
 | `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves` | Season and date-range curves |
-| `get_training_summary` | Totals per week, month, sport or gear with the Intervals.icu load (power, else HR, else pace per activity) and the overlapping per-method sums, time in power zones (sweet spot apart) and HR zones, CTL/ATL at the end of each week or month; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change); text and JSON follow `detail_level` |
+| `get_training_summary` | Totals per week, month, sport or gear with the Intervals.icu load (power, else HR, else pace per activity) and the overlapping per-method sums, time in power zones (sweet spot apart) and HR zones, CTL/ATL at the end of each week or month; custom fields aggregated by units and meaning (sums only where they make sense, otherwise mean, median, range or change); an explicit `detail_level` also selects the JSON parts (without it the JSON is complete) |
 | `get_weekly_summary`, `get_plan_compliance` | Weekly review and planned-vs-done overview |
 
 **Wellness and recovery**
@@ -161,7 +161,7 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 | Tool | What it does |
 | --- | --- |
 | `get_recovery_snapshot` | Today and the previous days, 42-day baselines, recent load and planned sessions in one call; names the usual wellness fields today's record does not have yet (not yet available, not normal) |
-| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days, today's not-yet-available wellness fields and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule); text and JSON follow `detail_level` |
+| `get_coach_context` | Recommended first call for a weekly analysis: overview in about 2-2.5k characters with load, fitness, intensity distribution (per-sport split when zone bases mix), HRV / resting HR / sleep 7-day means against the 42 days before them (z against the week-to-week spread of the prior 90 days), durability, top sessions, the plan of the next 7 days, today's not-yet-available wellness fields and a method line (windows, coupled ACWR, `threshold_as`, hard-session rule); an explicit `detail_level` also selects the JSON parts (without it the JSON is complete) |
 | `get_wellness_trends` | Rolling means, baselines, outliers, week-over-week changes, correlations, eFTP per sport; requested period, lookback and baseline window stated separately, small samples flagged |
 | `get_nutrition_summary` | Intake, device burn, energy balance on logged days, weight trend, training load per day |
 | `get_fueling_analysis` | Fueling of one activity or the long sessions of a period: carbs used (Intervals.icu estimate) and ingested per moving hour, ingested share of used, energy, fluid intake, sodium and sweat loss from custom fields found by units and name (device-file zeros treated as placeholders); per sport family, and within it per duration and intensity, with sample sizes, logging coverage and Spearman correlations from 8 sessions; no targets |
@@ -183,7 +183,7 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 
 | Tool | What it does |
 | --- | --- |
-| `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions (`update_custom_item` with `dry_run`: the content after the merge) |
+| `get_custom_items`, `get_custom_item_by_id`, `create_custom_item` ⚙, `update_custom_item` ⚙, `delete_custom_item` ✖ | Custom field, stream and chart definitions (`create_custom_item` and `update_custom_item` with `dry_run`; update: the content after the merge) |
 | `get_server_status` | Version, enabled permissions, tool set, hidden tools, transport and sign-in mode, API check (also `--doctor`) |
 | `get_guide` | Usage guide, workout syntax and method guides (the resources below) for clients that only call tools |
 
@@ -361,14 +361,17 @@ activity unless asked. Empty values from a client never wipe existing text or wo
 
 Every write is predictable and verifiable (details: write safety in `intervals://guide`):
 
-- `dry_run=true` on every create/update tool returns the exact request (method, path, body after
-  all defaults and merges, as compact JSON) and the validation result; no write request is sent
-  (the server refuses every non-GET request during a dry run).
-- Creating an event (single, bulk or from the library) first reads that day's events and refuses
-  a duplicate (same category and name, or the same workout) unless `allow_duplicate=true`; the
-  bulk tool decides per entry and lists the refused ones.
+- `dry_run=true` on every create/update tool (including `create_custom_item`) returns the exact
+  request (method, path, body after all defaults and merges, as compact JSON) and the validation
+  result; no write request is sent (the server refuses every non-GET request during a dry run).
+- Creating an event (single, bulk or from the library) first reads the events of its date (one
+  request over the date range) and refuses a duplicate (same category and sport with the same name,
+  or the same non-trivial workout or text) unless `allow_duplicate=true`; a brick day or an AM/PM
+  pair with different names is not a duplicate. The bulk tool decides per entry, lists the refused
+  ones and creates planned double sessions (same name, different content).
 - After every event or library workout write the answer reads back what Intervals.icu stored and
-  parsed: date, name, category, sport, duration, load, steps parsed vs sent and parse warnings.
+  parsed: date, name, category, sport, duration, load, steps parsed vs sent and parse warnings
+  (notes: date, name, category, text length).
 - `delete_event`, `delete_library_workout` and `delete_custom_item` read the object first and name
   what was deleted; a missing id deletes nothing.
 
