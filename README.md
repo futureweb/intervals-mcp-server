@@ -10,6 +10,7 @@ metrics, every custom field and stream, recovery insights and endurance performa
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![Status: public beta](https://img.shields.io/badge/status-1.0.0b1%20public%20beta-orange)
 [![Garmin Intervals Bridge](https://img.shields.io/badge/companion-Garmin%20Intervals%20Bridge-6f42c1)](https://github.com/futureweb/garmin-intervals-bridge)
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/futureweb/intervals-mcp-server)
 
 <!-- MCP Registry ownership proof for the PyPI package; keep on its own line. -->
 <!-- mcp-name: io.github.futureweb/intervals-mcp-server -->
