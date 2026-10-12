@@ -12,8 +12,9 @@ from enum import Enum, StrEnum
 import json
 import re
 
-from pydantic import ConfigDict
+from pydantic import GetCoreSchemaHandler
 from pydantic.json_schema import SkipJsonSchema
+from pydantic_core import core_schema
 
 
 __all__ = [
@@ -144,8 +145,54 @@ def has_press_lap(text: Any) -> bool:
     return any(word in ("press", "hit") and following == "lap" for word, following in zip(words, words[1:], strict=False))
 
 
+_UNKNOWN_KEYS = "_unknown_keys"
+
+
+class KeepsUnknownKeys:  # pylint: disable=too-few-public-methods
+    """Mixin for the workout dataclasses: the parameter validation (pydantic) drops keys that are
+    not fields; this keeps them, as a dict on the instance, so the workout validation can refuse or
+    report them instead of writing a workout without them (a "press_lap" flag once turned lap-press
+    steps into timed steps). No attribute is ever named after a client key, and the JSON schema is
+    unchanged."""
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        schema = handler(source)
+
+        def keep_unknown(value: Any, validate: core_schema.ValidatorFunctionWrapHandler) -> Any:
+            result = validate(value)
+            if isinstance(value, dict):
+                _attach_unknown_keys(result, value)
+            return result
+
+        return core_schema.no_info_wrap_validator_function(keep_unknown, schema)
+
+    def unknown_keys(self) -> Dict[str, Any]:
+        """Keys a client sent that are not fields of this object (see KeepsUnknownKeys)."""
+        return dict(getattr(self, _UNKNOWN_KEYS, None) or {})
+
+
+def _attach_unknown_keys(obj: Any, raw: Dict[str, Any]) -> None:
+    """Record the keys of *raw* that are not fields of *obj*, also for nested steps and targets
+    (a step's own nested steps are validated without the hook, being the same recursive type)."""
+    if not isinstance(obj, KeepsUnknownKeys):
+        return
+    declared = {field.name for field in fields(obj)}  # type: ignore[arg-type]
+    unknown = {str(key): value for key, value in raw.items() if key not in declared}
+    if unknown:
+        object.__setattr__(obj, _UNKNOWN_KEYS, unknown)
+    for name in ("power", "hr", "pace", "cadence"):
+        if isinstance(raw.get(name), dict):
+            _attach_unknown_keys(getattr(obj, name, None), raw[name])
+    children, raw_children = getattr(obj, "steps", None), raw.get("steps")
+    if isinstance(children, list) and isinstance(raw_children, list):
+        for child, raw_child in zip(children, raw_children, strict=False):
+            if isinstance(raw_child, dict):
+                _attach_unknown_keys(child, raw_child)
+
+
 @dataclass
-class Value:
+class Value(KeepsUnknownKeys):
     """A step target: value, or start and end (a range; a ramp with ramp=true on the step), with units. MINS_KM/MINS_MILE: seconds (335 = 5:35/km) or decimal minutes (5.583; 5.35 would be 5:21, not 5:35); SECS_100M/SECS_100Y/SECS_500M: seconds."""
 
     value: Optional[float] = None
@@ -167,6 +214,7 @@ class Value:
             data["units"] = self.units.value
         if self.target is not None:
             data["target"] = self.target.value
+        data.update(self.unknown_keys())
         return data
 
     @classmethod
@@ -255,12 +303,8 @@ class Value:
 
 
 @dataclass
-class Step:  # pylint: disable=too-many-instance-attributes
-    """One workout step: duration (s) or distance (m) with a target (power, hr, pace or cadence), or reps with nested steps. until_lap_press: true ends the step on the lap button (Garmin, Suunto); its duration or distance is then the planning estimate. See intervals://workout-syntax."""
-
-    # Unknown keys ("press_lap", "end_condition" ...) are kept so that the validation can refuse
-    # them instead of silently writing a workout without them.
-    __pydantic_config__ = ConfigDict(extra="allow")
+class Step(KeepsUnknownKeys):  # pylint: disable=too-many-instance-attributes
+    """One workout step: duration (s) or distance (m) with a target (power, hr, pace or cadence), or reps with nested steps. until_lap_press: true sets it to end on the lap button (Intervals.icu exports an OPEN step; device behaviour not yet verified); its duration or distance is then only the planning estimate. See intervals://workout-syntax."""
 
     text: Optional[str] = None
     text_locale: SkipJsonSchema[Optional[Dict[str, str]]] = None
@@ -336,13 +380,8 @@ class Step:  # pylint: disable=too-many-instance-attributes
             data["_pace"] = self._pace.to_dict()
         if self._distance is not None:
             data["_distance"] = self._distance
-        data.update(self.unknown_fields())
+        data.update(self.unknown_keys())
         return data
-
-    def unknown_fields(self) -> Dict[str, Any]:
-        """Keys a client sent that are not step fields (kept by the parameter validation)."""
-        declared = {field.name for field in fields(self)}
-        return {key: value for key, value in vars(self).items() if key not in declared and not key.startswith("__")}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Step":  # pylint: disable=too-many-branches
@@ -530,7 +569,7 @@ class SportSettings:
 
 
 @dataclass
-class WorkoutDoc:  # pylint: disable=too-many-instance-attributes
+class WorkoutDoc(KeepsUnknownKeys):  # pylint: disable=too-many-instance-attributes
     """Structured workout: steps (required for a structured workout) and an optional description. See intervals://workout-syntax."""
 
     # The fields hidden from the JSON schema are filled by Intervals.icu (thresholds, zone times,
@@ -590,6 +629,7 @@ class WorkoutDoc:  # pylint: disable=too-many-instance-attributes
             data["options"] = self.options
         if self.locales is not None:
             data["locales"] = self.locales
+        data.update(self.unknown_keys())
         return data
 
     @classmethod

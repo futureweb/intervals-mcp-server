@@ -35,9 +35,12 @@ result to the athlete before writing it.
   both (the distance would be dropped).
 - Every step needs a duration or a distance, except a pure text/comment step (`{"text": "..."}`
   without a target). A free ride without duration is refused.
-- Until lap press: `{"until_lap_press": true, "duration": 600, ...}` ends the step when the athlete
-  presses the lap button (see "Lap-press steps" below). Keys outside the workout format (e.g.
-  `press_lap`) are refused, because they would be dropped silently.
+- Until lap press: `{"until_lap_press": true, "duration": 600, ...}` sets the step to end on the
+  lap button (see "Lap-press steps" below).
+- Keys outside the workout format would be dropped: a key that could change how a step ends
+  (`press_lap`, `end_condition`, `open`, `time` ...) is refused, other unknown keys are ignored with
+  a warning; keys with a null value and keys Intervals.icu stores itself (e.g. `text_events`,
+  `zoneTimes`) pass.
 - `warmup: true` / `cooldown: true` on single steps (not on repeat blocks) mark warm-up and
   cool-down; a missing warm-up or cool-down is a warning.
 - Targets: one of `power`, `hr`, `pace` (and optionally `cadence`), each an object with `units`
@@ -91,20 +94,23 @@ For outdoor sessions whose next step should start at a suitable place (a climb, 
 ```
 
 - `until_lap_press: true` is written as Intervals.icu's own marker, `- Press lap Locker bis Anstieg 5m
-  45%-55% ftp` (the form of the builder's "End when lap button pressed" option); Intervals.icu stores
-  the step with `until_lap_press: true`, and its Garmin export has the step as OPEN (lap button)
-  without the time or distance.
+  45%-55% ftp` (the form of the builder's "End when lap button pressed" option).
+- Verified: Intervals.icu stores the step with `until_lap_press: true`, and its FIT export
+  (download-workout.fit) writes it as an OPEN step without time or distance.
+- Not verified yet (needs a device test): how Garmin Connect shows the pushed step and how a Garmin
+  device runs it. Intervals.icu documents lap-press steps for Garmin; per its developer a Suunto
+  step ends at the estimate or on lap, whichever comes first. Other devices and file formats: not
+  verified. The Garmin Edge manual says the lap button ends any running step, also a timed one.
 - The step still needs a `duration` or `distance`: it is only the planning estimate for the
-  planned duration, load and zone times (Intervals.icu drops a step without one). The following
-  step starts when the lap button is pressed, timed steps end after their time as usual.
+  planned duration, load and zone times (Intervals.icu drops a step without one).
 - Works on single steps and inside repeat blocks (not on the repeat block itself), with power, HR
   or pace targets, ramps or freeride.
-- Devices: Garmin (via Garmin Connect) and Suunto. Other devices, apps and .zwo/.erg files use the
-  estimate as a normal duration. On Garmin the lap button ends any step, also a timed one.
 - A label must not contain "press lap" or "hit lap" unless the step has `until_lap_press`
-  (Intervals.icu would turn the step into a lap-press step).
-- `validate_workout`/`preview_workout` count the lap-press steps and their estimate; after a write
-  the read-back warns when Intervals.icu stored a lap-press step as a timed step (or the reverse).
+  (Intervals.icu would turn the step into a lap-press step); in a comment line it would mark the
+  step before it.
+- `validate_workout`/`preview_workout` count the lap-press steps (each step of a repeat block once,
+  plus the number of runs) and their estimate; after a write the read-back reports the same count
+  and warns when Intervals.icu stored a lap-press step as a timed step (or the reverse).
 
 ## Native workout text (`description`)
 
@@ -122,7 +128,7 @@ Cooldown
 ```
 
 It is not validated by this server; prefer a workout_doc for structured workouts. "Press lap" (or
-"hit lap") anywhere in a step line makes that step end on the lap button.
+"hit lap") anywhere in a step line makes Intervals.icu store that step with `until_lap_press`.
 
 ## add_or_update_event
 

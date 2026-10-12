@@ -3,9 +3,10 @@ validation, read-back and the regression of the earlier failure (a lap-press fla
 dropped, so the device ended the step after its time).
 
 The fixture tests/ressources/lap_press_parser_cases.json holds what Intervals.icu's own workout
-parser (cut unchanged out of the public web client and run in V8) made of each workout text, and
-the FIT duration types of the documented conversion endpoint (download-workout.fit). Every test
-runs offline against mocked requests; nothing reaches Intervals.icu.
+parser (cut unchanged out of the public web client and run in V8) made of each workout text; for
+the proof-of-concept entries also the FIT duration types of the documented conversion endpoint
+(download-workout.fit), and a synthetic workout shaped like the failed one with its text from the
+80ef553 serialiser. Every test runs offline against mocked requests; nothing reaches Intervals.icu.
 """
 
 import asyncio
@@ -25,12 +26,13 @@ os.environ.setdefault("ATHLETE_ID", "i1")
 from intervals_mcp_server.tools.events import add_events_bulk, add_or_update_event  # noqa: E402
 from intervals_mcp_server.tools.workout_check import preview_workout, validate_workout  # noqa: E402
 from intervals_mcp_server.utils.formatting import format_event_details  # noqa: E402
-from intervals_mcp_server.utils.types import Step, WorkoutDoc, has_press_lap  # noqa: E402
+from intervals_mcp_server.utils.types import Step, Value, WorkoutDoc, has_press_lap  # noqa: E402
 from intervals_mcp_server.utils.workout_validation import validate_workout_doc, workout_text_for_write  # noqa: E402
 
 FIXTURE = json.loads((pathlib.Path(__file__).parent / "ressources" / "lap_press_parser_cases.json").read_text(encoding="utf-8"))
 CASES = {case["case"]: case for case in FIXTURE["cases"]}
 POC = FIXTURE["poc"]
+REGRESSION = FIXTURE["regression"]
 ADAPTER = TypeAdapter(WorkoutDoc)
 MODULES = ("intervals_mcp_server.api.client", "intervals_mcp_server.tools.events")
 
@@ -129,17 +131,95 @@ def test_regression_lap_flag_is_no_longer_dropped():
     assert totals["lap_press_steps"] == 1 and totals["lap_press_estimate_s"] == 1200 and totals["duration_s"] == 1800
 
 
-@pytest.mark.parametrize("alias", ["press_lap", "lap_press", "end_condition", "lap", "open_ended"])
+def _line_80ef553(step: dict) -> str:
+    """One step line as the 80ef553 serialiser wrote it: duration, targets, then the label; it had
+    the until_lap_press field but never wrote it."""
+    parts = [Step(duration=step["duration"])._format_duration()]  # pylint: disable=protected-access
+    parts += [str(Value.from_dict(step[kind])) for kind in ("power", "cadence") if kind in step]
+    return "- " + " ".join(parts) + f" {step['text']} "
+
+
+def test_regression_failed_workout_shape_80ef553_versus_now():
+    """The failed workout (13.09.2026): 7 lap steps with cadence and "LAP ..." hints in the labels.
+    80ef553 wrote them as timed steps with the labels after the targets; Intervals.icu stored nine
+    timed steps without labels. Now 7 lines carry the marker and the parse has 7 lap steps."""
+    doc = REGRESSION["mcp_workout_doc"]
+    old_lines = [line for line in REGRESSION["text_80ef553"].splitlines() if line.startswith("- ")]
+    assert old_lines == [_line_80ef553(step) for step in doc["steps"]]
+    assert not any(step.get("until_lap_press") or step.get("text") for step in REGRESSION["parsed_80ef553"])
+    written = workout_text_for_write(ADAPTER.validate_python(doc), "Ride")
+    assert written.problem is None and written.text == REGRESSION["text_new"]
+    assert [has_press_lap(line) for line in _step_lines(written.text)] == [False] + [True] * 7 + [False]
+    parsed = REGRESSION["parsed_new"]
+    assert [bool(step.get("until_lap_press")) for step in parsed] == [False] + [True] * 7 + [False]
+    for sent, stored in zip(doc["steps"], parsed, strict=True):
+        assert stored["duration"] == sent["duration"] and stored["power"] == sent["power"]
+        assert stored.get("cadence") == sent.get("cadence")
+    totals = validate_workout_doc(doc, "Ride")["totals"]
+    assert totals["lap_press_steps"] == 7 and totals["duration_s"] == 13620
+
+
+@pytest.mark.parametrize("alias", ["press_lap", "lap_press", "end_condition", "lap", "open_ended", "lap_button", "manual"])
 def test_unknown_lap_fields_are_refused_not_dropped(monkeypatch, alias):
     """A "press_lap" property was dropped silently by the parameter validation; it is refused now."""
     calls = _router(monkeypatch)
     raw = {"steps": [{"text": "Bis Anstieg", "duration": 1200, alias: True, "power": {"value": 60, "units": "%ftp"}}, WORK_STEP]}
     doc = ADAPTER.validate_python(raw)
     result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=doc, start_date="2026-11-21"))
-    assert result.startswith("Error: workout_doc is not valid") and f"unknown step field '{alias}'" in result
+    assert result.startswith("Error: workout_doc is not valid") and f"unknown field '{alias}' could change how the step ends" in result
     assert "until_lap_press: true" in result and not _writes(calls)
     report = asyncio.run(validate_workout(raw, "Ride", check_calendar=False))
     assert "ERRORS" in report and alias in report
+
+
+@pytest.mark.parametrize(
+    "raw,where",
+    [
+        ({"until_lap_press": True, "steps": [{"duration": 300, "power": {"value": 60, "units": "%ftp"}}]}, "workout_doc"),
+        ({"steps": [{"duration": 300, "power": {"value": 60, "units": "%ftp", "press_lap": True}}]}, "step 1: power target"),
+        ({"steps": [{"reps": 2, "steps": [{"duration": 300, "hr": {"value": 2, "units": "hr_zone", "until_lap_press": True}}]}]},
+         "step 1.1: hr target"),
+        ({"steps": [{"duration": 300, "time": 600, "power": {"value": 60, "units": "%ftp"}}]}, "step 1"),
+    ],
+)
+def test_end_condition_keys_are_refused_at_every_level(monkeypatch, raw, where):
+    calls = _router(monkeypatch)
+    result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=ADAPTER.validate_python(raw),
+                                             start_date="2026-11-21"))
+    assert result.startswith("Error: workout_doc is not valid") and f"{where}: unknown field" in result and not _writes(calls)
+    assert not validate_workout_doc(raw, "Ride")["ok"]
+
+
+@pytest.mark.parametrize("key", ["to_dict", "unknown_keys", "__str__", "__init__", "__dict__", "_secret", "from_dict"])
+def test_reserved_keys_are_refused_cleanly(monkeypatch, key):
+    """Method and dunder names neither crash the tool nor pass silently."""
+    calls = _router(monkeypatch)
+    raw = {"steps": [{"duration": 300, key: 1, "power": {"value": 60, "units": "%ftp"}}]}
+    result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=ADAPTER.validate_python(raw),
+                                             start_date="2026-11-21"))
+    assert result.startswith("Error: workout_doc is not valid") and "reserved name" in result and not _writes(calls)
+
+
+def test_harmless_unknown_keys_are_written_with_a_warning(monkeypatch):
+    """Keys main dropped silently (name, notes ...) are ignored with a warning; null values and keys
+    Intervals.icu stores itself pass without one."""
+    calls = _router(monkeypatch, stored_steps=[{"duration": 300, "power": {"units": "%ftp", "value": 60}, "text": "Spin"}])
+    raw = {"zoneTimes": [], "average_watts": 150, "steps": [
+        {"text": "Spin", "duration": 300, "name": "Spin", "notes": "easy", "step_type": "active", "text_events": None,
+         "comment": None, "power": {"value": 60, "units": "%ftp", "zone": 2}}]}
+    raw["steps"][0]["text_events"] = [{"text": "Spin", "timeoffset": 0}]
+    result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=ADAPTER.validate_python(raw),
+                                             start_date="2026-11-21"))
+    assert result.startswith("Successfully created") and _writes(calls)
+    for key in ("'name'", "'notes'", "'step_type'", "'zone'"):
+        assert f"unknown field {key} is ignored" in result
+    for key in ("text_events", "comment", "zoneTimes", "average_watts"):
+        assert f"'{key}'" not in result
+    assert _writes(calls)[0]["data"]["description"].startswith("- Spin 5m 60% ftp")
+
+
+def test_schema_does_not_invite_extra_keys():
+    assert "additionalProperties" not in json.dumps(ADAPTER.json_schema())
 
 
 def test_unknown_fields_in_bulk_entries_are_refused(monkeypatch):
@@ -162,7 +242,18 @@ def test_lap_flag_must_be_boolean_and_not_on_repeat_blocks():
                      {"reps": 2, "until_lap_press": True, "steps": [{"duration": 60, "power": {"value": 50, "units": "%ftp"}}]}]}
     errors = validate_workout_doc(doc, "Ride")["errors"]
     assert any("until_lap_press must be true or false" in e for e in errors)
-    assert any("repeat block cannot have its own until_lap_press" in e for e in errors)
+    assert any("a repeat block cannot end on the lap button itself" in e for e in errors)
+
+
+def test_lap_flag_false_is_accepted_everywhere():
+    """Clients that fill every boolean send until_lap_press: false, also on repeat blocks (main wrote it)."""
+    work = {"duration": 600, "until_lap_press": False, "power": {"start": 240, "end": 250, "units": "w"}}
+    doc = {"steps": [{"duration": 600, "until_lap_press": False, "warmup": True, "power": {"value": 50, "units": "%ftp"}},
+                     {"reps": 3, "until_lap_press": False, "steps": [work, {**LAP_STEP, "duration": 300}]},
+                     {"duration": 600, "until_lap_press": False, "cooldown": True, "power": {"value": 50, "units": "%ftp"}}]}
+    result = validate_workout_doc(doc, "Ride")
+    assert result["ok"] and result["totals"]["lap_press_steps"] == 1 and result["totals"]["lap_press_runs"] == 3
+    assert result["preview"].count("Press lap") == 1
 
 
 # ------------------------------------------------------------------ labels
@@ -171,6 +262,17 @@ def test_press_lap_in_a_label_needs_the_flag(label):
     doc = {"steps": [{"text": label, "duration": 300, "power": {"value": 50, "units": "%ftp"}}]}
     errors = validate_workout_doc(doc, "Ride")["errors"]
     assert any("set until_lap_press: true" in e for e in errors)
+
+
+def test_press_lap_in_a_comment_line_gets_a_fitting_message():
+    """A comment line joins the step before it, so 'press lap' there would mark that step."""
+    doc = {"steps": [{"duration": 600, "power": {"value": 50, "units": "%ftp"}}, {"text": "Press lap at the junction"},
+                     {"duration": 600, "power": {"value": 90, "units": "%ftp"}}]}
+    errors = validate_workout_doc(doc, "Ride")["errors"]
+    assert any("in a comment line Intervals.icu reads it as the lap marker of the step before it" in e for e in errors)
+    assert not any("set until_lap_press: true for that" in e for e in errors)
+    block = {"steps": [{"reps": 2, "text": "Hit lap block", "steps": [{"duration": 60, "power": {"value": 50, "units": "%ftp"}}]}]}
+    assert any("a repeat label cannot end on the lap button" in e for e in validate_workout_doc(block, "Ride")["errors"])
 
 
 def test_press_lap_label_with_the_flag_is_written_once():
@@ -190,7 +292,8 @@ def test_german_lap_hint_stays_a_plain_label():
 def test_lap_steps_inside_repeat_blocks():
     doc = POC["outdoor_threshold_route_aware_repeat"]["mcp_workout_doc"]
     result = validate_workout_doc(doc, "Ride")
-    assert result["ok"] and result["totals"]["lap_press_steps"] == 3 and result["totals"]["lap_press_estimate_s"] == 3 * 450
+    totals = result["totals"]
+    assert result["ok"] and totals["lap_press_steps"] == 1 and totals["lap_press_runs"] == 3 and totals["lap_press_estimate_s"] == 3 * 450
     assert "3x Anstiege \n- Press lap Locker bis Anstieg 7m30s 110W-155W \n- Schwelle 10m 240W-250W" in result["preview"]
     parsed = POC["outdoor_threshold_route_aware_repeat"]["parsed"]["steps"][1]
     assert parsed["reps"] == 3 and parsed["steps"][0]["until_lap_press"] is True
@@ -207,8 +310,25 @@ def test_lap_step_with_a_distance_estimate():
 
 def test_preview_shows_lap_steps_and_their_estimate():
     report = asyncio.run(preview_workout(POC["outdoor_threshold_route_aware"]["mcp_workout_doc"], "Ride"))
-    assert "Until lap press: 3 step(s) end only on the lap button" in report and "planning estimate 20:00" in report
+    assert "Until lap press: 3 step(s) set to end on the lap button;" in report and "planning estimate 20:00" in report
+    assert "needs a device test" in report and "0 without duration or distance" in report and "open-ended" not in report
     assert "planned duration 1:17:00" in report and "- Press lap Locker bis Anstieg 10m 130W-155W" in report
+
+
+def test_lap_counts_agree_between_preview_and_read_back(monkeypatch):
+    """Each step of a repeat block counts once in both places; the preview adds the runs."""
+    poc = POC["outdoor_threshold_route_aware_repeat"]
+    report = asyncio.run(preview_workout(poc["mcp_workout_doc"], "Ride"))
+    assert "Until lap press: 1 step(s) set to end on the lap button (run 3 times with the repeats)" in report
+    _router(monkeypatch, stored_steps=poc["parsed"]["steps"])
+    result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=ADAPTER.validate_python(poc["mcp_workout_doc"]),
+                                             start_date="2026-11-21"))
+    assert ", 1 until lap press." in result and "until-lap-press steps stored" not in result and "sent as until lap press" not in result
+
+
+def test_distance_steps_mark_the_planned_duration_as_partial():
+    report = asyncio.run(preview_workout(POC["outdoor_threshold_route_aware_distance"]["mcp_workout_doc"], "Ride"))
+    assert "planned duration 47:00 for the timed steps + 10500 m in distance steps (Intervals.icu estimates their time" in report
 
 
 def test_stored_lap_step_is_shown_with_one_marker():
@@ -259,7 +379,7 @@ def test_read_back_warns_when_the_lap_flag_was_not_stored(monkeypatch):
     _router(monkeypatch, stored_steps=stored)
     doc = ADAPTER.validate_python({"steps": [LAP_STEP, WORK_STEP]})
     result = asyncio.run(add_or_update_event(name="Route aware", workout_type="Ride", workout_doc=doc, start_date="2026-11-21"))
-    assert "step 1: sent as until lap press, stored as a timed step" in result
+    assert "step 1: sent as until lap press, stored as a timed step: Intervals.icu exports it with the planning estimate" in result
 
 
 def test_read_back_of_native_text_compares_the_lap_steps(monkeypatch):

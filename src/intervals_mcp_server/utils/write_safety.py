@@ -280,7 +280,8 @@ def _has_target(step: dict[str, Any]) -> bool:
 
 
 def _lap_steps(leaves: list[dict[str, Any]]) -> int:
-    """Steps that end on the lap button (until_lap_press), each step of a repeat block once."""
+    """Steps set to end on the lap button (until_lap_press), each step of a repeat block once (as
+    validate_workout counts them)."""
     return len([leaf for leaf in leaves if leaf.get("until_lap_press") is True and _timed(leaf)])
 
 
@@ -385,11 +386,11 @@ def _lap_warning(number: int, mine: dict[str, Any], theirs: dict[str, Any]) -> s
     sent, stored = mine.get("until_lap_press") is True, theirs.get("until_lap_press") is True
     if sent and not stored:
         return (
-            f"step {number}: sent as until lap press, stored as a timed step: the device ends it after the planning "
-            "estimate, not on the lap button"
+            f"step {number}: sent as until lap press, stored as a timed step: Intervals.icu exports it with the planning "
+            "estimate as a fixed duration instead of an OPEN lap-button step"
         )
     if stored and not sent:
-        return f"step {number}: stored as until lap press (ends on the lap button), sent as a timed step"
+        return f"step {number}: stored as until lap press (exported as an OPEN lap-button step), sent as a timed step"
     return None
 
 
