@@ -2,16 +2,18 @@
 Client-side validation and preview of workout documents before they are written to the
 Intervals.icu calendar. Intervals.icu has no parse/validate endpoint, so the checks here
 mirror what the workout builder expects: durations or distances per step, repeat blocks,
-target units per sport, ramps and ranges, warm-up/cool-down, and the total duration.
+target units per sport, ramps and ranges, warm-up/cool-down, lap-press steps and the total
+duration.
 """
 
+import dataclasses
 import re
 from typing import Any, NamedTuple
 
 from pydantic import TypeAdapter, ValidationError
 
 from intervals_mcp_server.utils.sports import hms
-from intervals_mcp_server.utils.types import ValueUnits, WorkoutDoc
+from intervals_mcp_server.utils.types import Step, Value, ValueUnits, WorkoutDoc, has_press_lap
 
 RUN_TYPES = ("Run", "TrailRun", "VirtualRun", "Walk", "Hike")
 RIDE_TYPES = ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide", "EBikeRide")
@@ -47,6 +49,30 @@ PLAUSIBLE = {
     "rpm": (20, 140),
 }
 DURATION_TOLERANCE_S = 60
+# Keys of the workout format per level. Anything else would be dropped without a trace (a
+# "press_lap" flag once turned lap-press steps into timed steps): keys that could change how a step
+# ends are refused, other unknown keys are reported as ignored.
+KNOWN_KEYS = {
+    "doc": frozenset(field.name for field in dataclasses.fields(WorkoutDoc)) | {"sportSettings", "zoneTimes"},
+    "step": frozenset(field.name for field in dataclasses.fields(Step)),
+    "target": frozenset(field.name for field in dataclasses.fields(Value)),
+}
+# Keys Intervals.icu itself stores in a workout_doc (computed, or derived from the text, which is
+# rebuilt from the steps): a doc copied from get_event_by_id may carry them.
+INTERVALS_KEYS = {
+    "doc": frozenset({"hrZoneTimes", "paceZoneTimes", "average_watts", "normalized_power", "polarization_index",
+                      "strain_score", "variability_index"}),
+    "step": frozenset({"text_events"}),
+    "target": frozenset(),
+}
+_END_CONDITION_KEY = re.compile(r"lap|press|open|until|condition|manual|button|trigger", re.I)
+_LENGTH_KEY = re.compile(
+    r"^(?:dur|duration\w*|\w*_duration|dist|distance\w*|\w*_distance|time|time_\w*|\w*_time|secs?|seconds|mins?|"
+    r"minutes|hours?|length|met(?:er|re)s?|km|miles?)$",
+    re.I,
+)
+# Method names of the workout classes (keys starting with "_" are reserved as well).
+_RESERVED_KEYS = frozenset(name for cls in (Step, Value, WorkoutDoc) for name in dir(cls) if callable(getattr(cls, name, None)))
 
 # Step labels are written BEFORE the duration ("- Sprint 40mtr Z5 HR"), unescaped: a word of the
 # label that Intervals.icu reads as workout syntax would change the step. The checks work on
@@ -77,14 +103,19 @@ _KEYWORD_RE = re.compile(r"(?<![a-z])(ramp|freeride|free ride|maxeffort|max effo
 _STRUCTURE_LINE = re.compile(r"\s*(?:-|\d+\s*x\b|(?:warm\s*-?\s*up|cool\s*-?\s*down)\s*:?\s*$)", re.I)
 
 
-def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> str | None:
+def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> str | None:  # pylint: disable=too-many-return-statements
     """Why a step label would be read as workout syntax, or None when it is a plain label.
 
-    flags: keywords the step already carries (ramp, freeride, maxeffort, hidepower); the same
-    word in the label then changes nothing.
+    flags: keywords the step already carries (ramp, freeride, maxeffort, hidepower,
+    until_lap_press); the same word in the label then changes nothing.
     """
     if not isinstance(text, str):
         return "must be a string"
+    if has_press_lap(text) and "until_lap_press" not in flags:
+        return (
+            "contains 'press lap' or 'hit lap', which Intervals.icu would read as 'end the step on the lap button'; "
+            "set until_lap_press: true for that instead"
+        )
     for pattern, meaning in _TEXT_SYNTAX:
         found = pattern.search(text)
         if found:
@@ -131,6 +162,7 @@ def _check_value(kind: str, value: Any, path: str, errors: list[str], warnings: 
     if not isinstance(value, dict):
         errors.append(f"{path}: {kind} target must be an object with value/start/end and units")
         return
+    check_unknown_keys(value, "target", f"{path}: {kind} target", errors, warnings)
     units = value.get("units")
     valid = {u.value for u in ValueUnits}
     if units not in valid:
@@ -167,7 +199,18 @@ def _check_value(kind: str, value: Any, path: str, errors: list[str], warnings: 
 def _check_label(step: dict[str, Any], path: str, errors: list[str]) -> None:
     if step.get("text") is None:
         return
-    flags = {key for key in ("ramp", "freeride", "maxeffort", "hidepower") if step.get(key)}
+    block = step.get("reps") is not None or bool(step.get("steps"))
+    timed = step.get("duration") is not None or step.get("distance") is not None
+    if has_press_lap(step["text"]) and step.get("until_lap_press") is not True and (block or not timed):
+        effect = (
+            "a repeat label cannot end on the lap button; set until_lap_press on the nested step that should"
+            if block
+            else "in a comment line Intervals.icu reads it as the lap marker of the step before it (the line joins "
+            "that step)"
+        )
+        errors.append(f"{path}: text {step['text']!r} contains 'press lap' or 'hit lap': {effect}; rephrase it (e.g. 'LAP druecken')")
+        return
+    flags = {key for key in ("ramp", "freeride", "maxeffort", "hidepower", "until_lap_press") if step.get(key)}
     problem = label_problem(step["text"], flags)
     timed = any(step.get(k) is not None for k in ("duration", "distance", "reps", "steps"))
     if problem is None and not timed:
@@ -191,12 +234,58 @@ def _check_number(name: str, value: Any, path: str, errors: list[str], *, whole:
     return float(value)
 
 
+def _new_totals() -> dict[str, Any]:
+    return {"duration": 0.0, "distance": 0.0, "open": 0, "work": 0, "steps": 0, "lap_runs": 0, "lap_estimate": 0.0, "lap_estimate_distance": 0.0}
+
+
+def check_unknown_keys(obj: dict[str, Any], level: str, path: str, errors: list[str], warnings: list[str]) -> None:
+    """Keys outside the workout format at *level* (doc, step or target).
+
+    Null values and keys Intervals.icu stores itself pass; a key that could change how a step
+    ends (lap, press, open, until ...; a length other than duration/distance on a step) and
+    reserved names are refused; any other key is reported as ignored."""
+    for key in sorted(str(k) for k in obj if k not in KNOWN_KEYS[level]):
+        if obj[key] is None or key in INTERVALS_KEYS[level]:
+            continue
+        if key.startswith("_") or key in _RESERVED_KEYS:
+            errors.append(f"{path}: {key!r} is not a field of the workout format (reserved name)")
+        elif _END_CONDITION_KEY.search(key):
+            errors.append(
+                f"{path}: unknown field {key!r} could change how the step ends and would be lost; for a step that ends "
+                "on the lap button set until_lap_press: true on that step, with a duration or distance as planning estimate"
+            )
+        elif level == "step" and _LENGTH_KEY.match(key):
+            errors.append(f"{path}: unknown field {key!r} would be lost; give the step length as duration (seconds) or distance (metres)")
+        else:
+            warnings.append(f"{path}: unknown field {key!r} is ignored (not part of the workout format)")
+
+
+def _lap_steps(steps: Any) -> tuple[int, int]:
+    """(lap-press steps as defined, as run): a step of a repeat block counts once, resp. reps times."""
+    defined = runs = 0
+    for step in steps if isinstance(steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        if isinstance(step.get("steps"), list):
+            inner, _ = _lap_steps(step["steps"])
+            raw_reps = step.get("reps")
+            reps = raw_reps if isinstance(raw_reps, int) and not isinstance(raw_reps, bool) and raw_reps > 0 else 1
+            defined, runs = defined + inner, runs + inner * reps
+        elif step.get("until_lap_press") is True and (step.get("duration") is not None or step.get("distance") is not None):
+            defined, runs = defined + 1, runs + 1
+    return defined, runs
+
+
 def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-statements
     step: dict[str, Any], path: str, sport: str, errors: list[str], warnings: list[str], totals: dict[str, Any]
 ) -> None:
     duration, distance = step.get("duration"), step.get("distance")
     reps, children = step.get("reps"), step.get("steps")
+    lap = step.get("until_lap_press")
+    check_unknown_keys(step, "step", path, errors, warnings)
     _check_label(step, path, errors)
+    if lap is not None and not isinstance(lap, bool):
+        errors.append(f"{path}: until_lap_press must be true or false")
     if reps is not None or children:
         if not isinstance(reps, int) or isinstance(reps, bool) or reps < 1:
             errors.append(f"{path}: reps must be a positive integer")
@@ -209,20 +298,28 @@ def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-man
         for key in ("duration", "distance", "power", "hr", "pace", "cadence"):
             if step.get(key) is not None:
                 errors.append(f"{path}: a repeat block cannot have its own {key}; put it on the nested steps")
+        if lap is True:
+            errors.append(f"{path}: a repeat block cannot end on the lap button itself; set until_lap_press on the nested step that should")
         for index, child in enumerate(children, 1):
             if not isinstance(child, dict):
                 errors.append(f"{path}.{index}: step must be an object")
                 continue
             for _ in range(max(reps, 1)):
                 _check_step(child, f"{path}.{index}", sport, [], [], totals)
-            _check_step(child, f"{path}.{index}", sport, errors, warnings, {"duration": 0, "distance": 0, "open": 0, "work": 0, "steps": 0})
+            _check_step(child, f"{path}.{index}", sport, errors, warnings, _new_totals())
         return
     totals["steps"] += 1
     if duration is None and distance is None:
-        if step.get("until_lap_press") or step.get("freeride"):
+        if lap is True:
             totals["open"] += 1
             errors.append(
-                f"{path}: open-ended step (until lap press / free ride without duration) cannot be written as "
+                f"{path}: open-ended step (until lap press) needs a duration or distance as planning estimate "
+                "(Intervals.icu drops a step without one); the estimate only counts for the planned time and load"
+            )
+        elif step.get("freeride"):
+            totals["open"] += 1
+            errors.append(
+                f"{path}: open-ended step (free ride without duration) cannot be written as "
                 "Intervals.icu workout text; give it a duration or distance"
             )
         elif step.get("text") and not any(step.get(k) for k in ("power", "hr", "pace", "cadence")):
@@ -235,10 +332,16 @@ def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-man
         seconds = _check_number("duration", duration, path, errors, whole=True)
         if seconds is not None:
             totals["duration"] += seconds
+            if lap is True:
+                totals["lap_estimate"] += seconds
     if distance is not None:
         metres = _check_number("distance", distance, path, errors)
         if metres is not None:
             totals["distance"] += metres
+            if lap is True:
+                totals["lap_estimate_distance"] += metres
+    if lap is True and (duration is not None or distance is not None):
+        totals["lap_runs"] += 1
     if step.get("ramp") and not any(isinstance(step.get(k), dict) and step[k].get("start") is not None for k in ("power", "hr", "pace")):
         errors.append(f"{path}: a ramp needs a start/end range target")
     has_target = False
@@ -279,7 +382,8 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
     description_problem = structure_line_problem(doc.get("description"))
     if description_problem:
         errors.append(f"workout_doc.description: {description_problem}")
-    totals: dict[str, Any] = {"duration": 0.0, "distance": 0.0, "open": 0, "work": 0, "steps": 0}
+    check_unknown_keys(doc, "doc", "workout_doc", errors, warnings)
+    totals = _new_totals()
     for index, step in enumerate(steps, 1):
         if not isinstance(step, dict):
             errors.append(f"step {index}: must be an object")
@@ -298,6 +402,7 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
         )
     if workout_type not in RUN_TYPES + RIDE_TYPES + SWIM_TYPES:
         warnings.append(f"workout_type {workout_type!r} is not a common Intervals.icu activity type (Ride, GravelRide, Run, Swim ...)")
+    lap_defined, _ = _lap_steps(steps)
     preview = ""
     if not errors:
         try:
@@ -314,6 +419,10 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
             "steps": totals["steps"],
             "work_steps": totals["work"],
             "open_steps": totals["open"],
+            "lap_press_steps": lap_defined,
+            "lap_press_runs": totals["lap_runs"],
+            "lap_press_estimate_s": totals["lap_estimate"],
+            "lap_press_estimate_m": totals["lap_estimate_distance"],
             "has_warmup": has_warmup,
             "has_cooldown": has_cooldown,
         },
@@ -327,10 +436,25 @@ def format_validation(result: dict[str, Any], workout_type: str) -> str:
     lines = [f"Workout validation ({workout_type}): {'OK' if result['ok'] else 'ERRORS'}"]
     if totals:
         lines.append(
-            f"Totals: {totals['steps']} steps ({totals['work_steps']} with targets, {totals['open_steps']} open-ended), "
-            f"planned duration {hms(totals['duration_s'])}"
-            + (f", distance {totals['distance_m']:.0f} m" if totals["distance_m"] else "")
+            f"Totals: {totals['steps']} steps ({totals['work_steps']} with targets, {totals['open_steps']} without duration "
+            f"or distance), planned duration {hms(totals['duration_s'])}"
+            + (
+                f" for the timed steps + {totals['distance_m']:.0f} m in distance steps (Intervals.icu estimates their time "
+                "from the pace target or pace zones, else at 30 km/h for Ride/VirtualRide settings and 10 km/h otherwise)"
+                if totals["distance_m"]
+                else ""
+            )
             + f", warm-up {'yes' if totals['has_warmup'] else 'no'}, cool-down {'yes' if totals['has_cooldown'] else 'no'}"
+        )
+    if totals.get("lap_press_steps"):
+        estimate = [hms(totals["lap_press_estimate_s"])] if totals.get("lap_press_estimate_s") else []
+        estimate += [f"{totals['lap_press_estimate_m']:.0f} m"] if totals.get("lap_press_estimate_m") else []
+        runs = totals.get("lap_press_runs") or totals["lap_press_steps"]
+        lines.append(
+            f"Until lap press: {totals['lap_press_steps']} step(s) set to end on the lap button"
+            + (f" (run {runs} times with the repeats)" if runs != totals["lap_press_steps"] else "")
+            + "; Intervals.icu's FIT export writes them as OPEN steps without time, how the device runs them still "
+            f"needs a device test; planning estimate {' + '.join(estimate)}, counted in the planned duration and load"
         )
     for error in result["errors"]:
         lines.append(f"ERROR: {error}")

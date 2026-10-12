@@ -6,7 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Lap-press steps: `until_lap_press: true` on a step with a duration or distance is written as
+  Intervals.icu's native `Press lap` marker; the duration or distance stays the planning estimate
+  for planned time and load. Works inside repeat blocks. Verified: Intervals.icu stores the flag and
+  its FIT export writes an OPEN step; how Garmin Connect and the device run it still needs a device
+  test. `validate_workout`/`preview_workout` count the lap-press steps and their estimate; the
+  write read-back reports the same count and warns when Intervals.icu stored a lap-press step as a
+  timed step or the reverse.
+
+### Changed
+- Unknown keys in a workout_doc (doc, step or target) are no longer dropped silently: a key that
+  could change how a step ends (`press_lap`, `end_condition`, `open`, `time` ...) and reserved
+  names are refused, other unknown keys are ignored with a validation warning (before: all were
+  dropped without notice). Keys with a null value and keys Intervals.icu stores itself
+  (`text_events`, `zoneTimes` ...) pass.
+- Labels with "press lap"/"hit lap" need `until_lap_press`, because Intervals.icu reads them as the
+  marker; in comment lines and repeat labels they are refused.
+- The validation totals say "without duration or distance" instead of "open-ended", and the planned
+  duration of workouts with distance steps is marked as covering the timed steps only.
+
 ### Fixed
+- A step with `until_lap_press: true` and a duration was written as a plain timed step (the flag was
+  dropped silently), so Intervals.icu exported it with a fixed duration instead of an OPEN step.
 - `serverInfo.version` in the MCP `initialize` answer reports this package's version instead of the
   MCP SDK version (directories that read the server directly showed `1.30.0`).
 

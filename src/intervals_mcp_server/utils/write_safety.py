@@ -27,6 +27,7 @@ from typing import Any
 
 from intervals_mcp_server.api.client import remaining_requests, seg
 from intervals_mcp_server.utils.sports import hms
+from intervals_mcp_server.utils.types import has_press_lap
 from intervals_mcp_server.utils.workout_validation import DURATION_TOLERANCE_S, step_lines
 
 Request = Callable[..., Awaitable[Any]]
@@ -278,6 +279,12 @@ def _has_target(step: dict[str, Any]) -> bool:
     return any(isinstance(step.get(kind), dict) for kind in TARGET_KINDS)
 
 
+def _lap_steps(leaves: list[dict[str, Any]]) -> int:
+    """Steps set to end on the lap button (until_lap_press), each step of a repeat block once (as
+    validate_workout counts them)."""
+    return len([leaf for leaf in leaves if leaf.get("until_lap_press") is True and _timed(leaf)])
+
+
 def flat_steps(steps: Any) -> tuple[list[dict[str, Any]], list[int]]:
     """(steps that carry a duration, distance or target, in order; reps of the repeat blocks).
 
@@ -309,11 +316,17 @@ def sent_shape(doc: Any = None, text: Any = None) -> dict[str, Any] | None:
                 total = None  # a distance step: the planned time is an estimate
                 break
             total = (total or 0.0) + float(leaf["duration"]) * leaf.get("_reps", 1)
-        return {"steps": leaves, "count": len([s for s in leaves if _timed(s)]), "repeats": reps, "duration_s": total or None}
+        return {
+            "steps": leaves, "count": len([s for s in leaves if _timed(s)]), "repeats": reps, "duration_s": total or None,
+            "lap": _lap_steps(leaves),
+        }
     lines = step_lines(str(text or ""))
     if lines:
         reps = [count for line in str(text).splitlines() if (count := repeat_count(line)) is not None]
-        return {"steps": None, "count": len(lines), "repeats": reps, "duration_s": None}
+        return {
+            "steps": None, "count": len(lines), "repeats": reps, "duration_s": None,
+            "lap": len([line for line in lines if has_press_lap(line)]),
+        }
     return None
 
 
@@ -362,7 +375,23 @@ def _step_warnings(sent: list[dict[str, Any]], stored: list[dict[str, Any]]) -> 
                 shown = (hms(a), hms(b)) if key == "duration" else (f"{a:g} m", f"{b:g} m")
                 warnings.append(f"step {number}: {label} {shown[0]} sent, {shown[1]} stored")
         warnings.extend(_target_warnings(number, mine, theirs))
+        lap_warning = _lap_warning(number, mine, theirs)
+        if lap_warning:
+            warnings.append(lap_warning)
     return warnings
+
+
+def _lap_warning(number: int, mine: dict[str, Any], theirs: dict[str, Any]) -> str | None:
+    """A step whose end condition (lap button or duration/distance) was not stored as sent."""
+    sent, stored = mine.get("until_lap_press") is True, theirs.get("until_lap_press") is True
+    if sent and not stored:
+        return (
+            f"step {number}: sent as until lap press, stored as a timed step: Intervals.icu exports it with the planning "
+            "estimate as a fixed duration instead of an OPEN lap-button step"
+        )
+    if stored and not sent:
+        return f"step {number}: stored as until lap press (exported as an OPEN lap-button step), sent as a timed step"
+    return None
 
 
 def _target_warnings(number: int, mine: dict[str, Any], theirs: dict[str, Any]) -> list[str]:
@@ -418,6 +447,8 @@ def stored_summary(stored: dict[str, Any], sent: dict[str, Any] | None = None) -
     if stored.get("icu_training_load") is not None:
         summary["load"] = stored.get("icu_training_load")
     summary["steps"] = len([leaf for leaf in leaves if _timed(leaf)])
+    if _lap_steps(leaves):
+        summary["lap_press_steps"] = _lap_steps(leaves)
     if reps:
         summary["repeats"] = reps
     if sent is not None:
@@ -473,6 +504,11 @@ def parse_warnings(body: dict[str, Any], stored: dict[str, Any], sent: dict[str,
         warnings.append(f"repeats {shown} sent, {', '.join(f'{r}x' for r in reps) or 'none'} stored")
     if sent["steps"] is not None and len(sent["steps"]) == len(leaves):
         warnings.extend(_step_warnings(sent["steps"], leaves))
+    elif sent.get("lap", 0) != _lap_steps(leaves):
+        warnings.append(
+            f"{_lap_steps(leaves)} until-lap-press steps stored, {sent.get('lap', 0)} sent: check which steps end on "
+            "the lap button"
+        )
     if sent["count"] and not moving:
         warnings.append("no planned duration stored")
     elif sent["duration_s"] and moving and abs(sent["duration_s"] - moving) > DURATION_TOLERANCE_S:
@@ -519,6 +555,8 @@ def read_back_text(stored: dict[str, Any] | None, warnings: list[str], error: st
         if stored.get("steps") or "steps_sent" in stored:
             steps = f"{_plural(stored['steps'], 'step')} parsed"
             details.append(steps + (f" ({stored['steps_sent']} sent)" if "steps_sent" in stored else ""))
+        if stored.get("lap_press_steps"):
+            details.append(f"{stored['lap_press_steps']} until lap press")
     if stored.get("paired_activity_id"):
         details.append(f"paired with {stored['paired_activity_id']}")
     text = f"Read-back: Intervals.icu stored {head}, {', '.join(details)}. Parse warnings: "

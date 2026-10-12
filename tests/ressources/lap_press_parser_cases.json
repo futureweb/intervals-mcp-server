@@ -1,0 +1,1133 @@
+{
+ "_source": "Intervals.icu web client workout parser (WorkoutParser / hasPressLap from https://intervals.icu/assets/index-DXdU7X62.js, 2026-10-12), run unchanged in V8. FIT duration types (PoC entries only) from the documented conversion endpoint POST /api/v1/athlete/{id}/download-workout.fit. 'regression': a synthetic workout shaped like the failed one (7 lap steps, cadence, labels with 'LAP ...'), its text from the 80ef553 serialiser and from this branch. Synthetic workouts, no athlete data.",
+ "cases": [
+  {
+   "case": "M01_time",
+   "text": "- Schwelle 10m 240-250W",
+   "parsed_steps": [
+    {
+     "duration": 600,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     },
+     "text": "Schwelle"
+    }
+   ]
+  },
+  {
+   "case": "M02_distance",
+   "text": "- Flachstueck 5km 240-250W",
+   "parsed_steps": [
+    {
+     "distance": 5000,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     },
+     "text": "Flachstueck"
+    }
+   ]
+  },
+  {
+   "case": "M03_open_warmup",
+   "text": "Warmup\n- Press lap Einrollen bis Startpunkt 17m 50-65%",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 1020,
+     "power": {
+      "units": "%ftp",
+      "start": 50,
+      "end": 65
+     },
+     "text": "Press lap Einrollen bis Startpunkt",
+     "warmup": true
+    }
+   ]
+  },
+  {
+   "case": "M04_open_recovery",
+   "text": "- Press lap Erholung bis Anstieg 5m 45-55%",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 300,
+     "power": {
+      "units": "%ftp",
+      "start": 45,
+      "end": 55
+     },
+     "text": "Press lap Erholung bis Anstieg"
+    }
+   ]
+  },
+  {
+   "case": "M06_fixed_after_lap",
+   "text": "- Press lap Rollen bis Anstieg 10m 55-65%\n- Anstieg 10m 240-250W",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 600,
+     "power": {
+      "units": "%ftp",
+      "start": 55,
+      "end": 65
+     },
+     "text": "Press lap Rollen bis Anstieg"
+    },
+    {
+     "duration": 600,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     },
+     "text": "Anstieg"
+    }
+   ]
+  },
+  {
+   "case": "M09b_freeride_lap",
+   "text": "- Press lap Frei fahren 10m freeride",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 600,
+     "freeride": true,
+     "text": "Press lap Frei fahren"
+    }
+   ]
+  },
+  {
+   "case": "M10_marker_at_end",
+   "text": "- Erholung 5m 45-55% press lap",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 300,
+     "power": {
+      "units": "%ftp",
+      "start": 45,
+      "end": 55
+     },
+     "text": "Erholung"
+    }
+   ]
+  },
+  {
+   "case": "M11_hit_lap",
+   "text": "- Erholung 5m 45-55% hit lap",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 300,
+     "power": {
+      "units": "%ftp",
+      "start": 45,
+      "end": 55
+     },
+     "text": "Erholung"
+    }
+   ]
+  },
+  {
+   "case": "M12_lap_without_duration",
+   "text": "- Press lap Erholung 45-55%",
+   "parsed_steps": []
+  },
+  {
+   "case": "M13_lap_distance",
+   "text": "- Press lap Anfahrt 3km 55-65%",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "distance": 3000,
+     "power": {
+      "units": "%ftp",
+      "start": 55,
+      "end": 65
+     },
+     "text": "Press lap Anfahrt"
+    }
+   ]
+  },
+  {
+   "case": "M14_german_LAP_text_only",
+   "text": "- Bis Anstieg LAP druecken 10m 55-65%",
+   "parsed_steps": [
+    {
+     "duration": 600,
+     "power": {
+      "units": "%ftp",
+      "start": 55,
+      "end": 65
+     },
+     "text": "Bis Anstieg LAP druecken"
+    }
+   ]
+  },
+  {
+   "case": "M16_ramp_lap",
+   "text": "- Press lap Rampe 10m ramp 50-75%",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 600,
+     "power": {
+      "units": "%ftp",
+      "start": 50,
+      "end": 75
+     },
+     "ramp": true,
+     "text": "Press lap Rampe"
+    }
+   ]
+  },
+  {
+   "case": "M17_hr_lap",
+   "text": "- Press lap Locker 10m Z2 HR",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 600,
+     "hr": {
+      "value": 2,
+      "units": "hr_zone"
+     },
+     "text": "Press lap Locker"
+    }
+   ]
+  },
+  {
+   "case": "M18_lap_no_target",
+   "text": "- Press lap Warten 5m",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 300,
+     "text": "Press lap Warten"
+    }
+   ]
+  },
+  {
+   "case": "R1_80ef553_lap_with_duration",
+   "text": "- 20m 60%-70% ftp Bis Anstieg \n- 10m 240W-250W Anstieg \n",
+   "parsed_steps": [
+    {
+     "duration": 1200,
+     "power": {
+      "units": "%ftp",
+      "start": 60,
+      "end": 70
+     }
+    },
+    {
+     "duration": 600,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     }
+    }
+   ]
+  },
+  {
+   "case": "R3_main_lap_with_duration",
+   "text": "- Bis Anstieg 20m 60%-70% ftp \n- Anstieg 10m 240W-250W \n",
+   "parsed_steps": [
+    {
+     "duration": 1200,
+     "power": {
+      "units": "%ftp",
+      "start": 60,
+      "end": 70
+     },
+     "text": "Bis Anstieg"
+    },
+    {
+     "duration": 600,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     },
+     "text": "Anstieg"
+    }
+   ]
+  },
+  {
+   "case": "R4_new_serialiser_lap",
+   "text": "- Press lap Bis Anstieg 20m 60%-70% ftp \n- Anstieg 10m 240W-250W \n",
+   "parsed_steps": [
+    {
+     "until_lap_press": true,
+     "duration": 1200,
+     "power": {
+      "units": "%ftp",
+      "start": 60,
+      "end": 70
+     },
+     "text": "Press lap Bis Anstieg"
+    },
+    {
+     "duration": 600,
+     "power": {
+      "units": "w",
+      "start": 240,
+      "end": 250
+     },
+     "text": "Anstieg"
+    }
+   ]
+  }
+ ],
+ "poc": {
+  "outdoor_threshold_route_aware": {
+   "mcp_workout_doc": {
+    "description": "Schwellenintervalle auf vorher gewählten Anstiegen. Offene Phasen sind auf Ende per LAP-Taste gesetzt; ihre Zeiten sind Planungsannahmen.",
+    "steps": [
+     {
+      "text": "Einrollen",
+      "duration": 1020,
+      "warmup": true,
+      "power": {
+       "start": 120,
+       "end": 150,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Locker bis Anstieg",
+      "until_lap_press": true,
+      "duration": 600,
+      "power": {
+       "start": 130,
+       "end": 155,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Schwelle 1",
+      "duration": 600,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Erholung bis Anstieg",
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "start": 110,
+       "end": 135,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Schwelle 2",
+      "duration": 600,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Erholung bis Anstieg",
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "start": 110,
+       "end": 135,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Schwelle 3",
+      "duration": 600,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Ausrollen",
+      "duration": 600,
+      "cooldown": true,
+      "power": {
+       "start": 100,
+       "end": 130,
+       "units": "w"
+      }
+     }
+    ]
+   },
+   "native_text": "Schwellenintervalle auf vorher gewählten Anstiegen. Offene Phasen sind auf Ende per LAP-Taste gesetzt; ihre Zeiten sind Planungsannahmen.\n\n\nWarmup\n- Einrollen 17m 120W-150W \n\n- Press lap Locker bis Anstieg 10m 130W-155W \n- Schwelle 1 10m 240W-250W \n- Press lap Erholung bis Anstieg 5m 110W-135W \n- Schwelle 2 10m 240W-250W \n- Press lap Erholung bis Anstieg 5m 110W-135W \n- Schwelle 3 10m 240W-250W \n\nCooldown\n- Ausrollen 10m 100W-130W \n\n",
+   "parsed": {
+    "description": "Schwellenintervalle auf vorher gewählten Anstiegen. Offene Phasen sind auf Ende per LAP-Taste gesetzt; ihre Zeiten sind Planungsannahmen.",
+    "duration": 4620,
+    "steps": [
+     {
+      "duration": 1020,
+      "power": {
+       "units": "w",
+       "start": 120,
+       "end": 150
+      },
+      "text": "Einrollen",
+      "warmup": true
+     },
+     {
+      "until_lap_press": true,
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 130,
+       "end": 155
+      },
+      "text": "Press lap Locker bis Anstieg"
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Schwelle 1"
+     },
+     {
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "units": "w",
+       "start": 110,
+       "end": 135
+      },
+      "text": "Press lap Erholung bis Anstieg"
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Schwelle 2"
+     },
+     {
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "units": "w",
+       "start": 110,
+       "end": 135
+      },
+      "text": "Press lap Erholung bis Anstieg"
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Schwelle 3"
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 100,
+       "end": 130
+      },
+      "text": "Ausrollen",
+      "cooldown": true
+     }
+    ],
+    "options": {},
+    "locales": []
+   },
+   "fit_duration_types": [
+    "time",
+    "open",
+    "time",
+    "open",
+    "time",
+    "open",
+    "time",
+    "time"
+   ]
+  },
+  "outdoor_threshold_route_aware_repeat": {
+   "mcp_workout_doc": {
+    "steps": [
+     {
+      "text": "Einrollen",
+      "duration": 1020,
+      "warmup": true,
+      "power": {
+       "start": 120,
+       "end": 150,
+       "units": "w"
+      }
+     },
+     {
+      "reps": 3,
+      "text": "Anstiege",
+      "steps": [
+       {
+        "text": "Locker bis Anstieg",
+        "until_lap_press": true,
+        "duration": 450,
+        "power": {
+         "start": 110,
+         "end": 155,
+         "units": "w"
+        }
+       },
+       {
+        "text": "Schwelle",
+        "duration": 600,
+        "power": {
+         "start": 240,
+         "end": 250,
+         "units": "w"
+        }
+       }
+      ]
+     },
+     {
+      "text": "Ausrollen",
+      "duration": 600,
+      "cooldown": true,
+      "power": {
+       "start": 100,
+       "end": 130,
+       "units": "w"
+      }
+     }
+    ]
+   },
+   "native_text": "\nWarmup\n- Einrollen 17m 120W-150W \n\n\n3x Anstiege \n- Press lap Locker bis Anstieg 7m30s 110W-155W \n- Schwelle 10m 240W-250W \n\n\nCooldown\n- Ausrollen 10m 100W-130W \n\n",
+   "parsed": {
+    "duration": 4770,
+    "steps": [
+     {
+      "duration": 1020,
+      "power": {
+       "units": "w",
+       "start": 120,
+       "end": 150
+      },
+      "text": "Einrollen",
+      "warmup": true
+     },
+     {
+      "reps": 3,
+      "text": "3x Anstiege ",
+      "steps": [
+       {
+        "until_lap_press": true,
+        "duration": 450,
+        "power": {
+         "units": "w",
+         "start": 110,
+         "end": 155
+        },
+        "text": "Press lap Locker bis Anstieg"
+       },
+       {
+        "duration": 600,
+        "power": {
+         "units": "w",
+         "start": 240,
+         "end": 250
+        },
+        "text": "Schwelle"
+       }
+      ],
+      "duration": 3150
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 100,
+       "end": 130
+      },
+      "text": "Ausrollen",
+      "cooldown": true
+     }
+    ],
+    "options": {},
+    "locales": []
+   },
+   "fit_duration_types": [
+    "time",
+    "open",
+    "time",
+    "repeat_until_steps_cmplt",
+    "time"
+   ]
+  },
+  "outdoor_threshold_route_aware_distance": {
+   "mcp_workout_doc": {
+    "description": "Belastungen als Distanzschritte über die Länge des gewählten Anstiegs, Start jeweils per LAP am Fuß des Anstiegs. Zeiten der offenen Phasen sind Planungsannahmen; die Dauer der Distanzschritte schätzt Intervals.icu (Rad ohne Schwellenpace mit 30 km/h).",
+    "steps": [
+     {
+      "text": "Einrollen",
+      "duration": 1020,
+      "warmup": true,
+      "power": {
+       "start": 120,
+       "end": 150,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Locker bis Anstieg",
+      "until_lap_press": true,
+      "duration": 600,
+      "power": {
+       "start": 130,
+       "end": 155,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Anstieg 1",
+      "distance": 3500,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Erholung bis Anstieg",
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "start": 110,
+       "end": 135,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Anstieg 2",
+      "distance": 3500,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Erholung bis Anstieg",
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "start": 110,
+       "end": 135,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Anstieg 3",
+      "distance": 3500,
+      "power": {
+       "start": 240,
+       "end": 250,
+       "units": "w"
+      }
+     },
+     {
+      "text": "Ausrollen",
+      "duration": 600,
+      "cooldown": true,
+      "power": {
+       "start": 100,
+       "end": 130,
+       "units": "w"
+      }
+     }
+    ]
+   },
+   "native_text": "Belastungen als Distanzschritte über die Länge des gewählten Anstiegs, Start jeweils per LAP am Fuß des Anstiegs. Zeiten der offenen Phasen sind Planungsannahmen; die Dauer der Distanzschritte schätzt Intervals.icu (Rad ohne Schwellenpace mit 30 km/h).\n\n\nWarmup\n- Einrollen 17m 120W-150W \n\n- Press lap Locker bis Anstieg 10m 130W-155W \n- Anstieg 1 3.5km 240W-250W \n- Press lap Erholung bis Anstieg 5m 110W-135W \n- Anstieg 2 3.5km 240W-250W \n- Press lap Erholung bis Anstieg 5m 110W-135W \n- Anstieg 3 3.5km 240W-250W \n\nCooldown\n- Ausrollen 10m 100W-130W \n\n",
+   "parsed": {
+    "description": "Belastungen als Distanzschritte über die Länge des gewählten Anstiegs, Start jeweils per LAP am Fuß des Anstiegs. Zeiten der offenen Phasen sind Planungsannahmen; die Dauer der Distanzschritte schätzt Intervals.icu (Rad ohne Schwellenpace mit 30 km/h).",
+    "duration": null,
+    "steps": [
+     {
+      "duration": 1020,
+      "power": {
+       "units": "w",
+       "start": 120,
+       "end": 150
+      },
+      "text": "Einrollen",
+      "warmup": true
+     },
+     {
+      "until_lap_press": true,
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 130,
+       "end": 155
+      },
+      "text": "Press lap Locker bis Anstieg"
+     },
+     {
+      "distance": 3500,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Anstieg 1"
+     },
+     {
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "units": "w",
+       "start": 110,
+       "end": 135
+      },
+      "text": "Press lap Erholung bis Anstieg"
+     },
+     {
+      "distance": 3500,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Anstieg 2"
+     },
+     {
+      "until_lap_press": true,
+      "duration": 300,
+      "power": {
+       "units": "w",
+       "start": 110,
+       "end": 135
+      },
+      "text": "Press lap Erholung bis Anstieg"
+     },
+     {
+      "distance": 3500,
+      "power": {
+       "units": "w",
+       "start": 240,
+       "end": 250
+      },
+      "text": "Anstieg 3"
+     },
+     {
+      "duration": 600,
+      "power": {
+       "units": "w",
+       "start": 100,
+       "end": 130
+      },
+      "text": "Ausrollen",
+      "cooldown": true
+     }
+    ],
+    "options": {},
+    "locales": []
+   },
+   "fit_duration_types": [
+    "time",
+    "open",
+    "distance",
+    "open",
+    "distance",
+    "open",
+    "distance",
+    "time"
+   ]
+  }
+ },
+ "regression": {
+  "mcp_workout_doc": {
+   "description": "Streckenspezifische Ausdauereinheit (synthetische Nachbildung des Events vom 13.09.2026).",
+   "steps": [
+    {
+     "text": "Einrollen auf Nebenstrassen",
+     "duration": 1020,
+     "warmup": true,
+     "power": {
+      "start": 50,
+      "end": 65,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 85,
+      "end": 95,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Bis Anstieg A – LAP wenn der Anstieg beginnt",
+     "until_lap_press": true,
+     "duration": 1200,
+     "power": {
+      "start": 60,
+      "end": 70,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 85,
+      "end": 95,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Anstieg A – LAP oben",
+     "until_lap_press": true,
+     "duration": 2100,
+     "power": {
+      "start": 75,
+      "end": 90,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 75,
+      "end": 90,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Abschnitt B – LAP am Ort B",
+     "until_lap_press": true,
+     "duration": 2100,
+     "power": {
+      "start": 50,
+      "end": 68,
+      "units": "%ftp"
+     }
+    },
+    {
+     "text": "Abschnitt C – LAP vor dem Anstieg",
+     "until_lap_press": true,
+     "duration": 2100,
+     "power": {
+      "start": 58,
+      "end": 70,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 85,
+      "end": 95,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Anstieg D – LAP wenn vorbei",
+     "until_lap_press": true,
+     "duration": 1800,
+     "power": {
+      "start": 70,
+      "end": 82,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 75,
+      "end": 90,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Abschnitt E – LAP bei E",
+     "until_lap_press": true,
+     "duration": 1500,
+     "power": {
+      "start": 55,
+      "end": 68,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 85,
+      "end": 95,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Abschnitt F – LAP beim Abzweig",
+     "until_lap_press": true,
+     "duration": 1200,
+     "power": {
+      "start": 60,
+      "end": 72,
+      "units": "%ftp"
+     },
+     "cadence": {
+      "start": 85,
+      "end": 95,
+      "units": "rpm"
+     }
+    },
+    {
+     "text": "Ausrollen",
+     "duration": 600,
+     "cooldown": true,
+     "power": {
+      "start": 40,
+      "end": 55,
+      "units": "%ftp"
+     }
+    }
+   ]
+  },
+  "text_80ef553": "Streckenspezifische Ausdauereinheit (synthetische Nachbildung des Events vom 13.09.2026).\n\nWarmup\n- 17m 50%-65% ftp 85rpm-95rpm Cadence Einrollen auf Nebenstrassen \n\n- 20m 60%-70% ftp 85rpm-95rpm Cadence Bis Anstieg A – LAP wenn der Anstieg beginnt \n- 35m 75%-90% ftp 75rpm-90rpm Cadence Anstieg A – LAP oben \n- 35m 50%-68% ftp Abschnitt B – LAP am Ort B \n- 35m 58%-70% ftp 85rpm-95rpm Cadence Abschnitt C – LAP vor dem Anstieg \n- 30m 70%-82% ftp 75rpm-90rpm Cadence Anstieg D – LAP wenn vorbei \n- 25m 55%-68% ftp 85rpm-95rpm Cadence Abschnitt E – LAP bei E \n- 20m 60%-72% ftp 85rpm-95rpm Cadence Abschnitt F – LAP beim Abzweig \n\nCooldown\n- 10m 40%-55% ftp Ausrollen \n\n",
+  "text_new": "Streckenspezifische Ausdauereinheit (synthetische Nachbildung des Events vom 13.09.2026).\n\n\nWarmup\n- Einrollen auf Nebenstrassen 17m 50%-65% ftp 85rpm-95rpm Cadence \n\n- Press lap Bis Anstieg A – LAP wenn der Anstieg beginnt 20m 60%-70% ftp 85rpm-95rpm Cadence \n- Press lap Anstieg A – LAP oben 35m 75%-90% ftp 75rpm-90rpm Cadence \n- Press lap Abschnitt B – LAP am Ort B 35m 50%-68% ftp \n- Press lap Abschnitt C – LAP vor dem Anstieg 35m 58%-70% ftp 85rpm-95rpm Cadence \n- Press lap Anstieg D – LAP wenn vorbei 30m 70%-82% ftp 75rpm-90rpm Cadence \n- Press lap Abschnitt E – LAP bei E 25m 55%-68% ftp 85rpm-95rpm Cadence \n- Press lap Abschnitt F – LAP beim Abzweig 20m 60%-72% ftp 85rpm-95rpm Cadence \n\nCooldown\n- Ausrollen 10m 40%-55% ftp \n\n",
+  "parsed_80ef553": [
+   {
+    "duration": 1020,
+    "power": {
+     "units": "%ftp",
+     "start": 50,
+     "end": 65
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "warmup": true
+   },
+   {
+    "duration": 1200,
+    "power": {
+     "units": "%ftp",
+     "start": 60,
+     "end": 70
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    }
+   },
+   {
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 75,
+     "end": 90
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 75,
+     "end": 90
+    }
+   },
+   {
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 50,
+     "end": 68
+    }
+   },
+   {
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 58,
+     "end": 70
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    }
+   },
+   {
+    "duration": 1800,
+    "power": {
+     "units": "%ftp",
+     "start": 70,
+     "end": 82
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 75,
+     "end": 90
+    }
+   },
+   {
+    "duration": 1500,
+    "power": {
+     "units": "%ftp",
+     "start": 55,
+     "end": 68
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    }
+   },
+   {
+    "duration": 1200,
+    "power": {
+     "units": "%ftp",
+     "start": 60,
+     "end": 72
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    }
+   },
+   {
+    "duration": 600,
+    "power": {
+     "units": "%ftp",
+     "start": 40,
+     "end": 55
+    },
+    "cooldown": true
+   }
+  ],
+  "parsed_new": [
+   {
+    "duration": 1020,
+    "power": {
+     "units": "%ftp",
+     "start": 50,
+     "end": 65
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "text": "Einrollen auf Nebenstrassen",
+    "warmup": true
+   },
+   {
+    "until_lap_press": true,
+    "duration": 1200,
+    "power": {
+     "units": "%ftp",
+     "start": 60,
+     "end": 70
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "text": "Press lap Bis Anstieg A – LAP wenn der Anstieg beginnt"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 75,
+     "end": 90
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 75,
+     "end": 90
+    },
+    "text": "Press lap Anstieg A – LAP oben"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 50,
+     "end": 68
+    },
+    "text": "Press lap Abschnitt B – LAP am Ort B"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 2100,
+    "power": {
+     "units": "%ftp",
+     "start": 58,
+     "end": 70
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "text": "Press lap Abschnitt C – LAP vor dem Anstieg"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 1800,
+    "power": {
+     "units": "%ftp",
+     "start": 70,
+     "end": 82
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 75,
+     "end": 90
+    },
+    "text": "Press lap Anstieg D – LAP wenn vorbei"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 1500,
+    "power": {
+     "units": "%ftp",
+     "start": 55,
+     "end": 68
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "text": "Press lap Abschnitt E – LAP bei E"
+   },
+   {
+    "until_lap_press": true,
+    "duration": 1200,
+    "power": {
+     "units": "%ftp",
+     "start": 60,
+     "end": 72
+    },
+    "cadence": {
+     "units": "rpm",
+     "start": 85,
+     "end": 95
+    },
+    "text": "Press lap Abschnitt F – LAP beim Abzweig"
+   },
+   {
+    "duration": 600,
+    "power": {
+     "units": "%ftp",
+     "start": 40,
+     "end": 55
+    },
+    "text": "Ausrollen",
+    "cooldown": true
+   }
+  ]
+ }
+}

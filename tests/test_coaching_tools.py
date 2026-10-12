@@ -567,7 +567,7 @@ def test_preview_and_validate_workout(monkeypatch):
     doc = EVENT_DATA["workout_doc"]
     preview = asyncio.run(preview_workout(doc, "Ride", moving_time=1740))
     assert preview.startswith("Workout validation (Ride): OK")
-    assert "Totals: 6 steps (4 with targets, 0 open-ended), planned duration 29:00" in preview
+    assert "Totals: 6 steps (4 with targets, 0 without duration or distance), planned duration 29:00" in preview
     assert "Preview (Intervals.icu workout text):" in preview
     bad = {"steps": [{"power": {"value": 300, "units": "%ftp"}}, {"reps": 0, "steps": []}, {"duration": 60, "pace": {"value": 90, "units": "%pace"}}]}
     result = asyncio.run(validate_workout(bad, "Ride", name="2x5 min Threshold", start_date="2026-10-06"))
