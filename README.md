@@ -41,6 +41,7 @@ read all of it, but works just as well without the bridge.
 - [Works with the Garmin Intervals Bridge](https://github.com/futureweb/intervals-mcp-server#works-with-the-garmin-intervals-bridge)
 - [Tools](https://github.com/futureweb/intervals-mcp-server#tools)
 - [Quick start](https://github.com/futureweb/intervals-mcp-server#quick-start)
+- [Route-aware outdoor workouts](https://github.com/futureweb/intervals-mcp-server#route-aware-outdoor-workouts-lap-press-steps)
 - [Connect an AI client](https://github.com/futureweb/intervals-mcp-server#connect-an-ai-client)
 - [Sharing the server with friends](https://github.com/futureweb/intervals-mcp-server#sharing-the-server-with-friends)
 - [Configuration](https://github.com/futureweb/intervals-mcp-server#configuration)
@@ -69,14 +70,22 @@ read all of it, but works just as well without the bridge.
   trends and correlations, nutrition and weight trends, weekly and monthly summaries.
   Statistics with their sample sizes; the interpretation stays with the coach.
 - **Token-efficient.** `detail_level` (`compact`, `standard`, `full`) and `output_format="json"`
-  on the heavy tools, nine ready-made coaching prompts and two MCP resources.
+  on the heavy tools, a compact tool catalogue (about 23k tokens for read and write, an optional
+  core set of about 10k), 13 ready-made coaching prompts and method guides as MCP resources and
+  through `get_guide`.
 - **Safe remote access.** Built-in OAuth 2.1 server with **"Continue with Intervals.icu"**
   sign-in, a consent page with per-connection permissions, client metadata documents with
   `private_key_jwt` (ChatGPT), PKCE and RFC 9207. Streamable HTTP (`/mcp`) and SSE from one
   process.
+- **Safe, verifiable writes.** Workouts are validated before they are written, `dry_run` shows the
+  exact request, a second identical event on the same day is refused, and every write reads back
+  what Intervals.icu stored and parsed.
+- **Route-aware outdoor workouts.** Steps that end on the lap button (`until_lap_press`) let you
+  start the next interval where the road suits it, e.g. at the foot of a climb, while the work
+  steps stay timed. Garmin Edge 1040 shows them as "until lap button" (see below).
 - **Read-only by default.** Tools are grouped into permission classes (`read`, `write`,
   `destructive`, `admin`) enforced on the server; only `read` is active unless you enable more.
-- **Tested.** More than 400 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
+- **Tested.** More than 1,100 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
   build and Docker smoke tests on every pull request.
 
 ## Works with the Garmin Intervals Bridge
@@ -180,7 +189,7 @@ that only call tools. `tools/list` is about 22.7k tokens at `MCP_PERMISSIONS=rea
 | `update_sport_settings` ⚙ | Validated change of FTP, LTHR, max HR or threshold pace (pace with its unit, e.g. `4:30/km`); `dry_run` shows the request with the current values |
 | `get_gear_list`, `get_gear_details` | Bikes, shoes and components with mileage and maintenance reminders |
 | `get_events`, `get_event_by_id`, `get_training_plan` | Calendar with the full workout document; plan phases, weekly targets, races |
-| `validate_workout`, `preview_workout` | Check and render a workout document before writing it |
+| `validate_workout`, `preview_workout` | Check and render a workout document before writing it, including lap-press steps (count and planning estimate) |
 | `add_or_update_event` ✎, `add_or_update_note` ✎, `add_events_bulk` ⚙, `delete_event` ✖, `delete_events_by_date_range` ✖ | Calendar changes: workouts are validated before they are written, `dry_run` returns the exact request, a new event is refused when that day already has the same one (`allow_duplicate`), the answer reads back what Intervals.icu stored and parsed (steps parsed vs sent, parse warnings); deletions name what was deleted; the range delete previews by default |
 | `get_workout_library`, `get_library_workout`, `create_library_workout` ✎, `add_event_from_library` ✎, `delete_library_workout` ✖ | Workout library (dry run, duplicate check when scheduling, read-back, deletions name what was deleted) |
 
@@ -319,6 +328,34 @@ as `io.github.futureweb/intervals-mcp-server`, with the PyPI package and the GHC
 environment variables they need. Clients that read the registry can install the server from
 there. The entry lists packages only: every user runs an own instance with their own
 Intervals.icu credentials.
+
+## Route-aware outdoor workouts (lap-press steps)
+
+Timed intervals outdoors often start on a descent or at a junction. A step with
+`until_lap_press: true` ends on the lap button instead, so you ride easy until the road suits the
+next effort and then press lap; the work steps stay timed:
+
+```json
+{"steps": [
+  {"text": "Warm-up", "duration": 1020, "warmup": true, "power": {"start": 50, "end": 65, "units": "%ftp"}},
+  {"reps": 3, "steps": [
+    {"text": "Easy to the climb", "until_lap_press": true, "duration": 300, "power": {"start": 45, "end": 55, "units": "%ftp"}},
+    {"text": "Threshold", "duration": 600, "power": {"start": 240, "end": 250, "units": "w"}}
+  ]},
+  {"text": "Cool-down", "duration": 600, "cooldown": true, "power": {"start": 45, "end": 55, "units": "%ftp"}}
+]}
+```
+
+- The `duration` (or `distance`) of a lap-press step is only the planning estimate for the planned
+  time and load; Intervals.icu drops a lap-press step without one.
+- What is verified: Intervals.icu stores the step with `until_lap_press`, its Garmin FIT export
+  writes an OPEN step without a time limit, and a Garmin Edge 1040 lists it as "until lap button"
+  with the power and cadence targets. Still to confirm on the device: that the step really waits for
+  the lap button and the following timed step starts immediately.
+- With a Garmin course, add course points at the start of each climb and press lap there. Garmin's
+  Auto Pause also pauses timed steps when you stop; lap-press steps are not affected.
+- `validate_workout`/`preview_workout` show the lap-press steps and their estimate; after a write
+  the read-back warns if Intervals.icu stored a lap-press step as a timed step.
 
 ## Connect an AI client
 
@@ -588,16 +625,28 @@ Details and how to report a vulnerability: [SECURITY.md](https://github.com/futu
   one-call activity report, prompts and resources
 - OAuth with "Continue with Intervals.icu", per-connection permissions, client metadata
   documents, streamable HTTP and SSE in one process
-- Analytics quality: extended rides split correctly, only comparable intervals compared,
-  custom field aggregation by meaning, clear wellness periods, minimum sample sizes for
-  efficiency trends, honest fatigue resistance, smoothed climb grades, compact report
-- Training load and intensity: acute:chronic ratio, monotony and strain, three-zone distribution
-  with polarization index, aerobic durability, load projection and a weekly coach context
+- Analytics quality, training load and intensity distribution, aerobic durability, load
+  projection and a weekly coach context
+- Phase 6: what-if plan simulation with form on race day, long-ride fatigue profile (kJ, kJ/kg),
+  submax test trends, multi-ride power meter comparison, data provenance audit, fueling analysis,
+  W′ balance, weather and same-route history, today's incomplete wellness record flagged
+- Multi-persona code review (security, operations, API, writes, analytics) with all findings
+  fixed and independently re-checked
+- Compact tool catalogue, guides, server instructions, optional core tool set
+- Safe writes: dry run, duplicate check, read-back with parse warnings, deletions that name what
+  they delete
+- Optional multi-user mode (`MCP_TENANCY=multi`): friends sign in with Intervals.icu and only ever
+  reach their own data
+- Lap-press steps for route-aware outdoor workouts
+- First public beta `1.0.0b1` on PyPI, GHCR, Docker Hub, the MCP Registry and as a Claude Desktop
+  bundle
 
 **Next**
-- First tagged release: PyPI package, GHCR and Docker Hub images, MCP Registry entry and Claude
-  Desktop bundle, all published by the release workflow from one tag
-- Optional multi-athlete mode that uses each athlete's own Intervals.icu OAuth token
+- Lap-press steps: confirm on the device that an open step waits for the lap button and the next
+  timed step starts immediately (the Edge 1040 already shows them as "until lap button")
+- Route-aware workouts with a Garmin course: course points at the climbs, lap to start the work
+  step (no API link between a course and a planned workout exists yet)
+- `1.0.0b2` with the fixes since the first beta
 - Migration to MCP SDK v2 once it is stable for the transports used here
 
 ## Documentation

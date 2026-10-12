@@ -97,8 +97,9 @@ For outdoor sessions whose next step should start at a suitable place (a climb, 
   45%-55% ftp` (the form of the builder's "End when lap button pressed" option).
 - Verified: Intervals.icu stores the step with `until_lap_press: true`, and its FIT export
   (download-workout.fit) writes it as an OPEN step without time or distance.
-- Not verified yet (needs a device test): how Garmin Connect shows the pushed step and how a Garmin
-  device runs it. Intervals.icu documents lap-press steps for Garmin; per its developer a Suunto
+- Seen on a Garmin Edge 1040 after the push through Garmin Connect: the step is listed as
+  "until lap button" with its targets. Not verified yet (needs a device test): that the device
+  really waits for the lap button and starts the next step immediately. Intervals.icu documents lap-press steps for Garmin; per its developer a Suunto
   step ends at the estimate or on lap, whichever comes first. Other devices and file formats: not
   verified. The Garmin Edge manual says the lap button ends any running step, also a timed one.
 - The step still needs a `duration` or `distance`: it is only the planning estimate for the
