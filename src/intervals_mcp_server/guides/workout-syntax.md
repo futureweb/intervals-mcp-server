@@ -34,8 +34,10 @@ result to the athlete before writing it.
 - `distance`: metres (positive), e.g. `{"distance": 5000}`. Give `duration` OR `distance`, never
   both (the distance would be dropped).
 - Every step needs a duration or a distance, except a pure text/comment step (`{"text": "..."}`
-  without a target). Open-ended steps (until lap press, free ride without duration) cannot be
-  written as Intervals.icu workout text and are refused.
+  without a target). A free ride without duration is refused.
+- Until lap press: `{"until_lap_press": true, "duration": 600, ...}` ends the step when the athlete
+  presses the lap button (see "Lap-press steps" below). Keys outside the workout format (e.g.
+  `press_lap`) are refused, because they would be dropped silently.
 - `warmup: true` / `cooldown: true` on single steps (not on repeat blocks) mark warm-up and
   cool-down; a missing warm-up or cool-down is a warning.
 - Targets: one of `power`, `hr`, `pace` (and optionally `cadence`), each an object with `units`
@@ -73,6 +75,37 @@ result to the athlete before writing it.
   part of the step.
 - Optional on the doc: `target` (AUTO, POWER, HR, PACE: which target the device follows).
 
+## Lap-press steps (until lap press)
+
+For outdoor sessions whose next step should start at a suitable place (a climb, after a junction):
+
+```json
+{"steps": [
+  {"text": "Einrollen", "duration": 1020, "warmup": true, "power": {"start": 50, "end": 65, "units": "%ftp"}},
+  {"reps": 3, "steps": [
+    {"text": "Locker bis Anstieg", "until_lap_press": true, "duration": 300, "power": {"start": 45, "end": 55, "units": "%ftp"}},
+    {"text": "Schwelle", "duration": 600, "power": {"start": 240, "end": 250, "units": "w"}}
+  ]},
+  {"text": "Ausrollen", "duration": 600, "cooldown": true, "power": {"start": 45, "end": 55, "units": "%ftp"}}
+]}
+```
+
+- `until_lap_press: true` is written as Intervals.icu's own marker, `- Press lap Locker bis Anstieg 5m
+  45%-55% ftp` (the form of the builder's "End when lap button pressed" option); Intervals.icu stores
+  the step with `until_lap_press: true`, and its Garmin export has the step as OPEN (lap button)
+  without the time or distance.
+- The step still needs a `duration` or `distance`: it is only the planning estimate for the
+  planned duration, load and zone times (Intervals.icu drops a step without one). The following
+  step starts when the lap button is pressed, timed steps end after their time as usual.
+- Works on single steps and inside repeat blocks (not on the repeat block itself), with power, HR
+  or pace targets, ramps or freeride.
+- Devices: Garmin (via Garmin Connect) and Suunto. Other devices, apps and .zwo/.erg files use the
+  estimate as a normal duration. On Garmin the lap button ends any step, also a timed one.
+- A label must not contain "press lap" or "hit lap" unless the step has `until_lap_press`
+  (Intervals.icu would turn the step into a lap-press step).
+- `validate_workout`/`preview_workout` count the lap-press steps and their estimate; after a write
+  the read-back warns when Intervals.icu stored a lap-press step as a timed step (or the reverse).
+
 ## Native workout text (`description`)
 
 Instead of a workout_doc, `description` may hold plain text ("Squats 5x5, Deadlifts 3x5") or native
@@ -88,7 +121,8 @@ Cooldown
 - 10m 50%
 ```
 
-It is not validated by this server; prefer a workout_doc for structured workouts.
+It is not validated by this server; prefer a workout_doc for structured workouts. "Press lap" (or
+"hit lap") anywhere in a step line makes that step end on the lap button.
 
 ## add_or_update_event
 

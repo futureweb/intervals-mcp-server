@@ -6,7 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Lap-press steps: `until_lap_press: true` on a step with a duration or distance ends it on the lap
+  button (Garmin, Suunto); written as Intervals.icu's native `Press lap` marker, the duration or
+  distance stays the planning estimate for planned time and load. Works inside repeat blocks.
+  `validate_workout`/`preview_workout` count the lap-press steps and their estimate; the write
+  read-back warns when Intervals.icu stored a lap-press step as a timed step or the reverse.
+
 ### Fixed
+- A step with `until_lap_press: true` and a duration was written as a plain timed step (the flag was
+  dropped silently), so the device ended it after the time instead of on the lap button.
+- Unknown step fields (e.g. `press_lap`) are refused instead of being dropped silently; labels with
+  "press lap"/"hit lap" need `until_lap_press`, because Intervals.icu reads them as the marker.
 - `serverInfo.version` in the MCP `initialize` answer reports this package's version instead of the
   MCP SDK version (directories that read the server directly showed `1.30.0`).
 

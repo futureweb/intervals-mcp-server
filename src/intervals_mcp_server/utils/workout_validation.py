@@ -2,16 +2,18 @@
 Client-side validation and preview of workout documents before they are written to the
 Intervals.icu calendar. Intervals.icu has no parse/validate endpoint, so the checks here
 mirror what the workout builder expects: durations or distances per step, repeat blocks,
-target units per sport, ramps and ranges, warm-up/cool-down, and the total duration.
+target units per sport, ramps and ranges, warm-up/cool-down, lap-press steps and the total
+duration.
 """
 
+import dataclasses
 import re
 from typing import Any, NamedTuple
 
 from pydantic import TypeAdapter, ValidationError
 
 from intervals_mcp_server.utils.sports import hms
-from intervals_mcp_server.utils.types import ValueUnits, WorkoutDoc
+from intervals_mcp_server.utils.types import Step, ValueUnits, WorkoutDoc, has_press_lap
 
 RUN_TYPES = ("Run", "TrailRun", "VirtualRun", "Walk", "Hike")
 RIDE_TYPES = ("Ride", "VirtualRide", "GravelRide", "MountainBikeRide", "EBikeRide")
@@ -47,6 +49,10 @@ PLAUSIBLE = {
     "rpm": (20, 140),
 }
 DURATION_TOLERANCE_S = 60
+# Step keys of the workout format; anything else would be dropped without a trace (a "press_lap"
+# flag once turned lap-press steps into timed steps), so it is refused.
+STEP_KEYS = frozenset(field.name for field in dataclasses.fields(Step))
+_LAP_ALIAS_RE = re.compile(r"lap|open|end_?condition|manual", re.I)
 
 # Step labels are written BEFORE the duration ("- Sprint 40mtr Z5 HR"), unescaped: a word of the
 # label that Intervals.icu reads as workout syntax would change the step. The checks work on
@@ -77,14 +83,19 @@ _KEYWORD_RE = re.compile(r"(?<![a-z])(ramp|freeride|free ride|maxeffort|max effo
 _STRUCTURE_LINE = re.compile(r"\s*(?:-|\d+\s*x\b|(?:warm\s*-?\s*up|cool\s*-?\s*down)\s*:?\s*$)", re.I)
 
 
-def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> str | None:
+def label_problem(text: Any, flags: set[str] | frozenset[str] = frozenset()) -> str | None:  # pylint: disable=too-many-return-statements
     """Why a step label would be read as workout syntax, or None when it is a plain label.
 
-    flags: keywords the step already carries (ramp, freeride, maxeffort, hidepower); the same
-    word in the label then changes nothing.
+    flags: keywords the step already carries (ramp, freeride, maxeffort, hidepower,
+    until_lap_press); the same word in the label then changes nothing.
     """
     if not isinstance(text, str):
         return "must be a string"
+    if has_press_lap(text) and "until_lap_press" not in flags:
+        return (
+            "contains 'press lap' or 'hit lap', which Intervals.icu would read as 'end the step on the lap button'; "
+            "set until_lap_press: true for that instead"
+        )
     for pattern, meaning in _TEXT_SYNTAX:
         found = pattern.search(text)
         if found:
@@ -167,7 +178,7 @@ def _check_value(kind: str, value: Any, path: str, errors: list[str], warnings: 
 def _check_label(step: dict[str, Any], path: str, errors: list[str]) -> None:
     if step.get("text") is None:
         return
-    flags = {key for key in ("ramp", "freeride", "maxeffort", "hidepower") if step.get(key)}
+    flags = {key for key in ("ramp", "freeride", "maxeffort", "hidepower", "until_lap_press") if step.get(key)}
     problem = label_problem(step["text"], flags)
     timed = any(step.get(k) is not None for k in ("duration", "distance", "reps", "steps"))
     if problem is None and not timed:
@@ -191,12 +202,32 @@ def _check_number(name: str, value: Any, path: str, errors: list[str], *, whole:
     return float(value)
 
 
+def _new_totals() -> dict[str, Any]:
+    return {"duration": 0.0, "distance": 0.0, "open": 0, "work": 0, "steps": 0, "lap": 0, "lap_estimate": 0.0, "lap_estimate_distance": 0.0}
+
+
+def _check_unknown_keys(step: dict[str, Any], path: str, errors: list[str]) -> None:
+    """Keys outside the workout format would be dropped silently: refuse them."""
+    for key in sorted(str(k) for k in step if k not in STEP_KEYS):
+        hint = (
+            "; for a step that ends on the lap button set until_lap_press: true and keep a duration or distance "
+            "as planning estimate"
+            if _LAP_ALIAS_RE.search(key)
+            else ""
+        )
+        errors.append(f"{path}: unknown step field {key!r} is not part of the workout format and would be lost{hint}")
+
+
 def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-locals,too-many-statements
     step: dict[str, Any], path: str, sport: str, errors: list[str], warnings: list[str], totals: dict[str, Any]
 ) -> None:
     duration, distance = step.get("duration"), step.get("distance")
     reps, children = step.get("reps"), step.get("steps")
+    lap = step.get("until_lap_press")
+    _check_unknown_keys(step, path, errors)
     _check_label(step, path, errors)
+    if lap is not None and not isinstance(lap, bool):
+        errors.append(f"{path}: until_lap_press must be true or false")
     if reps is not None or children:
         if not isinstance(reps, int) or isinstance(reps, bool) or reps < 1:
             errors.append(f"{path}: reps must be a positive integer")
@@ -206,7 +237,7 @@ def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-man
             return
         if step.get("warmup") or step.get("cooldown"):
             warnings.append(f"{path}: warmup/cooldown on a repeat block is ignored by the workout text; set it on a single step")
-        for key in ("duration", "distance", "power", "hr", "pace", "cadence"):
+        for key in ("duration", "distance", "power", "hr", "pace", "cadence", "until_lap_press"):
             if step.get(key) is not None:
                 errors.append(f"{path}: a repeat block cannot have its own {key}; put it on the nested steps")
         for index, child in enumerate(children, 1):
@@ -215,14 +246,21 @@ def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-man
                 continue
             for _ in range(max(reps, 1)):
                 _check_step(child, f"{path}.{index}", sport, [], [], totals)
-            _check_step(child, f"{path}.{index}", sport, errors, warnings, {"duration": 0, "distance": 0, "open": 0, "work": 0, "steps": 0})
+            _check_step(child, f"{path}.{index}", sport, errors, warnings, _new_totals())
         return
     totals["steps"] += 1
     if duration is None and distance is None:
-        if step.get("until_lap_press") or step.get("freeride"):
+        if lap is True:
             totals["open"] += 1
             errors.append(
-                f"{path}: open-ended step (until lap press / free ride without duration) cannot be written as "
+                f"{path}: open-ended step (until lap press) needs a duration or distance as planning estimate "
+                "(Intervals.icu drops a step without one); the estimate only counts for the planned time and load, "
+                "the step itself ends on the lap button"
+            )
+        elif step.get("freeride"):
+            totals["open"] += 1
+            errors.append(
+                f"{path}: open-ended step (free ride without duration) cannot be written as "
                 "Intervals.icu workout text; give it a duration or distance"
             )
         elif step.get("text") and not any(step.get(k) for k in ("power", "hr", "pace", "cadence")):
@@ -235,10 +273,16 @@ def _check_step(  # pylint: disable=too-many-branches,too-many-arguments,too-man
         seconds = _check_number("duration", duration, path, errors, whole=True)
         if seconds is not None:
             totals["duration"] += seconds
+            if lap is True:
+                totals["lap_estimate"] += seconds
     if distance is not None:
         metres = _check_number("distance", distance, path, errors)
         if metres is not None:
             totals["distance"] += metres
+            if lap is True:
+                totals["lap_estimate_distance"] += metres
+    if lap is True and (duration is not None or distance is not None):
+        totals["lap"] += 1
     if step.get("ramp") and not any(isinstance(step.get(k), dict) and step[k].get("start") is not None for k in ("power", "hr", "pace")):
         errors.append(f"{path}: a ramp needs a start/end range target")
     has_target = False
@@ -279,7 +323,7 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
     description_problem = structure_line_problem(doc.get("description"))
     if description_problem:
         errors.append(f"workout_doc.description: {description_problem}")
-    totals: dict[str, Any] = {"duration": 0.0, "distance": 0.0, "open": 0, "work": 0, "steps": 0}
+    totals = _new_totals()
     for index, step in enumerate(steps, 1):
         if not isinstance(step, dict):
             errors.append(f"step {index}: must be an object")
@@ -314,6 +358,9 @@ def validate_workout_doc(  # pylint: disable=too-many-locals
             "steps": totals["steps"],
             "work_steps": totals["work"],
             "open_steps": totals["open"],
+            "lap_press_steps": totals["lap"],
+            "lap_press_estimate_s": totals["lap_estimate"],
+            "lap_press_estimate_m": totals["lap_estimate_distance"],
             "has_warmup": has_warmup,
             "has_cooldown": has_cooldown,
         },
@@ -331,6 +378,14 @@ def format_validation(result: dict[str, Any], workout_type: str) -> str:
             f"planned duration {hms(totals['duration_s'])}"
             + (f", distance {totals['distance_m']:.0f} m" if totals["distance_m"] else "")
             + f", warm-up {'yes' if totals['has_warmup'] else 'no'}, cool-down {'yes' if totals['has_cooldown'] else 'no'}"
+        )
+    if totals.get("lap_press_steps"):
+        estimate = [hms(totals["lap_press_estimate_s"])] if totals.get("lap_press_estimate_s") else []
+        estimate += [f"{totals['lap_press_estimate_m']:.0f} m"] if totals.get("lap_press_estimate_m") else []
+        lines.append(
+            f"Until lap press: {totals['lap_press_steps']} step(s) end only on the lap button (Garmin, Suunto; other "
+            f"devices and files use the estimate); planning estimate {' + '.join(estimate)}, counted in the planned "
+            "duration and load"
         )
     for error in result["errors"]:
         lines.append(f"ERROR: {error}")

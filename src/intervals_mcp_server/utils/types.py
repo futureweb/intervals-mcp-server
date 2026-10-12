@@ -6,11 +6,13 @@ used in the Intervals.icu API, including workout steps, values, and documentatio
 Also includes enums for server configuration.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, Dict, Optional, Any, Union
 from enum import Enum, StrEnum
 import json
+import re
 
+from pydantic import ConfigDict
 from pydantic.json_schema import SkipJsonSchema
 
 
@@ -26,6 +28,8 @@ __all__ = [
     "Step",
     "SportSettings",
     "WorkoutDoc",
+    "PRESS_LAP_MARKER",
+    "has_press_lap",
 ]
 
 
@@ -123,6 +127,21 @@ class TransportAliases(StrEnum):
 def float_to_str(value: float) -> str:
     """Format the value without decimals if it's a whole number."""
     return str(int(value)) if value.is_integer() else str(value)
+
+
+# Intervals.icu's workout parser (hasPressLap in the web client, which the server uses as well)
+# marks a step "until_lap_press" when its line holds the word "press" or "hit" followed by "lap",
+# anywhere and in any case; words are split at whitespace, commas and semicolons.
+PRESS_LAP_MARKER = "Press lap"
+_PARSER_TOKENS = re.compile(r"[\s,;]+")
+
+
+def has_press_lap(text: Any) -> bool:
+    """True when Intervals.icu would read *text* (a step line or label) as "until lap press"."""
+    if not isinstance(text, str):
+        return False
+    words = [word.lower() for word in _PARSER_TOKENS.split(text) if word]
+    return any(word in ("press", "hit") and following == "lap" for word, following in zip(words, words[1:], strict=False))
 
 
 @dataclass
@@ -237,13 +256,17 @@ class Value:
 
 @dataclass
 class Step:  # pylint: disable=too-many-instance-attributes
-    """One workout step: duration (s) or distance (m) with a target (power, hr, pace or cadence), or reps with nested steps. See intervals://workout-syntax."""
+    """One workout step: duration (s) or distance (m) with a target (power, hr, pace or cadence), or reps with nested steps. until_lap_press: true ends the step on the lap button (Garmin, Suunto); its duration or distance is then the planning estimate. See intervals://workout-syntax."""
+
+    # Unknown keys ("press_lap", "end_condition" ...) are kept so that the validation can refuse
+    # them instead of silently writing a workout without them.
+    __pydantic_config__ = ConfigDict(extra="allow")
 
     text: Optional[str] = None
     text_locale: SkipJsonSchema[Optional[Dict[str, str]]] = None
     duration: Optional[int] = None
     distance: Optional[float] = None
-    until_lap_press: SkipJsonSchema[Optional[bool]] = None  # open-ended steps cannot be written
+    until_lap_press: Optional[bool] = None
     reps: Optional[int] = None
     warmup: Optional[bool] = None
     cooldown: Optional[bool] = None
@@ -313,7 +336,13 @@ class Step:  # pylint: disable=too-many-instance-attributes
             data["_pace"] = self._pace.to_dict()
         if self._distance is not None:
             data["_distance"] = self._distance
+        data.update(self.unknown_fields())
         return data
+
+    def unknown_fields(self) -> Dict[str, Any]:
+        """Keys a client sent that are not step fields (kept by the parameter validation)."""
+        declared = {field.name for field in fields(self)}
+        return {key: value for key, value in vars(self).items() if key not in declared and not key.startswith("__")}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Step":  # pylint: disable=too-many-branches
@@ -430,6 +459,10 @@ class Step:  # pylint: disable=too-many-instance-attributes
             # read as part of it (upstream mvilanova/intervals-mcp-server#132).
             if self.duration is not None or self.distance is not None:
                 val += "- "  # a step without duration or distance stays a plain text line
+                if self.until_lap_press and not has_press_lap(self.text):
+                    # The form the "End when lap button pressed" option of Intervals.icu's step
+                    # dialog writes; the duration or distance stays the planning estimate.
+                    val += f"{PRESS_LAP_MARKER} "
             if self.text is not None:
                 val += f"{self._label()} "
             if self.duration is not None:
