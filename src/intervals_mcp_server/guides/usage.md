@@ -179,9 +179,10 @@ Short form in the server instructions; the reasons and details:
 - Dates are YYYY-MM-DD in the athlete's time zone; `athlete_id` defaults to the configured athlete.
   Core outputs (`get_coach_context`, `get_recovery_snapshot`, `get_wellness_data`,
   `get_training_plan`, `get_activity_report`, `get_load_projection`) state `today = YYYY-MM-DD,
-  weekday (time zone)` and label listed days with weekday and relative day. A multi-day calendar entry
-  (sick, injured, holiday, plan phase) is shown with its last day: Intervals.icu stores the midnight
-  after it as `end_date_local`.
+  weekday (time zone)` and label listed days with weekday and relative day. Intervals.icu stores the
+  end of a multi-day calendar entry (sick, injured, holiday, plan phase) as the midnight after its
+  last day (`end_date_local`, shown as stored by `get_events` and `get_event_by_id`);
+  `get_training_plan` and the health markers show the last day itself.
 - Times are local (time zone name when stored, else the UTC offset) and UTC.
 - Run/walk/hike cadence in steps per minute (spm = 2 x the stored per-leg value, shown as
   stored), bike cadence in rpm; temperatures in °C.
