@@ -143,10 +143,20 @@ one-call activity report and the data audit contain.
 - `detail_level`: `compact` (one line per interval with the key numbers; custom streams as
   start→end with the minimum), `standard` (default, the full block per interval) or `full`
   (standard plus every custom stream when `stream_types` is not given, i.e. `stream_types="custom"`).
+- Values are shown as stored; a missing value (absent, null or NaN) is `n/a`, never 0. A stored 0
+  of a heart rate, DFA α1, respiration, SmO2 or THb is `n/a (0 stored)` (such a 0 is no
+  measurement); other zeros are real values. Wind speed and gusts are stored in m/s (km/h added).
+- Per-interval decoupling and DFA α1 are shown as stored, with a caveat: on segments under 10 min
+  (marked "short segment, under 10 min"; the same 10 min as the Pw:HR drift of
+  `analyze_workout_execution`) they mostly reflect the shape of the effort, the heart-rate lag and the
+  calculation window (DFA α1 is typically computed over about 2 min of beats), not aerobic drift or
+  intensity; the same applies to unsteady segments. A note under the intervals says so. Aerobic
+  decoupling over whole steady sessions: `get_durability` (method: durability).
 - `output_format=json`: activity type, a cadence note for foot sports, the raw intervals with
-  `average_cadence_spm`, custom fields with a value (or 0), `stream_metrics` per stream (name,
-  units, samples, non_null, first, last, min, max, mean, delta) and, with planned types,
-  `planned_step` and `plan_position`; the groups; a note.
+  `average_cadence_spm`, `short_segment` (under 10 min), custom fields with a value (or 0),
+  `stream_metrics` per stream (name, units, samples, non_null, first, last, min, max, mean, delta)
+  and, with planned types, `planned_step` and `plan_position`; the groups; a note and
+  `short_segment_note` (when a short segment has a decoupling or DFA α1 value).
 - `include_planned_types` (default false): shows the planned step (type) matched to each interval
   from the paired event or `planned_workout_doc`; the Intervals.icu WORK/RECOVERY type is kept as
   stored and marked when it differs from the plan. An interval longer than its planned step (plus

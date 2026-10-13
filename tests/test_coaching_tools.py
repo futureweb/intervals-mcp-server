@@ -9,6 +9,7 @@ validation and the server status tool. All API calls are routed to synthetic fix
 import asyncio
 import json
 import os
+from datetime import date
 import pathlib
 import sys
 
@@ -278,6 +279,16 @@ def test_get_activity_intervals_json_with_stream_metrics(monkeypatch):
     assert work["stream_metrics"]["Stamina"]["first"] == 88.0
     assert work["stream_metrics"]["Stamina"]["samples"] == 300
     assert payload["groups"] == []
+    # Short segments are flagged; without a decoupling or DFA α1 value there is no note.
+    assert [i["short_segment"] for i in payload["intervals"]] == [False, True, True, True, True, True]
+    assert payload["short_segment_note"] is None
+    with_drift = dict(EXECUTION_INTERVALS, icu_intervals=[dict(i, decoupling=4.2) for i in EXECUTION_INTERVALS["icu_intervals"]])
+    _install_router(monkeypatch, {"/intervals": with_drift})
+    payload = json.loads(asyncio.run(get_activity_intervals("i1", output_format="json")))
+    assert payload["short_segment_note"].startswith("per-interval decoupling and DFA α1 of segments under 10 min")
+    text = asyncio.run(get_activity_intervals("i1"))
+    assert "Decoupling: 4.2\n" in text and "Decoupling: 4.2 (short segment, under 10 min)" in text
+    assert text.count("Note: per-interval decoupling and DFA α1") == 1
 
 
 # ----------------------------------------------------------- analysis tools
@@ -453,7 +464,9 @@ def test_get_recovery_snapshot(monkeypatch):
     monkeypatch.setattr("intervals_mcp_server.tools.wellness_insights.get_default_end_date", lambda: "2026-10-09")
     result = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=2))
     assert "Recovery snapshot for athlete i1: 2026-10-09 and 2 day(s) before" in result
-    assert "2026-10-09 (today, preliminary) | updated 2026-10-09T07:00:00+00:00 | locked no" in result
+    assert "today = 2026-10-09, Friday (" in result.splitlines()[0]
+    assert "2026-10-09 (Fri, today, preliminary) | updated 2026-10-09T07:00:00+00:00 | locked no" in result
+    assert "2026-10-08 (Thu, yesterday) | updated" in result
     assert "RHR 48 bpm | HRV 44 ms" in result
     assert "CTL 65.8 | ATL 66 | form -0.2 | ramp 1" in result
     assert "custom: Garmin Deep Sleep 85 min" in result
@@ -463,14 +476,15 @@ def test_get_recovery_snapshot(monkeypatch):
     assert "42d baseline mean" in result
     assert "Activities 2026-10-07 to 2026-10-09 (3):" in result
     assert "'Grail gravel' (i11): 1:51:48, load 130 (Intervals.icu, P130/H50), IF 70%, feel 2/5, RPE 5/10 | device fields: Aerobic Effect 3.3" in result
-    assert "Planned on 2026-10-09 (1):" in result
+    assert "Planned on 2026-10-09 (Fri, today) (1):" in result
     assert "Workout (Ride) '2x5 min Threshold' (event 5), planned 29:00, planned load 40, done: i1" in result
     payload = json.loads(asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1, output_format="json")))
     assert payload["days"][-1]["preliminary"] is True
     # A past day is not labelled as today (the athlete's today decides, not date_str).
     monkeypatch.setattr("intervals_mcp_server.tools.wellness_insights.get_default_end_date", lambda: "2026-10-10")
     past = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1))
-    assert "(today, preliminary)" not in past and "2026-10-09 | updated 2026-10-09T07:00" in past
+    assert "preliminary" not in past and "2026-10-09 (Fri, yesterday) | updated 2026-10-09T07:00" in past
+    assert "Recovery snapshot for athlete i1: 2026-10-09 (Fri, yesterday) and 1 day(s) before; today = 2026-10-10, Saturday" in past
     assert json.loads(asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1, output_format="json")))[
         "days"][-1]["preliminary"] is False
     assert payload["days"][-1]["custom"]["GarminSleepDeepMinutes"] == 85.0
@@ -635,9 +649,22 @@ def test_get_training_plan(monkeypatch):
     calls = []
     _install_router(monkeypatch, {"/training-plan": {"training_plan_id": None}, "/events": PLAN_EVENTS,
                                   "/fitness-model-events": [{"start_date_local": "2026-09-01T00:00:00", "category": "SET_EFTP", "eftp": 230}]}, calls=calls)
+    monkeypatch.setattr("intervals_mcp_server.tools.events.athlete_today", lambda: date(2026, 10, 14))
     result = asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01"))
+    assert result.startswith("Training plan for athlete i1, 2026-10-01 to 2027-09-01; today = 2026-10-14, Wednesday (")
     assert "Assigned plan: none" in result
-    assert "Phases / season markers (1):" in result and "- 2026-10-13 to 2026-11-09 Plan (Ride): Base 2 (event 901) | aerobic base" in result
+    # The end of a multi-day event is exclusive (midnight after its last day): the phase ends on 11-08.
+    assert "Phases / season markers (1):" in result and (
+        "- 2026-10-13 (Tue, yesterday) to 2026-11-08 (Sun, in 25 days) Plan (Ride): Base 2 (event 901) | aerobic base" in result
+    )
+    assert "- 2027-08-29 (Sun, in 319 days) Race A (Ride)" in result
+    assert "- 2026-09-01 (Tue, 43 days ago) SET_EFTP" in result
+    plan_json = json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01", output_format="json")))
+    assert plan_json["today"]["weekday"] == "Wednesday"
+    # JSON rows carry the first and last day besides the stored (exclusive) end.
+    assert (plan_json["phases"][0]["first_day"], plan_json["phases"][0]["last_day"]) == ("2026-10-13", "2026-11-08")
+    assert plan_json["phases"][0]["end_date_local"] == "2026-11-09T00:00:00"
+    assert plan_json["races"][0]["first_day"] == plan_json["races"][0]["last_day"] == "2027-08-29"
     assert "Weekly targets (1):" in result and "load 450, time 10:00:00, weekly target" in result
     assert "Races (1):" in result and "Race A (Ride): Ötztaler (event 903)" in result
     assert "ignored" not in result
@@ -753,8 +780,10 @@ def test_get_activity_report_single_call(monkeypatch):
     calls = []
     with_power2 = dict(EXECUTION_ACTIVITY, stream_types=EXECUTION_ACTIVITY["stream_types"] + ["secondary_power"])
     _install_router(monkeypatch, {"/activity/": with_power2, "/streams": streams}, calls=calls)
+    monkeypatch.setattr("intervals_mcp_server.tools.report.athlete_today", lambda: date(2026, 10, 9))
     result = asyncio.run(get_activity_report("i1"))
-    assert result.startswith("== Overview\nThreshold Ride (i1, Ride) 2026-10-06 17:36 local")
+    assert result.startswith("== Overview\ntoday = 2026-10-09, Friday (")
+    assert "; activity day 2026-10-06 (Tue, 3 days ago)\nThreshold Ride (i1, Ride) 2026-10-06 17:36 local" in result
     assert "== Plan vs execution (event 5 ('2x5 min Threshold'))" in result
     assert "work steps in target: 2/2" in result
     assert "== Second power meter check (watts vs secondary_power, no calibration)" in result

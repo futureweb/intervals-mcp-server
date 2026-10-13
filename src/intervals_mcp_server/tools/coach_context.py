@@ -4,10 +4,12 @@ Compact coaching context MCP tool for Intervals.icu (read-only).
 get_coach_context combines, for one end date, the training load (acute/chronic, ratio,
 monotony, strain, CTL/ATL/form), the intensity distribution of the last 7 and 28 days, the
 recovery markers against the athlete's own 42-day baselines (numbers only), durability, the
-most notable sessions and the plan of the next days in about 2-3k characters. It reuses the
-metric modules of get_training_load, get_intensity_distribution and get_durability and needs
-at most four API calls (for today: activities, wellness, events and the last 14 wellness
-records with all fields for the completeness of today's record). The idea of one pre-computed
+most notable sessions, the plan of the next days and recorded health markers (SICK/INJURED
+calendar entries, a high wellness injury score; utils.health_markers) in about 2-3k characters.
+It reuses the metric modules of get_training_load, get_intensity_distribution and
+get_durability and needs at most five API calls (activities, wellness, the SICK/INJURED
+entries and, for today, the events of the plan and the last 14 wellness records with all
+fields for the completeness of today's record). The idea of one pre-computed
 coaching context comes from the coach report by morritter in upstream pull request
 mvilanova/intervals-mcp-server#150.
 """
@@ -39,6 +41,8 @@ from intervals_mcp_server.tools.training_load import (
     past_end,
 )
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD
+from intervals_mcp_server.utils.dates import dated, today_anchor, today_json
+from intervals_mcp_server.utils.health_markers import health_lines, health_markers, request_params
 from intervals_mcp_server.utils.durability import decoupling_summary, efficiency_summary
 from intervals_mcp_server.utils.intensity import THRESHOLD_MODES, analyze_period
 from intervals_mcp_server.utils.load_metrics import (
@@ -181,13 +185,15 @@ def _durability_text(durability: dict[str, Any], efficiency: dict[str, Any]) -> 
     return ("; ".join(parts) or "no qualifying steady sessions") + excluded
 
 
-def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable=too-many-locals
+def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable=too-many-locals,too-many-statements
     load, sports = payload["load"], payload["sports"]
     week = load["week"]
     intensity = payload["intensity"]
+    today = date.fromisoformat(payload["today"]["date"])
+    end = "" if payload["end"] == today.isoformat() else f" at {dated(payload['end'], today)};"
     lines = [
-        f"Coach context for athlete {payload['athlete_id']} at {payload['end']} (load windows end {payload['load_end']}; "
-        "Intervals.icu load, statistics only, no assessment):",
+        f"Coach context for athlete {payload['athlete_id']}{end or ','} {today_anchor(today)}; load windows end "
+        f"{payload['load_end']}; Intervals.icu load, statistics only, no assessment:",
     ]
     if payload["load_end_note"]:
         lines.append(f"Note: {payload['load_end_note']}.")
@@ -219,6 +225,7 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
     today_line = completeness_line(payload["today_completeness"], COMPLETENESS_NAMES, " (see get_recovery_snapshot)")
     if today_line:
         lines.append(today_line)
+    lines.extend(health_lines(payload["health_markers"], today))
     lines.append(f"Durability 28 d: {_durability_text(payload['durability'], payload['efficiency'])}")
     if detail_level != "compact":
         if sports["by_sport"]:
@@ -235,7 +242,7 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
             )
         if payload["top_sessions"]:
             lines.append("Top sessions 7 d: " + "; ".join(
-                f"{s['date'][5:]} {s['type']} {fmt(s['minutes'])} min load {fmt(s['load'])} IF {fmt(s['intensity_factor'], 2)}"
+                f"{dated(s['date'], today)[5:]} {s['type']} {fmt(s['minutes'])} min load {fmt(s['load'])} IF {fmt(s['intensity_factor'], 2)}"
                 for s in payload["top_sessions"]
             ))
         plan = payload["plan"]
@@ -248,8 +255,8 @@ def _text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable
                 if plan["sessions"] else "NO PLANNED WORKOUTS in the calendar (a load projection shows only the decay)"
             )
             lines.append(
-                f"Planned {plan['from']} to {plan['to']}: {planned}"
-                + (f" | next race {race['date']} {race['category']} '{race['name']}'" if race else "")
+                f"Planned {dated(plan['from'], today)} to {dated(plan['to'], today)}: {planned}"
+                + (f" | next race {dated(race['date'], today)} {race['category']} '{race['name']}'" if race else "")
             )
         cov = payload["coverage"]
         lines.append(
@@ -286,12 +293,13 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
 
     Combines 7/28-day Intervals.icu load with acute:chronic ratio, monotony, strain and
     CTL/ATL/form; the three-zone intensity of 7 and 28 days; recovery markers (HRV, resting HR,
-    sleep) against personal baselines with a z-score (numbers only); durability; top sessions;
-    and, when the end date is today, planned workouts of the next 7 days and the next race. For
-    today it names wellness fields not yet recorded (not yet available, not normal). A method
-    line states windows and rules; small samples are flagged; missing values are never 0; no
-    verdict. Details: get_training_load, get_intensity_distribution, get_durability,
-    get_recovery_snapshot, get_load_projection. Method: intervals://methods/load (get_guide).
+    sleep) against personal baselines with a z-score; durability; recorded SICK/INJURED
+    entries; top sessions; and, when the end date is today, planned workouts of the next 7 days
+    and the next race. For today it names wellness fields not yet recorded (not yet available,
+    not normal). A method line states windows and rules; small samples are flagged; missing
+    values are never 0; no verdict. Details: get_training_load, get_intensity_distribution,
+    get_durability, get_recovery_snapshot, get_load_projection. Method:
+    intervals://methods/load (get_guide).
     """
     level = detail_level or "standard"
     athlete_id_to_use, error_msg = resolve_request(athlete_id, level)
@@ -312,7 +320,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
         return error
     wellness_list, error = await fetch_wellness(
         athlete_id_to_use, end - timedelta(days=SPREAD_DAYS + RECENT_DAYS), end,
-        FITNESS_FIELDS + "," + ",".join(m for m, _, _ in RECOVERY_METRICS),
+        FITNESS_FIELDS + "," + ",".join(m for m, _, _ in RECOVERY_METRICS) + ",injury",
     )
     if error:
         return error
@@ -328,9 +336,15 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
             {"date": today.isoformat(), "error": recent_error} if recent_error
             else today_completeness(recent, today, (cached_custom_item_index(athlete_id_to_use) or {}).get(INPUT_FIELD))
         )
+    # SICK/INJURED entries around the end day (one request, last; a failure is reported, not fatal).
+    health_query = request_params(end)
+    health_events, health_error = await fetch_events(
+        athlete_id_to_use, date.fromisoformat(health_query["oldest"]), end, health_query["category"]
+    )
 
     load_end, note = load_end_for(end_date, end, activities)
     wellness = wellness_by_day(wellness_list)
+    markers = health_markers(health_events, wellness_list, end, health_error, today)
     window_start = load_end - timedelta(days=27)
     window = between(activities, window_start, load_end)
     intensity_28 = analyze_period(activities, window_start, load_end, threshold_as=threshold_mode)
@@ -341,7 +355,8 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
         entry.pop("sessions")
     window_days = [load_end - timedelta(days=o) for o in range(28)]
     payload: dict[str, Any] = {
-        "athlete_id": athlete_id_to_use, "end": end.isoformat(), "load_end": load_end.isoformat(), "load_end_note": note,
+        "athlete_id": athlete_id_to_use, "today": today_json(today), "end": end.isoformat(),
+        "load_end": load_end.isoformat(), "load_end_note": note,
         "method": {
             "acute_days": 7, "chronic_days": 28, "acwr": "ratio of the daily means, coupled (acute window inside the chronic one)",
             "monotony": "mean / SD of the last 7 daily loads (rest days 0)", "zone_basis": "auto (power for cycling, HR then pace otherwise)",
@@ -355,6 +370,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
                       "by_sport_28": intensity_28["by_sport"]},
         "recovery": _recovery(wellness_list, end),
         "today_completeness": completeness,
+        "health_markers": markers,
         "durability": durability,
         "efficiency": efficiency_summary(activities, window_start, load_end),
         "top_sessions": top_sessions(between(activities, load_end - timedelta(days=6), load_end)),

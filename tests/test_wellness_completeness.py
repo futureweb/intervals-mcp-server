@@ -66,8 +66,12 @@ def _now(monkeypatch, utc="2026-10-10T08:05:00+00:00", zone="Europe/Vienna"):
     monkeypatch.setenv("ATHLETE_TIMEZONE", zone)
 
 
-def _api(monkeypatch, wellness, fail=None):
-    """Answer the API like Intervals.icu (oldest/newest/fields honoured); returns the sent requests."""
+def _api(monkeypatch, wellness, fail=None, events=None):
+    """Answer the API like Intervals.icu (oldest/newest/fields honoured); returns the sent requests.
+
+    Calendar *events* (default none) are selected by their START day and by ``category``, as the
+    events endpoint does (a multi-day entry that started before ``oldest`` is not returned).
+    """
     sent: list[httpx.Request] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -83,7 +87,13 @@ def _api(monkeypatch, wellness, fail=None):
             return httpx.Response(200, json=rows)
         if path.endswith("/custom-item"):
             return httpx.Response(200, json=COMPLETENESS_ITEMS)
-        if path.endswith(("/activities", "/events")):
+        if path.endswith("/events"):
+            wanted = set(params["category"].split(",")) if params.get("category") else None
+            return httpx.Response(200, json=[
+                e for e in events or [] if params["oldest"] <= e["start_date_local"][:10] <= params["newest"]
+                and (wanted is None or e["category"] in wanted)
+            ])
+        if path.endswith("/activities"):
             return httpx.Response(200, json=[])
         return httpx.Response(404, json={})
 
@@ -245,9 +255,11 @@ def test_get_wellness_data_today_line_one_header_and_one_request(monkeypatch):
     _now(monkeypatch)
     sent = _api(monkeypatch, completeness_wellness())
     text = asyncio.run(get_wellness_data(start_date="2026-10-09", end_date="2026-10-10"))
-    assert text.startswith("Wellness Data:\n\n" + MORNING_LINE + "\n\nDate: 2026-10-09\n")
+    assert text.startswith("Wellness Data:\ntoday = 2026-10-10, Saturday (Europe/Vienna)\n\n" + MORNING_LINE
+                           + "\n\nDate: 2026-10-09 (Fri, yesterday)\n")
     assert text.count("Wellness Data:") == 1
-    assert [line for line in text.splitlines() if line.startswith("Date:")] == ["Date: 2026-10-09", "Date: 2026-10-10"]
+    assert [line for line in text.splitlines() if line.startswith("Date:")] == [
+        "Date: 2026-10-09 (Fri, yesterday)", "Date: 2026-10-10 (Sat, today)"]
     # One wellness request widened to the 14 days before today, plus the (cached) custom item definitions.
     assert _wellness_requests(sent) == [{"oldest": "2026-09-26", "newest": "2026-10-10"}]
     assert [r.url.path.rsplit("/", 1)[-1] for r in sent] == ["wellness", "custom-item"]
@@ -269,7 +281,8 @@ def test_get_wellness_data_without_today_or_complete(monkeypatch):
     assert MORNING_LINE in default and default.count("Date: ") == 31
     sent = _api(monkeypatch, completeness_wellness(completeness_day("2026-10-10", 30)))
     complete = asyncio.run(get_wellness_data(start_date="2026-10-10"))
-    assert "Today" not in complete and complete.startswith("Wellness Data:\n\nDate: 2026-10-10\n")
+    assert "Today" not in complete and complete.startswith(
+        "Wellness Data:\ntoday = 2026-10-10, Saturday (Europe/Vienna)\n\nDate: 2026-10-10 (Sat, today)\n")
     assert len(sent) == 1
 
 
@@ -281,12 +294,15 @@ def test_recovery_snapshot_today_line_json_and_requests(monkeypatch):
     text = asyncio.run(get_recovery_snapshot())
     lines = text.splitlines()
     assert lines[2:4] == MORNING_LINE.splitlines() and lines[4] == ""
-    assert "2026-10-10 (today, preliminary) | updated 2026-10-10T07:46:01.604+00:00" in text
+    assert "2026-10-10 (Sat, today, preliminary) | updated 2026-10-10T07:46:01.604+00:00" in text
     assert [line.split(" ")[0] for line in lines if line[:4] == "2026" and " | updated" in line] == [
         "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10"]
-    # Same number of requests as before: the first wellness request starts 14 days before today.
+    # The first wellness request starts 14 days before today (no extra request for the completeness);
+    # the last request reads the SICK/INJURED entries of the health markers (none here: no block).
     assert _wellness_requests(sent)[0] == {"oldest": "2026-09-26", "newest": "2026-10-10"}
-    assert len(sent) == 5 and len(_wellness_requests(sent)) == 2
+    assert len(sent) == 6 and len(_wellness_requests(sent)) == 2
+    assert dict(sent[-1].url.params) == {"oldest": "2024-10-10", "newest": "2026-10-10", "category": "SICK,INJURED"}
+    assert "Health markers" not in text
     payload = json.loads(asyncio.run(get_recovery_snapshot(output_format="json")))
     completeness = payload["today_completeness"]
     assert completeness["updated_local"] == "2026-10-10T09:46+02:00" and completeness["exists"] is True
@@ -303,10 +319,11 @@ def test_recovery_snapshot_labels_only_the_athletes_today(monkeypatch):
     _now(monkeypatch, utc="2026-10-09T22:30:00+00:00")  # 00:30 on 2026-10-10 in Vienna
     _api(monkeypatch, completeness_wellness())
     past = asyncio.run(get_recovery_snapshot(date_str="2026-10-09", days_back=1))
-    assert "(today, preliminary)" not in past and "\n2026-10-09 | updated 2026-10-09T20:21:13.526+00:00 | locked no" in past
+    assert "preliminary" not in past and "\n2026-10-09 (Fri, yesterday) | updated 2026-10-09T20:21:13.526+00:00 | locked no" in past
     assert "Today 2026-10-10" not in past
     today = asyncio.run(get_recovery_snapshot(days_back=1))
-    assert "\n2026-10-10 (today, preliminary) | updated" in today and "\n2026-10-09 | updated" in today
+    assert "\n2026-10-10 (Sat, today, preliminary) | updated" in today and "\n2026-10-09 (Fri, yesterday) | updated" in today
+    assert "today = 2026-10-10, Saturday (Europe/Vienna); generated 2026-10-10 00:30 local" in today
 
 
 def test_recovery_snapshot_caps_names_by_detail_level(monkeypatch):
@@ -357,7 +374,8 @@ def test_coach_context_today_line_and_one_extra_request(monkeypatch):
         "Day totals not yet available (normally complete in the evening): GarminTotalCalories, floors climbed."
     )
     assert rows[rows.index(line) + 2].startswith("Durability 28 d")
-    assert [r.url.path.rsplit("/", 1)[-1] for r in sent] == ["activities", "wellness", "events", "wellness"]
+    assert [r.url.path.rsplit("/", 1)[-1] for r in sent] == ["activities", "wellness", "events", "wellness", "events"]
+    assert dict(sent[-1].url.params)["category"] == "SICK,INJURED"  # health markers, last
     assert _wellness_requests(sent)[1] == {"oldest": "2026-09-26", "newest": "2026-10-10"}  # all fields
     assert "fields" in _wellness_requests(sent)[0]
     asyncio.run(get_recovery_snapshot())  # caches the definitions
@@ -365,10 +383,10 @@ def test_coach_context_today_line_and_one_extra_request(monkeypatch):
     payload = json.loads(asyncio.run(get_coach_context(output_format="json")))
     assert payload["today_completeness"]["missing_usual_fields"][3] == {
         "field": "GarminSleepDeepMinutes", "name": "Garmin Deep Sleep", "group": "night_morning"}
-    assert len(sent) == 4
+    assert len(sent) == 5
     sent.clear()
     past = json.loads(asyncio.run(get_coach_context(end_date="2026-10-09", output_format="json")))
-    assert past["today_completeness"] is None and len(sent) == 2
+    assert past["today_completeness"] is None and len(sent) == 3 and past["health_markers"] is None
 
 
 def test_coach_context_recovery_leaves_out_todays_missing_values(monkeypatch):
@@ -398,6 +416,8 @@ def test_coach_context_check_respects_errors_and_the_request_budget(monkeypatch)
     assert len(sent) == 3
     assert "Today 2026-10-10: completeness not checked (Error fetching wellness data: Not sent: this tool call reached its limit of 3" in limited
     assert "Note: this tool call reached its limit of 3 Intervals.icu API requests" in limited
+    # The refused SICK/INJURED request is reported as unknown, never as "no markers".
+    assert "- SICK/INJURED entries could not be loaded (Error fetching events: Not sent: " in limited and "unknown, not none" in limited
 
 
 def test_daily_metrics_are_their_own_group(monkeypatch):

@@ -48,7 +48,8 @@ missing and whole days can be absent. Missing values are never filled in or coun
   - `standard` (default): plus up to 20 custom wellness fields per day ("+N more
     (detail_level=full)"); 15 names per group.
   - `full`: every custom field with a value and every missing name.
-- `output_format=json`: `date`, `today_completeness`, `days` (per day: date, updated, locked,
+- `output_format=json`: `today` (date anchor: date, weekday, time zone), `date`,
+  `today_completeness`, `health_markers` (null without markers), `days` (per day: date, updated, locked,
   native, fitness, subjective, custom, missing, preliminary), `baselines` (the full trend
   statistics per metric without the day series), `activities` and `planned_events` (raw),
   `load_errors`.
@@ -75,11 +76,18 @@ missing and whole days can be absent. Missing values are never filled in or coun
   to 12 numeric custom activity fields with a non-zero value ("device fields").
 - Planned events of `date_str`: category and sport, name, event id, planned duration and load,
   paired activity.
-- Today is tagged "(today, preliminary)" (JSON `preliminary=true`): its aggregates (steps,
-  calories, burn) can still be incomplete. Today's completeness line: see "Today's record".
+- The header states the date anchor `today = YYYY-MM-DD, weekday (time zone)` and the generation
+  time in that time zone ("local"); each listed day carries its weekday and relative day, e.g.
+  `2026-10-12 (Mon, yesterday)`. Today is tagged `(Tue, today, preliminary)` (JSON
+  `preliminary=true`): its aggregates (steps, calories, burn) can still be incomplete. Today's
+  completeness line: see "Today's record".
+- Health markers of `date_str` (SICK/INJURED calendar entries on the day or ending in the 14 days
+  before, wellness injury 3 or 4 of the day or, without a value on the day, of the day before; no
+  assessment, block left out without markers): see the usage guide (section 3). The injury score is
+  read with the baseline request (field `injury` added).
 - Requests: wellness of the listed days (widened by 14 days for today), baseline wellness, custom
-  item definitions (cached), activities, events. An activity or event request that fails is
-  reported as "could not be loaded", never as "none".
+  item definitions (cached), activities, events of the day, SICK/INJURED entries (health markers).
+  An activity or event request that fails is reported as "could not be loaded", never as "none".
 
 ## get_wellness_trends
 

@@ -118,14 +118,15 @@ def test_coach_context_json_follows_detail_level(monkeypatch):
     full = json.loads(asyncio.run(get_coach_context(output_format="json", detail_level="full")))
     default = json.loads(asyncio.run(get_coach_context(output_format="json")))
     # R29-11: without an explicit detail_level the JSON keeps the previous full structure.
-    assert set(default) == {"athlete_id", "end", "load_end", "load_end_note", "method", "load", "sports", "fitness", "intensity",
-                            "recovery", "today_completeness", "durability", "efficiency", "top_sessions", "plan", "weeks", "coverage"}
+    assert set(default) == {"athlete_id", "today", "end", "load_end", "load_end_note", "method", "load", "sports", "fitness",
+                            "intensity", "recovery", "today_completeness", "health_markers", "durability", "efficiency",
+                            "top_sessions", "plan", "weeks", "coverage"}
     assert "drift" in default["intensity"] and len(default["weeks"]) == 4
     assert compact["detail_level"] == "compact" and standard["detail_level"] == "standard"
     for key in ("sports", "top_sessions", "plan", "coverage", "weeks", "references"):
         assert key not in compact, key
     assert "drift" not in compact["intensity"] and set(compact["intensity"]) == {"last_7", "last_28", "by_sport_28"}
-    for key in ("load", "fitness", "recovery", "durability", "efficiency", "method", "today_completeness"):
+    for key in ("today", "load", "fitness", "recovery", "durability", "efficiency", "method", "today_completeness", "health_markers"):
         assert key in compact, key
     assert {"sports", "top_sessions", "plan", "coverage"} <= set(standard) and "weeks" not in standard
     assert "drift" in standard["intensity"] and "references" not in standard

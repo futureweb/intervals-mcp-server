@@ -293,13 +293,14 @@ def test_simulation_text_compares_scenario_and_calendar(monkeypatch):
     text = asyncio.run(get_load_projection(scenario=SCENARIO, target_form="5,15"))
     assert text.startswith("SIMULATION (what-if, nothing is written to the calendar): scenario vs calendar plan for athlete i1, "
                            "2026-10-09 to 2026-11-08")
+    assert "; today = 2026-10-09, Friday (" in text.splitlines()[0]
     assert "1 proposed session(s), load 196" in text
     assert "template 1: 4 week(s) from 2026-10-12, 5 Ride sessions/week on Tue, Wed, Thu, Sat, Sun, long day Sat 40 %" in text
     assert "planned workouts 2026-10-10 to 2026-11-08 replaced (3 left out, load 200)" in text
     assert "1 load(s) estimated as load = hours x IF^2 x 100" in text
     assert "Calendar plan: 4 planned workouts (3 with a planned load, sum 300)" in text
     assert "Assumptions: model: CTL and ATL are exponentially weighted averages" in text and "no illness" in text
-    assert "Target 2026-10-18 RACE_A 'Gran Fondo' (next RACE_A in the calendar), start of day: scenario CTL" in text
+    assert "Target 2026-10-18 (Sun, in 9 days) RACE_A 'Gran Fondo' (next RACE_A in the calendar), start of day: scenario CTL" in text
     assert "Target form range +5 to +15 (CTL - ATL): scenario outside, calendar plan inside" in text
     assert "Search on the scenario (only the 7 days 2026-10-11 to 2026-10-17 vary" in text
     assert "(a) 0-26 % of the 425 planned there" in text and "(b) a constant 0-140 per week" in text
@@ -355,7 +356,7 @@ def test_target_values_search_consistency_and_percent(monkeypatch):
     assert search["planned_window_load"] == 200  # the long ride and the tempo ride, the strength session has no load
     assert payload["mode"] == "projection" and payload["assumptions"]
     text = asyncio.run(get_load_projection(target_date="2026-10-16", target_form="5%,40%", taper_days=5))
-    assert "Target 2026-10-16 (target_date), start of day: CTL" in text and "% of CTL:" in text
+    assert "Target 2026-10-16 (Fri, in 7 days) (target_date), start of day: CTL" in text and "% of CTL:" in text
     race = json.loads(asyncio.run(get_load_projection(target_date="2026-10-18", output_format="json")))
     assert race["target"]["event"] == "Gran Fondo" and "range" not in race["target"]
 
@@ -403,7 +404,7 @@ def test_target_date_today_gives_the_start_of_race_day(monkeypatch):
     assert target["baseline"]["ctl"] == row["ctl"] and target["baseline"]["form"] == row["form"]
     assert target["search"]["available"] is False
     text = asyncio.run(get_load_projection(target_date=TODAY.isoformat()))
-    assert f"Target {TODAY.isoformat()} RACE_B 'Club race'" in text and "start of day" in text
+    assert f"Target {TODAY.isoformat()} (Fri, today) RACE_B 'Club race'" in text and "start of day" in text
 
 
 @pytest.mark.parametrize(
@@ -490,7 +491,7 @@ def test_race_day_values_use_one_convention(monkeypatch):
     assert race_day_row["form"] != race["form"]  # end of day: one more day of decay
     assert payload["value_basis"]["races_and_target"].startswith("start of day")
     text = asyncio.run(get_load_projection(target_form="5,15"))
-    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo': CTL 42.0, ATL 32.1, form +9.9" in text
+    assert "Races (start of day, before the race's own load): 2026-10-18 (Sun, in 9 days) RACE_A 'Gran Fondo': CTL 42.0, ATL 32.1, form +9.9" in text
     assert "start of day: CTL 42.0 | ATL 32.1 | form +9.9" in text
     assert "End of 2026-11-06:" in text and "Lowest projected form (end of day)" in text
     with_race = [{"date": "2026-10-18", "load": 300, "sport": "Ride", "name": "Gran Fondo"}]
@@ -500,7 +501,7 @@ def test_race_day_values_use_one_convention(monkeypatch):
     end_of_race_day = next(d for d in sim["simulation"]["days"] if d["date"] == "2026-10-18")
     assert end_of_race_day["form"] < sim_race["form"] - 10
     sim_text = asyncio.run(get_load_projection(scenario=with_race))
-    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo': scenario CTL" in sim_text
+    assert "Races (start of day, before the race's own load): 2026-10-18 (Sun, in 9 days) RACE_A 'Gran Fondo': scenario CTL" in sim_text
     assert "Lowest form (end of day, that day's load included): scenario" in sim_text
 
 

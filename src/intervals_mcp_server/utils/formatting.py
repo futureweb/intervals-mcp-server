@@ -7,11 +7,12 @@ This module contains formatting functions for handling data from the Intervals.i
 # pylint: disable=too-many-lines
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from intervals_mcp_server.utils.types import WorkoutDoc
 
+from intervals_mcp_server.utils.dates import dated
 from intervals_mcp_server.utils.custom_fields import (
     CustomFieldDefs,
     format_custom_activity_fields,
@@ -59,6 +60,15 @@ def _wind_text(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value):
         return "N/A"
     return f"{value:.1f} m/s ({value * 3.6:.0f} km/h)"
+
+
+def _stored(payload: dict[str, Any], *keys: str) -> str:
+    """The first stored value of *keys* as stored; 'N/A' when none has a value (never 0).
+
+    Every key is read (a _KeyTracker then leaves all of them out of "Other Fields").
+    """
+    values = [payload.get(key) for key in keys]
+    return next((format_value(value) for value in values if not is_missing(value)), "N/A")
 
 
 def format_activity_summary(activity: dict[str, Any]) -> str:
@@ -111,10 +121,10 @@ Sub-type: {sub_type}
 Date: {start_time}
 Tags: {tags or "None"}
 Description: {activity.get("description", "N/A")}
-Distance: {activity.get("distance", 0)} meters
-Duration: {activity.get("duration", activity.get("elapsed_time", 0))} seconds
-Moving Time: {activity.get("moving_time", "N/A")} seconds
-Elevation Gain: {activity.get("elevationGain", activity.get("total_elevation_gain", 0))} meters
+Distance: {_stored(activity, "distance")} meters
+Duration: {_stored(activity, "duration", "elapsed_time")} seconds
+Moving Time: {_stored(activity, "moving_time")} seconds
+Elevation Gain: {_stored(activity, "elevationGain", "total_elevation_gain")} meters
 Elevation Loss: {activity.get("total_elevation_loss", "N/A")} meters
 
 Power Data:
@@ -342,7 +352,7 @@ def format_workout(workout: dict[str, Any]) -> str:
 Workout: {workout.get("name", "Unnamed")}
 Description: {workout.get("description", "No description")}
 Sport: {workout.get("sport", "Unknown")}
-Duration: {workout.get("duration", 0)} seconds
+Duration: {_stored(workout, "duration")} seconds
 TSS: {workout.get("tss", "N/A")}
 Intervals: {len(workout.get("intervals", []))}
 """
@@ -535,6 +545,7 @@ def format_wellness_entry(
     include_all_fields: bool = False,
     field_definitions: CustomFieldDefs | None = None,
     header: bool = True,
+    today: date | None = None,
 ) -> str:
     """Format wellness entry data into a readable string.
 
@@ -559,6 +570,8 @@ def format_wellness_entry(
             wellness fields in "Other Fields" with name and units (optional).
         header: Start with the "Wellness Data:" heading (default True; a list of days has
             one heading of its own).
+        today: The athlete's today; when given the date gets its weekday and the day relative
+            to today, e.g. "2026-10-12 (Mon, yesterday)".
 
     Returns:
         A formatted string representation of the wellness entry.
@@ -572,7 +585,8 @@ def format_wellness_entry(
         entries.get("tempRestingHR")
 
     lines = ["Wellness Data:"] if header else []
-    lines.append(f"Date: {entries.get('id', 'N/A')}")
+    day = entries.get("id", "N/A")
+    lines.append(f"Date: {dated(day, today) if today is not None else day}")
     lines.append("")
 
     training_metrics = _format_training_metrics(entries)
@@ -801,7 +815,7 @@ Indoor: {event["indoor"]}"""
 Workout Information:
 Workout ID: {workout.get("id", "N/A")}
 Sport: {workout.get("sport", "Unknown")}
-Duration: {workout.get("duration", 0)} seconds
+Duration: {_stored(workout, "duration")} seconds
 TSS: {workout.get("tss", "N/A")}"""
 
         # Include interval count if available
@@ -883,65 +897,143 @@ def _cadence_range(payload: dict[str, Any], keys: tuple[str, ...], activity_type
     return ", ".join(f"{labels[k]} {text(v)}" for k, v in zip(keys, values, strict=True)) + " rpm"
 
 
+# Interval metrics where a stored 0 is no measurement (a heart rate, DFA α1, respiration, SmO2 or THb
+# of 0 does not occur): shown as "n/a (0 stored)", like the zero placeholders of the wellness statistics.
+ZERO_IS_NO_VALUE = frozenset({
+    "average_heartrate", "min_heartrate", "max_heartrate", "average_dfa_a1", "average_respiration",
+    "average_smo2", "average_smo2_2", "average_thb", "average_thb_2",
+})
+# Per-interval decoupling and DFA α1 are marked for segments shorter than this (the same 10 min as the
+# Pw:HR drift of analyze_workout_execution, utils.execution.DRIFT_MIN_SECS).
+SHORT_SEGMENT_SECS = 600
+SHORT_SEGMENT_NOTE = (
+    "Note: per-interval decoupling and DFA α1 of segments under 10 min (marked \"short segment\") mostly reflect "
+    "the shape of the effort, the heart-rate lag and the calculation window (DFA α1 is typically computed over about "
+    "2 min of beats), not aerobic drift or intensity; the same applies to unsteady segments. Shown as stored."
+)
+
+
+def _number(value: Any) -> bool:
+    """True for a stored number (not bool, null or NaN)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and not is_missing(value)
+
+
+def _val(payload: dict[str, Any], key: str, unit: str = "") -> str:
+    """A stored value as stored, with its unit; 'n/a' when missing (absent, null or NaN), never 0.
+
+    A stored 0 of a ``ZERO_IS_NO_VALUE`` metric is 'n/a (0 stored)'; other zeros are real values.
+    """
+    value = payload.get(key)
+    if is_missing(value):
+        return "n/a"
+    if key in ZERO_IS_NO_VALUE and _number(value) and value == 0:
+        return "n/a (0 stored)"
+    text = format_value(value)
+    if not unit:
+        return text
+    return f"{text}{unit}" if unit in ("%", "°") else f"{text} {unit}"
+
+
+def _range(payload: dict[str, Any], low: str, high: str, unit: str) -> str:
+    """'129-175 watts', or 'n/a' when both ends are missing."""
+    if is_missing(payload.get(low)) and is_missing(payload.get(high)):
+        return "n/a"
+    return f"{_val(payload, low)}-{_val(payload, high)} {unit}"
+
+
+def is_short_segment(interval: dict[str, Any]) -> bool:
+    """True when the interval lasts less than SHORT_SEGMENT_SECS (elapsed, else moving time)."""
+    secs = interval.get("elapsed_time") if _number(interval.get("elapsed_time")) else interval.get("moving_time")
+    return isinstance(secs, (int, float)) and _number(secs) and secs < SHORT_SEGMENT_SECS
+
+
+def _segment_metric(interval: dict[str, Any], key: str) -> str:
+    """Per-interval decoupling or DFA α1, marked on short segments (see SHORT_SEGMENT_NOTE)."""
+    text = _val(interval, key)
+    if text.startswith("n/a") or not is_short_segment(interval):
+        return text
+    return f"{text} (short segment, under 10 min)"
+
+
+def has_short_segment_metric(intervals: list[Any]) -> bool:
+    """True when a short segment carries a per-interval decoupling or DFA α1 (SHORT_SEGMENT_NOTE applies)."""
+    return any(
+        isinstance(i, dict) and is_short_segment(i)
+        and any(not _val(i, k).startswith("n/a") for k in ("decoupling", "average_dfa_a1"))  # a stored DFA 0 is no value
+        for i in intervals
+    )
+
+
+def _interval_wind(value: Any) -> str:
+    """Wind speed as stored by Intervals.icu (m/s) with km/h; 'n/a' when missing."""
+    text = _wind_text(value)
+    return "n/a" if text == "N/A" else text
+
+
 def _format_interval_block(index: int, interval: dict[str, Any], activity_type: Any = None) -> str:
-    """Render the standard metrics of one interval (cadence on the sport's basis when the type is known)."""
-    return f"""[{index}] {interval.get("label") or f"Interval {index}"} ({interval.get("type", "Unknown")})
-Duration: {interval.get("elapsed_time", 0)} seconds (moving: {interval.get("moving_time", 0)} seconds)
-Distance: {interval.get("distance", 0)} meters
-Start-End Indices: {interval.get("start_index", 0)}-{interval.get("end_index", 0)}
+    """Render the standard metrics of one interval (cadence on the sport's basis when the type is known).
+
+    Values are shown as stored; a missing value is 'n/a', never 0 (see _val).
+    """
+    v = interval
+    return f"""[{index}] {v.get("label") or f"Interval {index}"} ({v.get("type") or "Unknown"})
+Duration: {_val(v, "elapsed_time", "seconds")} (moving: {_val(v, "moving_time", "seconds")})
+Distance: {_val(v, "distance", "meters")}
+Start-End Indices: {_val(v, "start_index")}-{_val(v, "end_index")}
 
 Power Metrics:
-  Average Power: {interval.get("average_watts", 0)} watts ({interval.get("average_watts_kg", 0)} W/kg)
-  Max Power: {interval.get("max_watts", 0)} watts ({interval.get("max_watts_kg", 0)} W/kg)
-  Weighted Avg Power: {interval.get("weighted_average_watts", 0)} watts
-  Intensity: {interval.get("intensity", 0)}
-  Training Load: {interval.get("training_load", 0)}
-  Joules: {interval.get("joules", 0)}
-  Joules > FTP: {interval.get("joules_above_ftp", 0)}
-  Power Zone: {interval.get("zone", "N/A")} ({interval.get("zone_min_watts", 0)}-{interval.get("zone_max_watts", 0)} watts)
-  W' Balance: Start {interval.get("wbal_start", 0)}, End {interval.get("wbal_end", 0)}
-  L/R Balance: {interval.get("avg_lr_balance", 0)}
-  Variability: {interval.get("w5s_variability", 0)}
-  Torque: Avg {interval.get("average_torque", 0)}, Min {interval.get("min_torque", 0)}, Max {interval.get("max_torque", 0)}
+  Average Power: {_val(v, "average_watts", "watts")} ({_val(v, "average_watts_kg", "W/kg")})
+  Max Power: {_val(v, "max_watts", "watts")} ({_val(v, "max_watts_kg", "W/kg")})
+  Weighted Avg Power: {_val(v, "weighted_average_watts", "watts")}
+  Intensity: {_val(v, "intensity")}
+  Training Load: {_val(v, "training_load")}
+  Joules: {_val(v, "joules")}
+  Joules > FTP: {_val(v, "joules_above_ftp")}
+  Power Zone: {_val(v, "zone")} ({_range(v, "zone_min_watts", "zone_max_watts", "watts")})
+  W' Balance: Start {_val(v, "wbal_start")}, End {_val(v, "wbal_end")}
+  L/R Balance: {_val(v, "avg_lr_balance")}
+  Variability: {_val(v, "w5s_variability")}
+  Torque: Avg {_val(v, "average_torque")}, Min {_val(v, "min_torque")}, Max {_val(v, "max_torque")}
 
 Heart Rate & Metabolic:
-  Heart Rate: Avg {interval.get("average_heartrate", 0)}, Min {interval.get("min_heartrate", 0)}, Max {interval.get("max_heartrate", 0)} bpm
-  Decoupling: {interval.get("decoupling", 0)}
-  DFA α1: {interval.get("average_dfa_a1", 0)}
-  Respiration: {interval.get("average_respiration", 0)} breaths/min
-  EPOC: {interval.get("average_epoc", 0)}
-  SmO2: {interval.get("average_smo2", 0)}% / {interval.get("average_smo2_2", 0)}%
-  THb: {interval.get("average_thb", 0)} / {interval.get("average_thb_2", 0)}
+  Heart Rate: Avg {_val(v, "average_heartrate")}, Min {_val(v, "min_heartrate")}, Max {_val(v, "max_heartrate")} bpm
+  Decoupling: {_segment_metric(v, "decoupling")}
+  DFA α1: {_segment_metric(v, "average_dfa_a1")}
+  Respiration: {_val(v, "average_respiration", "breaths/min")}
+  EPOC: {_val(v, "average_epoc")}
+  SmO2: {_val(v, "average_smo2", "%")} / {_val(v, "average_smo2_2", "%")}
+  THb: {_val(v, "average_thb")} / {_val(v, "average_thb_2")}
 
 Speed & Cadence:
-  Speed: Avg {interval.get("average_speed", 0)}, Min {interval.get("min_speed", 0)}, Max {interval.get("max_speed", 0)} m/s
-  GAP: {interval.get("gap", 0)} m/s
-  Cadence: {_cadence_range(interval, ("average_cadence", "min_cadence", "max_cadence"), activity_type)}
-  Stride: {interval.get("average_stride", 0)}
+  Speed: Avg {_val(v, "average_speed")}, Min {_val(v, "min_speed")}, Max {_val(v, "max_speed")} m/s
+  GAP: {_val(v, "gap", "m/s")}
+  Cadence: {_cadence_range(v, ("average_cadence", "min_cadence", "max_cadence"), activity_type)}
+  Stride: {_val(v, "average_stride")}
 
 Elevation & Environment:
-  Elevation Gain: {interval.get("total_elevation_gain", 0)} meters
-  Altitude: Min {interval.get("min_altitude", 0)}, Max {interval.get("max_altitude", 0)} meters
-  Gradient: {interval.get("average_gradient", 0)}%
-  Temperature: {temperature_text(interval.get("average_temp"))} (Weather: {temperature_text(interval.get("average_weather_temp"))}, Feels like: {temperature_text(interval.get("average_feels_like"))})
-  Wind: Speed {interval.get("average_wind_speed", 0)} km/h, Gust {interval.get("average_wind_gust", 0)} km/h, Direction {interval.get("prevailing_wind_deg", 0)}°
-  Headwind: {interval.get("headwind_percent", 0)}%, Tailwind: {interval.get("tailwind_percent", 0)}%
+  Elevation Gain: {_val(v, "total_elevation_gain", "meters")}
+  Altitude: Min {_val(v, "min_altitude")}, Max {_val(v, "max_altitude")} meters
+  Gradient: {_val(v, "average_gradient", "%")}
+  Temperature: {temperature_text(v.get("average_temp"))} (Weather: {temperature_text(v.get("average_weather_temp"))}, Feels like: {temperature_text(v.get("average_feels_like"))})
+  Wind: Speed {_interval_wind(v.get("average_wind_speed"))}, Gust {_interval_wind(v.get("average_wind_gust"))}, Direction {_val(v, "prevailing_wind_deg", "°")}
+  Headwind: {_val(v, "headwind_percent", "%")}, Tailwind: {_val(v, "tailwind_percent", "%")}
 
 """
 
 
 def _format_group_block(index: int, group: dict[str, Any], activity_type: Any = None) -> str:
-    """Render the standard metrics of one interval group."""
-    return f"""Group: {group.get("id", f"Group {index}")} (Contains {group.get("count", 0)} intervals)
-Duration: {group.get("elapsed_time", 0)} seconds (moving: {group.get("moving_time", 0)} seconds)
-Distance: {group.get("distance", 0)} meters
-Start-End Indices: {group.get("start_index", 0)}-N/A
+    """Render the standard metrics of one interval group (missing values 'n/a', never 0)."""
+    g = group
+    return f"""Group: {g.get("id") or f"Group {index}"} (Contains {_val(g, "count")} intervals)
+Duration: {_val(g, "elapsed_time", "seconds")} (moving: {_val(g, "moving_time", "seconds")})
+Distance: {_val(g, "distance", "meters")}
+Start-End Indices: {_val(g, "start_index")}-n/a
 
-Power: Avg {group.get("average_watts", 0)} watts ({group.get("average_watts_kg", 0)} W/kg), Max {group.get("max_watts", 0)} watts
-W. Avg Power: {group.get("weighted_average_watts", 0)} watts, Intensity: {group.get("intensity", 0)}
-Heart Rate: Avg {group.get("average_heartrate", 0)}, Max {group.get("max_heartrate", 0)} bpm
-Speed: Avg {group.get("average_speed", 0)}, Max {group.get("max_speed", 0)} m/s
-Cadence: {_cadence_range(group, ("average_cadence", "max_cadence"), activity_type)}
+Power: Avg {_val(g, "average_watts", "watts")} ({_val(g, "average_watts_kg", "W/kg")}), Max {_val(g, "max_watts", "watts")}
+W. Avg Power: {_val(g, "weighted_average_watts", "watts")}, Intensity: {_val(g, "intensity")}
+Heart Rate: Avg {_val(g, "average_heartrate")}, Max {_val(g, "max_heartrate")} bpm
+Speed: Avg {_val(g, "average_speed")}, Max {_val(g, "max_speed")} m/s
+Cadence: {_cadence_range(g, ("average_cadence", "max_cadence"), activity_type)}
 
 """
 
@@ -1052,6 +1144,9 @@ Analyzed: {intervals_data.get("analyzed", "N/A")}
                 stream_defs,
                 "interval",
             )
+
+        if has_short_segment_metric(intervals):
+            result += SHORT_SEGMENT_NOTE + "\n\n"
 
     # Format interval groups
     groups = intervals_data.get("icu_groups") or []

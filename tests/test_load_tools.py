@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import sys
 from datetime import date, timedelta
 
@@ -206,10 +207,12 @@ def test_get_load_projection_text_and_json(monkeypatch):
     result = asyncio.run(get_load_projection())
     assert result.startswith("PROJECTION: load projection for athlete i1, 2026-10-09 to 2026-11-06 (assumes every planned workout")
     assert "Start (end of 2026-10-08, Intervals.icu)" in result
-    assert "Today 2026-10-09: completed load 0 + planned, not yet done 100" in result
+    assert "today = 2026-10-09, Friday (" in result and "): completed load 0 + planned, not yet done 100" in result
     assert "Planned workouts: 4 (3 with a planned load, sum 300); 1 without a planned load are not included" in result
     assert "Intervals.icu's own projection" in result
-    assert "Races (start of day, before the race's own load): 2026-10-18 RACE_A 'Gran Fondo'" in result
+    assert "Races (start of day, before the race's own load): 2026-10-18 (Sun, in 9 days) RACE_A 'Gran Fondo'" in result
+    assert re.search(r"Lowest projected form \(end of day\) \S+ on 2026-\d\d-\d\d \(\w{3}, [^)]+\); highest 7-day ramp \S+ on "
+                     r"2026-\d\d-\d\d \(\w{3}, ", result)
     assert "reproduces the stored CTL within 0.00 and ATL within 0.00" in result
     assert "2026-W42 (2026-10-12 to 2026-10-18): load 80 (2 planned, 1 without load)" in result
     payload = json.loads(asyncio.run(get_load_projection(end_date="2026-10-20", output_format="json")))
@@ -248,7 +251,7 @@ def test_projection_and_coach_context_say_when_nothing_is_planned(monkeypatch):
     payload = json.loads(asyncio.run(get_load_projection(output_format="json")))
     assert payload["projection_basis"]["kind"] == "no_planned_workouts"
     context = asyncio.run(get_coach_context())
-    assert "Planned 2026-10-10 to 2026-10-16: NO PLANNED WORKOUTS in the calendar" in context
+    assert "Planned 2026-10-10 (Sat, tomorrow) to 2026-10-16 (Fri, in 7 days): NO PLANNED WORKOUTS in the calendar" in context
     unloaded = [dict(e, icu_training_load=None) for e in EVENTS if e["category"] == "WORKOUT" and not e.get("paired_activity_id")]
     _setup(monkeypatch, {"/events": unloaded})
     text = asyncio.run(get_load_projection(detail_level="compact"))
@@ -333,17 +336,20 @@ def test_get_coach_context_text_and_json(monkeypatch):
     """One compact overview: load, fitness, intensity, recovery numbers, durability, top sessions, plan."""
     _setup(monkeypatch)
     result = asyncio.run(get_coach_context())
-    assert len(result) < 3000
-    assert "Coach context for athlete i1 at 2026-10-09 (load windows end 2026-10-08" in result
+    assert len(result) < 3100  # the dense fixture lists 5 top sessions; weekday and relative day labels add about 150
+    assert result.startswith("Coach context for athlete i1, today = 2026-10-09, Friday (")
+    assert "; load windows end 2026-10-08; Intervals.icu load" in result.splitlines()[0]
     assert "Load: 7 d 350 (5 sessions, 3 days with load 0) | 28 d 1400 (350/week) | ratio 1.00 (inside 0.8-1.3)" in result
     assert "Intensity 7 d: " in result and "Intensity 28 d: " in result
     # ANA-14: the baseline is the 42 days before the compared 7 days (not pulled towards 35 by them)
     assert "HRV 7-d mean 35 ms (n 7) vs prior 42-d 42 (n 42): -7.0 ms" in result and "resting HR 7-d mean 50 bpm" in result
     assert "z vs the week-to-week spread of the prior 90 d; |z| up to about 2 is normal week-to-week variation" in result
     assert "Durability 28 d: cycling decoupling median" in result
-    assert "Top sessions 7 d: 10-03 Ride 180 min load 150" in result
-    assert "Planned 2026-10-10 to 2026-10-16: 3 workouts, load 200 (1 without planned load)" in result
-    assert "next race 2026-10-18 RACE_A 'Gran Fondo'" in result
+    assert "Top sessions 7 d: 10-03 (Sat, 6 days ago) Ride 180 min load 150" in result
+    assert "10-08 (Thu, yesterday) Run 50 min" in result
+    assert "Planned 2026-10-10 (Sat, tomorrow) to 2026-10-16 (Fri, in 7 days): 3 workouts, load 200 (1 without planned load)" in result
+    assert "next race 2026-10-18 (Sun, in 9 days) RACE_A 'Gran Fondo'" in result
+    assert "Health markers" not in result  # no SICK/INJURED entries and no injury score: no block
     assert "wellness days with HRV 28" in result
     compact = asyncio.run(get_coach_context(detail_level="compact"))
     assert len(compact) < len(result) and "Top sessions" not in compact

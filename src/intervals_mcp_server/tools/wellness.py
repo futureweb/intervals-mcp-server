@@ -13,7 +13,7 @@ from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.utils.custom_fields import INPUT_FIELD, CustomFieldDefs
-from intervals_mcp_server.utils.dates import athlete_today
+from intervals_mcp_server.utils.dates import athlete_today, today_anchor
 from intervals_mcp_server.utils.formatting import format_wellness_entry
 from intervals_mcp_server.utils.params import AthleteId, DryRun, EndDate, StartDate
 from intervals_mcp_server.utils.validation import (
@@ -119,7 +119,7 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
     # Page by day so the answer stays within the size of one tool result (a year with all
     # fields is about 1 MB); the note says where to continue.
     budget = output_budget()
-    wellness_summary = "Wellness Data:\n\n" + (f"{today_line}\n\n" if today_line else "")
+    wellness_summary = f"Wellness Data:\n{today_anchor(today)}\n\n" + (f"{today_line}\n\n" if today_line else "")
     for position, entry in enumerate(entries):
         block = (
             format_wellness_entry(
@@ -127,6 +127,7 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
                 include_all_fields=include_all_fields,
                 field_definitions=field_definitions,
                 header=False,
+                today=today,
             )
             + "\n\n"
         )

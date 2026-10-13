@@ -31,6 +31,7 @@ from intervals_mcp_server.utils.activity_context import (
     weather_summary,
     wprime_summary,
 )
+from intervals_mcp_server.utils.dates import as_day, athlete_today, dated, relative_day, today_anchor, today_json
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, is_missing
 from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps, target_text
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
@@ -440,6 +441,8 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
     # An API error is not "no intervals" / "file not retained": say what failed (API-7).
     notes = [_load_error_note(note, intervals_result, streams_result) for note in notes]
     findings = _key_findings(activity, execution, bool(planned), intervals, power, climbs, field_defs, assigned)
+    today = athlete_today()
+    activity_day = as_day(activity.get("start_date_local"))
 
     if output_format.strip().lower() == "json":
         execution_json = None
@@ -452,6 +455,10 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
         if not planned:
             interval_rows = intervals if detail_level != "compact" else [{k: i.get(k) for k in INTERVAL_JSON_KEYS} for i in intervals]
         payload = {
+            "today": today_json(today),
+            "activity_day": (
+                {"date": activity_day.isoformat(), "relative": relative_day(activity_day, today)} if activity_day else None
+            ),
             "activity": {
                 **{k: activity.get(k) for k in ("id", "name", "type", "start_date_local", "start_date", "moving_time", "elapsed_time", "distance", "total_elevation_gain", "icu_training_load", "icu_intensity", "icu_ftp", "device_name", "power_meter", "power_field_names", "compliance", "paired_event_id", "_resolved_gear_name")},
                 "utc_offset": utc_offset(activity),
@@ -475,7 +482,8 @@ async def get_activity_report(  # pylint: disable=too-many-locals,too-many-branc
 
     overview = _compact_details(activity, field_defs, None if detail_level == "full" else assigned, wprime,
                                 full_context=detail_level != "compact")
-    sections = ["== Overview", overview]
+    anchor = today_anchor(today) + (f"; activity day {dated(activity_day, today)}" if activity_day else "")
+    sections = ["== Overview", anchor, overview]
     route_lines = route_history_lines(route, detail_level) if route else (
         ["No Intervals.icu route for this activity (routes need GPS)"] if include_route_history else [])
     if detail_level == "compact":
