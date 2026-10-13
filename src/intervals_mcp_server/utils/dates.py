@@ -122,12 +122,24 @@ def today_json(today: date | None = None) -> dict[str, str]:
     return {"date": day.isoformat(), "weekday": WEEKDAYS[day.weekday()], "time_zone": time_zone_label()}
 
 
+def _is_midnight(text: str) -> bool:
+    """True for a date without a time or a time of exactly 00:00 (any precision, 'Z' or an offset)."""
+    if len(text) <= 10:
+        return True
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text[11:19] in ("00:00", "00:00:00")
+    return (moment.hour, moment.minute, moment.second, moment.microsecond) == (0, 0, 0, 0)
+
+
 def event_day_span(event: dict[str, Any]) -> tuple[date, date] | None:
     """First and last local day of a calendar event (None without a start day).
 
-    Intervals.icu stores the end of a multi-day event (sick, injured, holiday, plan phase) as the
-    midnight after its last day (``end_date_local`` exclusive): an end at midnight belongs to the
-    day before. Without an end the event lies on its start day.
+    Intervals.icu stores the end of a multi-day event (sick, injured, holiday, plan phase) and of a
+    single-day event as the midnight after its last day (``end_date_local`` exclusive): an end at
+    midnight (``T00:00:00``, ``T00:00``, ``T00:00:00.000``, with ``Z`` or an offset, or a bare date)
+    belongs to the day before. Without an end the event lies on its start day.
     """
     first = as_day(event.get("start_date_local"))
     if first is None:
@@ -136,7 +148,7 @@ def event_day_span(event: dict[str, Any]) -> tuple[date, date] | None:
     last = as_day(end_local)
     if last is None:
         return first, first
-    if last > first and end_local[11:19] in ("", "00:00:00"):
+    if last > first and _is_midnight(end_local):
         last -= timedelta(days=1)
     return first, max(first, last)
 

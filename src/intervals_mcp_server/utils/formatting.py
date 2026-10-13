@@ -958,7 +958,8 @@ def _segment_metric(interval: dict[str, Any], key: str) -> str:
 def has_short_segment_metric(intervals: list[Any]) -> bool:
     """True when a short segment carries a per-interval decoupling or DFA α1 (SHORT_SEGMENT_NOTE applies)."""
     return any(
-        isinstance(i, dict) and is_short_segment(i) and any(_number(i.get(k)) for k in ("decoupling", "average_dfa_a1"))
+        isinstance(i, dict) and is_short_segment(i)
+        and any(not _val(i, k).startswith("n/a") for k in ("decoupling", "average_dfa_a1"))  # a stored DFA 0 is no value
         for i in intervals
     )
 

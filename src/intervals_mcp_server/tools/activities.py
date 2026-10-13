@@ -223,6 +223,19 @@ def _n(value: Any, digits: int = 0) -> str:
     return f"{value:.{digits}f}"
 
 
+def _hr(value: Any) -> str:
+    """Heart rate for compact lines: 'n/a' when missing, 'n/a (0 stored)' for a stored 0 (no measurement)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+        return "n/a (0 stored)"
+    return _n(value)
+
+
+def _hr_pair(interval: dict[str, Any]) -> str:
+    """'HR 150/162' for compact lines; a stored average of 0 is 'HR n/a (0 stored)' (not 'HR 0/0')."""
+    average = _hr(interval.get("average_heartrate"))
+    return f"HR {average}" if average.startswith("n/a") else f"HR {average}/{_hr(interval.get('max_heartrate'))}"
+
+
 def _km(metres: Any) -> str:
     """Metres as km with one decimal for compact lines; 'n/a' when missing (never 0.0)."""
     if isinstance(metres, bool) or not isinstance(metres, (int, float)) or is_missing(metres):
@@ -785,7 +798,7 @@ def _compact_intervals(
         if interval.get("average_watts") is not None:
             parts.append(f"avg {interval['average_watts']} W NP {_n(interval.get('weighted_average_watts'))} max {_n(interval.get('max_watts'))}")
         if interval.get("average_heartrate") is not None:
-            parts.append(f"HR {interval['average_heartrate']}/{_n(interval.get('max_heartrate'))}")
+            parts.append(_hr_pair(interval))
         if interval.get("average_cadence") is not None:
             parts.append(f"cad {cadence_text(interval['average_cadence'], activity_type)}")
         if interval.get("average_speed"):
@@ -810,7 +823,7 @@ def _compact_intervals(
         if isinstance(group, dict):
             lines.append(
                 f"group {group.get('id')}: {group.get('count', '?')} intervals, {hms(group.get('elapsed_time'))}, "
-                f"avg {_n(group.get('average_watts'))} W, HR {_n(group.get('average_heartrate'))}"
+                f"avg {_n(group.get('average_watts'))} W, HR {_hr(group.get('average_heartrate'))}"
             )
     return "\n".join(lines)
 

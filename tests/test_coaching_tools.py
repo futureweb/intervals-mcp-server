@@ -659,8 +659,12 @@ def test_get_training_plan(monkeypatch):
     )
     assert "- 2027-08-29 (Sun, in 319 days) Race A (Ride)" in result
     assert "- 2026-09-01 (Tue, 43 days ago) SET_EFTP" in result
-    assert json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01", output_format="json")))[
-        "today"]["weekday"] == "Wednesday"
+    plan_json = json.loads(asyncio.run(get_training_plan(start_date="2026-10-01", end_date="2027-09-01", output_format="json")))
+    assert plan_json["today"]["weekday"] == "Wednesday"
+    # JSON rows carry the first and last day besides the stored (exclusive) end.
+    assert (plan_json["phases"][0]["first_day"], plan_json["phases"][0]["last_day"]) == ("2026-10-13", "2026-11-08")
+    assert plan_json["phases"][0]["end_date_local"] == "2026-11-09T00:00:00"
+    assert plan_json["races"][0]["first_day"] == plan_json["races"][0]["last_day"] == "2027-08-29"
     assert "Weekly targets (1):" in result and "load 450, time 10:00:00, weekly target" in result
     assert "Races (1):" in result and "Race A (Ride): Ötztaler (event 903)" in result
     assert "ignored" not in result

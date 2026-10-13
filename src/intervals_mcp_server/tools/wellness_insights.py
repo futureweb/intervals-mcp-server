@@ -338,8 +338,8 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     if error:
         return error
     entries = [e for e in fetched if start <= str(e.get("id"))[:10] <= target]
-    baseline_entries, _ = await _fetch_wellness(
-        athlete_id_to_use, baseline_start, target, fields="id," + ",".join(metrics)
+    baseline_entries, _ = await _fetch_wellness(  # with the injury score of the health markers (day and day before)
+        athlete_id_to_use, baseline_start, target, fields=",".join(dict.fromkeys(["id", *metrics, "injury"]))
     )
     input_defs = await _defs(athlete_id_to_use, INPUT_FIELD)
     field_defs = await _defs(athlete_id_to_use, ACTIVITY_FIELD)
@@ -363,7 +363,7 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
     )
     markers = health_markers(
         [e for e in health_result if isinstance(e, dict)] if isinstance(health_result, list) else [],
-        next((e for e in fetched if str(e.get("id"))[:10] == target), None), target_day, health_error,
+        baseline_entries + fetched, target_day, health_error, date.fromisoformat(today),
     )
 
     if output_format.strip().lower() == "json":

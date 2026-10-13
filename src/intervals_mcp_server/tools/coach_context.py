@@ -344,7 +344,7 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
 
     load_end, note = load_end_for(end_date, end, activities)
     wellness = wellness_by_day(wellness_list)
-    markers = health_markers(health_events, wellness.get(end), end, health_error)
+    markers = health_markers(health_events, wellness_list, end, health_error, today)
     window_start = load_end - timedelta(days=27)
     window = between(activities, window_start, load_end)
     intensity_28 = analyze_period(activities, window_start, load_end, threshold_as=threshold_mode)

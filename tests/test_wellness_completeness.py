@@ -301,7 +301,7 @@ def test_recovery_snapshot_today_line_json_and_requests(monkeypatch):
     # the last request reads the SICK/INJURED entries of the health markers (none here: no block).
     assert _wellness_requests(sent)[0] == {"oldest": "2026-09-26", "newest": "2026-10-10"}
     assert len(sent) == 6 and len(_wellness_requests(sent)) == 2
-    assert dict(sent[-1].url.params) == {"oldest": "2026-05-29", "newest": "2026-10-10", "category": "SICK,INJURED"}
+    assert dict(sent[-1].url.params) == {"oldest": "2024-10-10", "newest": "2026-10-10", "category": "SICK,INJURED"}
     assert "Health markers" not in text
     payload = json.loads(asyncio.run(get_recovery_snapshot(output_format="json")))
     completeness = payload["today_completeness"]

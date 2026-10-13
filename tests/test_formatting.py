@@ -314,8 +314,9 @@ def test_short_segment_caveat_for_decoupling_and_dfa():
     text = format_intervals(data)
     assert text.count(SHORT_SEGMENT_NOTE) == 1 and "mostly reflect the shape of the effort" in SHORT_SEGMENT_NOTE
     assert "not aerobic drift or intensity" in SHORT_SEGMENT_NOTE and "Shown as stored" in SHORT_SEGMENT_NOTE
-    # No note when no short segment carries one of the two values.
+    # No note when no short segment carries one of the two values (a stored DFA α1 of 0 is no value).
     assert SHORT_SEGMENT_NOTE not in format_intervals({"icu_intervals": [data["icu_intervals"][0], data["icu_intervals"][2]]})
+    assert SHORT_SEGMENT_NOTE not in format_intervals({"icu_intervals": [{"type": "WORK", "elapsed_time": 60, "average_dfa_a1": 0}]})
 
 
 def test_group_block_and_summaries_show_missing_as_na():
@@ -342,5 +343,11 @@ def test_compact_intervals_and_weekly_load_never_print_none():
         "icu_groups": [{"id": "g", "count": 3, "average_watts": None}]}, {}, None, {})
     assert "avg 230 W NP n/a max n/a" in compact and "HR 150/n/a" in compact and "avg n/a W, HR n/a" in compact
     assert "None" not in compact
+    # A stored heart rate of 0 is no measurement, also in the compact line (not "HR 0/0").
+    zero = _compact_intervals({"id": "i1", "icu_intervals": [{"type": "WORK", "average_heartrate": 0, "max_heartrate": 0},
+                                                            {"type": "WORK", "average_heartrate": 140, "max_heartrate": 0}],
+                               "icu_groups": [{"id": "g", "average_heartrate": 0}]}, {}, None, {})
+    assert "HR 0" not in zero and "| HR n/a (0 stored)" in zero and "HR 140/n/a (0 stored)" in zero
+    assert "HR n/a (0 stored)" in zero.splitlines()[-1]
     week = _format_week({"date": "2026-10-05", "count": 0, "training_load": None, "byCategory": [{"category": "Ride", "count": 1}]})
     assert "load n/a" in week and "load 0" not in week and "None" not in week

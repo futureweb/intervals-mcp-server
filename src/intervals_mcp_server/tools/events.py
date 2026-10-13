@@ -1014,6 +1014,13 @@ def _format_plan_event(event: dict[str, Any], today: date) -> str:
     return text
 
 
+def _plan_event_json(event: dict[str, Any]) -> dict[str, Any]:
+    """The event JSON plus its first and last day (``end_date_local`` is the midnight after the last day)."""
+    span = event_day_span(event)
+    return {**_event_json(event), "first_day": span[0].isoformat() if span else None,
+            "last_day": span[1].isoformat() if span else None}
+
+
 @tool("read")
 async def get_training_plan(  # pylint: disable=too-many-locals
     start_date: Annotated[str | None, Field(description="First day YYYY-MM-DD; default 30 days ago")] = None,
@@ -1060,8 +1067,9 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     races = [e for e in plan_events if str(e.get("category", "")).startswith("RACE")]
     if output_format.strip().lower() == "json":
         return json.dumps(
-            {"today": today_json(today), "start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error, "phases": [_event_json(e) for e in phases],
-             "targets": [_event_json(e) for e in targets], "races": [_event_json(e) for e in races],
+            {"today": today_json(today), "start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error,
+             "phases": [_plan_event_json(e) for e in phases], "targets": [_plan_event_json(e) for e in targets],
+             "races": [_plan_event_json(e) for e in races],
              "fitness_model_events": model_list},
             ensure_ascii=False,
         )

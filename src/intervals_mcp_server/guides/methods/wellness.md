@@ -82,8 +82,9 @@ missing and whole days can be absent. Missing values are never filled in or coun
   `preliminary=true`): its aggregates (steps, calories, burn) can still be incomplete. Today's
   completeness line: see "Today's record".
 - Health markers of `date_str` (SICK/INJURED calendar entries on the day or ending in the 14 days
-  before, wellness injury 3 or 4 of the day; no assessment, block left out without markers): see
-  the usage guide (section 3).
+  before, wellness injury 3 or 4 of the day or, without a value on the day, of the day before; no
+  assessment, block left out without markers): see the usage guide (section 3). The injury score is
+  read with the baseline request (field `injury` added).
 - Requests: wellness of the listed days (widened by 14 days for today), baseline wellness, custom
   item definitions (cached), activities, events of the day, SICK/INJURED entries (health markers).
   An activity or event request that fails is reported as "could not be loaded", never as "none".
