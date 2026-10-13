@@ -258,3 +258,89 @@ def test_format_power_curves_without_normalised():
     result = format_power_curves(curves, "Ride", include_normalised=False)
     assert "780W" in result
     assert "W/kg" not in result
+
+
+# ---------------------------------------------------------------- missing values are n/a, never 0 (P1-6)
+def _block(interval, activity_type="Ride"):
+    from intervals_mcp_server.utils.formatting import _format_interval_block  # pylint: disable=import-outside-toplevel
+    return _format_interval_block(1, interval, activity_type)
+
+
+def test_interval_block_shows_missing_values_as_na_never_0():
+    """Absent keys, null and NaN are 'n/a' (before: absent keys printed 0, null printed None)."""
+    for missing in ({}, dict.fromkeys(("average_watts", "average_dfa_a1", "decoupling", "joules_above_ftp",
+                                       "average_heartrate", "average_wind_speed", "elapsed_time"), None),
+                    {"average_watts": float("nan"), "average_dfa_a1": "NaN", "decoupling": float("nan")}):
+        block = _block({"type": "WORK", **missing})
+        for line in ("Average Power: n/a (n/a)", "DFA α1: n/a", "Decoupling: n/a", "Joules > FTP: n/a",
+                     "Heart Rate: Avg n/a, Min n/a, Max n/a bpm", "Wind: Speed n/a, Gust n/a, Direction n/a",
+                     "Duration: n/a (moving: n/a)", "Power Zone: n/a (n/a)", "SmO2: n/a / n/a", "GAP: n/a"):
+            assert line in block, (line, missing)
+        assert "None" not in block and ": 0" not in block and " 0 " not in block and "nan" not in block.lower()
+
+
+def test_interval_block_keeps_real_zeros_and_marks_impossible_ones():
+    """A stored 0 stays 0 where it is a real value; a heart rate or DFA α1 of 0 is no measurement."""
+    block = _block({"type": "WORK", "elapsed_time": 720, "moving_time": 720, "joules_above_ftp": 0, "min_cadence": 0,
+                    "average_cadence": 88.0, "max_cadence": 110, "min_speed": 0.0, "average_heartrate": 0, "max_heartrate": 151,
+                    "average_dfa_a1": 0, "average_gradient": 0, "average_watts": 230, "average_watts_kg": 2.76,
+                    "average_wind_speed": 1.8895506, "average_wind_gust": 4.0149145, "prevailing_wind_deg": 337,
+                    "zone": 3, "zone_min_watts": 176, "zone_max_watts": 211, "average_smo2": 61.5})
+    assert "Joules > FTP: 0\n" in block and "Cadence: Avg 88, Min 0, Max 110 rpm" in block
+    assert "Speed: Avg n/a, Min 0, Max n/a m/s" in block and "Gradient: 0%" in block
+    assert "Heart Rate: Avg n/a (0 stored), Min n/a, Max 151 bpm" in block and "DFA α1: n/a (0 stored)" in block
+    assert "Average Power: 230 watts (2.76 W/kg)" in block and "Power Zone: 3 (176-211 watts)" in block
+    # Intervals.icu stores wind in m/s (the block used to label the stored value km/h).
+    assert "Wind: Speed 1.9 m/s (7 km/h), Gust 4.0 m/s (14 km/h), Direction 337°" in block
+    assert "SmO2: 61.5% / n/a" in block and "Duration: 720 seconds (moving: 720 seconds)" in block
+
+
+def test_short_segment_caveat_for_decoupling_and_dfa():
+    """Under 10 min the per-interval decoupling and DFA α1 are marked; one neutral note under the list."""
+    from intervals_mcp_server.utils.execution import DRIFT_MIN_SECS  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.utils.formatting import SHORT_SEGMENT_NOTE, SHORT_SEGMENT_SECS  # pylint: disable=import-outside-toplevel
+
+    assert SHORT_SEGMENT_SECS == DRIFT_MIN_SECS == 600
+    short = _block({"type": "RECOVERY", "elapsed_time": 240, "decoupling": -22.161798, "average_dfa_a1": 0.81})
+    assert "Decoupling: -22.161798 (short segment, under 10 min)" in short
+    assert "DFA α1: 0.81 (short segment, under 10 min)" in short
+    long = _block({"type": "WORK", "elapsed_time": 720, "decoupling": 3.44, "average_dfa_a1": 0.62})
+    assert "Decoupling: 3.44\n" in long and "DFA α1: 0.62\n" in long
+    moving_only = _block({"type": "WORK", "moving_time": 300, "decoupling": 1.0})
+    assert "Decoupling: 1 (short segment, under 10 min)" in moving_only
+    data = {"id": "i1", "icu_intervals": [{"type": "WORK", "elapsed_time": 720, "decoupling": 3.4},
+                                          {"type": "RECOVERY", "elapsed_time": 240, "decoupling": -22.2},
+                                          {"type": "WORK", "elapsed_time": 1, "decoupling": None}]}
+    text = format_intervals(data)
+    assert text.count(SHORT_SEGMENT_NOTE) == 1 and "mostly reflect the shape of the effort" in SHORT_SEGMENT_NOTE
+    assert "not aerobic drift or intensity" in SHORT_SEGMENT_NOTE and "Shown as stored" in SHORT_SEGMENT_NOTE
+    # No note when no short segment carries one of the two values.
+    assert SHORT_SEGMENT_NOTE not in format_intervals({"icu_intervals": [data["icu_intervals"][0], data["icu_intervals"][2]]})
+
+
+def test_group_block_and_summaries_show_missing_as_na():
+    """Groups, the activity summary and workouts: missing durations and distances are n/a, not 0."""
+    text = format_intervals({"icu_groups": [{"id": "g1"}]})
+    assert "Group: g1 (Contains n/a intervals)" in text and "Duration: n/a (moving: n/a)" in text
+    assert "Power: Avg n/a (n/a), Max n/a" in text and "Heart Rate: Avg n/a, Max n/a bpm" in text and " 0 " not in text
+    summary = format_activity_summary({"name": "Indoor", "id": "i1", "distance": None, "moving_time": None})
+    assert "Distance: N/A meters" in summary and "Duration: N/A seconds" in summary and "Moving Time: N/A seconds" in summary
+    assert "Elevation Gain: N/A meters" in summary and "meters\nDuration: N/A" in summary
+    assert "Duration: 3600 seconds" in format_activity_summary({"elapsed_time": 3600})
+    assert "Distance: 0 meters" in format_activity_summary({"distance": 0})  # a stored 0 stays
+    assert "Duration: N/A seconds" in format_workout({"name": "x"})
+    assert "Duration: N/A seconds" in format_event_details({"workout": {"id": 1}})
+
+
+def test_compact_intervals_and_weekly_load_never_print_none():
+    """The compact interval lines and the weekly summary show n/a for null values."""
+    from intervals_mcp_server.tools.activities import _compact_intervals  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tools.training_review import _format_week  # pylint: disable=import-outside-toplevel
+
+    compact = _compact_intervals({"id": "i1", "icu_intervals": [
+        {"type": "WORK", "average_watts": 230, "weighted_average_watts": None, "average_heartrate": 150, "max_heartrate": None}],
+        "icu_groups": [{"id": "g", "count": 3, "average_watts": None}]}, {}, None, {})
+    assert "avg 230 W NP n/a max n/a" in compact and "HR 150/n/a" in compact and "avg n/a W, HR n/a" in compact
+    assert "None" not in compact
+    week = _format_week({"date": "2026-10-05", "count": 0, "training_load": None, "byCategory": [{"category": "Ride", "count": 1}]})
+    assert "load n/a" in week and "load 0" not in week and "None" not in week

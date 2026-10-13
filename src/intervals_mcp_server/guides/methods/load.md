@@ -139,7 +139,10 @@ Model and start:
 - Start: Intervals.icu's CTL/ATL at the end of the latest of the last 14 days before today that
   has both values (normally yesterday); without one there is nothing to project from (error).
   Days between that record and yesterday use Intervals.icu's `ctlLoad`.
-- Today: the load completed today plus the planned workouts of today that are not done yet.
+- Today: the load completed today plus the planned workouts of today that are not done yet. The
+  text states the date anchor `today = YYYY-MM-DD, weekday (time zone)` (JSON `today` with `date`,
+  `weekday`, `time_zone`); race, target, lowest-form and highest-ramp days carry weekday and
+  relative day, e.g. `2026-10-18 (Sun, in 9 days)`.
 - Planned workouts: calendar events of category WORKOUT from today to the end that are not paired
   with an activity, with their planned Intervals.icu load. Workouts without a planned load add 0
   and are reported (the projection understates those days). Without planned workouts the
@@ -350,10 +353,17 @@ Contents and method:
   with HRV, resting HR and sleep.
 - Weeks (full): the last 4 ISO weeks with load, rest days, monotony and % of the trailing weekly
   mean.
+- Health markers (every detail level, text and JSON `health_markers`, null without markers): SICK
+  and INJURED calendar entries on the end date or ending in the 14 days before it and the wellness
+  injury score 3 or 4 of the end date, as recorded, with a hint to ask the athlete before planning
+  intensity; no assessment (usage guide, section 3).
+- Date anchor: the header states `today = YYYY-MM-DD, weekday (time zone)` (JSON `today`); top
+  sessions, the plan days and the next race carry weekday and relative day, e.g. `(Sun, in 9 days)`.
 - Small samples are flagged; missing values are never counted as 0; no verdict or diagnosis.
-- API: at most four requests: the activities of the last 57 days, the wellness records of the
-  last 98 days and, when the end date is today, the calendar events of the next 42 days and the
-  last 14 days of wellness with all fields (completeness). Custom field names come from cached
-  definitions only (no extra request).
+- API: at most five requests: the activities of the last 57 days, the wellness records of the
+  last 98 days (with the injury score), when the end date is today the calendar events of the next
+  42 days and the last 14 days of wellness with all fields (completeness), and the SICK/INJURED
+  entries of the health markers (`category=SICK,INJURED`, 134 days back, last; a failure is
+  reported as unknown). Custom field names come from cached definitions only (no extra request).
 - Details: get_training_load, get_intensity_distribution, get_durability, get_recovery_snapshot,
   get_load_projection.

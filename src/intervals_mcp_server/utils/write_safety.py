@@ -22,10 +22,11 @@ serves every request of the tool.
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Any
 
 from intervals_mcp_server.api.client import remaining_requests, seg
+from intervals_mcp_server.utils.dates import event_day_span
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import has_press_lap
 from intervals_mcp_server.utils.workout_validation import DURATION_TOLERANCE_S, step_lines
@@ -165,20 +166,12 @@ def _day(body: dict[str, Any]) -> str:
 
 def _covered_days(event: dict[str, Any]) -> list[str]:
     """Days an event lies on: its start day, for a multi-day event every day up to its end
-    (an end at midnight belongs to the day before)."""
-    start = str(event.get("start_date_local") or "")[:10]
-    end_local = str(event.get("end_date_local") or "")
-    try:
-        first = date.fromisoformat(start)
-    except ValueError:
+    (an end at midnight belongs to the day before, see utils.dates.event_day_span)."""
+    span = event_day_span(event)
+    if span is None:
         return []
-    try:
-        last = date.fromisoformat(end_local[:10])
-    except ValueError:
-        return [start]
-    if last > first and end_local[11:19] in ("", "00:00:00"):
-        last -= timedelta(days=1)
-    return [(first + timedelta(days=offset)).isoformat() for offset in range(min(max((last - first).days, 0), 366) + 1)]
+    first, last = span
+    return [(first + timedelta(days=offset)).isoformat() for offset in range(min((last - first).days, 366) + 1)]
 
 
 async def events_by_day(

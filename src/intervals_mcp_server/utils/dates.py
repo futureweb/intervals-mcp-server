@@ -15,6 +15,7 @@ import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("intervals_icu_mcp_server")
@@ -58,6 +59,86 @@ def athlete_today() -> date:
     """Today's date in the athlete's time zone (server clock when the zone is unknown)."""
     zone = _zone(active_timezone())
     return datetime.now(zone).date() if zone is not None else date.today()
+
+
+def athlete_now() -> datetime:
+    """The current time in the athlete's time zone (server local time when the zone is unknown)."""
+    zone = _zone(active_timezone())
+    return datetime.now(zone) if zone is not None else datetime.now().astimezone()
+
+
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def as_day(value: Any) -> date | None:
+    """A date from a date, datetime or text starting with YYYY-MM-DD; None otherwise."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def relative_day(day: date, today: date) -> str:
+    """'today', 'yesterday', 'tomorrow', '3 days ago' or 'in 2 days'."""
+    delta = (day - today).days
+    if delta == 0:
+        return "today"
+    if delta == -1:
+        return "yesterday"
+    if delta == 1:
+        return "tomorrow"
+    return f"{-delta} days ago" if delta < 0 else f"in {delta} days"
+
+
+def dated(value: Any, today: date | None = None) -> str:
+    """'2026-10-12 (Mon, yesterday)': a listed day with its weekday and the day relative to today.
+
+    ``today`` defaults to athlete_today(); a value that is not a date is returned as text.
+    """
+    day = as_day(value)
+    if day is None:
+        return str(value)
+    return f"{day.isoformat()} ({WEEKDAYS[day.weekday()][:3]}, {relative_day(day, today or athlete_today())})"
+
+
+def time_zone_label() -> str:
+    """The time zone "today" is computed in: the athlete's IANA name, or the server clock."""
+    return active_timezone() or "server clock"
+
+
+def today_anchor(today: date | None = None) -> str:
+    """'today = 2026-10-13, Tuesday (Europe/Vienna)': the date anchor of the core outputs."""
+    day = today or athlete_today()
+    return f"today = {day.isoformat()}, {WEEKDAYS[day.weekday()]} ({time_zone_label()})"
+
+
+def today_json(today: date | None = None) -> dict[str, str]:
+    """The date anchor of JSON answers: date, weekday and time zone of the athlete's today."""
+    day = today or athlete_today()
+    return {"date": day.isoformat(), "weekday": WEEKDAYS[day.weekday()], "time_zone": time_zone_label()}
+
+
+def event_day_span(event: dict[str, Any]) -> tuple[date, date] | None:
+    """First and last local day of a calendar event (None without a start day).
+
+    Intervals.icu stores the end of a multi-day event (sick, injured, holiday, plan phase) as the
+    midnight after its last day (``end_date_local`` exclusive): an end at midnight belongs to the
+    day before. Without an end the event lies on its start day.
+    """
+    first = as_day(event.get("start_date_local"))
+    if first is None:
+        return None
+    end_local = str(event.get("end_date_local") or "")
+    last = as_day(end_local)
+    if last is None:
+        return first, first
+    if last > first and end_local[11:19] in ("", "00:00:00"):
+        last -= timedelta(days=1)
+    return first, max(first, last)
 
 
 def athlete_local_time(moment: datetime) -> datetime:

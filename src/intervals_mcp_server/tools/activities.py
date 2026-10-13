@@ -42,10 +42,13 @@ from intervals_mcp_server.utils.provenance import (
 )
 from intervals_mcp_server.utils.sports import cadence_spm, cadence_text, format_local_start, format_start_times, hms, start_times
 from intervals_mcp_server.utils.formatting import (
+    SHORT_SEGMENT_NOTE,
     format_activity_details,
     format_activity_message,
     format_activity_summary,
     format_intervals,
+    has_short_segment_metric,
+    is_short_segment,
 )
 from intervals_mcp_server.utils.streams import (
     DEFAULT_STREAM_TYPES,
@@ -166,7 +169,7 @@ def _compact_details(
     lines = [
         f"{activity.get('name', 'Unnamed')} ({activity.get('id')}, {activity.get('type', '?')}) {format_local_start(activity)}",
         f"Time {hms(activity.get('moving_time'))} moving / {hms(activity.get('elapsed_time'))} elapsed | "
-        f"{(activity.get('distance') or 0) / 1000:.1f} km | +{activity.get('total_elevation_gain') or 0:.0f} m"
+        f"{_km(activity.get('distance'))} km | +{_n(activity.get('total_elevation_gain'))} m"
         + (f" | gear {gear}" if gear else ""),
         f"Load {_n(activity.get('icu_training_load'))} (Intervals.icu; power {_n(activity.get('power_load'))} / HR {_n(activity.get('hr_load'))} / pace {_n(activity.get('pace_load'))}) | "
         f"IF {_n(activity.get('icu_intensity'))}% | NP {_n(activity.get('icu_weighted_avg_watts'))} W | avg {_n(activity.get('icu_average_watts'))} W | "
@@ -218,6 +221,13 @@ def _n(value: Any, digits: int = 0) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value):
         return "n/a"
     return f"{value:.{digits}f}"
+
+
+def _km(metres: Any) -> str:
+    """Metres as km with one decimal for compact lines; 'n/a' when missing (never 0.0)."""
+    if isinstance(metres, bool) or not isinstance(metres, (int, float)) or is_missing(metres):
+        return "n/a"
+    return f"{metres / 1000:.1f}"
 
 
 def format_start_times_short(activity: dict[str, Any]) -> str:
@@ -770,12 +780,12 @@ def _compact_intervals(
     for index, interval in enumerate(intervals, 1):
         parts = [
             f"[{index}] {interval.get('type', '?')}" + (f" '{interval['label']}'" if interval.get("label") else ""),
-            f"{hms(interval.get('elapsed_time'))} ({hms(interval.get('start_time'))}-{hms(interval.get('end_time'))}, idx {interval.get('start_index')}-{interval.get('end_index')})",
+            f"{hms(interval.get('elapsed_time'))} ({hms(interval.get('start_time'))}-{hms(interval.get('end_time'))}, idx {_n(interval.get('start_index'))}-{_n(interval.get('end_index'))})",
         ]
         if interval.get("average_watts") is not None:
-            parts.append(f"avg {interval['average_watts']} W NP {interval.get('weighted_average_watts', 'n/a')} max {interval.get('max_watts', 'n/a')}")
+            parts.append(f"avg {interval['average_watts']} W NP {_n(interval.get('weighted_average_watts'))} max {_n(interval.get('max_watts'))}")
         if interval.get("average_heartrate") is not None:
-            parts.append(f"HR {interval['average_heartrate']}/{interval.get('max_heartrate', 'n/a')}")
+            parts.append(f"HR {interval['average_heartrate']}/{_n(interval.get('max_heartrate'))}")
         if interval.get("average_cadence") is not None:
             parts.append(f"cad {cadence_text(interval['average_cadence'], activity_type)}")
         if interval.get("average_speed"):
@@ -800,7 +810,7 @@ def _compact_intervals(
         if isinstance(group, dict):
             lines.append(
                 f"group {group.get('id')}: {group.get('count', '?')} intervals, {hms(group.get('elapsed_time'))}, "
-                f"avg {group.get('average_watts', 'n/a')} W, HR {group.get('average_heartrate', 'n/a')}"
+                f"avg {_n(group.get('average_watts'))} W, HR {_n(group.get('average_heartrate'))}"
             )
     return "\n".join(lines)
 
@@ -977,6 +987,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             "intervals": [
                 {
                     **interval,
+                    "short_segment": is_short_segment(interval),
                     "average_cadence_spm": cadence_spm(interval.get("average_cadence"), activity_type),
                     "custom_fields": [r for r in custom_fields_json(interval, interval_field_defs) if r["status"] in ("value", "zero")],
                     "stream_metrics": _interval_stream_metrics(interval, streams or [], stream_defs),
@@ -989,6 +1000,7 @@ async def get_activity_intervals(  # pylint: disable=too-many-arguments,too-many
             ],
             "groups": [g for g in result.get("icu_groups") or [] if isinstance(g, dict)],
             "note": note.strip() or None,
+            "short_segment_note": SHORT_SEGMENT_NOTE.removeprefix("Note: ") if has_short_segment_metric(intervals) else None,
         }
         return json.dumps(_json_safe(payload), ensure_ascii=False)
 

@@ -30,7 +30,7 @@ from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
-from intervals_mcp_server.utils.dates import athlete_today
+from intervals_mcp_server.utils.dates import athlete_today, dated, today_anchor, today_json
 from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs
 from intervals_mcp_server.utils.field_policy import aggregate_field, aggregation_policy
 from intervals_mcp_server.utils.load_metrics import (
@@ -145,13 +145,13 @@ async def fetch_wellness(
 
 
 async def fetch_events(
-    athlete_id: str, start: date, end: date
+    athlete_id: str, start: date, end: date, categories: str | None = None
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Calendar events from start to end (all categories)."""
-    result = await make_intervals_request(
-        url=f"/athlete/{seg(athlete_id)}/events",
-        params={"oldest": start.isoformat(), "newest": end.isoformat()},
-    )
+    """Calendar events that START from start to end (all categories or the comma-separated *categories*)."""
+    params = {"oldest": start.isoformat(), "newest": end.isoformat()}
+    if categories:
+        params["category"] = categories
+    result = await make_intervals_request(url=f"/athlete/{seg(athlete_id)}/events", params=params)
     error = _error(result, "events")
     if error:
         return [], error
@@ -778,7 +778,7 @@ def _search_lines(search: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _target_lines(target: dict[str, Any], has_scenario: bool) -> list[str]:
+def _target_lines(target: dict[str, Any], has_scenario: bool, today: date) -> list[str]:
     if not target.get("available", True):
         return [f"Target: {target['note']}."]
     event = f" {target['category']} '{target['event']}'" if target["event"] else ""
@@ -787,7 +787,7 @@ def _target_lines(target: dict[str, Any], has_scenario: bool) -> list[str]:
     source = "next RACE_A in the calendar" if target["source"] == "next_race_a" else "target_date"
     states = (f"scenario {_state(target['scenario'])}; calendar plan {_state(target['baseline'])}" if has_scenario
               else _state(target["baseline"]))
-    lines = [f"Target {target['date']}{event} ({source}), start of day: {states}"]
+    lines = [f"Target {dated(target['date'], today)}{event} ({source}), start of day: {states}"]
     form_range = target.get("range")
     if form_range:
         unit = " % of CTL" if form_range["unit"] == "pct" else " (CTL - ATL)"
@@ -854,6 +854,7 @@ def _model_check_line(check: dict[str, Any] | None) -> str:
 
 def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable=too-many-locals
     start, today_info, plan = payload["start"], payload["today"], payload["planned"]
+    today = date.fromisoformat(today_info["date"])
     end_row = payload["days"][-1] if payload["days"] else None
     basis = payload["projection_basis"]
     assumption = (
@@ -865,7 +866,7 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
         f"({assumption}; model CTL {payload['ctl_days']} d / ATL {payload['atl_days']} d).",
         f"Start (end of {start['date']}, Intervals.icu): CTL {fmt(start['ctl'], 1)} | ATL {fmt(start['atl'], 1)} | "
         f"form {fmt(start['form'], 1, signed=True)}",
-        f"Today {today_info['date']}: completed load {fmt(today_info['completed_load'])} + planned, not yet done "
+        f"{today_anchor(today)}: completed load {fmt(today_info['completed_load'])} + planned, not yet done "
         f"{fmt(today_info['planned_load'])}",
         (f"Planned workouts: {plan['sessions']} ({plan['with_load']} with a planned load, sum {fmt(plan['load'])}); "
          + (f"{plan['without_load']} without a planned load are not included, so the projection understates those days"
@@ -880,8 +881,9 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
             + (f" (Intervals.icu's own projection: CTL {fmt(icu['ctl'], 1)}, ATL {fmt(icu['atl'], 1)})" if icu else "")
         )
         lowest = payload["lowest_form"]
-        lines.append(f"Lowest projected form (end of day) {fmt(lowest['form'], 1, signed=True)} on {lowest['date']}; highest 7-day ramp "
-                     f"{fmt(payload['highest_ramp']['ramp'], 1, signed=True)} on {payload['highest_ramp']['date']}")
+        lines.append(f"Lowest projected form (end of day) {fmt(lowest['form'], 1, signed=True)} on {dated(lowest['date'], today)}; "
+                     f"highest 7-day ramp {fmt(payload['highest_ramp']['ramp'], 1, signed=True)} on "
+                     f"{dated(payload['highest_ramp']['date'], today)}")
     if detail_level != "compact":
         lines.append("Weeks (values at the end of the week's last day):")
         for week in payload["weeks"]:
@@ -894,11 +896,12 @@ def _projection_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
             )
     if payload["races"]:
         lines.append(f"Races ({RACE_BASIS}): " + "; ".join(
-            f"{r['date']} {r['category']} '{r['name']}': CTL {fmt(r['ctl'], 1)}, ATL {fmt(r['atl'], 1)}, form {fmt(r['form'], 1, signed=True)}"
+            f"{dated(r['date'], today)} {r['category']} '{r['name']}': CTL {fmt(r['ctl'], 1)}, ATL {fmt(r['atl'], 1)}, "
+            f"form {fmt(r['form'], 1, signed=True)}"
             for r in payload["races"]
         ))
     if "target" in payload:
-        lines.extend(_target_lines(payload["target"], False))
+        lines.extend(_target_lines(payload["target"], False, today))
     flagged_weeks = payload["checks"]["baseline"]
     if detail_level != "compact":
         lines.extend(_check_lines(payload["checks"], (("baseline", "calendar plan"),)))
@@ -943,9 +946,10 @@ def _scenario_line(sim: dict[str, Any]) -> str:
 def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pylint: disable=too-many-locals
     sim, start, plan = payload["simulation"], payload["start"], payload["planned"]
     end = payload["comparison"]["end"]
+    today = date.fromisoformat(payload["today"]["date"])
     lines = [
         f"{sim['label']}: scenario vs calendar plan for athlete {payload['athlete_id']}, {payload['from']} to {payload['to']} "
-        f"(model CTL {payload['ctl_days']} d / ATL {payload['atl_days']} d).",
+        f"(model CTL {payload['ctl_days']} d / ATL {payload['atl_days']} d); {today_anchor(today)}.",
         _scenario_line(sim),
         "Calendar plan: " + (f"{plan['sessions']} planned workouts ({plan['with_load']} with a planned load, sum {fmt(plan['load'])})"
                              if plan["sessions"] else "no planned workouts (decay only)"),
@@ -955,12 +959,12 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
         f"End of {end['date']}: scenario {_state(end['scenario'])}; calendar plan {_state(end['baseline'])}; difference CTL "
         f"{fmt(end['difference']['ctl'], 1, signed=True)}, form {fmt(end['difference']['form'], 1, signed=True)}",
         f"Lowest form (end of day, that day's load included): scenario {fmt(sim['lowest_form']['form'], 1, signed=True)} on "
-        f"{sim['lowest_form']['date']}, calendar plan "
-        f"{fmt(payload['lowest_form']['form'], 1, signed=True)} on {payload['lowest_form']['date']}; highest 7-day ramp: scenario "
+        f"{dated(sim['lowest_form']['date'], today)}, calendar plan "
+        f"{fmt(payload['lowest_form']['form'], 1, signed=True)} on {dated(payload['lowest_form']['date'], today)}; highest 7-day ramp: scenario "
         f"{fmt(sim['highest_ramp']['ramp'], 1, signed=True)}, calendar plan {fmt(payload['highest_ramp']['ramp'], 1, signed=True)}",
     ]
     if "target" in payload:
-        lines.extend(_target_lines(payload["target"], True))
+        lines.extend(_target_lines(payload["target"], True, today))
     recent = payload.get("recent_weeks")
     if recent and detail_level != "compact":
         longest = recent["longest_session"]
@@ -989,7 +993,7 @@ def _simulation_text(payload: dict[str, Any], detail_level: str) -> str:  # pyli
                      "plan outside the commonly cited range (details at standard).")
     if sim["races"]:
         lines.append(f"Races ({RACE_BASIS}): " + "; ".join(
-            f"{r['date']} {r['category']} '{r['name']}': scenario CTL {fmt(r['ctl'], 1)}, form {fmt(r['form'], 1, signed=True)}; "
+            f"{dated(r['date'], today)} {r['category']} '{r['name']}': scenario CTL {fmt(r['ctl'], 1)}, form {fmt(r['form'], 1, signed=True)}; "
             f"calendar plan CTL {fmt(b['ctl'], 1)}, form {fmt(b['form'], 1, signed=True)}"
             for r, b in zip(sim["races"], payload["races"], strict=True)
         ))
@@ -1110,7 +1114,7 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
         "athlete_id": athlete_id_to_use, "from": today.isoformat(), "to": end.isoformat(),
         "ctl_days": ctl_days, "atl_days": atl_days, "mode": "simulation" if parsed else "projection",
         "start": dict(base_row), "value_basis": VALUE_BASIS,
-        "today": {"date": today.isoformat(), "completed_load": rnd(completed, 0),
+        "today": {**today_json(today), "completed_load": rnd(completed, 0),
                   "planned_load": rnd(sum(activity_load(e) or 0.0 for e in workouts.get(today, [])), 0)},
         "planned": _planned_counts(calendar),
         "intervals_icu_end": ({"ctl": rnd(num(end_icu.get("ctl")), 1), "atl": rnd(num(end_icu.get("atl")), 1)}

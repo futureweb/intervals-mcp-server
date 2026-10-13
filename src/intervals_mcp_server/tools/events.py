@@ -17,9 +17,13 @@ from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.utils.dates import (
     athlete_today,
+    dated,
+    event_day_span,
     get_default_end_date,
     get_default_future_end_date,
     get_default_start_date,
+    today_anchor,
+    today_json,
 )
 from intervals_mcp_server.utils.params import AllowDuplicate, AthleteId, DryRun, OutputFormat, lower_choice, upper_choice
 from intervals_mcp_server.utils.formatting import (
@@ -986,11 +990,14 @@ async def add_events_bulk(  # pylint: disable=too-many-locals,too-many-branches,
 PLAN_CATEGORIES = ("PLAN", "TARGET", "RACE_A", "RACE_B", "RACE_C", "SEASON_START")
 
 
-def _format_plan_event(event: dict[str, Any]) -> str:
-    """One line for a plan phase, weekly target or race."""
-    day = str(event.get("start_date_local", ""))[:10]
-    end = str(event.get("end_date_local", ""))[:10]
-    text = f"- {day}" + (f" to {end}" if end and end != day else "") + f" {event_type_label(event)}: {event.get('name', 'unnamed')} (event {event.get('id')})"
+def _format_plan_event(event: dict[str, Any], today: date) -> str:
+    """One line for a plan phase, weekly target or race: first (and last) day with weekday and relative day."""
+    span = event_day_span(event)
+    if span is None:
+        days = str(event.get("start_date_local", "")) or "date unknown"
+    else:
+        days = dated(span[0], today) + (f" to {dated(span[1], today)}" if span[1] != span[0] else "")
+    text = f"- {days} {event_type_label(event)}: {event.get('name', 'unnamed')} (event {event.get('id')})"
     targets = []
     if event.get("load_target") is not None:
         targets.append(f"load {event['load_target']}")
@@ -1021,6 +1028,7 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
         return error_msg
+    today = athlete_today()
     start = start_date or get_default_start_date(30)
     end = end_date or get_default_future_end_date(180)
     try:
@@ -1052,12 +1060,12 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     races = [e for e in plan_events if str(e.get("category", "")).startswith("RACE")]
     if output_format.strip().lower() == "json":
         return json.dumps(
-            {"start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error, "phases": [_event_json(e) for e in phases],
+            {"today": today_json(today), "start": start, "end": end, "training_plan": plan_info, "training_plan_error": plan_error, "phases": [_event_json(e) for e in phases],
              "targets": [_event_json(e) for e in targets], "races": [_event_json(e) for e in races],
              "fitness_model_events": model_list},
             ensure_ascii=False,
         )
-    lines = [f"Training plan for athlete {athlete_id_to_use}, {start} to {end}:"]
+    lines = [f"Training plan for athlete {athlete_id_to_use}, {start} to {end}; {today_anchor(today)}:"]
     if plan_info.get("training_plan_id") or plan_info.get("training_plan"):
         lines.append(
             f"Assigned plan: {plan_info.get('training_plan_alias') or plan_info.get('training_plan') or plan_info.get('training_plan_id')}, "
@@ -1070,15 +1078,15 @@ async def get_training_plan(  # pylint: disable=too-many-locals
     if not (phases or targets or races or model_list):
         lines.append("No plan phases, weekly targets, races or fitness-model events in this range.")
     lines.append(f"Phases / season markers ({len(phases)}):")
-    lines.extend([_format_plan_event(e) for e in phases] or ["- none"])
+    lines.extend([_format_plan_event(e, today) for e in phases] or ["- none"])
     lines.append(f"Weekly targets ({len(targets)}):")
-    lines.extend([_format_plan_event(e) for e in targets] or ["- none"])
+    lines.extend([_format_plan_event(e, today) for e in targets] or ["- none"])
     lines.append(f"Races ({len(races)}):")
-    lines.extend([_format_plan_event(e) for e in races] or ["- none"])
+    lines.extend([_format_plan_event(e, today) for e in races] or ["- none"])
     lines.append(f"Fitness model events ({len(model_list)}):")
     lines.extend(
         [
-            f"- {str(e.get('start_date_local', ''))[:10]} {e.get('category')}: {e.get('name') or ''} "
+            f"- {dated(e.get('start_date_local'), today)} {e.get('category')}: {e.get('name') or ''} "
             f"{json.dumps({k: v for k, v in e.items() if k in ('ctl', 'atl', 'eftp', 'ctl_days', 'atl_days', 'type') and v is not None})}"
             for e in model_list
         ]

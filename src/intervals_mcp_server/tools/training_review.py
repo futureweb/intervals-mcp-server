@@ -14,6 +14,7 @@ from pydantic import Field
 from intervals_mcp_server.api.client import make_intervals_request, seg
 from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import canonical_athlete_id
+from intervals_mcp_server.utils.custom_fields import format_value, is_missing
 from intervals_mcp_server.utils.dates import athlete_today
 from intervals_mcp_server.utils.params import AthleteId
 from intervals_mcp_server.utils.validation import resolve_athlete_id, validate_date
@@ -50,6 +51,11 @@ def _fmt_km(meters: Any) -> str:
     return f"{meters / 1000:.1f} km"
 
 
+def _stored(value: Any) -> str:
+    """A number as stored, or 'n/a' if missing (never 0)."""
+    return format_value(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and not is_missing(value) else "n/a"
+
+
 def _fmt_num(value: Any, digits: int = 1) -> str:
     """Format a number with fixed digits, or 'n/a' if missing."""
     if not isinstance(value, (int, float)):
@@ -82,7 +88,7 @@ def _format_week(week: dict[str, Any]) -> str:
         f"Week {label}: {week.get('count', 0)} sessions | "
         f"time {_fmt_duration(week.get('moving_time'))} | "
         f"distance {_fmt_km(week.get('distance'))} | "
-        f"load {week.get('training_load', 0)}"
+        f"load {_stored(week.get('training_load'))}"
     ]
     as_of = week.get("mostRecentWellnessId")
     lines.append(
@@ -108,7 +114,7 @@ def _format_week(week: dict[str, Any]) -> str:
             f"  - {cat.get('category', 'Unknown')}: {cat.get('count', 0)} sessions | "
             f"time {_fmt_duration(cat.get('moving_time'))} | "
             f"distance {_fmt_km(cat.get('distance'))} | "
-            f"load {cat.get('training_load', 0)}"
+            f"load {_stored(cat.get('training_load'))}"
         )
     return "\n".join(lines)
 

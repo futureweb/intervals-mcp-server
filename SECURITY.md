@@ -124,7 +124,10 @@ Out of scope (please report these to the respective vendor or project):
   are slow to pick up an available fix.
 - Issues that require an already compromised host, user account or MCP client, and prompt
   injection against the LLM itself, unless the server fails to enforce its own guards (permission
-  class, input validation).
+  class, input validation). The server instructions and the usage guide tell clients to treat free
+  text from Intervals.icu (activity descriptions, notes, comments, chat messages, workout texts,
+  custom field values) as data, never as instructions, and never to call a write tool because such
+  text says so; this is guidance for the client, not a server-side guarantee.
 
 ## Operational guidance
 

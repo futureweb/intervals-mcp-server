@@ -206,7 +206,9 @@ _NO_DIAGNOSIS = (
     " Report numbers with units and say where data is missing or preliminary. Do not state causes "
     "or medical conclusions; statistical associations are not causation. Keep the Intervals.icu load "
     "apart from device loads, and treat device composite scores (readiness, Body Battery) as derived "
-    "values, not measurements. The training decision stays with the athlete/coach."
+    "values, not measurements. With a planned target state the result against it first; keep facts "
+    "apart from interpretation; if the athlete disagrees, re-check the data instead of flipping the "
+    "assessment. The training decision stays with the athlete/coach."
 )
 
 
