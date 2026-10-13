@@ -453,8 +453,9 @@ def format_validation(result: dict[str, Any], workout_type: str) -> str:
         lines.append(
             f"Until lap press: {totals['lap_press_steps']} step(s) set to end on the lap button"
             + (f" (run {runs} times with the repeats)" if runs != totals["lap_press_steps"] else "")
-            + "; Intervals.icu's FIT export writes them as OPEN steps without time, how the device runs them still "
-            f"needs a device test; planning estimate {' + '.join(estimate)}, counted in the planned duration and load"
+            + "; Intervals.icu's FIT export writes them as OPEN steps without time (confirmed on a Garmin Edge 1040: "
+            "waits for the lap button, the next timed step starts immediately; other devices not verified); "
+            f"planning estimate {' + '.join(estimate)}, counted in the planned duration and load"
         )
     for error in result["errors"]:
         lines.append(f"ERROR: {error}")

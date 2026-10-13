@@ -311,7 +311,7 @@ def test_lap_step_with_a_distance_estimate():
 def test_preview_shows_lap_steps_and_their_estimate():
     report = asyncio.run(preview_workout(POC["outdoor_threshold_route_aware"]["mcp_workout_doc"], "Ride"))
     assert "Until lap press: 3 step(s) set to end on the lap button;" in report and "planning estimate 20:00" in report
-    assert "needs a device test" in report and "0 without duration or distance" in report and "open-ended" not in report
+    assert "confirmed on a Garmin Edge 1040" in report and "0 without duration or distance" in report and "open-ended" not in report
     assert "planned duration 1:17:00" in report and "- Press lap Locker bis Anstieg 10m 130W-155W" in report
 
 

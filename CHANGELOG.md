@@ -11,8 +11,8 @@ All notable changes to this project are documented here. The format follows
 - Lap-press steps: `until_lap_press: true` on a step with a duration or distance is written as
   Intervals.icu's native `Press lap` marker; the duration or distance stays the planning estimate
   for planned time and load. Works inside repeat blocks. Verified: Intervals.icu stores the flag and
-  its FIT export writes an OPEN step, and a Garmin Edge 1040 lists the pushed step as "until lap
-  button" with its targets; that the device waits for the lap button still needs a device test. `validate_workout`/`preview_workout` count the lap-press steps and their estimate; the
+  its FIT export writes an OPEN step, and on a Garmin Edge 1040 the pushed step is listed as "until
+  lap button", waits for the lap button on the bike and the next timed step starts immediately. `validate_workout`/`preview_workout` count the lap-press steps and their estimate; the
   write read-back reports the same count and warns when Intervals.icu stored a lap-press step as a
   timed step or the reverse.
 

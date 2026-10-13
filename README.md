@@ -82,7 +82,7 @@ read all of it, but works just as well without the bridge.
   what Intervals.icu stored and parsed.
 - **Route-aware outdoor workouts.** Steps that end on the lap button (`until_lap_press`) let you
   start the next interval where the road suits it, e.g. at the foot of a climb, while the work
-  steps stay timed. Garmin Edge 1040 shows them as "until lap button" (see below).
+  steps stay timed. Confirmed on a Garmin Edge 1040 on the bike (see below).
 - **Read-only by default.** Tools are grouped into permission classes (`read`, `write`,
   `destructive`, `admin`) enforced on the server; only `read` is active unless you enable more.
 - **Tested.** More than 1,100 tests on synthetic data, ruff, mypy, CodeQL, pinned GitHub Actions,
@@ -348,10 +348,12 @@ next effort and then press lap; the work steps stay timed:
 
 - The `duration` (or `distance`) of a lap-press step is only the planning estimate for the planned
   time and load; Intervals.icu drops a lap-press step without one.
-- What is verified: Intervals.icu stores the step with `until_lap_press`, its Garmin FIT export
-  writes an OPEN step without a time limit, and a Garmin Edge 1040 lists it as "until lap button"
-  with the power and cadence targets. Still to confirm on the device: that the step really waits for
-  the lap button and the following timed step starts immediately.
+- Verified end to end: Intervals.icu stores the step with `until_lap_press`, its Garmin FIT export
+  writes an OPEN step without a time limit, Garmin Connect pushes it to the device, and a Garmin
+  Edge 1040 lists it as "until lap button" with its power and cadence targets, waits for the lap
+  button on the bike and starts the following timed step immediately (a ride with a 17-minute
+  planning estimate ended the open warm-up by lap after 16:01, then ran the 3-minute steps to the
+  second). Other devices are not verified.
 - With a Garmin course, add course points at the start of each climb and press lap there. Garmin's
   Auto Pause also pauses timed steps when you stop; lap-press steps are not affected.
 - `validate_workout`/`preview_workout` show the lap-press steps and their estimate; after a write
@@ -642,8 +644,6 @@ Details and how to report a vulnerability: [SECURITY.md](https://github.com/futu
   bundle
 
 **Next**
-- Lap-press steps: confirm on the device that an open step waits for the lap button and the next
-  timed step starts immediately (the Edge 1040 already shows them as "until lap button")
 - Route-aware workouts with a Garmin course: course points at the climbs, lap to start the work
   step (no API link between a course and a planned workout exists yet)
 - `1.0.0b2` with the fixes since the first beta
