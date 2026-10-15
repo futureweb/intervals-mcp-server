@@ -32,8 +32,8 @@ from intervals_mcp_server.utils.activity_context import (
     wprime_summary,
 )
 from intervals_mcp_server.utils.dates import as_day, athlete_today, dated, relative_day, today_anchor, today_json
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, is_missing
-from intervals_mcp_server.utils.execution import analyze, format_execution, plan_steps, target_text
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, ACTIVITY_STREAM, INTERVAL_FIELD, assigned_codes, format_value, is_missing
+from intervals_mcp_server.utils.execution import analyze, format_execution, lap_press_text, plan_steps, target_text
 from intervals_mcp_server.utils.field_policy import aggregation_policy, start_end_pairs
 from intervals_mcp_server.utils.fueling import activity_fueling
 from intervals_mcp_server.utils.params import ActivityId, DetailLevel, OutputFormat
@@ -52,6 +52,7 @@ config = get_config()
 CORE_STREAMS = ("time", "watts", "heartrate", "cadence", "velocity_smooth", "distance", "altitude", "secondary_power")
 MAX_CLIMBS = 6
 MAX_FINDINGS = 5
+MAX_LAP_PRESS_FINDINGS = 3  # lap-press steps named in the plan finding
 STANDARD_MAX_INTERVALS = 30
 MIN_POWER_PAIRS = 300  # five minutes of valid paired samples before two power meters are compared
 IDENTICAL_SHARE = 0.99
@@ -191,6 +192,12 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
             text += f", mean time in target {summary['work_time_in_target_pct_mean']:.0f}%"
         text += ")"
     text += f"; steps with clear deviations: {summary.get('steps_with_deviations', 0)}"
+    lap_rows = [r for r in rows if r.get("lap_press")]
+    if lap_rows:
+        listed = ", ".join(f"plan {r['planned']['index']} {r['planned']['kind']} {lap_press_text(r['lap_press'])}"
+                           for r in lap_rows[:MAX_LAP_PRESS_FINDINGS])
+        more = f" and {len(lap_rows) - MAX_LAP_PRESS_FINDINGS} more" if len(lap_rows) > MAX_LAP_PRESS_FINDINGS else ""
+        text += f"; lap-press steps (length set by the lap press, not judged; targets judged): {listed}{more}"
     findings.append(text)
     extension = execution.get("extension")
     if extension:
@@ -230,9 +237,9 @@ def _field_findings(activity: dict[str, Any], field_defs: dict[str, Any], assign
         first, last = _num(activity.get(start_code)), _num(activity.get(end_code))
         if first is not None and last is not None:
             units = defs[start_code].get("units") or ""
-            findings.append(f"{stem.capitalize()} {first:g} → {last:g} {units}".rstrip())
+            findings.append(f"{stem.capitalize()} {format_value(first)} → {format_value(last)} {units}".rstrip())
     loads = [
-        f"{d['name']} {activity[c]:g}" for c, d in defs.items()
+        f"{d['name']} {format_value(activity[c])}" for c, d in defs.items()
         if aggregation_policy(d)["policy"] == "device_load_sum" and _num(activity.get(c)) not in (None, 0.0) and "load" in str(d["name"]).lower()
     ]
     if activity.get("icu_training_load") is not None:

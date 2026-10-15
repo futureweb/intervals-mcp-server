@@ -96,15 +96,44 @@ def is_missing(value: Any) -> bool:
     return isinstance(value, str) and value.strip().lower() == "nan"
 
 
-def format_value(value: Any) -> str:
-    """Render a scalar as stored (only float noise beyond 6 decimals is trimmed)."""
+# Text display of stored floats: SIGNIFICANT_DIGITS significant digits (whole numbers are never
+# rounded, at most MAX_DECIMALS decimals), so float32 noise such as 2.400024 or 13.399596 and
+# excess precision such as 25.666667 are not shown. JSON outputs keep the stored values.
+SIGNIFICANT_DIGITS = 4
+MAX_DECIMALS = 6
+
+
+def _decimals(value: float) -> int:
+    """Decimals that show *value* with SIGNIFICANT_DIGITS significant digits (0 to MAX_DECIMALS)."""
+    if value == 0 or not math.isfinite(value):
+        return 0
+    return max(0, min(MAX_DECIMALS, SIGNIFICANT_DIGITS - 1 - math.floor(math.log10(abs(value)))))
+
+
+def float_text(value: float, digits: int | None = None) -> str:
+    """A float rounded to *digits* decimals (default: SIGNIFICANT_DIGITS significant digits), trailing
+    zeros dropped ('91', '1.29', '0.003791'); never scientific notation. A non-zero value that would
+    round to 0 keeps one significant digit ('0.002', '0.0000001'): a stored non-zero is never shown as 0."""
+    if not math.isfinite(value):
+        return str(value)
+    places = _decimals(value) if digits is None else max(0, digits)
+    if value and round(value, places) == 0:
+        places = max(places, -math.floor(math.log10(abs(value))))
+    text = f"{value:.{places}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def format_value(value: Any, digits: int | None = None) -> str:
+    """Render a scalar as stored; a float is rounded for display: to *digits* decimals when given (a
+    metric with a known precision), else to SIGNIFICANT_DIGITS significant digits (``float_text``)."""
     if is_missing(value):
         return "no value"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
-        rounded = round(value, 6)
-        return str(int(rounded)) if rounded.is_integer() else str(rounded)
+        return float_text(value, digits)
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
@@ -335,5 +364,6 @@ def format_custom_activity_fields(
             "Zero values in device-file fields (a real 0 or an absent source field; Intervals.icu "
             "stores 0 for both, so treat with care): " + ", ".join(ambiguous)
         )
-    lines.append("Note: 'no value' = null/NaN in Intervals.icu; values are reported exactly as stored.")
+    lines.append("Note: 'no value' = null/NaN in Intervals.icu; values are reported as stored (decimals shortened to "
+                 f"{SIGNIFICANT_DIGITS} significant digits; JSON keeps them exact).")
     return "\n".join(lines)

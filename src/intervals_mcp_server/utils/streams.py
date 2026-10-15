@@ -162,7 +162,7 @@ def format_stats(stats: dict[str, Any]) -> str:
             f"end {format_value(stats['last'])}",
             f"min {format_value(stats['min'])}",
             f"max {format_value(stats['max'])}",
-            f"mean {format_value(round(stats['mean'], 2))}",
+            f"mean {format_value(float(stats['mean']), 2)}",
             f"delta {format_value(stats['delta'])}",
             f"samples {stats['non_null']}/{stats['samples']}",
         ]

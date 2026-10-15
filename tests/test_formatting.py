@@ -302,10 +302,10 @@ def test_short_segment_caveat_for_decoupling_and_dfa():
 
     assert SHORT_SEGMENT_SECS == DRIFT_MIN_SECS == 600
     short = _block({"type": "RECOVERY", "elapsed_time": 240, "decoupling": -22.161798, "average_dfa_a1": 0.81})
-    assert "Decoupling: -22.161798 (short segment, under 10 min)" in short
+    assert "Decoupling: -22.2 (short segment, under 10 min)" in short
     assert "DFA α1: 0.81 (short segment, under 10 min)" in short
     long = _block({"type": "WORK", "elapsed_time": 720, "decoupling": 3.44, "average_dfa_a1": 0.62})
-    assert "Decoupling: 3.44\n" in long and "DFA α1: 0.62\n" in long
+    assert "Decoupling: 3.4\n" in long and "DFA α1: 0.62\n" in long
     moving_only = _block({"type": "WORK", "moving_time": 300, "decoupling": 1.0})
     assert "Decoupling: 1 (short segment, under 10 min)" in moving_only
     data = {"id": "i1", "icu_intervals": [{"type": "WORK", "elapsed_time": 720, "decoupling": 3.4},
@@ -351,3 +351,46 @@ def test_compact_intervals_and_weekly_load_never_print_none():
     assert "HR n/a (0 stored)" in zero.splitlines()[-1]
     week = _format_week({"date": "2026-10-05", "count": 0, "training_load": None, "byCategory": [{"category": "Ride", "count": 1}]})
     assert "load n/a" in week and "load 0" not in week and "None" not in week
+
+
+def test_float_noise_is_rounded_for_display():
+    """R39-14: stored floats are rounded for display (known metrics to their usual decimals, other
+    values to 4 significant digits); missing values stay N/A, real zeros 0, JSON is not affected."""
+    summary = format_activity_summary({
+        "distance": 29012.64, "total_elevation_gain": 2.400024, "total_elevation_loss": 11.999878, "icu_training_load": 13.399596,
+        "icu_intensity": 91.02564, "icu_power_hr": 1.2857143, "icu_variability_index": 1.1833333, "decoupling": 7.2646327,
+        "average_speed": 8.2491, "average_stride": 2.8159044, "avg_lr_balance": 45.389656, "icu_weight": 83.019,
+        "headwind_percent": 31.532557, "tailwind_percent": 0.0, "icu_ctl": 67.02364, "icu_atl": 78.275314, "trimp": 87.10906,
+        "icu_efficiency_factor": 1.5214286, "icu_average_watts": 180.27, "average_heartrate": 140.4,
+    })
+    for expected in ("Distance: 29012.6 meters", "Elevation Gain: 2.4 meters", "Elevation Loss: 12 meters",
+                     "Training Load (Intervals.icu): 13.4", "Intensity: 91\n", "Power:HR Ratio: 1.29", "Variability Index: 1.18",
+                     "Decoupling: 7.3", "Average Speed: 8.249 m/s", "Average Stride: 2.82", "L/R Balance: 45.4",
+                     "Weight: 83.02 kg", "Headwind %: 31.5%", "Tailwind %: 0%", "Fitness (CTL): 67\n", "Fatigue (ATL): 78.3",
+                     "TRIMP: 87.1", "Efficiency Factor: 1.52", "Average Power: 180 watts", "Average Heart Rate: 140 bpm",
+                     "Max Speed: N/A m/s", "Polarization Index: N/A"):
+        assert expected in summary, expected
+    block = _block({"type": "WORK", "elapsed_time": 600, "training_load": 13.399596, "total_elevation_gain": 2.400024,
+                    "average_torque": 18.373035, "min_torque": 0.540526, "w5s_variability": 0.039962, "average_respiration": 28.267124,
+                    "average_speed": 8.481457, "decoupling": -1.340999, "average_gradient": 0.001984, "intensity": 91.02564})
+    for expected in ("Training Load: 13.4", "Elevation Gain: 2.4 meters", "Torque: Avg 18.4, Min 0.5, Max n/a", "Variability: 0.04\n",
+                     "Respiration: 28.3 breaths/min", "Speed: Avg 8.481", "Decoupling: -1.3\n", "Gradient: 0.002%", "Intensity: 91\n"):
+        assert expected in block, expected
+    details = format_event_details({"id": 1, "start_date_local": "2026-10-13T00:00:00", "icu_atl": 76.81097, "ss_p_max": 0.47685498,
+                                    "icu_ctl": 66.0})
+    assert "Other fields: icu_atl=76.81, ss_p_max=0.4769, icu_ctl=66" in details
+
+
+def test_rounding_follow_ups_kj_form_ramp_and_baselines():
+    """R40-6/7/8: work in kJ (icu_joules is J), form/ramp never "-0.0", baselines by metric."""
+    from intervals_mcp_server.tools.summary import _one  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tools.wellness_insights import _baseline_lines  # pylint: disable=import-outside-toplevel
+
+    assert "Work: 872 kJ" in format_activity_summary({"icu_joules": 871775}) and "Work: N/A kJ" in format_activity_summary({})
+    assert (_one(-0.04), _one(0.04), _one(-0.0), _one(58.0), _one(-6.134842), _one(None)) == ("-0.04", "0.04", "0.0", "58.0", "-6.1", "n/a")
+    entries = [{"id": f"2026-09-{day:02d}", "hrv": 40 + day % 3, "lactate": 0.97 + (day % 3) / 100} for day in range(1, 31)]
+    entries += [{"id": f"2026-10-{day:02d}", "hrv": 40 + day % 3, "lactate": 0.97 + (day % 3) / 100} for day in range(1, 16)]
+    lines = _baseline_lines(entries, ["hrv", "lactate"])
+    hrv, lactate = lines[0], lines[1]
+    assert "7d mean 40.9 | 42d baseline mean 41, median 41, sd 0.8" in hrv  # known metric: 1 decimal
+    assert "7d mean 0.9786 | 42d baseline mean 0.98, median 0.98, sd 0.008264" in lactate  # other metric: 4 significant digits

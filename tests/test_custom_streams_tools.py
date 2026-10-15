@@ -94,7 +94,7 @@ def test_get_activity_details_lists_custom_fields(monkeypatch):
     assert "Activity: Sweet Spot" in result
     assert "Custom Activity Fields:" in result
     assert "- Aerobic Effect [AerobicEffect]: 3.5" in result
-    assert "- EPOC [EPOC]: 129.58348 ml/kg" in result
+    assert "- EPOC [EPOC]: 129.6 ml/kg" in result
     assert "- Training Effect [TrainingEffectSelect]: 2 (Base)" in result
     assert "- Flight Time [FlightTime]: no value" in result
     assert "- Sweat loss [Sweatloss]: 0 ml" in result

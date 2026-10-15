@@ -221,6 +221,31 @@ def test_get_event_by_id_uses_plural_endpoint_and_renders_doc(monkeypatch):
     assert payload["workout_doc"]["duration"] == 1740
 
 
+def test_get_event_by_id_shows_the_last_day_of_multi_day_events(monkeypatch):
+    """R39-13: Intervals.icu stores the end of a multi-day event as the midnight after its last day;
+    get_event_by_id names the last day in text and JSON (last_day). Single-day events are unchanged."""
+    events = {
+        "/events/71": {"id": 71, "category": "SICK", "name": "Grippe", "start_date_local": "2026-09-12T00:00:00",
+                       "end_date_local": "2026-10-14T00:00:00"},
+        "/events/72": {"id": 72, "category": "WORKOUT", "type": "Ride", "name": "Z2", "start_date_local": "2026-09-05T00:00:00",
+                       "end_date_local": "2026-09-06T00:00:00"},
+        "/events/73": {"id": 73, "category": "NOTE", "name": "Night ride", "start_date_local": "2026-10-13T22:00:00",
+                       "end_date_local": "2026-10-14T02:00:00"},
+        "/events/74": {"id": 74, "category": "NOTE", "name": "No end", "start_date_local": "2026-10-13T00:00:00"},
+    }
+    _install_router(monkeypatch, overrides=events)
+    sick = asyncio.run(get_event_by_id("71"))
+    assert "End: 2026-10-14T00:00:00 (local; last day 2026-10-13 (Tue))" in sick
+    assert json.loads(asyncio.run(get_event_by_id("71", output_format="json")))["last_day"] == "2026-10-13"
+    single = asyncio.run(get_event_by_id("72"))
+    assert single.endswith("End: 2026-09-06T00:00:00 (local)") and "last day" not in single
+    assert "last_day" not in json.loads(asyncio.run(get_event_by_id("72", output_format="json")))
+    assert "End: 2026-10-14T02:00:00 (local; last day 2026-10-14 (Wed))" in asyncio.run(get_event_by_id("73"))
+    no_end = asyncio.run(get_event_by_id("74"))
+    assert "End:" not in no_end and "last day" not in no_end
+    assert "last_day" not in json.loads(asyncio.run(get_event_by_id("74", output_format="json")))
+
+
 # ------------------------------------------------------------- activities
 def test_get_activities_filters_sort_and_pagination(monkeypatch):
     """Sport and gear filters, sorting, offsets and compact output work together."""

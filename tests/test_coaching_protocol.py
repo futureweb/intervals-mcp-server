@@ -25,7 +25,14 @@ from intervals_mcp_server.utils.dates import (  # pylint: disable=wrong-import-p
     today_anchor,
     today_json,
 )
-from intervals_mcp_server.utils.health_markers import HINT, HINT_PAST, health_lines, health_markers  # pylint: disable=wrong-import-position
+from intervals_mcp_server.utils.health_markers import (  # pylint: disable=wrong-import-position
+    HINT,
+    HINT_PAST,
+    NOTE_CHARS,
+    NOTE_DAYS_AFTER,
+    health_lines,
+    health_markers,
+)
 from tests.test_wellness_completeness import _api as completeness_api  # pylint: disable=wrong-import-position
 from tests.test_wellness_completeness import _now  # pylint: disable=wrong-import-position  # fixed clock, athlete time zone
 
@@ -188,6 +195,31 @@ def test_health_markers_none_without_markers_and_unknown_on_error():
                                [], TODAY)["events"][0]
     assert len(long_note["note"]) == 120 and long_note["note"].endswith("...")
     assert '"unnamed"' in health_lines(health_markers([{"category": "SICK", "start_date_local": "2026-10-10"}], [], TODAY), TODAY)[1]
+
+
+def test_health_markers_note_only_while_the_entry_is_current():
+    """R39-10: the medical note is shown while the entry covers the day or ended at most 2 days before;
+    later only category, name and dates (no note in text or JSON for the rest of the 14 days)."""
+    def entry(last_day_offset, start_offset=5):
+        start = TODAY - timedelta(days=start_offset)
+        end = TODAY - timedelta(days=last_day_offset - 1)  # stored as the midnight after the last day
+        return {"id": last_day_offset, "category": "SICK", "name": "Infekt", "description": "Fieber ~39,2 °C",
+                "start_date_local": f"{start.isoformat()}T00:00:00", "end_date_local": f"{end.isoformat()}T00:00:00"}
+
+    markers = health_markers([entry(-2), entry(0), entry(1), entry(2), entry(3, 9), entry(14, 20)], [], TODAY, today=TODAY)
+    notes = {r["id"]: r["note"] for r in markers["events"]}
+    assert notes == {-2: "Fieber ~39,2 °C", 0: "Fieber ~39,2 °C", 1: "Fieber ~39,2 °C", 2: "Fieber ~39,2 °C", 3: None, 14: None}
+    assert {r["id"]: r["note_withheld"] for r in markers["events"]} == {-2: False, 0: False, 1: False, 2: False, 3: True, 14: True}
+    no_text = health_markers([dict(entry(14, 20), description="")], [], TODAY, today=TODAY)["events"][0]
+    assert no_text["note"] is None and no_text["note_withheld"] is False  # nothing withheld: there is no note
+    lines = health_lines(markers, TODAY)
+    assert sum("Fieber" in line for line in lines) == 4
+    assert '- SICK 2026-09-20 (Sun, 20 days ago) to 2026-09-26 (Sat, 14 days ago): "Infekt"' in lines
+    assert '- SICK 2026-10-01 (Thu, 9 days ago) to 2026-10-07 (Wed, 3 days ago): "Infekt"' in lines
+    # The window is the tool's day: for a past day the note follows that day, not today.
+    past = health_markers([entry(3, 9)], [], TODAY - timedelta(days=4), today=TODAY)
+    assert past["events"][0]["note"] == "Fieber ~39,2 °C"
+    assert NOTE_CHARS == 120 and NOTE_DAYS_AFTER == 2
 
 
 def test_health_markers_flatten_and_quote_names_and_notes():

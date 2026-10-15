@@ -112,6 +112,11 @@ For outdoor sessions whose next step should start at a suitable place (a climb, 
 - `validate_workout`/`preview_workout` count the lap-press steps (each step of a repeat block once,
   plus the number of runs) and their estimate; after a write the read-back reports the same count
   and warns when Intervals.icu stored a lap-press step as a timed step (or the reverse).
+- After the ride, `analyze_workout_execution` (and `get_activity_report`,
+  `get_activity_intervals(include_planned_types=true)`) treats a lap-press step as open: "ended by
+  lap after 16:01 (planning estimate 17:00)", no shorter/longer deviation, its targets still
+  judged, and the following steps are compared from the actual lap. Riding before the workout
+  start or after the last press stays outside the plan (intervals://methods/execution).
 
 ## Native workout text (`description`)
 
