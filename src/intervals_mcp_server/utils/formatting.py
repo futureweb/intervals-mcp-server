@@ -72,6 +72,14 @@ def _stored(payload: dict[str, Any], *keys: str, digits: int | None = None) -> s
     return next((format_value(value, digits) for value in values if not is_missing(value)), "N/A")
 
 
+def _kilojoules(activity: dict[str, Any]) -> str:
+    """The mechanical work in kJ (Intervals.icu stores ``icu_joules`` in J); 'N/A' without a value."""
+    joules = activity.get("icu_joules")
+    if isinstance(joules, bool) or not isinstance(joules, (int, float)) or is_missing(joules):
+        return "N/A"
+    return format_value(float(joules) / 1000, 0)
+
+
 def format_activity_summary(activity: dict[str, Any]) -> str:
     """Format an activity into a readable string."""
     # Local and UTC start are reported side by side (P0: timezone clarity).
@@ -133,7 +141,7 @@ Average Power: {_stored(activity, "avgPower", "icu_average_watts", "average_watt
 Weighted Avg Power: {_stored(activity, "icu_weighted_avg_watts", digits=0)} watts
 Training Load (Intervals.icu): {_stored(activity, "trainingLoad", "icu_training_load", digits=1)}
 FTP: {_stored(activity, "icu_ftp", digits=0)} watts
-Kilojoules: {_stored(activity, "icu_joules", digits=0)}
+Work: {_kilojoules(activity)} kJ
 Intensity: {_stored(activity, "icu_intensity", digits=1)}
 Power:HR Ratio: {_stored(activity, "icu_power_hr", digits=2)}
 Variability Index: {_stored(activity, "icu_variability_index", digits=2)}

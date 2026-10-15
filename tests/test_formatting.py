@@ -379,3 +379,18 @@ def test_float_noise_is_rounded_for_display():
     details = format_event_details({"id": 1, "start_date_local": "2026-10-13T00:00:00", "icu_atl": 76.81097, "ss_p_max": 0.47685498,
                                     "icu_ctl": 66.0})
     assert "Other fields: icu_atl=76.81, ss_p_max=0.4769, icu_ctl=66" in details
+
+
+def test_rounding_follow_ups_kj_form_ramp_and_baselines():
+    """R40-6/7/8: work in kJ (icu_joules is J), form/ramp never "-0.0", baselines by metric."""
+    from intervals_mcp_server.tools.summary import _one  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.tools.wellness_insights import _baseline_lines  # pylint: disable=import-outside-toplevel
+
+    assert "Work: 872 kJ" in format_activity_summary({"icu_joules": 871775}) and "Work: N/A kJ" in format_activity_summary({})
+    assert (_one(-0.04), _one(0.04), _one(-0.0), _one(58.0), _one(-6.134842), _one(None)) == ("-0.04", "0.04", "0.0", "58.0", "-6.1", "n/a")
+    entries = [{"id": f"2026-09-{day:02d}", "hrv": 40 + day % 3, "lactate": 0.97 + (day % 3) / 100} for day in range(1, 31)]
+    entries += [{"id": f"2026-10-{day:02d}", "hrv": 40 + day % 3, "lactate": 0.97 + (day % 3) / 100} for day in range(1, 16)]
+    lines = _baseline_lines(entries, ["hrv", "lactate"])
+    hrv, lactate = lines[0], lines[1]
+    assert "7d mean 40.9 | 42d baseline mean 41, median 41, sd 0.8" in hrv  # known metric: 1 decimal
+    assert "7d mean 0.9786 | 42d baseline mean 0.98, median 0.98, sd 0.008264" in lactate  # other metric: 4 significant digits

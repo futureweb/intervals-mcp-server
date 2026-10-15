@@ -209,6 +209,9 @@ def test_health_markers_note_only_while_the_entry_is_current():
     markers = health_markers([entry(-2), entry(0), entry(1), entry(2), entry(3, 9), entry(14, 20)], [], TODAY, today=TODAY)
     notes = {r["id"]: r["note"] for r in markers["events"]}
     assert notes == {-2: "Fieber ~39,2 °C", 0: "Fieber ~39,2 °C", 1: "Fieber ~39,2 °C", 2: "Fieber ~39,2 °C", 3: None, 14: None}
+    assert {r["id"]: r["note_withheld"] for r in markers["events"]} == {-2: False, 0: False, 1: False, 2: False, 3: True, 14: True}
+    no_text = health_markers([dict(entry(14, 20), description="")], [], TODAY, today=TODAY)["events"][0]
+    assert no_text["note"] is None and no_text["note_withheld"] is False  # nothing withheld: there is no note
     lines = health_lines(markers, TODAY)
     assert sum("Fieber" in line for line in lines) == 4
     assert '- SICK 2026-09-20 (Sun, 20 days ago) to 2026-09-26 (Sat, 14 days ago): "Infekt"' in lines

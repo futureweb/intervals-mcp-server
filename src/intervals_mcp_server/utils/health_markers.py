@@ -8,7 +8,7 @@ get_recovery_snapshot and get_coach_context list, for their day,
   days before it (recognised by the category only, never by the title), with first and last
   day and name; the short note from the description (at most ``NOTE_CHARS`` characters) only while
   the entry covers the day or ended at most ``NOTE_DAYS_AFTER`` days before it, so a medical note
-  is not repeated in every output for two weeks;
+  is not repeated in every output for two weeks (JSON ``note_withheld`` says that a note exists);
 - the wellness ``injury`` score when it is 3 (Poor) or 4 (Injured) on the 1-4 scale: the day's
   value or, when the day has none yet (a subjective score is often entered later in the day), the
   value of the day before, labelled with its date,
@@ -118,11 +118,13 @@ def health_markers(
         span = event_day_span(event)
         if span is None or span[0] > day or span[1] < window_start:
             continue
+        current = span[1] >= day - timedelta(days=NOTE_DAYS_AFTER)  # the note only while the entry is current
         rows.append({
             "id": event.get("id"), "category": event.get("category"), "name": _flat(event.get("name"), NAME_CHARS),
             "start": span[0].isoformat(), "last_day": span[1].isoformat(),
             "covers_day": span[1] >= day, "ongoing": span[0] <= today <= span[1],
-            "note": _flat(event.get("description"), NOTE_CHARS) if span[1] >= day - timedelta(days=NOTE_DAYS_AFTER) else None,
+            "note": _flat(event.get("description"), NOTE_CHARS) if current else None,
+            "note_withheld": not current and _flat(event.get("description"), NOTE_CHARS) is not None,
         })
     rows.sort(key=lambda row: (row["start"], row["last_day"]))
     injury = _injury(wellness, day)

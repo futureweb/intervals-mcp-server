@@ -20,7 +20,7 @@ from intervals_mcp_server.config import get_config
 from intervals_mcp_server.tools.athlete import field_assignments
 from intervals_mcp_server.tools.custom_items import get_custom_item_index
 from intervals_mcp_server.tools.gear import get_gear_map
-from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, is_missing
+from intervals_mcp_server.utils.custom_fields import ACTIVITY_FIELD, CustomFieldDefs, float_text, is_missing
 from intervals_mcp_server.utils.field_policy import aggregate_custom_fields, format_aggregate, format_pair, pair_changes
 from intervals_mcp_server.utils.dates import get_default_end_date
 from intervals_mcp_server.utils.params import AthleteId, DetailLevel, EndDate, OutputFormat, SportTypes, lower_choice
@@ -222,8 +222,11 @@ def _fitness_at(wellness: list[dict[str, Any]], last_day: str) -> dict[str, Any]
 
 
 def _one(value: Any) -> str:
-    """One decimal, 'n/a' for a missing value."""
-    return f"{value:.1f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else "n/a"
+    """One decimal (never -0.0; a non-zero below 0.05 keeps one significant digit), 'n/a' for a missing value."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "n/a"
+    text = float_text(float(value), 1)
+    return text if "." in text else f"{text}.0"
 
 
 def _format_group(  # pylint: disable=too-many-locals,too-many-branches

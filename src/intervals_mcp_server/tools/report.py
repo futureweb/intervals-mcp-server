@@ -197,7 +197,7 @@ def _execution_findings(execution: dict[str, Any]) -> list[str]:
         listed = ", ".join(f"plan {r['planned']['index']} {r['planned']['kind']} {lap_press_text(r['lap_press'])}"
                            for r in lap_rows[:MAX_LAP_PRESS_FINDINGS])
         more = f" and {len(lap_rows) - MAX_LAP_PRESS_FINDINGS} more" if len(lap_rows) > MAX_LAP_PRESS_FINDINGS else ""
-        text += f"; lap-press steps (open length, not judged): {listed}{more}"
+        text += f"; lap-press steps (length set by the lap press, not judged; targets judged): {listed}{more}"
     findings.append(text)
     extension = execution.get("extension")
     if extension:

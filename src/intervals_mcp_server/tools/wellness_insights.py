@@ -69,6 +69,9 @@ SNAPSHOT_FIELDS: tuple[tuple[str, str, str, float], ...] = (
 )
 SUBJECTIVE_FIELDS = ("sleepQuality", "soreness", "fatigue", "stress", "mood", "motivation", "injury")
 DEFAULT_BASELINE_METRICS = "hrv,restingHR,avgSleepingHR,sleepScore,readiness,respiration,spO2"
+# Baseline means, medians and SDs of these metrics are shown with 1 decimal (their values are whole numbers or
+# have one decimal); other metrics (e.g. lactate, custom ratios) with 4 significant digits.
+ONE_DECIMAL_BASELINES = frozenset(DEFAULT_BASELINE_METRICS.split(",")) | {"hrvSDNN", "weight", "bodyFat", "vo2max", "systolic", "diastolic"}
 DEFAULT_TREND_METRICS = "hrv,restingHR,avgSleepingHR,sleepScore,readiness,respiration,spO2,weight"
 BASELINE_DAYS = 42
 MAX_DAYS_BACK = 14
@@ -220,10 +223,11 @@ def _baseline_lines(entries: list[dict[str, Any]], metrics: list[str]) -> list[s
         pct = f"{comp['diff_pct']:+.1f}%" if comp.get("diff_pct") is not None else "% n/a"  # baseline mean 0
         seven = (rolling.get(7) or {}).get("latest_mean")
         small = f" [small sample, fewer than {MIN_BASELINE_VALUES} values]" if base.get("n", 0) < MIN_BASELINE_VALUES else ""
+        digits = 1 if metric in ONE_DECIMAL_BASELINES else None
         lines.append(
-            f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven, 1) if seven is not None else 'n/a'}"
-            f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'), 1)}, median {format_value(base.get('median'), 1)}, "
-            f"sd {format_value(base.get('stdev'), 1)} (n {base.get('n')})"
+            f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven, digits) if seven is not None else 'n/a'}"
+            f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'), digits)}, median {format_value(base.get('median'), digits)}, "
+            f"sd {format_value(base.get('stdev'), digits)} (n {base.get('n')})"
             + (f" | vs baseline {comp['diff']:+.2f} ({pct}, z {comp['z']:+.2f})" if comp.get("diff") is not None and comp.get("z") is not None else "")
             + small
         )

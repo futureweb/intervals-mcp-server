@@ -40,7 +40,8 @@ workout format: `intervals://workout-syntax`.
   calendar entries of the categories SICK and INJURED that lie on the tool's day (the snapshot day,
   the coach context's end date) or ended in the 14 days before it, with first and last day and name,
   plus a short note from the description (at most 120 characters) only while the entry covers that
-  day or ended at most 2 days before it (both on one line, in quotes), and the wellness `injury` score
+  day or ended at most 2 days before it (both on one line, in quotes; later JSON `note_withheld`),
+  and the wellness `injury` score
   when it is 3 (Poor) or 4 (Injured), as stored with its 1-4 scale: the day's value or, when the day
   has none yet (a subjective score is often entered later), the value of the day before, labelled
   with its date. Entries are recognised by their category only, never by the title.

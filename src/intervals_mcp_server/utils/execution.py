@@ -33,11 +33,14 @@ from recorded samples only, time-weighted by the sample spacing.
 
 Lap-press steps (``until_lap_press``) end when the athlete presses the lap button; their
 duration or distance is only a planning estimate. They are open: any length costs little in
-the alignment (a slight preference for lengths near the estimate breaks ties), their end is
-always the lap boundary (never moved, split or extended by trailing laps), their length is
-reported as "ended by lap after <actual> (planning estimate <estimate>)" instead of a
-shorter/longer deviation, their target adherence is evaluated as usual, and the plan clock
-restarts at their actual end so the following timed steps are judged from the lap boundary.
+the alignment (a slight preference for lengths near the estimate breaks ties). The press closes
+one lap, so a lap-press step is that lap preceded only by full device auto-laps
+(``auto_lap_evidence``); it never reaches across a press, a step lap or the lap that starts the
+workout, so riding before or after the workout stays outside the plan. Its lap boundaries are
+never moved, split or extended afterwards, its length is reported as "ended by lap after
+<actual> (planning estimate <estimate>)" instead of a shorter/longer deviation, its target
+adherence is evaluated as usual, and the plan clock restarts at its actual end so the following
+timed steps are judged from the lap boundary.
 """
 
 # pylint: disable=too-many-lines
@@ -76,6 +79,12 @@ ALIGN_TIME_BUDGET_S = 20.0  # the alignment gives up (plan comparison skipped) a
 AUTO_LAP_TOLERANCE = 0.03  # laps within +-3 % of the typical lap count as device auto-laps ...
 AUTO_LAP_MIN_SHARE = 0.6  # ... when they hold at least this share of the time (the last lap excluded)
 AUTO_LAP_MIN_LAPS = 4
+AUTO_LAP_BELOW = 0.005  # a full auto-lap is at most this much shorter than the shortest one (a press lap usually is)
+AUTO_LAP_SETTING_BELOW = 0.005  # without a detected layout: a lap from this much below ...
+AUTO_LAP_SETTING_ABOVE = 0.015  # ... to this much above a usual auto-lap distance is a full auto-lap
+# Usual device auto-lap distances (m), to recognise auto-laps that only some steps have
+AUTO_LAP_SETTINGS_M = (200.0, 250.0, 400.0, 500.0, 800.0, 1000.0, 1500.0, 1609.344, 2000.0, 2500.0, 3000.0, 3218.688,
+                       4000.0, 5000.0, 8046.72, 10000.0, 16093.44, 20000.0)
 CHANGE_MIN_PCT = 3.0  # step targets closer than this are not told apart inside a lap
 LAP_CHANGE_PCT = 20.0  # a lap whose two parts differ this much in intensity runs across a step change
 MIN_BOUNDARY_SHIFT_S = 5.0
@@ -104,7 +113,12 @@ TIME_IN_TARGET_LOW_PCT = 50.0
 LAP_PRESS_COST_PER_DOUBLING = 0.05
 LAP_PRESS_MAX_COST = 0.3
 LAP_PRESS_LAP_FACTOR = 4
-LAP_PRESS_AUTO_END_COST = 1.0  # with device auto-laps: a lap-press step ending on a full auto-lap (no press there; > GAP_COST)
+# A lap-press step ending on a full device auto-lap although a lap of another length (the press) follows
+# within reach through laps that fit its target: the press came later.
+LAP_PRESS_AUTO_END_COST = 1.0
+LAP_PRESS_AUTO_LAP_END_COST = 0.4  # ... otherwise (a press at about the auto-lap length, or no press seen); below GAP_COST
+LAP_PRESS_FIT_COST = 0.0  # a lap "fits" a lap-press step's target at this intensity cost or less
+EDGE_CHARGE_MARGIN = 0.01  # a first/last lap-press step pays for each extra lap a little less than the lap costs outside the plan
 STREAM_KEYS = {"power": "watts", "hr": "heartrate", "pace": "velocity_smooth"}
 INTERVAL_KEYS = {"power": "average_watts", "hr": "average_heartrate", "pace": "average_speed"}
 DETAIL_LEVELS = ("compact", "standard", "full")
@@ -756,11 +770,14 @@ def coarsen_limit(steps: int) -> int:
     return max(MIN_ALIGN_INTERVALS, 2 * steps, min(MAX_ALIGN_INTERVALS, MAX_ALIGN_CELLS // max(steps, 1)))
 
 
-def _coarsen(spans: list[_Span], limit: int = MAX_ALIGN_INTERVALS) -> tuple[list[_Span], list[list[int]]]:
+def _coarsen(
+    spans: list[_Span], limit: int = MAX_ALIGN_INTERVALS, keep_after: list[bool] | None = None
+) -> tuple[list[_Span], list[list[int]]]:
     """Adjacent intervals merged pairwise until at most ``limit`` remain.
 
     Bounds the alignment's run time for activities with very many (e.g. 100 m) laps or long
-    plans; the boundaries inside long steps are refined on the samples afterwards.
+    plans; the boundaries inside long steps are refined on the samples afterwards. The boundary
+    after an interval flagged in ``keep_after`` (a lap that may close a lap-press step) is kept.
     """
     groups = [[s.index] for s in spans]
     while len(groups) > limit:
@@ -769,7 +786,7 @@ def _coarsen(spans: list[_Span], limit: int = MAX_ALIGN_INTERVALS) -> tuple[list
             pair = groups[pos:pos + 2]
             left = spans[pair[0][-1]]
             right = spans[pair[1][0]] if len(pair) == 2 else None
-            joinable = right is not None and (
+            joinable = right is not None and not (keep_after and keep_after[left.index]) and (
                 (left.end is not None and right.start == left.end) or (left.start is None and right.start is None)
             )
             if joinable:
@@ -849,7 +866,7 @@ class AlignmentBudgetExceeded(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _MatchRules:
+class _MatchRules:  # pylint: disable=too-many-instance-attributes
     """Per-step limits of the alignment: how many intervals a step may span and whether it may
     absorb surplus auto-laps before (``leading``) or after (``trailing``) its planned amount."""
 
@@ -857,12 +874,15 @@ class _MatchRules:
     leading: bool = False
     trailing: bool = False
     absorb_parts: int = 0  # intervals a step may span at most while absorbing surplus laps
-    open_parts: int = MAX_MERGE_WITHOUT_AMOUNT  # intervals a lap-press step may span (more with auto-laps)
+    open_parts: int = MAX_MERGE_WITHOUT_AMOUNT  # intervals a lap-press step may span (full auto-laps + its closing lap)
+    edge: bool = False  # the first or last planned step (laps beyond it lie outside the plan)
+    first: bool = False  # the first planned step
+    nearer: bool = False  # lap-press step inside the plan: its first lap may be any lap that brings it to its estimate
 
 
 def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments,too-many-positional-arguments,too-many-statements
     step: dict[str, Any], spans: list[_Span], j: int, profile: Profile, part_cost: Any, rules: _MatchRules = _MatchRules(),
-    auto_end: list[bool] | None = None,
+    typical: list[int] | None = None,
 ) -> list[tuple[int, float]]:
     """(k, cost) for matching ``step`` with the k consecutive spans ending before index ``j``.
 
@@ -871,11 +891,19 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-man
     must each stay short of the planned duration (or distance). With device auto-laps a
     step may in addition absorb surplus laps that fit its target (an overrun, reported as
     longer than planned), except before the first and after the last step. Steps without
-    duration or distance absorb at most ``MAX_MERGE_WITHOUT_AMOUNT`` intervals. A lap-press step
-    is open: its estimate only adds a small cost (``_estimate_cost``), it spans up to
-    ``rules.open_parts`` intervals and its intensity is measured on the whole span; with device
-    auto-laps (``auto_end``: per span, whether it is a full auto-lap) ending on an auto-lap costs
-    ``LAP_PRESS_AUTO_END_COST``, since the press closes a partial lap. Every merged
+    duration or distance absorb at most ``MAX_MERGE_WITHOUT_AMOUNT`` intervals.
+
+    A lap-press step is open: its estimate only adds a small cost (``_estimate_cost``) and its
+    intensity is measured on the whole span. The press closes exactly one lap, so the step is
+    its closing lap preceded only by full device auto-laps (``typical``: per span, the
+    ``auto_lap_evidence``; at most ``rules.open_parts`` intervals), see ``_open_part_allowed``:
+    it never reaches across another lap (a press, a step lap, the start of the workout), so
+    riding before the workout or after the press stays outside. The first step takes the full
+    auto-laps back to the workout start (no merge penalty, the estimate cost never grows); at the
+    first or last step a lap off the target costs about what it costs outside the plan. Ending
+    on a full auto-lap costs ``LAP_PRESS_AUTO_END_COST`` when a lap of another length follows
+    through laps that fit the target (the press came later), else ``LAP_PRESS_AUTO_LAP_END_COST``
+    (below ``GAP_COST``: a press at about the auto-lap length is still matched). Every merged
     interval must be adjacent to the next and about as close to the target as the whole span.
     """
     amount = _planned_amount(step, j > 0 and spans[j - 1].distance is not None)
@@ -883,11 +911,15 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-man
     weight = 1.0 if step.get("kind") == "work" else 0.5
     open_end = bool(step.get("lap_press"))
     cap_secs = None if open_end else step.get("duration") or step.get("est_duration")
-    end_cost = LAP_PRESS_AUTO_END_COST if open_end and auto_end and j and auto_end[j - 1] else 0.0
+    end_cost = 0.0
+    if open_end and typical and j and typical[j - 1] == 2:  # ends on a full auto-lap: no press there
+        follows = bool(target) and _press_follows(spans, typical, j - 1, part_cost, rules.open_parts)
+        end_cost = LAP_PRESS_AUTO_END_COST if follows else LAP_PRESS_AUTO_LAP_END_COST
     options: list[tuple[int, float]] = []
     last = spans[j - 1] if j else None
-    covered_time, covered_distance, worst_part = 0.0, 0.0, 0.0
-    absorbing = False
+    covered_time, covered_distance, worst_part, edge_charge = 0.0, 0.0, 0.0, 0.0
+    absorbing = earliest = False
+    best_estimate = float("inf")
     weighted, weights = 0.0, 0.0  # interval averages, for intervals without sample indices
     stream = STREAM_KEYS[target["kind"]] if target else ""
     use_stream = bool(target) and last is not None and last.end is not None and profile.has(stream)
@@ -897,8 +929,10 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-man
             following = spans[j - k + 1]
             if part.end is not None and following.start is not None and following.start != part.end:
                 break
-            if open_end and k > rules.open_parts:
-                break
+            if open_end and (earliest or not _open_part_allowed(k, typical[j - k] if typical else 0, rules,
+                                                               _nearer_estimate(amount, part, covered_time, covered_distance))):
+                break  # the press closes one lap: before it only full auto-laps
+            earliest = open_end and not (typical and typical[j - k] == 2)  # another lap can only be the step's first
             if amount is None and not open_end and k > MAX_MERGE_WITHOUT_AMOUNT:
                 break
             if amount is not None and not open_end and last is not None:
@@ -921,7 +955,13 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-man
         else:
             actual = covered_time if amount[0] == "time" else covered_distance or None
             cost = _estimate_cost(amount[1], actual) if open_end else _amount_cost(amount[1], actual)
-        cost += (MERGE_PENALTY if k > 1 else 0.0) + end_cost
+            if open_end and rules.first:  # the workout starts with its lap: earlier full auto-laps are the step's
+                best_estimate = cost = min(cost, best_estimate)
+        cost += (MERGE_PENALTY if k > 1 and not (open_end and rules.first) else 0.0) + end_cost
+        if open_end and k > 1 and rules.edge and target and part_cost(j - k) > LAP_PRESS_FIT_COST:
+            # first/last step: a lap off its target costs about what it costs outside the plan (riding before/after)
+            edge_charge += max(0.0, EDGE_EXTRA_COST + EDGE_COST_PER_HOUR * (part.active or part.elapsed) / 3600 - EDGE_CHARGE_MARGIN)
+        cost += edge_charge
         if not target:
             options.append((k, cost + 0.25))
             continue
@@ -943,13 +983,18 @@ def _match_options(  # pylint: disable=too-many-locals,too-many-branches,too-man
     return options
 
 
-def _match_rules(planned: list[dict[str, Any]], spans: list[_Span], auto_laps: bool) -> list[_MatchRules]:
+def _match_rules(
+    planned: list[dict[str, Any]], spans: list[_Span], auto_laps: bool, typical: list[int] | None = None
+) -> list[_MatchRules]:
     """Per planned step: interval limit (enough laps for three times the planned amount) and
     whether surplus auto-laps may be absorbed (not before the first / after the last step). A
-    lap-press step may span ``MAX_MERGE_WITHOUT_AMOUNT`` intervals (e.g. a double press), with
-    device auto-laps enough laps for ``LAP_PRESS_LAP_FACTOR`` times its estimate."""
+    lap-press step may span enough full auto-laps (``typical``) for ``LAP_PRESS_LAP_FACTOR``
+    times its estimate plus its closing lap."""
     lap_secs = statistics.median([s.active for s in spans if s.active > 0] or [1.0])
     lap_metres = statistics.median([s.distance for s in spans if s.distance] or [0.0])
+    auto = [s for s, level in zip(spans, typical or [], strict=False) if level == 2]
+    auto_lap = (statistics.median([s.active for s in auto if s.active > 0] or [lap_secs]),
+                statistics.median([s.distance for s in auto if s.distance] or [lap_metres]))  # seconds, metres
     rules: list[_MatchRules] = []
     for position, step in enumerate(planned):
         secs = step.get("duration") or step.get("est_duration")
@@ -957,12 +1002,87 @@ def _match_rules(planned: list[dict[str, Any]], spans: list[_Span], auto_laps: b
         if not secs and step.get("distance") and lap_metres:
             needed = step["distance"] / lap_metres
         open_parts = MAX_MERGE_WITHOUT_AMOUNT
-        if auto_laps and step.get("lap_press"):
-            open_parts = max(MAX_MERGE_WITHOUT_AMOUNT, int(LAP_PRESS_LAP_FACTOR * needed) + 3)
+        if step.get("lap_press"):
+            laps = secs / auto_lap[0] if secs else (step.get("distance") or 0.0) / auto_lap[1] if auto_lap[1] else 0.0
+            open_parts = max(MAX_MERGE_WITHOUT_AMOUNT, int(LAP_PRESS_LAP_FACTOR * laps) + 2)
         rules.append(_MatchRules(max_parts=max(MAX_MERGE_PARTS, int(3 * needed) + 3), absorb_parts=int(2 * needed) + 3,
                                  leading=auto_laps and position > 0, trailing=auto_laps and position < len(planned) - 1,
-                                 open_parts=open_parts))
+                                 open_parts=open_parts, edge=position in (0, len(planned) - 1), first=position == 0,
+                                 nearer=bool(step.get("lap_press")) and 0 < position < len(planned) - 1))
     return rules
+
+
+def _open_part_allowed(k: int, evidence: int, rules: _MatchRules, nearer: bool) -> bool:
+    """Whether a lap-press span may take one more lap before its closing lap: a full auto-lap, or as
+    its first lap one that brings it nearer to its estimate: the only lap of a usual auto-lap distance,
+    or, inside the plan, any lap (a double press, or the part of a lap before the step on a device
+    whose auto-laps do not restart at a press)."""
+    if k > rules.open_parts:
+        return False
+    return evidence == 2 or nearer and (evidence == 1 or rules.nearer)
+
+
+def _nearer_estimate(amount: tuple[str, float] | None, part: _Span, covered_time: float, covered_distance: float) -> bool:
+    """Whether adding ``part`` brings a lap-press span closer to its planning estimate (e.g. a short
+    extra lap from a double press, or the one full auto-lap of a step when no auto-lap length is known)."""
+    if amount is None:
+        return False
+    before, added = (covered_time, part.active) if amount[0] == "time" else (covered_distance, part.distance or 0.0)
+    if before <= 0 or added <= 0:
+        return False
+    return abs(math.log((before + added) / amount[1])) < abs(math.log(before / amount[1]))
+
+
+def _press_follows(spans: list[_Span], typical: list[int], end: int, part_cost: Any, limit: int) -> bool:
+    """Whether a lap of another length than the auto-lap (a press, a step lap or the end of the
+    recording) follows the full auto-lap ``spans[end]`` within ``limit`` adjacent laps that all fit the
+    step's target: a lap-press step ending at ``end`` would then have stopped before its press."""
+    for index in range(end + 1, min(len(spans) - 1, end + 1 + limit)):  # the recording's end is no press
+        before, part = spans[index - 1], spans[index]
+        if before.end is not None and part.start is not None and part.start != before.end:
+            return False
+        if part_cost(index) > LAP_PRESS_FIT_COST:
+            return False
+        if not typical[index]:
+            return True
+    return False
+
+
+def auto_lap_evidence(spans: list[_Span], layout: dict[str, Any] | None) -> list[int]:
+    """Per interval: how surely it is a full device auto-lap (a lap the device closed by itself).
+
+    2: it has the length of the detected auto-lap layout, from AUTO_LAP_BELOW below its setting (the
+    shortest length most of its laps reach) to AUTO_LAP_TOLERANCE above its typical length: a device
+    closes an auto-lap when the set distance or time is reached, so a full auto-lap is never clearly
+    shorter than the setting, while a lap closed by a press usually is. Or, without a
+    layout (auto-laps only in some steps, e.g. a long warm-up), a usual auto-lap distance
+    (``AUTO_LAP_SETTINGS_M``, from 0.5 % below to 1.5 % above) that at least two laps have (the
+    activity's last lap not counted). 1: the only lap of such a usual distance. 0: neither.
+    """
+    if layout is not None:
+        values = [span.distance if layout["by"] == "distance" else span.active for span in spans]
+        setting = _auto_lap_setting(sorted(v for v, span in zip(values, spans, strict=True) if v and _is_auto_lap(span, layout)))
+        low, high = (setting or float(layout["lap"])) * (1 - AUTO_LAP_BELOW), float(layout["lap"]) * (1 + AUTO_LAP_TOLERANCE)
+        return [2 if v is not None and low <= v <= high else 0 for v in values]
+    settings = [_usual_setting(span.distance) for span in spans]
+    repeated = {setting for setting in settings[:-1] if setting and settings[:-1].count(setting) >= 2}
+    return [0 if not setting else 2 if setting in repeated else 1 for setting in settings]
+
+
+def _auto_lap_setting(lengths: list[float]) -> float | None:
+    """The device's auto-lap setting from the sorted lengths of its laps: the shortest length that a
+    fifth of them (at least two) reach within 2 x AUTO_LAP_BELOW (laps overshoot the setting slightly,
+    a stray shorter lap, e.g. a press, is not the setting)."""
+    for value in lengths:
+        if sum(1 for v in lengths if value <= v <= value * (1 + 2 * AUTO_LAP_BELOW)) >= max(2, len(lengths) / 5):
+            return value
+    return None
+
+
+def _usual_setting(metres: float | None) -> float | None:
+    """The usual auto-lap distance a lap of ``metres`` has (from 0.5 % below to 1.5 % above), if any."""
+    return next((setting for setting in AUTO_LAP_SETTINGS_M
+                 if setting * (1 - AUTO_LAP_SETTING_BELOW) <= (metres or 0.0) <= setting * (1 + AUTO_LAP_SETTING_ABOVE)), None)
 
 
 def align_spans(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
@@ -977,12 +1097,14 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
     original = _spans(intervals, profile)
     layout = lap_layout(original, planned, profile)
     auto_laps = layout is not None
+    evidence = auto_lap_evidence(original, layout)
+    open_plan = any(step.get("lap_press") for step in planned)
     if auto_laps:  # only device auto-laps are merged; lap presses that follow the plan never are
-        spans, groups = _coarsen(original, coarsen_limit(len(planned)))
+        spans, groups = _coarsen(original, coarsen_limit(len(planned)), [not e for e in evidence] if open_plan else None)
     else:
         spans, groups = original, [[s.index] for s in original]
-    rules = _match_rules(planned, spans, auto_laps)
-    auto_end = [_is_auto_lap(original[group[-1]], layout) for group in groups] if auto_laps else None
+    typical = [min(evidence[index] for index in group) for group in groups]
+    rules = _match_rules(planned, spans, auto_laps, typical)
     n, m = len(planned), len(spans)
     inf = float("inf")
     part_costs: dict[tuple[int, int], float] = {}
@@ -1015,13 +1137,16 @@ def align_spans(  # pylint: disable=too-many-locals,too-many-branches,too-many-s
                 best, move = score[i - 1][j] + GAP_COST, ("up", 0)
             if j > 0:
                 if i in (0, n):
-                    extra = EDGE_EXTRA_COST + EDGE_COST_PER_HOUR * (spans[j - 1].active or spans[j - 1].elapsed) / 3600
+                    # with lap-press steps riding before/after the plan costs its fixed part once per block (a long
+                    # ride home in many auto-laps is no reason to move an open step onto it)
+                    fixed = EDGE_EXTRA_COST if not open_plan or (i == 0 and j == 1) or (i == n and j == m) else 0.0
+                    extra = fixed + EDGE_COST_PER_HOUR * (spans[j - 1].active or spans[j - 1].elapsed) / 3600
                 else:
                     extra = GAP_COST
                 if score[i][j - 1] + extra < best:
                     best, move = score[i][j - 1] + extra, ("left", 0)
             if i > 0:
-                for k, match in _match_options(planned[i - 1], spans, j, profile, part_cost, rules[i - 1], auto_end):
+                for k, match in _match_options(planned[i - 1], spans, j, profile, part_cost, rules[i - 1], typical):
                     if score[i - 1][j - k] == inf:
                         continue
                     cost = score[i - 1][j - k] + match
@@ -1428,13 +1553,21 @@ def _estimate_text(secs: float | None, metres: float | None) -> str:
     return hms(secs) if secs else "none"
 
 
+LAP_PRESS_ENDINGS = {"lap": "by lap", "end of recording": "with the recording", "auto-lap": "at a full device auto-lap"}
+
+
 def lap_press_text(info: dict[str, Any]) -> str:
-    """'ended by lap after 16:01 (planning estimate 17:00)' for a row's ``lap_press`` entry."""
+    """'ended by lap after 16:01 (planning estimate 17:00)' for a row's ``lap_press`` entry (elapsed time;
+    with a recording pause also the moving time)."""
     actual = hms(info.get("elapsed_s"))
+    moving = info.get("moving_time_s")
+    if moving is not None and info.get("elapsed_s") is not None and info["elapsed_s"] - moving >= 1:
+        actual += f" elapsed, {hms(moving)} moving"
     if info.get("actual_m") is not None and info.get("estimate_m"):
         actual += f", {_distance_text(info['actual_m'])}"
-    ended = "with the recording" if info.get("ended_by") == "end of recording" else "by lap"
-    return f"ended {ended} after {actual} (planning estimate {_estimate_text(info.get('estimate_s'), info.get('estimate_m'))})"
+    ended = LAP_PRESS_ENDINGS.get(str(info.get("ended_by")), "by lap")
+    note = "no shorter lap closed by a press; " if info.get("ended_by") == "auto-lap" else ""
+    return f"ended {ended} after {actual} ({note}planning estimate {_estimate_text(info.get('estimate_s'), info.get('estimate_m'))})"
 
 
 def _step_deviations(  # pylint: disable=too-many-locals
@@ -1819,8 +1952,8 @@ def _step_row(  # pylint: disable=too-many-arguments,too-many-locals
     if seg.get("unverifiable_start") or seg.get("unverifiable_end"):
         row["boundary_unverifiable"] = [side for side, key in (("start", "unverifiable_start"), ("end", "unverifiable_end")) if seg.get(key)]
     if step.get("lap_press"):
-        row["lap_press"] = _lap_press_info(step, metrics["duration_s"], span_active, profile.distance(start, end),
-                                           "end of recording" if is_last and end >= profile.n else "lap")
+        ended_by = "end of recording" if is_last and end >= profile.n else "auto-lap" if seg.get("closing_auto") else "lap"
+        row["lap_press"] = _lap_press_info(step, metrics["duration_s"], span_active, profile.distance(start, end), ended_by)
     elif step.get("duration"):
         row["duration_diff_s"] = round(span_active - step["duration"], 1)
     elif step.get("distance"):
@@ -1975,6 +2108,8 @@ def _summary(  # pylint: disable=too-many-arguments,too-many-positional-argument
         "planned_total_estimated": any(not s.get("duration") and s.get("est_duration") for s in planned),
         "lap_press_steps": sum(1 for s in planned if s.get("lap_press")),
         "lap_press_estimate_s": sum(s.get("duration") or s.get("est_duration") or 0 for s in planned if s.get("lap_press")) or None,
+        "lap_press_estimate_m": sum(s.get("distance") or 0 for s in planned
+                                    if s.get("lap_press") and not s.get("duration") and not s.get("est_duration")) or None,
         "planned_distance_without_duration_m": sum(s.get("distance") or 0 for s in planned if not s.get("duration") and not s.get("est_duration")) or None,
         "actual_total_s": sum(_num(i.get("elapsed_time")) or 0 for i in intervals) or None,
         "plan_start_s": start,
@@ -2086,6 +2221,7 @@ def _analyze_plan(  # pylint: disable=too-many-locals,too-many-statements,too-ma
     alignment = align_spans(planned, intervals, profile)
     layout = lap_layout(spans, planned, profile)
     segments, boundary_stats = _step_segments(planned, alignment, spans, profile, layout)
+    evidence = auto_lap_evidence(spans, layout)
     boundary_stats["coarsened"] = layout is not None and len(spans) > coarsen_limit(len(planned))
     matched = [(p, idx) for p, idx in alignment if p is not None and idx]
     first_matched = matched[0][1][0] if matched else None
@@ -2118,6 +2254,8 @@ def _analyze_plan(  # pylint: disable=too-many-locals,too-many-statements,too-ma
         is_last = bool(indices) and indices[-1] == last_matched
         if anchor is None and seg is not None:
             anchor = profile.at(seg["start"]) - step["planned_start"]
+        if seg is not None and step.get("lap_press") and seg.get("indices"):
+            seg["closing_auto"] = evidence[seg["indices"][-1]] == 2  # no shorter lap closed by a press
         row = _step_row(step, [spans[i] for i in (seg["indices"] if seg else indices)], profile, tol, seg=seg,
                         is_last=is_last, anchor=anchor, ftp=ftp, hidden=hidden)
         if seg is not None and seg.get("carved"):
@@ -2260,8 +2398,8 @@ def _actual_text(row: dict[str, Any], metrics: dict[str, Any]) -> str:
     if overrun:
         total = (metrics.get("moving_time_s") or 0) + (overrun.get("moving_time_s") or 0)
         actual = f"-> {row['label']} ({type_text}) first {hms(metrics.get('moving_time_s'))} of {hms(total)} from {hms(row.get('start_time'))}"
-    elif row.get("lap_press"):  # open length: no "vs plan"
-        actual = f"-> {row['label']} ({type_text}) from {hms(row.get('start_time'))}, {lap_press_text(row['lap_press'])}{paused}"
+    elif row.get("lap_press"):  # open length: no "vs plan" (the text names a moving time itself)
+        actual = f"-> {row['label']} ({type_text}) from {hms(row.get('start_time'))}, {lap_press_text(row['lap_press'])}"
     else:
         actual = f"-> {row['label']} ({type_text}) {hms(metrics.get('duration_s'))} from {hms(row.get('start_time'))}{paused}"
         if row.get("duration_diff_s") is not None:
@@ -2347,8 +2485,10 @@ def _planned_total_text(summary: dict[str, Any]) -> str:
     if summary.get("lap_press_steps"):
         count = summary["lap_press_steps"]
         steps = f"{count} lap-press step{'s' if count > 1 else ''}"
-        estimate = summary.get("lap_press_estimate_s")
-        estimates.append(f"incl. {hms(estimate)} planning estimate of {steps}" if estimate else f"{steps} of open length")
+        parts = [hms(summary["lap_press_estimate_s"])] if summary.get("lap_press_estimate_s") else []
+        if summary.get("lap_press_estimate_m"):
+            parts.append(_distance_text(summary["lap_press_estimate_m"]))
+        estimates.append(f"incl. {' + '.join(parts)} planning estimate of {steps}" if parts else f"{steps} without an estimate")
     return total + (f" ({'; '.join(estimates)})" if estimates else "")
 
 

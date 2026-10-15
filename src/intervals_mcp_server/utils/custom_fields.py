@@ -113,12 +113,12 @@ def _decimals(value: float) -> int:
 def float_text(value: float, digits: int | None = None) -> str:
     """A float rounded to *digits* decimals (default: SIGNIFICANT_DIGITS significant digits), trailing
     zeros dropped ('91', '1.29', '0.003791'); never scientific notation. A non-zero value that would
-    round to 0 at *digits* keeps one significant digit ('0.002'): a stored non-zero is never shown as 0."""
+    round to 0 keeps one significant digit ('0.002', '0.0000001'): a stored non-zero is never shown as 0."""
     if not math.isfinite(value):
         return str(value)
     places = _decimals(value) if digits is None else max(0, digits)
-    if digits is not None and value and round(value, places) == 0:
-        places = min(MAX_DECIMALS, max(places, -math.floor(math.log10(abs(value)))))
+    if value and round(value, places) == 0:
+        places = max(places, -math.floor(math.log10(abs(value))))
     text = f"{value:.{places}f}"
     if "." in text:
         text = text.rstrip("0").rstrip(".")
