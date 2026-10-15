@@ -72,7 +72,8 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
   press is usually shorter. Without a detected auto-lap layout, a lap of a usual auto-lap distance
   also counts (200 m to 20 km, or 0.1 to 10 miles, up to 1.5 % over), when two laps have it. A single
   such lap, or inside the plan any one lap, can be the step's first lap when it brings the length
-  nearer to the estimate (a double press, devices whose auto-laps do not restart at a press).
+  nearer to the estimate (e.g. a double press). Devices whose auto-laps keep fixed distance markers
+  instead of restarting at a press are not handled well: see the known limitations below.
   - **Never across a press**: the step never reaches across another lap: a press, a step lap, the
     lap that starts the workout. Riding before the workout start and after the last press is
     reported as riding before the plan or additional training after it. With lap-press steps the
@@ -95,7 +96,11 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
     longer or shorter lap-press step never shifts the timed steps after it.
   - **Plan total**: marked "≈" with the planning estimates it includes (JSON `lap_press_steps`,
     `lap_press_estimate_s`, `lap_press_estimate_m`).
-  - **Known limitations**:
+  - **Known limitations** (lap boundaries are inferred from lap lengths; Intervals.icu does not
+    expose the lap trigger):
+    - Auto-laps that keep fixed distance markers instead of restarting at a press or step lap: a
+      lap-press step can be cut at a marker, and its remainder goes to the next step or shows as
+      additional training.
     - Workout not run on the device (auto-laps only, no press): the step ends at some auto-lap near
       a fitting length and the neighbouring timed steps can be off.
     - Two lap-press steps with an extra lap inside one of them (a double press, or a lap split by
@@ -103,9 +108,9 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
       lap is reported as riding before or after the plan.
     - Riding before the workout that ends exactly on an auto-lap at the first step's intensity: no
       lap marks the workout start, and the riding counts as part of the first step.
-    - With more than about 600 auto-laps, laps are merged pairwise for the matching (never across a
-      lap that may close a lap-press step), so boundaries can be off by a merged lap and a short step
-      can be missed.
+    - Very short auto-laps (about 200 m or less at riding speed, where laps overshoot their distance)
+      or more than about 600 laps (merged pairwise for the matching, never across a lap that may
+      close a lap-press step): boundaries can be off and a short step can be missed.
 - **Per step**: planned vs actual duration on moving time (recording pauses excluded; distance
   steps on distance), the target range (resolved to W, bpm or pace), the actual average, below / in
   / above target with the offset from the exact range, time within the target range (±5 %), HR at

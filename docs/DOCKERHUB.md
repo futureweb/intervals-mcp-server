@@ -20,14 +20,14 @@ of the GitHub repository.
 | `X.Y.Z` (e.g. `1.0.0`) | a final release |
 | `X.Y` | the newest final release of that minor version |
 | `latest` | the newest final release |
-| `X.Y.ZbN`, `X.Y.ZrcN` (e.g. `1.0.0b1`) | a beta or release candidate, only under its own tag |
+| `X.Y.ZbN`, `X.Y.ZrcN` (e.g. `1.0.0b2`) | a beta or release candidate, only under its own tag |
 
 ## Run (stdio, for local MCP clients)
 
-`1.0.0b1` is the current beta; from 1.0.0 on `latest` points to the newest final release.
+`1.0.0b2` is the current beta; from 1.0.0 on `latest` points to the newest final release.
 
 ```bash
-docker run --rm -i -e API_KEY=your-api-key -e ATHLETE_ID=i123456 futurewebat/futureweb-intervals-mcp:1.0.0b1
+docker run --rm -i -e API_KEY=your-api-key -e ATHLETE_ID=i123456 futurewebat/futureweb-intervals-mcp:1.0.0b2
 ```
 
 Claude Desktop (`claude_desktop_config.json`):
@@ -38,7 +38,7 @@ Claude Desktop (`claude_desktop_config.json`):
     "intervals-icu": {
       "command": "docker",
       "args": ["run", "--rm", "-i", "-e", "API_KEY", "-e", "ATHLETE_ID", "-e", "MCP_PERMISSIONS",
-               "futurewebat/futureweb-intervals-mcp:1.0.0b1"],
+               "futurewebat/futureweb-intervals-mcp:1.0.0b2"],
       "env": { "API_KEY": "your-api-key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read" }
     }
   }
