@@ -38,8 +38,9 @@ workout format: `intervals://workout-syntax`.
   or as a change.
 - Health markers (`get_recovery_snapshot`, `get_coach_context`, text and JSON `health_markers`):
   calendar entries of the categories SICK and INJURED that lie on the tool's day (the snapshot day,
-  the coach context's end date) or ended in the 14 days before it, with first and last day, name and
-  a short note from the description (both on one line, in quotes), and the wellness `injury` score
+  the coach context's end date) or ended in the 14 days before it, with first and last day and name,
+  plus a short note from the description (at most 120 characters) only while the entry covers that
+  day or ended at most 2 days before it (both on one line, in quotes), and the wellness `injury` score
   when it is 3 (Poor) or 4 (Injured), as stored with its 1-4 scale: the day's value or, when the day
   has none yet (a subjective score is often entered later), the value of the day before, labelled
   with its date. Entries are recognised by their category only, never by the title.
@@ -193,9 +194,13 @@ Short form in the server instructions; the reasons and details:
   weekday (time zone)` and label listed days with weekday and relative day. Intervals.icu stores the
   end of a multi-day calendar entry (sick, injured, holiday, plan phase) as the midnight after its
   last day (`end_date_local`, shown as stored by `get_events` and `get_event_by_id`);
+  `get_event_by_id` adds the last day of a multi-day entry (text, and `last_day` in JSON),
   `get_training_plan` (text, and `first_day`/`last_day` in JSON) and the health markers show the last
   day itself.
 - Times are local (time zone name when stored, else the UTC offset) and UTC.
+- Text outputs round stored decimals for display: known metrics to their usual precision (e.g.
+  load, CTL/ATL and decoupling 1 decimal, ratios such as VI or EF 2, speeds in m/s 3), other values
+  to 4 significant digits; a stored non-zero is never shown as 0. JSON keeps the stored values.
 - Run/walk/hike cadence in steps per minute (spm = 2 x the stored per-leg value, shown as
   stored), bike cadence in rpm; temperatures in °C.
 - "no value" = null/NaN; a 0 in a device-file field may mean the source field was absent;

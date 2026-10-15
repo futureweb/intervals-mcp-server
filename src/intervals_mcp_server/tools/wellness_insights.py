@@ -163,7 +163,7 @@ def _day_line(entry: dict[str, Any]) -> str:
         if is_missing(value) or not isinstance(value, (int, float)):
             continue
         shown = value / divisor if divisor != 1 else value
-        parts.append(f"{label} {format_value(round(shown, 2))}{(' ' + units) if units else ''}")
+        parts.append(f"{label} {format_value(float(shown), 2)}{(' ' + units) if units else ''}")
     return " | ".join(parts) if parts else "no native values"
 
 
@@ -174,8 +174,8 @@ def _fitness_line(entry: dict[str, Any]) -> str | None:
     form = (ctl - atl) if isinstance(ctl, (int, float)) and isinstance(atl, (int, float)) else None
     ramp = entry.get("rampRate")
     return (
-        f"CTL {format_value(ctl)} | ATL {format_value(atl)} | form {format_value(round(form, 1)) if form is not None else 'n/a'}"
-        f" | ramp {format_value(round(ramp, 2)) if isinstance(ramp, (int, float)) else 'n/a'}"
+        f"CTL {format_value(ctl, 1)} | ATL {format_value(atl, 1)} | form {format_value(float(form), 1) if form is not None else 'n/a'}"
+        f" | ramp {format_value(float(ramp), 2) if isinstance(ramp, (int, float)) else 'n/a'}"
     )
 
 
@@ -221,8 +221,9 @@ def _baseline_lines(entries: list[dict[str, Any]], metrics: list[str]) -> list[s
         seven = (rolling.get(7) or {}).get("latest_mean")
         small = f" [small sample, fewer than {MIN_BASELINE_VALUES} values]" if base.get("n", 0) < MIN_BASELINE_VALUES else ""
         lines.append(
-            f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven) if seven is not None else 'n/a'}"
-            f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'))}, median {format_value(base.get('median'))}, sd {format_value(base.get('stdev'))} (n {base.get('n')})"
+            f"  {metric}: latest {format_value(latest['value'])} ({latest['date']}) | 7d mean {format_value(seven, 1) if seven is not None else 'n/a'}"
+            f" | {BASELINE_DAYS}d baseline mean {format_value(base.get('mean'), 1)}, median {format_value(base.get('median'), 1)}, "
+            f"sd {format_value(base.get('stdev'), 1)} (n {base.get('n')})"
             + (f" | vs baseline {comp['diff']:+.2f} ({pct}, z {comp['z']:+.2f})" if comp.get("diff") is not None and comp.get("z") is not None else "")
             + small
         )

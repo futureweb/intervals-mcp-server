@@ -38,7 +38,7 @@ def test_update_wellness_sends_only_passed_fields(monkeypatch):
     assert result == (
         "Wellness updated:\n\n"
         "Wellness Data:\nDate: 2024-01-01\n\n"
-        "Vital Signs:\n- Weight: 70.0 kg\n- HRV: 55\n\n"
+        "Vital Signs:\n- Weight: 70 kg\n- HRV: 55\n\n"
         "Subjective Feelings:\n  Injury Level: 2 (Niggle)\n\n"
         "Comments: left knee niggle"
     )

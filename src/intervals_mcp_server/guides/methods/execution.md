@@ -63,8 +63,20 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
   ride home, extra sprints) with its own metrics, kJ share, estimated load and the extra efforts it
   contains (intervals at or above 90 % FTP, up to 5 listed), and is not counted against the plan;
   it is reported separately when it lasts at least 120 s. The remainder of an earlier step is extra time inside the plan.
-  Riding before the first step is reported the same way. Steps without a duration (distance, lap
-  button) restart the plan clock at their actual end.
+  Riding before the first step is reported the same way. Steps without a duration (distance) and
+  lap-press steps restart the plan clock at their actual end.
+- **Lap-press steps** (`until_lap_press`, "Press lap" in the workout text): the step ends when the
+  athlete presses the lap button; its duration or distance is only the planning estimate. The step
+  is open: in the alignment any length costs little (lengths nearer the estimate win ties), and
+  with device auto-laps it ends on the lap closed by the press (a partial lap), never on a full
+  auto-lap. It is never capped, split, extended by trailing laps or reported as shorter/longer than
+  planned; its end boundary is never moved. The row says "ended by lap after <actual> (planning
+  estimate <estimate>)" (JSON `lap_press`: `ended_by`, `elapsed_s`, `moving_time_s`, `estimate_s`
+  or `estimate_m`, `actual_m`); "ended with the recording" when it is the last step and the
+  activity ends there. Target adherence, time in target and the other metrics are evaluated as
+  usual. The following steps are judged from the actual lap (start shift and durations), so a
+  longer or shorter lap-press step never shifts the timed steps after it. The plan total is marked
+  "≈" with the share of planning estimates (JSON `lap_press_steps`, `lap_press_estimate_s`).
 - **Per step**: planned vs actual duration on moving time (recording pauses excluded; distance
   steps on distance), the target range (resolved to W, bpm or pace), the actual average, below / in
   / above target with the offset from the exact range, time within the target range (±5 %), HR at
@@ -105,6 +117,9 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
   at least 30 s). Each interval gets the planned step it belongs to; the Intervals.icu WORK /
   RECOVERY type is kept as stored and marked "type differs from the plan" when the planned step is
   work and the interval is not WORK, or the planned step is rest and the interval is not RECOVERY.
+- A lap-press step is open: its intervals get `lap_press`, `estimate_s` / `estimate_m` and the
+  text "until lap press, ended by lap after <actual> (planning estimate <estimate>)", never
+  `beyond_plan_s`.
 - A matched span (one or several consecutive intervals) longer than the planned duration plus the
   tolerance gets `beyond_plan_s` on each of its intervals, counted as in `analyze_workout_execution`:
   after the last matched step as additional training after the plan, earlier as extra time inside
@@ -123,5 +138,6 @@ matching is used by `get_activity_intervals(include_planned_types=true)` and
   targets in the unit of the targets (power, HR or pace; clearly different targets, e.g. an easy
   block and strides, listed separately), work steps within ±5 % and inside the exact range, the
   mean time in target, steps with clear deviations, and the additional training after the plan
-  (duration, work share, extra efforts). When the plan comparison was skipped, the finding says
-  so instead of "0/0 steps".
+  (duration, work share, extra efforts). Lap-press steps are named with their actual length and
+  planning estimate (open length, not judged). When the plan comparison was skipped, the finding
+  says so instead of "0/0 steps".

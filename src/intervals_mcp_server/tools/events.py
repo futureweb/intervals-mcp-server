@@ -30,6 +30,7 @@ from intervals_mcp_server.utils.formatting import (
     event_type_label,
     format_event_details,
     format_event_summary,
+    multi_day_last_day,
 )
 from intervals_mcp_server.utils.sports import hms
 from intervals_mcp_server.utils.types import WorkoutDoc
@@ -280,7 +281,11 @@ async def get_event_by_id(
         return f"Invalid event format for event {event_id}."
 
     if output_format.strip().lower() == "json":
-        return json.dumps(_event_json(result, include_workout_doc=True), ensure_ascii=False)
+        row = _event_json(result, include_workout_doc=True)
+        last_day = multi_day_last_day(result)
+        if last_day is not None:  # end_date_local is the midnight after the last day
+            row["last_day"] = last_day.isoformat()
+        return json.dumps(row, ensure_ascii=False)
 
     return format_event_details(result)
 

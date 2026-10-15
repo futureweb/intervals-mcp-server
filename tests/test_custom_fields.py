@@ -57,7 +57,8 @@ def test_index_custom_items_ignores_invalid_payloads():
 
 def test_is_missing_and_format_value():
     """
-    null and NaN are 'no value'; numbers keep their stored precision (6 decimals max).
+    null and NaN are 'no value'; floats are shown with 4 significant digits (whole numbers never rounded,
+    R39-14) or with the decimals of a known metric; a stored non-zero is never shown as 0.
     """
     assert is_missing(None)
     assert is_missing(float("nan"))
@@ -69,8 +70,14 @@ def test_is_missing_and_format_value():
     assert format_value("NaN") == "no value"
     assert format_value(100.0) == "100"
     assert format_value(3.5) == "3.5"
-    assert format_value(129.58348) == "129.58348"
-    assert format_value(1.3794444444444445) == "1.379444"
+    assert format_value(129.58348) == "129.6"
+    assert format_value(1.3794444444444445) == "1.379"
+    assert format_value(2.400024) == "2.4" and format_value(13.399596) == "13.4" and format_value(25.666667) == "25.67"
+    assert format_value(8150.6797) == "8151" and format_value(123456.78) == "123457" and format_value(-0.0037906417) == "-0.003791"
+    assert format_value(1.5e-05) == "0.000015" and format_value(0.0) == "0" and format_value(-0.0) == "0"
+    assert format_value(8150.6797, 1) == "8150.7" and format_value(1.2857143, 2) == "1.29" and format_value(91.02564, 1) == "91"
+    assert format_value(0.039962, 1) == "0.04" and format_value(-0.000019, 1) == "-0.00002" and format_value(1e-9, 1) == "0"
+    assert format_value(7, 2) == "7" and format_value(None, 1) == "no value"
     assert format_value(True) == "true"
     assert format_value("text") == "text"
     assert format_value([1, 2]) == "[1, 2]"
@@ -92,7 +99,7 @@ def test_format_field_value_units_label_and_zero_marker():
     Units and select labels are appended; a 0 in a field read from the device file is marked.
     """
     defs = index_custom_items(CUSTOM_ITEMS_DATA)[ACTIVITY_FIELD]
-    assert format_field_value(defs["EPOC"], 129.58348) == "129.58348 ml/kg"
+    assert format_field_value(defs["EPOC"], 129.58348) == "129.6 ml/kg"
     assert format_field_value(defs["TrainingEffectSelect"], 2.0) == "2 (Base)"
     assert format_field_value(defs["FlightTime"], float("nan")) == "no value"
     # Zeros are reported as stored; the ambiguity is flagged per field via value_status.
@@ -122,7 +129,7 @@ def test_format_custom_activity_fields_section():
     text = format_custom_activity_fields(ACTIVITY_WITH_CUSTOM_FIELDS, defs)
     assert text.startswith("Custom Activity Fields:")
     assert "- Aerobic Effect [AerobicEffect]: 3.5" in text
-    assert "- EPOC [EPOC]: 129.58348 ml/kg" in text
+    assert "- EPOC [EPOC]: 129.6 ml/kg" in text
     assert "- Training Effect [TrainingEffectSelect]: 2 (Base)" in text
     assert "- Flight Time [FlightTime]: no value" in text
     assert "- Sweat loss [Sweatloss]: 0 ml" in text

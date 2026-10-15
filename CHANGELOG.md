@@ -64,6 +64,25 @@ All notable changes to this project are documented here. The format follows
   marker; in comment lines and repeat labels they are refused.
 - The validation totals say "without duration or distance" instead of "open-ended", and the planned
   duration of workouts with distance steps is marked as covering the timed steps only.
+- Health markers (`get_recovery_snapshot`, `get_coach_context`): the note from a SICK/INJURED
+  entry's description (at most 120 characters, unchanged) is shown only while the entry covers the
+  tool's day or ended at most 2 days before it; later in the 14-day window only category, name and
+  dates are listed (JSON `note` null), so a medical note is not repeated in every output for two
+  weeks (review R39-10).
+- `get_event_by_id` names the last day of a multi-day event (Intervals.icu stores the midnight
+  after it as `end_date_local`): `End: 2024-12-28T00:00:00 (local; last day 2024-12-27 (Fri))`,
+  JSON `last_day`; single-day events are unchanged (review R39-13).
+- Text outputs round stored decimals for display (review R39-14; JSON keeps the stored values):
+  `format_value` shows floats with 4 significant digits instead of up to 6 decimals (whole numbers
+  are never rounded, e.g. `2.400024` -> `2.4`, `25.666667 h` -> `25.67 h`), and known metrics use
+  their usual precision: the activity summary (power and HR 0 decimals, intensity, decoupling,
+  load, CTL/ATL, TRIMP, L/R balance and wind shares 1, VI, Power:HR, EF and stride 2, speeds 3),
+  the interval and group blocks of `get_activity_intervals` (e.g. `Training Load: 13.399596` ->
+  `13.4`, `Elevation Gain: 2.400024 meters` -> `2.4`, torque and respiration 1, variability 3),
+  activity thresholds (eFTP, CP, W', Pmax), wellness (CTL/ATL/ramp 1, eFTP 0, weight 2), the
+  recovery snapshot (CTL/ATL 1, 7-day and baseline mean, median and SD 1), the training summary's
+  form and ramp, `get_event_by_id`'s other fields and the device values in the report findings. A
+  stored non-zero is never shown as 0 (it keeps one significant digit).
 
 ### Fixed
 - `get_activity_intervals` (standard and full) and the interval groups printed a missing value as 0
@@ -79,6 +98,19 @@ All notable changes to this project are documented here. The format follows
   dropped silently), so Intervals.icu exported it with a fixed duration instead of an OPEN step.
 - `serverInfo.version` in the MCP `initialize` answer reports this package's version instead of the
   MCP SDK version (directories that read the server directly showed `1.30.0`).
+- `analyze_workout_execution` (and the plan in `get_activity_report` and
+  `get_activity_intervals(include_planned_types=true)`) treated the planning estimate of a lap-press
+  step (`until_lap_press`) as its planned length: a warm-up ended by lap after 16:01 was "-59 s vs
+  plan", a shorter one "shorter than planned" with every following step "started earlier than the
+  plan timeline", and a longer one was capped at the estimate with the rest reported as extra time
+  (review R36-11). Lap-press steps are now open: "ended by lap after 16:01 (planning estimate
+  17:00)" (JSON `lap_press`), no length deviation, no cap or split, target adherence as before, and
+  the plan clock restarts at the actual lap so the timed steps after it are judged from there. In
+  the alignment any length costs little (ties go to the length nearer the estimate), with device
+  auto-laps the step ends on the lap closed by the press rather than a full auto-lap, its end is
+  never moved or extended by trailing laps, and its estimate no longer makes auto-laps of the same
+  length look like lap presses. The plan total is marked as including the estimate, and the report's
+  key finding names the lap-press steps.
 
 ## [1.0.0b1] - 2026-10-10
 

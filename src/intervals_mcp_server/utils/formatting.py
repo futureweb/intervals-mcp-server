@@ -12,7 +12,7 @@ from typing import Any
 
 from intervals_mcp_server.utils.types import WorkoutDoc
 
-from intervals_mcp_server.utils.dates import dated
+from intervals_mcp_server.utils.dates import dated, event_day_span
 from intervals_mcp_server.utils.custom_fields import (
     CustomFieldDefs,
     format_custom_activity_fields,
@@ -62,13 +62,14 @@ def _wind_text(value: Any) -> str:
     return f"{value:.1f} m/s ({value * 3.6:.0f} km/h)"
 
 
-def _stored(payload: dict[str, Any], *keys: str) -> str:
-    """The first stored value of *keys* as stored; 'N/A' when none has a value (never 0).
+def _stored(payload: dict[str, Any], *keys: str, digits: int | None = None) -> str:
+    """The first stored value of *keys* as stored (a float rounded to *digits* decimals, by default to
+    4 significant digits, see format_value); 'N/A' when none has a value (never 0).
 
     Every key is read (a _KeyTracker then leaves all of them out of "Other Fields").
     """
     values = [payload.get(key) for key in keys]
-    return next((format_value(value) for value in values if not is_missing(value)), "N/A")
+    return next((format_value(value, digits) for value in values if not is_missing(value)), "N/A")
 
 
 def format_activity_summary(activity: dict[str, Any]) -> str:
@@ -121,39 +122,39 @@ Sub-type: {sub_type}
 Date: {start_time}
 Tags: {tags or "None"}
 Description: {activity.get("description", "N/A")}
-Distance: {_stored(activity, "distance")} meters
+Distance: {_stored(activity, "distance", digits=1)} meters
 Duration: {_stored(activity, "duration", "elapsed_time")} seconds
 Moving Time: {_stored(activity, "moving_time")} seconds
-Elevation Gain: {_stored(activity, "elevationGain", "total_elevation_gain")} meters
-Elevation Loss: {activity.get("total_elevation_loss", "N/A")} meters
+Elevation Gain: {_stored(activity, "elevationGain", "total_elevation_gain", digits=1)} meters
+Elevation Loss: {_stored(activity, "total_elevation_loss", digits=1)} meters
 
 Power Data:
-Average Power: {activity.get("avgPower", activity.get("icu_average_watts", activity.get("average_watts", "N/A")))} watts
-Weighted Avg Power: {activity.get("icu_weighted_avg_watts", "N/A")} watts
-Training Load (Intervals.icu): {activity.get("trainingLoad", activity.get("icu_training_load", "N/A"))}
-FTP: {activity.get("icu_ftp", "N/A")} watts
-Kilojoules: {activity.get("icu_joules", "N/A")}
-Intensity: {activity.get("icu_intensity", "N/A")}
-Power:HR Ratio: {activity.get("icu_power_hr", "N/A")}
-Variability Index: {activity.get("icu_variability_index", "N/A")}
+Average Power: {_stored(activity, "avgPower", "icu_average_watts", "average_watts", digits=0)} watts
+Weighted Avg Power: {_stored(activity, "icu_weighted_avg_watts", digits=0)} watts
+Training Load (Intervals.icu): {_stored(activity, "trainingLoad", "icu_training_load", digits=1)}
+FTP: {_stored(activity, "icu_ftp", digits=0)} watts
+Kilojoules: {_stored(activity, "icu_joules", digits=0)}
+Intensity: {_stored(activity, "icu_intensity", digits=1)}
+Power:HR Ratio: {_stored(activity, "icu_power_hr", digits=2)}
+Variability Index: {_stored(activity, "icu_variability_index", digits=2)}
 
 Heart Rate Data:
-Average Heart Rate: {activity.get("avgHr", activity.get("average_heartrate", "N/A"))} bpm
-Max Heart Rate: {activity.get("max_heartrate", "N/A")} bpm
-LTHR: {activity.get("lthr", "N/A")} bpm
-Resting HR: {activity.get("icu_resting_hr", "N/A")} bpm
-Decoupling: {activity.get("decoupling", "N/A")}
+Average Heart Rate: {_stored(activity, "avgHr", "average_heartrate", digits=0)} bpm
+Max Heart Rate: {_stored(activity, "max_heartrate", digits=0)} bpm
+LTHR: {_stored(activity, "lthr", digits=0)} bpm
+Resting HR: {_stored(activity, "icu_resting_hr", digits=0)} bpm
+Decoupling: {_stored(activity, "decoupling", digits=1)}
 
 Other Metrics:
 Cadence: {cadence_text(activity.get("average_cadence"), activity.get("type"), 1)}
-Calories burned: {activity.get("calories", "N/A")} kcal
-Average Speed: {activity.get("average_speed", "N/A")} m/s
-Max Speed: {activity.get("max_speed", "N/A")} m/s
-Average Stride: {activity.get("average_stride", "N/A")}
-L/R Balance: {activity.get("avg_lr_balance", "N/A")}
-Weight: {activity.get("icu_weight", "N/A")} kg
+Calories burned: {_stored(activity, "calories", digits=0)} kcal
+Average Speed: {_stored(activity, "average_speed", digits=3)} m/s
+Max Speed: {_stored(activity, "max_speed", digits=3)} m/s
+Average Stride: {_stored(activity, "average_stride", digits=2)}
+L/R Balance: {_stored(activity, "avg_lr_balance", digits=1)}
+Weight: {_stored(activity, "icu_weight", digits=2)} kg
 RPE: {rpe}
-Session RPE: {activity.get("session_rpe", "N/A")}
+Session RPE: {_stored(activity, "session_rpe", digits=0)}
 Feel: {feel}
 
 Environment:
@@ -162,18 +163,18 @@ Average Temp: {temperature_text(activity.get("average_temp"))}
 Min Temp: {temperature_text(activity.get("min_temp"))}
 Max Temp: {temperature_text(activity.get("max_temp"))}
 Avg Wind Speed: {_wind_text(activity.get("average_wind_speed"))}
-Headwind %: {activity.get("headwind_percent", "N/A")}%
-Tailwind %: {activity.get("tailwind_percent", "N/A")}%
+Headwind %: {_stored(activity, "headwind_percent", digits=1)}%
+Tailwind %: {_stored(activity, "tailwind_percent", digits=1)}%
 
 Training Metrics (Intervals.icu; device loads such as a Garmin training load are custom fields):
-Fitness (CTL): {activity.get("icu_ctl", "N/A")}
-Fatigue (ATL): {activity.get("icu_atl", "N/A")}
-TRIMP: {activity.get("trimp", "N/A")}
-Polarization Index: {activity.get("polarization_index", "N/A")}
-Power Load (Intervals.icu): {activity.get("power_load", "N/A")}
-HR Load (Intervals.icu): {activity.get("hr_load", "N/A")}
-Pace Load (Intervals.icu): {activity.get("pace_load", "N/A")}
-Efficiency Factor: {activity.get("icu_efficiency_factor", "N/A")}
+Fitness (CTL): {_stored(activity, "icu_ctl", digits=1)}
+Fatigue (ATL): {_stored(activity, "icu_atl", digits=1)}
+TRIMP: {_stored(activity, "trimp", digits=1)}
+Polarization Index: {_stored(activity, "polarization_index", digits=2)}
+Power Load (Intervals.icu): {_stored(activity, "power_load", digits=1)}
+HR Load (Intervals.icu): {_stored(activity, "hr_load", digits=1)}
+Pace Load (Intervals.icu): {_stored(activity, "pace_load", digits=1)}
+Efficiency Factor: {_stored(activity, "icu_efficiency_factor", digits=2)}
 
 Device Info:
 Device: {activity.get("device_name", "N/A")}
@@ -225,16 +226,16 @@ def _format_thresholds(activity: dict[str, Any]) -> str:  # pylint: disable=too-
     lines: list[str] = []
     ftp = activity.get("icu_ftp")
     if ftp is not None:
-        parts = [f"FTP {ftp} W (icu_ftp, setting at the time)"]
+        parts = [f"FTP {format_value(ftp, 0)} W (icu_ftp, setting at the time)"]
         if activity.get("icu_rolling_ftp") is not None:
-            parts.append(f"eFTP {activity['icu_rolling_ftp']} W (icu_rolling_ftp, Intervals.icu estimate)")
+            parts.append(f"eFTP {format_value(activity['icu_rolling_ftp'], 0)} W (icu_rolling_ftp, Intervals.icu estimate)")
         if activity.get("icu_pm_ftp") is not None:
-            parts.append(f"power-model FTP {activity['icu_pm_ftp']} W")
+            parts.append(f"power-model FTP {format_value(activity['icu_pm_ftp'], 0)} W")
         lines.append("- Power: " + ", ".join(parts))
     if activity.get("icu_pm_cp") is not None or activity.get("icu_w_prime") is not None:
         lines.append(
-            f"- Power model: CP {activity.get('icu_pm_cp', 'n/a')} W, W' {activity.get('icu_w_prime', 'n/a')} J "
-            f"(model W' {activity.get('icu_pm_w_prime', 'n/a')} J), Pmax {activity.get('icu_pm_p_max', 'n/a')} W"
+            f"- Power model: CP {_val(activity, 'icu_pm_cp', digits=0)} W, W' {_val(activity, 'icu_w_prime', digits=0)} J "
+            f"(model W' {_val(activity, 'icu_pm_w_prime', digits=0)} J), Pmax {_val(activity, 'icu_pm_p_max', digits=0)} W"
         )
     if activity.get("lthr") is not None or activity.get("athlete_max_hr") is not None:
         lines.append(
@@ -243,10 +244,10 @@ def _format_thresholds(activity: dict[str, Any]) -> str:  # pylint: disable=too-
         )
     if activity.get("threshold_pace") is not None:
         lines.append(
-            f"- Threshold pace: {activity['threshold_pace']} m/s = {format_pace(activity['threshold_pace'])}"
+            f"- Threshold pace: {format_value(activity['threshold_pace'], 4)} m/s = {format_pace(activity['threshold_pace'])}"
         )
     if activity.get("icu_weight") is not None:
-        lines.append(f"- Weight: {activity['icu_weight']} kg")
+        lines.append(f"- Weight: {format_value(activity['icu_weight'], 2)} kg")
     zones = format_zone_table("power", activity.get("icu_power_zones"), None, ftp=ftp)
     if zones:
         lines.append("- Power zones (% FTP, upper bounds): " + zones)
@@ -369,7 +370,7 @@ def _format_training_metrics(entries: dict[str, Any]) -> list[str]:
         ("atlLoad", "ATL Load"),
     ]:
         if entries.get(k) is not None:
-            training_metrics.append(f"- {label}: {entries[k]}")
+            training_metrics.append(f"- {label}: {format_value(entries[k], 1)}")
     return training_metrics
 
 
@@ -379,7 +380,7 @@ def _format_sport_info(entries: dict[str, Any]) -> list[str]:
     if entries.get("sportInfo"):
         for sport in entries.get("sportInfo", []):
             if isinstance(sport, dict) and sport.get("eftp") is not None:
-                sport_info_list.append(f"- {sport.get('type')}: eFTP = {sport['eftp']}")
+                sport_info_list.append(f"- {sport.get('type')}: eFTP = {format_value(sport['eftp'], 0)}")
     return sport_info_list
 
 
@@ -410,7 +411,7 @@ def _format_vital_signs(entries: dict[str, Any]) -> list[str]:
                     f"- Blood Pressure: {entries['systolic']}/{entries['diastolic']} mmHg"
                 )
             elif k not in ("systolic", "diastolic"):
-                vital_signs.append(f"- {label}: {value}{(' ' + unit) if unit else ''}")
+                vital_signs.append(f"- {label}: {format_value(value, 2 if k == 'weight' else None)}{(' ' + unit) if unit else ''}")
     return vital_signs
 
 
@@ -421,7 +422,7 @@ def _format_sleep_recovery(entries: dict[str, Any]) -> list[str]:
     if entries.get("sleepSecs") is not None:
         sleep_hours = f"{entries['sleepSecs'] / 3600:.2f}"
     elif entries.get("sleepHours") is not None:
-        sleep_hours = f"{entries['sleepHours']}"
+        sleep_hours = format_value(entries["sleepHours"], 2)
     if sleep_hours is not None:
         sleep_lines.append(f"  Sleep: {sleep_hours} hours")
 
@@ -436,7 +437,7 @@ def _format_sleep_recovery(entries: dict[str, Any]) -> list[str]:
 
     if entries.get("readiness") is not None:
         # Device readiness scores (e.g. Garmin Training Readiness) are 0-100; report as stored.
-        sleep_lines.append(f"  Readiness: {entries['readiness']}")
+        sleep_lines.append(f"  Readiness: {format_value(entries['readiness'])}")
 
     return sleep_lines
 
@@ -504,7 +505,7 @@ def _format_nutrition_hydration(entries: dict[str, Any]) -> list[str]:
     ]:
         if entries.get(k) is not None:
             suffix = f" {unit}" if unit else ""
-            nutrition_lines.append(f"- {label}: {entries[k]}{suffix}")
+            nutrition_lines.append(f"- {label}: {format_value(entries[k])}{suffix}")
 
     if entries.get("hydration") is not None:
         nutrition_lines.append(f"  Hydration Score: {entries['hydration']}")
@@ -526,7 +527,7 @@ def _format_other_fields(
     for key, value in entries.items():
         if key in known_keys or value is None:
             continue
-        text = json.dumps(value) if isinstance(value, (dict, list)) else str(value)
+        text = json.dumps(value) if isinstance(value, (dict, list)) else format_value(value)
         definition = (field_definitions or {}).get(key)
         if definition:
             meta = [
@@ -744,7 +745,7 @@ def _event_other_scalar_fields(event: dict[str, Any]) -> list[str]:
             continue
         if value is False:
             continue
-        parts.append(f"{key}={value}")
+        parts.append(f"{key}={format_value(value) if isinstance(value, float) else value}")
     return parts
 
 
@@ -777,6 +778,22 @@ def _format_workout_doc(doc: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def multi_day_last_day(event: dict[str, Any]) -> date | None:
+    """The last day of an event spanning several days (None for a single-day event).
+
+    Intervals.icu stores the end of a multi-day entry (sick, holiday, plan phase) as the midnight
+    after its last day (see utils.dates.event_day_span).
+    """
+    span = event_day_span(event)
+    return span[1] if span and span[1] > span[0] else None
+
+
+def _last_day_note(event: dict[str, Any]) -> str:
+    """'; last day 2026-11-08 (Sun)' for a multi-day event, '' otherwise."""
+    last = multi_day_last_day(event)
+    return f"; last day {last.isoformat()} ({last.strftime('%a')})" if last else ""
+
+
 def format_event_details(event: dict[str, Any]) -> str:
     """Format detailed event information into a readable string."""
 
@@ -791,7 +808,7 @@ Description: {event.get("description", "No description")}"""
     if extra:
         event_details += "\n" + "\n".join(extra)
     if event.get("end_date_local"):
-        event_details += f"\nEnd: {event['end_date_local']} (local)"
+        event_details += f"\nEnd: {event['end_date_local']} (local{_last_day_note(event)})"
     if event.get("tags"):
         event_details += f"\nTags: {', '.join(str(t) for t in event['tags'])}"
     if event.get("updated"):
@@ -887,7 +904,7 @@ def _cadence_range(payload: dict[str, Any], keys: tuple[str, ...], activity_type
     values = [payload.get(key) for key in keys]
 
     def text(value: Any) -> str:
-        return "n/a" if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value) else format_value(round(float(value), 1))
+        return "n/a" if isinstance(value, bool) or not isinstance(value, (int, float)) or is_missing(value) else format_value(float(value), 1)
 
     if is_foot_sport(activity_type):
         steps = [cadence_spm(value, activity_type) for value in values]
@@ -918,17 +935,19 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and not is_missing(value)
 
 
-def _val(payload: dict[str, Any], key: str, unit: str = "") -> str:
+def _val(payload: dict[str, Any], key: str, unit: str = "", digits: int | None = None) -> str:
     """A stored value as stored, with its unit; 'n/a' when missing (absent, null or NaN), never 0.
 
-    A stored 0 of a ``ZERO_IS_NO_VALUE`` metric is 'n/a (0 stored)'; other zeros are real values.
+    A float is rounded for display to *digits* decimals (by default 4 significant digits, see
+    format_value). A stored 0 of a ``ZERO_IS_NO_VALUE`` metric is 'n/a (0 stored)'; other zeros are
+    real values.
     """
     value = payload.get(key)
     if is_missing(value):
         return "n/a"
     if key in ZERO_IS_NO_VALUE and _number(value) and value == 0:
         return "n/a (0 stored)"
-    text = format_value(value)
+    text = format_value(value, digits)
     if not unit:
         return text
     return f"{text}{unit}" if unit in ("%", "°") else f"{text} {unit}"
@@ -938,7 +957,7 @@ def _range(payload: dict[str, Any], low: str, high: str, unit: str) -> str:
     """'129-175 watts', or 'n/a' when both ends are missing."""
     if is_missing(payload.get(low)) and is_missing(payload.get(high)):
         return "n/a"
-    return f"{_val(payload, low)}-{_val(payload, high)} {unit}"
+    return f"{_val(payload, low, digits=0)}-{_val(payload, high, digits=0)} {unit}"
 
 
 def is_short_segment(interval: dict[str, Any]) -> bool:
@@ -947,9 +966,9 @@ def is_short_segment(interval: dict[str, Any]) -> bool:
     return isinstance(secs, (int, float)) and _number(secs) and secs < SHORT_SEGMENT_SECS
 
 
-def _segment_metric(interval: dict[str, Any], key: str) -> str:
+def _segment_metric(interval: dict[str, Any], key: str, digits: int | None = None) -> str:
     """Per-interval decoupling or DFA α1, marked on short segments (see SHORT_SEGMENT_NOTE)."""
-    text = _val(interval, key)
+    text = _val(interval, key, digits=digits)
     if text.startswith("n/a") or not is_short_segment(interval):
         return text
     return f"{text} (short segment, under 10 min)"
@@ -977,46 +996,46 @@ def _format_interval_block(index: int, interval: dict[str, Any], activity_type: 
     """
     v = interval
     return f"""[{index}] {v.get("label") or f"Interval {index}"} ({v.get("type") or "Unknown"})
-Duration: {_val(v, "elapsed_time", "seconds")} (moving: {_val(v, "moving_time", "seconds")})
-Distance: {_val(v, "distance", "meters")}
+Duration: {_val(v, "elapsed_time", "seconds", digits=0)} (moving: {_val(v, "moving_time", "seconds", digits=0)})
+Distance: {_val(v, "distance", "meters", digits=1)}
 Start-End Indices: {_val(v, "start_index")}-{_val(v, "end_index")}
 
 Power Metrics:
-  Average Power: {_val(v, "average_watts", "watts")} ({_val(v, "average_watts_kg", "W/kg")})
-  Max Power: {_val(v, "max_watts", "watts")} ({_val(v, "max_watts_kg", "W/kg")})
-  Weighted Avg Power: {_val(v, "weighted_average_watts", "watts")}
-  Intensity: {_val(v, "intensity")}
-  Training Load: {_val(v, "training_load")}
-  Joules: {_val(v, "joules")}
-  Joules > FTP: {_val(v, "joules_above_ftp")}
+  Average Power: {_val(v, "average_watts", "watts", digits=0)} ({_val(v, "average_watts_kg", "W/kg", digits=2)})
+  Max Power: {_val(v, "max_watts", "watts", digits=0)} ({_val(v, "max_watts_kg", "W/kg", digits=2)})
+  Weighted Avg Power: {_val(v, "weighted_average_watts", "watts", digits=0)}
+  Intensity: {_val(v, "intensity", digits=1)}
+  Training Load: {_val(v, "training_load", digits=1)}
+  Joules: {_val(v, "joules", digits=0)}
+  Joules > FTP: {_val(v, "joules_above_ftp", digits=0)}
   Power Zone: {_val(v, "zone")} ({_range(v, "zone_min_watts", "zone_max_watts", "watts")})
-  W' Balance: Start {_val(v, "wbal_start")}, End {_val(v, "wbal_end")}
-  L/R Balance: {_val(v, "avg_lr_balance")}
-  Variability: {_val(v, "w5s_variability")}
-  Torque: Avg {_val(v, "average_torque")}, Min {_val(v, "min_torque")}, Max {_val(v, "max_torque")}
+  W' Balance: Start {_val(v, "wbal_start", digits=0)}, End {_val(v, "wbal_end", digits=0)}
+  L/R Balance: {_val(v, "avg_lr_balance", digits=1)}
+  Variability: {_val(v, "w5s_variability", digits=3)}
+  Torque: Avg {_val(v, "average_torque", digits=1)}, Min {_val(v, "min_torque", digits=1)}, Max {_val(v, "max_torque", digits=1)}
 
 Heart Rate & Metabolic:
-  Heart Rate: Avg {_val(v, "average_heartrate")}, Min {_val(v, "min_heartrate")}, Max {_val(v, "max_heartrate")} bpm
-  Decoupling: {_segment_metric(v, "decoupling")}
-  DFA α1: {_segment_metric(v, "average_dfa_a1")}
-  Respiration: {_val(v, "average_respiration", "breaths/min")}
-  EPOC: {_val(v, "average_epoc")}
-  SmO2: {_val(v, "average_smo2", "%")} / {_val(v, "average_smo2_2", "%")}
-  THb: {_val(v, "average_thb")} / {_val(v, "average_thb_2")}
+  Heart Rate: Avg {_val(v, "average_heartrate", digits=0)}, Min {_val(v, "min_heartrate", digits=0)}, Max {_val(v, "max_heartrate", digits=0)} bpm
+  Decoupling: {_segment_metric(v, "decoupling", 1)}
+  DFA α1: {_segment_metric(v, "average_dfa_a1", 2)}
+  Respiration: {_val(v, "average_respiration", "breaths/min", digits=1)}
+  EPOC: {_val(v, "average_epoc", digits=1)}
+  SmO2: {_val(v, "average_smo2", "%", digits=1)} / {_val(v, "average_smo2_2", "%", digits=1)}
+  THb: {_val(v, "average_thb", digits=2)} / {_val(v, "average_thb_2", digits=2)}
 
 Speed & Cadence:
-  Speed: Avg {_val(v, "average_speed")}, Min {_val(v, "min_speed")}, Max {_val(v, "max_speed")} m/s
-  GAP: {_val(v, "gap", "m/s")}
+  Speed: Avg {_val(v, "average_speed", digits=3)}, Min {_val(v, "min_speed", digits=3)}, Max {_val(v, "max_speed", digits=3)} m/s
+  GAP: {_val(v, "gap", "m/s", digits=3)}
   Cadence: {_cadence_range(v, ("average_cadence", "min_cadence", "max_cadence"), activity_type)}
-  Stride: {_val(v, "average_stride")}
+  Stride: {_val(v, "average_stride", digits=2)}
 
 Elevation & Environment:
-  Elevation Gain: {_val(v, "total_elevation_gain", "meters")}
-  Altitude: Min {_val(v, "min_altitude")}, Max {_val(v, "max_altitude")} meters
-  Gradient: {_val(v, "average_gradient", "%")}
+  Elevation Gain: {_val(v, "total_elevation_gain", "meters", digits=1)}
+  Altitude: Min {_val(v, "min_altitude", digits=1)}, Max {_val(v, "max_altitude", digits=1)} meters
+  Gradient: {_val(v, "average_gradient", "%", digits=1)}
   Temperature: {temperature_text(v.get("average_temp"))} (Weather: {temperature_text(v.get("average_weather_temp"))}, Feels like: {temperature_text(v.get("average_feels_like"))})
-  Wind: Speed {_interval_wind(v.get("average_wind_speed"))}, Gust {_interval_wind(v.get("average_wind_gust"))}, Direction {_val(v, "prevailing_wind_deg", "°")}
-  Headwind: {_val(v, "headwind_percent", "%")}, Tailwind: {_val(v, "tailwind_percent", "%")}
+  Wind: Speed {_interval_wind(v.get("average_wind_speed"))}, Gust {_interval_wind(v.get("average_wind_gust"))}, Direction {_val(v, "prevailing_wind_deg", "°", digits=0)}
+  Headwind: {_val(v, "headwind_percent", "%", digits=1)}, Tailwind: {_val(v, "tailwind_percent", "%", digits=1)}
 
 """
 
@@ -1025,14 +1044,14 @@ def _format_group_block(index: int, group: dict[str, Any], activity_type: Any = 
     """Render the standard metrics of one interval group (missing values 'n/a', never 0)."""
     g = group
     return f"""Group: {g.get("id") or f"Group {index}"} (Contains {_val(g, "count")} intervals)
-Duration: {_val(g, "elapsed_time", "seconds")} (moving: {_val(g, "moving_time", "seconds")})
-Distance: {_val(g, "distance", "meters")}
+Duration: {_val(g, "elapsed_time", "seconds", digits=0)} (moving: {_val(g, "moving_time", "seconds", digits=0)})
+Distance: {_val(g, "distance", "meters", digits=1)}
 Start-End Indices: {_val(g, "start_index")}-n/a
 
-Power: Avg {_val(g, "average_watts", "watts")} ({_val(g, "average_watts_kg", "W/kg")}), Max {_val(g, "max_watts", "watts")}
-W. Avg Power: {_val(g, "weighted_average_watts", "watts")}, Intensity: {_val(g, "intensity")}
-Heart Rate: Avg {_val(g, "average_heartrate")}, Max {_val(g, "max_heartrate")} bpm
-Speed: Avg {_val(g, "average_speed")}, Max {_val(g, "max_speed")} m/s
+Power: Avg {_val(g, "average_watts", "watts", digits=0)} ({_val(g, "average_watts_kg", "W/kg", digits=2)}), Max {_val(g, "max_watts", "watts", digits=0)}
+W. Avg Power: {_val(g, "weighted_average_watts", "watts", digits=0)}, Intensity: {_val(g, "intensity", digits=1)}
+Heart Rate: Avg {_val(g, "average_heartrate", digits=0)}, Max {_val(g, "max_heartrate", digits=0)} bpm
+Speed: Avg {_val(g, "average_speed", digits=3)}, Max {_val(g, "max_speed", digits=3)} m/s
 Cadence: {_cadence_range(g, ("average_cadence", "max_cadence"), activity_type)}
 
 """

@@ -239,7 +239,7 @@ def _format_group(  # pylint: disable=too-many-locals,too-many-branches
     if fitness:
         lines.append(
             f"  End of period ({fitness['date']}): CTL {_one(fitness['ctl'])}, ATL {_one(fitness['atl'])}, "
-            f"form {fitness['form'] if fitness['form'] is not None else 'n/a'}, ramp {fitness['ramp_rate'] if fitness['ramp_rate'] is not None else 'n/a'}"
+            f"form {_one(fitness['form'])}, ramp {_one(fitness['ramp_rate'])}"
         )
     if detail_level == "compact":
         lines.append("  " + ", ".join(f"{sport} {int(v['sessions'])}x {hms(v['moving_time'])}" for sport, v in s["by_sport"].items()))

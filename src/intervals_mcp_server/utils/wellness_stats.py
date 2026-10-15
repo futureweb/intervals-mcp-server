@@ -599,7 +599,7 @@ def _fmt(value: Any, digits: int = 2, signed: bool = False) -> str:
         return "n/a"
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return str(value)
-    text = format_value(round(float(value), digits))
+    text = format_value(float(value), digits)
     return f"+{text}" if signed and value > 0 else text
 
 
