@@ -3,7 +3,7 @@
   "name": "io.github.futureweb/intervals-mcp-server",
   "title": "Futureweb Intervals MCP",
   "description": "Self-hosted Intervals.icu MCP server: training analytics, Garmin data, wellness, workout planning",
-  "version": "1.0.0b1",
+  "version": "1.0.0b2",
   "websiteUrl": "https://github.com/futureweb/intervals-mcp-server",
   "repository": {
     "url": "https://github.com/futureweb/intervals-mcp-server",
@@ -14,12 +14,16 @@
     {
       "src": "https://raw.githubusercontent.com/futureweb/intervals-mcp-server/main/docs/assets/icon-futureweb-256.png",
       "mimeType": "image/png",
-      "sizes": ["256x256"]
+      "sizes": [
+        "256x256"
+      ]
     },
     {
       "src": "https://raw.githubusercontent.com/futureweb/intervals-mcp-server/main/docs/assets/icon-futureweb.svg",
       "mimeType": "image/svg+xml",
-      "sizes": ["any"]
+      "sizes": [
+        "any"
+      ]
     }
   ],
   "packages": [
@@ -27,7 +31,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "futureweb-intervals-mcp",
-      "version": "1.0.0b1",
+      "version": "1.0.0b2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -54,7 +58,10 @@
           "name": "MCP_TOOLSET",
           "description": "full (every tool of the enabled classes) or core (curated coaching set)",
           "default": "full",
-          "choices": ["full", "core"]
+          "choices": [
+            "full",
+            "core"
+          ]
         },
         {
           "name": "ATHLETE_TIMEZONE",
@@ -65,7 +72,7 @@
     },
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/futureweb/intervals-mcp-server:1.0.0b1",
+      "identifier": "ghcr.io/futureweb/intervals-mcp-server:1.0.0b2",
       "runtimeHint": "docker",
       "transport": {
         "type": "stdio"
@@ -92,7 +99,10 @@
           "name": "MCP_TOOLSET",
           "description": "full (every tool of the enabled classes) or core (curated coaching set)",
           "default": "full",
-          "choices": ["full", "core"]
+          "choices": [
+            "full",
+            "core"
+          ]
         },
         {
           "name": "ATHLETE_TIMEZONE",

@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "futureweb-intervals-mcp",
   "display_name": "Futureweb Intervals MCP",
-  "version": "1.0.0b1",
+  "version": "1.0.0b2",
   "description": "Intervals.icu training analysis for Claude: activities, Garmin-enriched metrics, wellness, load and workout planning.",
   "long_description": "Reads and analyses your Intervals.icu training data the way a coach would: activities with every custom field and stream, intervals, wellness against personal baselines, thresholds and zones, planned-versus-executed workouts, training load and the calendar. Works with the Garmin Intervals Bridge, but does not need it.\n\nThe server runs on your computer and talks only to the Intervals.icu API with your own API key. It is read-only unless you enable writing (Permissions: `read,write`).\n\nDocumentation: https://github.com/futureweb/intervals-mcp-server#readme",
   "author": {
@@ -22,7 +22,14 @@
     "entry_point": "src/intervals_mcp_server/server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "${__dirname}", "--frozen", "--no-dev", "futureweb-intervals-mcp"],
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "--frozen",
+        "--no-dev",
+        "futureweb-intervals-mcp"
+      ],
       "env": {
         "API_KEY": "${user_config.api_key}",
         "ATHLETE_ID": "${user_config.athlete_id}",
@@ -34,11 +41,26 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "keywords": ["intervals.icu", "cycling", "running", "triathlon", "training", "coaching", "garmin", "endurance"],
+  "keywords": [
+    "intervals.icu",
+    "cycling",
+    "running",
+    "triathlon",
+    "training",
+    "coaching",
+    "garmin",
+    "endurance"
+  ],
   "license": "GPL-3.0-only",
-  "privacy_policies": ["https://intervals.icu/privacy-policy/"],
+  "privacy_policies": [
+    "https://intervals.icu/privacy-policy/"
+  ],
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "python": ">=3.12"
     }

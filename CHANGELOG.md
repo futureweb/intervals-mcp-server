@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0b2] - 2026-10-15
+
+Second public beta: lap-press steps for route-aware outdoor workouts (confirmed on a Garmin Edge
+1040), coaching answer rules and health markers, date anchors, n/a instead of 0 for missing values,
+shorter display numbers, and the review follow-ups.
+
+### Known limitations
+- Lap-press steps in the execution analysis: lap boundaries are inferred from lap lengths (Intervals.icu
+  does not expose the lap trigger). Auto-laps with fixed distance markers, workouts not run on the
+  device, double presses, riding before the start that ends exactly on a full auto-lap at warm-up
+  intensity and very short or very many laps can misplace boundaries (details in
+  `get_guide("methods/execution")`). Plans without lap-press steps are analysed exactly as before.
+
 ### Added
 - Coaching protocol rules (P1 of the Section 11 analysis) in the server instructions and the usage
   guide (new section 7 "Answering rules"): read fresh (numbers only from this answer's tool results

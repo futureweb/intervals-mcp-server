@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "futureweb-intervals-mcp"
-version = "1.0.0b1"
+version = "1.0.0b2"
 description = "Advanced Intervals.icu MCP server with Garmin-enriched metrics, full custom streams, recovery insights and endurance performance analysis"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.12"

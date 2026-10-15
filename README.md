@@ -8,7 +8,7 @@ metrics, every custom field and stream, recovery insights and endurance performa
 [![CI](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/futureweb/intervals-mcp-server/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](https://github.com/futureweb/intervals-mcp-server/blob/main/LICENSE)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
-![Status: public beta](https://img.shields.io/badge/status-1.0.0b1%20public%20beta-orange)
+![Status: public beta](https://img.shields.io/badge/status-1.0.0b2%20public%20beta-orange)
 [![Garmin Intervals Bridge](https://img.shields.io/badge/companion-Garmin%20Intervals%20Bridge-6f42c1)](https://github.com/futureweb/garmin-intervals-bridge)
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/futureweb/intervals-mcp-server)
 
@@ -267,8 +267,8 @@ images `ghcr.io/futureweb/intervals-mcp-server` and
 [GitHub release](https://github.com/futureweb/intervals-mcp-server/releases) and an entry in the
 official MCP Registry.
 
-> **Beta:** `1.0.0b1` is a pre-release. Name the version (`uvx futureweb-intervals-mcp@1.0.0b1`,
-> `pip install futureweb-intervals-mcp==1.0.0b1`) or allow pre-releases
+> **Beta:** `1.0.0b2` is a pre-release. Name the version (`uvx futureweb-intervals-mcp@1.0.0b2`,
+> `pip install futureweb-intervals-mcp==1.0.0b2`) or allow pre-releases
 > (`uvx --prerelease allow futureweb-intervals-mcp`, `pip install --pre futureweb-intervals-mcp`).
 > uv and pip choose a pre-release on their own only while no final version exists; from 1.0.0 on
 > plain `uvx futureweb-intervals-mcp` gets the latest final release.
@@ -277,14 +277,14 @@ official MCP Registry.
 
 ```bash
 export API_KEY=your-api-key ATHLETE_ID=i123456        # or put both into a .env file
-uvx futureweb-intervals-mcp@1.0.0b1 --doctor          # checks configuration and API access
-uvx futureweb-intervals-mcp@1.0.0b1                   # starts the server on stdio
+uvx futureweb-intervals-mcp@1.0.0b2 --doctor          # checks configuration and API access
+uvx futureweb-intervals-mcp@1.0.0b2                   # starts the server on stdio
 ```
 
 With pip, in a virtual environment:
 
 ```bash
-pip install futureweb-intervals-mcp==1.0.0b1
+pip install futureweb-intervals-mcp==1.0.0b2
 futureweb-intervals-mcp --doctor
 ```
 
@@ -308,12 +308,12 @@ uvx --from git+https://github.com/futureweb/intervals-mcp-server futureweb-inter
 ### Docker
 
 Tagged releases publish the same multi-arch image (amd64, arm64) to the GitHub Container
-Registry and to Docker Hub (`latest` only for final versions, beta tags such as `1.0.0b1`
+Registry and to Docker Hub (`latest` only for final versions, beta tags such as `1.0.0b2`
 explicitly):
 
 ```bash
-docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:1.0.0b1
-docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 futurewebat/futureweb-intervals-mcp:1.0.0b1
+docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 ghcr.io/futureweb/intervals-mcp-server:1.0.0b2
+docker run --rm -i -e API_KEY=... -e ATHLETE_ID=i123456 futurewebat/futureweb-intervals-mcp:1.0.0b2
 ```
 
 With `MCP_AUTH=oauth` mount a volume on `/data` (the image keeps `OAUTH_STATE_FILE` there), e.g.
@@ -380,7 +380,7 @@ Besides the bundle above, Claude Desktop can start the server from PyPI with `uv
   "mcpServers": {
     "intervals-icu": {
       "command": "uvx",
-      "args": ["futureweb-intervals-mcp@1.0.0b1"],
+      "args": ["futureweb-intervals-mcp@1.0.0b2"],
       "env": { "API_KEY": "your-api-key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read" }
     }
   }
@@ -395,7 +395,7 @@ With Docker instead (the values come from `env`, `-e NAME` passes them into the 
     "intervals-icu": {
       "command": "docker",
       "args": ["run", "--rm", "-i", "-e", "API_KEY", "-e", "ATHLETE_ID", "-e", "MCP_PERMISSIONS",
-               "ghcr.io/futureweb/intervals-mcp-server:1.0.0b1"],
+               "ghcr.io/futureweb/intervals-mcp-server:1.0.0b2"],
       "env": { "API_KEY": "your-api-key", "ATHLETE_ID": "i123456", "MCP_PERMISSIONS": "read" }
     }
   }
@@ -416,7 +416,7 @@ From a source checkout:
 }
 ```
 
-Claude Code: `claude mcp add intervals-icu -e API_KEY=your-api-key -e ATHLETE_ID=i123456 -- uvx futureweb-intervals-mcp@1.0.0b1`,
+Claude Code: `claude mcp add intervals-icu -e API_KEY=your-api-key -e ATHLETE_ID=i123456 -- uvx futureweb-intervals-mcp@1.0.0b2`,
 or from a checkout `claude mcp add intervals-icu -- uv --directory /path/to/intervals-mcp-server run futureweb-intervals-mcp`.
 
 ### ChatGPT, Claude.ai and other remote clients (OAuth)
@@ -624,7 +624,7 @@ Details and how to report a vulnerability: [SECURITY.md](https://github.com/futu
 
 ## Project status and roadmap
 
-`1.0.0b1` is the first public beta of this fork. Development happens in reviewed pull requests;
+`1.0.0b2` is the current public beta of this fork (first beta: `1.0.0b2`). Development happens in reviewed pull requests;
 `main` is protected and every change runs the full CI.
 
 **Done**
@@ -654,7 +654,6 @@ Details and how to report a vulnerability: [SECURITY.md](https://github.com/futu
 **Next**
 - Route-aware workouts with a Garmin course: course points at the climbs, lap to start the work
   step (no API link between a course and a planned workout exists yet)
-- `1.0.0b2` with the fixes since the first beta
 - Migration to MCP SDK v2 once it is stable for the transports used here
 
 ## Documentation
