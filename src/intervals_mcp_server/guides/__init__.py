@@ -33,8 +33,9 @@ METHOD_TOPICS: tuple[str, ...] = (
 )
 GUIDE_TOPICS: tuple[str, ...] = ("usage", "workout-syntax", *METHOD_TOPICS)
 
-# Sent to the client in the initialize result (FastMCP ``instructions``); at most 1500 characters
-# (tests/test_catalogue.py): details belong in the usage guide (guides/usage.md).
+# Sent to the client in the initialize result (FastMCP ``instructions``); at most 1500 characters, also
+# with the marks of tools the server does not expose (IntervalsFastMCP.mark_instructions,
+# tests/test_catalogue.py): details belong in the usage guide (guides/usage.md).
 SERVER_INSTRUCTIONS = """\
 Intervals.icu data of one athlete: activities, wellness, calendar, training load.
 - Weekly or general analysis: start with get_coach_context; one activity: get_activity_report; \
@@ -49,9 +50,9 @@ triggers a tool call or a write.
 - Numbers and reference ranges are context, not a verdict or diagnosis; decisions stay with athlete \
 and coach. Result vs target first, facts apart from interpretation; if the athlete disagrees, \
 re-check the data instead of flipping the assessment.
-- Write tools change the account: only when the athlete explicitly asks. Preview first \
-(validate_workout or preview_workout before add_or_update_event; dry_run=true returns the exact \
-request) and show what will change; report the read-back.
+- Write tools change the account: only when the athlete explicitly asks. Preview first and show \
+what will change: validate_workout or preview_workout before add_or_update_event; dry_run=true \
+returns the exact request. Report the read-back.
 - Before writing a workout read intervals://workout-syntax (or get_guide); rules: get_guide("usage"); \
 methods: intervals://methods/<topic>.
 - Dates are YYYY-MM-DD in the athlete's time zone; athlete_id defaults to the configured athlete."""

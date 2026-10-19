@@ -307,16 +307,15 @@ async def get_training_summary(  # pylint: disable=too-many-arguments,too-many-p
         "zones, gear, feel/RPE, custom fields; full adds the aggregation reason per custom field"
     )] = None,
 ) -> str:
-    """Use for training totals of a period grouped by ISO week, month, sport (activity type), gear or in total, including custom activity fields (read-only).
+    """Use for training totals of a period computed from the activities, grouped by ISO week, month, sport, gear or in total (read-only). For a quick per-week count in one call use get_weekly_summary; for a review with recovery and plan get_coach_context; for ACWR and monotony get_training_load.
 
     Per group and in total: sessions, moving/elapsed time, distance, elevation, Intervals.icu load
-    with the power/HR/pace load sums, time-weighted intensity, CTL/ATL/form/ramp at the end of the
-    group's week or month, time in power (sweet spot apart) and HR zones, sport and gear splits,
-    feel and RPE, sessions of 3 h or more, the longest session, trainer sessions. Numeric custom
-    fields are aggregated by units and meaning: additive values summed, device loads summed apart
-    from the Intervals.icu load, estimates as latest value and change, per-activity values as
-    mean/median/range. Missing values are skipped, never counted as 0. Per-week view in one
-    call: get_weekly_summary. Method: intervals://methods/summary (get_guide).
+    and the power/HR/pace load sums, time-weighted intensity, CTL/ATL/form/ramp at the end of each
+    week or month, time in power (sweet spot apart) and HR zones, sport and gear splits, feel and
+    RPE, sessions of 3 h or more, the longest session, trainer sessions. Numeric custom activity
+    fields are aggregated by units and meaning (sums, device loads apart from the Intervals.icu
+    load, latest value and change, mean/median/range). Missing values are never counted as 0.
+    Method: intervals://methods/summary (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:

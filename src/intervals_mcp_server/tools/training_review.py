@@ -125,13 +125,12 @@ async def get_weekly_summary(
     end_date: Annotated[str, Field(description="Last day YYYY-MM-DD")],
     athlete_id: AthleteId = None,
 ) -> str:
-    """Use for a quick per-week overview from Intervals.icu's athlete summary (read-only, one API call).
+    """Use for a quick week-by-week overview in one API call: Intervals.icu's own athlete summary per ISO week (read-only). For totals per month, sport or gear, power zones, separate power/HR/pace loads or custom fields use get_training_summary; for a training review with recovery and plan get_coach_context.
 
     Per ISO week (from Monday): sessions, moving time, distance and training load, a split per
     sport category, time in HR zones (non-zero zones only) and CTL/ATL/form/ramp at the end of
     the week (the latest day with data for the current week). Sessions without HR (e.g.
-    strength) are counted. Rows of other (followed or coached) athletes are ignored. Grouping by
-    month, sport or gear, separate power/HR/pace loads and custom fields: get_training_summary.
+    strength) are counted. Rows of other (followed or coached) athletes are ignored.
     Method: intervals://methods/summary (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)

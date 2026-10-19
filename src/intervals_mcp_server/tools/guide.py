@@ -3,6 +3,7 @@ Guides as MCP resources and the get_guide tool.
 
 Resources: ``intervals://guide`` (usage), ``intervals://workout-syntax`` and
 ``intervals://methods/<topic>``. get_guide returns the same text for clients that only call tools.
+Tools the server does not expose (tool set, permission classes) are marked in both.
 """
 
 from collections.abc import Callable
@@ -10,9 +11,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field
 
-from intervals_mcp_server.config import get_config
 from intervals_mcp_server.guides import GUIDE_TOPICS, guide_text, guide_uri
-from intervals_mcp_server.mcp_instance import mark_outside_toolset, mcp, tool
+from intervals_mcp_server.mcp_instance import mcp, tool
 from intervals_mcp_server.utils.params import lower_choice
 
 _TOPIC_ALIASES = {
@@ -46,7 +46,7 @@ _RESOURCE_DESCRIPTIONS = {
 
 def _register_resource(topic: str) -> None:
     def read() -> str:
-        return mark_outside_toolset(guide_text(topic), get_config().toolset)
+        return mcp.mark_unavailable(guide_text(topic))
 
     read.__name__ = f"guide_{topic.replace('-', '_')}"
     description = _RESOURCE_DESCRIPTIONS.get(topic, f"Method guide: {topic.replace('-', ' ')} (how the analysis works, windows, filters, caveats).")
@@ -72,4 +72,4 @@ async def get_guide(
 
     Returns the same Markdown as the resources intervals://guide, intervals://workout-syntax and intervals://methods/<topic>. Static text, no athlete data.
     """
-    return mark_outside_toolset(guide_text(topic), get_config().toolset)
+    return mcp.mark_unavailable(guide_text(topic))

@@ -48,7 +48,7 @@ __all__ = [
     "compact_schema",
     "disabled_tools",
     "fastmcp_settings_from_env",
-    "mark_outside_toolset",
+    "mark_unavailable_tools",
     "mcp",
     "oauth_provider",
     "tool",
@@ -111,12 +111,17 @@ class IntervalsFastMCP(FastMCP[Any]):
     ``tools/call``.  Without OAuth (stdio, secret path) nothing changes: the server-wide
     ``MCP_PERMISSIONS`` decide which tools exist at all.
 
-    Every tool's input schema is compacted once at registration (:func:`compact_schema`). With a tool
-    set other than ``full`` the tool names that set leaves out are marked "(full tool set)" in the
-    tool descriptions and prompts (:func:`mark_outside_toolset`).
+    Every tool's input schema is compacted once at registration (:func:`compact_schema`). Tools of
+    this package the server does not expose are marked where they are named, so that no text points
+    to a tool the client cannot see (:func:`mark_unavailable_tools`): "(full tool set)" outside
+    MCP_TOOLSET, "(needs MCP_PERMISSIONS write)" etc. for a permission class that is not enabled. The
+    marks are applied to the tool and parameter descriptions (``tools/list``), prompts, guides
+    (resources and get_guide) and the server instructions (:meth:`mark_instructions`).
     """
 
     toolset: str = "full"
+    # Enabled permission classes (MCP_PERMISSIONS): only for the marks, registration is done by @tool.
+    permissions: frozenset[str] = frozenset(PERMISSION_CLASSES)
     # Multi-user mode: resolves each connection's Intervals.icu credential (the OAuth provider).
     credential_source: CredentialSource | None = None
 
@@ -184,26 +189,42 @@ class IntervalsFastMCP(FastMCP[Any]):
         with use_credential(credential):
             return await action()
 
+    def mark_unavailable(self, text: str) -> str:
+        """*text* with every tool of this package this server does not expose marked (:func:`mark_unavailable_tools`)."""
+        return mark_unavailable_tools(text, self.toolset, self.permissions)
+
+    def mark_instructions(self) -> None:
+        """Mark the tools named in the server instructions that this server does not expose.
+
+        Called once every tool is defined (end of ``server.py``): the instructions are passed to
+        the server before the tool modules are imported. Marking twice changes nothing.
+        """
+        if self._mcp_server.instructions:
+            self._mcp_server.instructions = self.mark_unavailable(self._mcp_server.instructions)
+
+    def _marked_tool(self, item: MCPTool) -> MCPTool:
+        """*item* with unavailable tools marked in its description and parameter descriptions."""
+        if self.toolset == "full" and self.permissions >= frozenset(PERMISSION_CLASSES):
+            return item
+        return item.model_copy(update={
+            "description": self.mark_unavailable(item.description) if item.description else item.description,
+            "inputSchema": _mark_descriptions(item.inputSchema, self.mark_unavailable),
+        })
+
     async def list_tools(self) -> list[Any]:
         """Tools of the classes the current connection was granted."""
-        tools = await super().list_tools()
-        if self.toolset != "full":
-            tools = [
-                t.model_copy(update={"description": mark_outside_toolset(t.description, self.toolset)}) if t.description else t
-                for t in tools
-            ]
+        tools = [self._marked_tool(t) for t in await super().list_tools()]
         allowed = granted_classes(self._token_scopes())
         if allowed is None:
             return tools
         return [t for t in tools if _TOOL_PERMISSIONS.get(t.name, "read") in allowed]
 
     async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> GetPromptResult:
-        """A prompt; tools outside the active tool set are marked in its text."""
+        """A prompt; tools this server does not expose are marked in its text."""
         result = await super().get_prompt(name, arguments)
-        if self.toolset != "full":
-            for message in result.messages:
-                if isinstance(message.content, TextContent):
-                    message.content.text = mark_outside_toolset(message.content.text, self.toolset)
+        for message in result.messages:
+            if isinstance(message.content, TextContent):
+                message.content.text = self.mark_unavailable(message.content.text)
         return result
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -233,6 +254,7 @@ mcp: IntervalsFastMCP = IntervalsFastMCP(  # pylint: disable=invalid-name
 # serverInfo.version: this package's version (the SDK would report its own version otherwise).
 mcp._mcp_server.version = __version__  # pylint: disable=protected-access
 mcp.toolset = get_config().toolset
+mcp.permissions = get_config().permissions
 install_icon_routes(mcp)
 if oauth_provider is not None:
     install_login_routes(mcp, oauth_provider)
@@ -331,6 +353,7 @@ async def catalogue(permissions: frozenset[str] | set[str], toolset: str = "full
     """
     server = IntervalsFastMCP("catalogue")
     server.toolset = toolset
+    server.permissions = frozenset(permissions)
     for name, spec in _TOOL_SPECS.items():
         if (
             spec.permission in permissions and in_toolset(name, toolset)
@@ -340,21 +363,65 @@ async def catalogue(permissions: frozenset[str] | set[str], toolset: str = "full
     return await server.list_tools()
 
 
-@lru_cache(maxsize=8)
-def _outside_pattern(toolset: str, names: frozenset[str]) -> re.Pattern[str] | None:
-    outside = sorted((name for name in names if not in_toolset(name, toolset)), key=len, reverse=True)
-    if not outside:
-        return None
-    return re.compile(r"\b(" + "|".join(map(re.escape, outside)) + r")\b(?! \(full tool set\))")
+# A mark follows the tool name, its call arguments and a closing backtick: "add_or_update_event (needs
+# MCP_PERMISSIONS write)", "`get_durability` (full tool set)", "get_fatigue_resistance(start_date=...) (full
+# tool set)", "create_library_workout (full tool set, needs MCP_PERMISSIONS write)".
+_MARK_START = r" \((?:full tool set|needs MCP_PERMISSIONS )"
 
 
-def mark_outside_toolset(text: str, toolset: str) -> str:
-    """Mark every tool of this package that *toolset* leaves out with "(full tool set)" in *text*."""
-    if toolset == "full" or not text:
+def _package_tools() -> frozenset[tuple[str, str]]:
+    """(name, permission class) of every tool this package defines, registered or not."""
+    return frozenset(
+        (name, spec.permission) for name, spec in _TOOL_SPECS.items() if spec.func.__module__.startswith("intervals_mcp_server.")
+    )
+
+
+@lru_cache(maxsize=16)
+def _unavailable_marks(
+    toolset: str, permissions: frozenset[str], tools: frozenset[tuple[str, str]]
+) -> tuple[re.Pattern[str] | None, dict[str, str]]:
+    """The pattern matching every unmarked mention of an unavailable tool, and the mark per tool."""
+    marks: dict[str, str] = {}
+    for name, permission in tools:
+        reasons = [] if in_toolset(name, toolset) else ["full tool set"]
+        if permission not in permissions:
+            reasons.append(f"needs MCP_PERMISSIONS {permission}")
+        if reasons:
+            marks[name] = f" ({', '.join(reasons)})"
+    if not marks:
+        return None, marks
+    names = "|".join(map(re.escape, sorted(marks, key=len, reverse=True)))
+    # Possessive: the arguments and the backtick are always taken, so a marked mention never matches again.
+    return re.compile(r"\b(" + names + r")\b((?:\([^()\n]*\))?+`?+)(?!" + _MARK_START + ")"), marks
+
+
+def mark_unavailable_tools(text: str, toolset: str = "full", permissions: Iterable[str] = PERMISSION_CLASSES) -> str:
+    """Mark every tool of this package that a server with *toolset* and *permissions* does not expose.
+
+    A tool outside the tool set gets "(full tool set)", a tool of a permission class that is not
+    enabled "(needs MCP_PERMISSIONS <class>)", a tool with both "(full tool set, needs MCP_PERMISSIONS
+    <class>)". The mark follows the name, after call arguments without nested parentheses and a
+    closing backtick; a mention that is already marked stays as it is.
+    """
+    enabled = frozenset(permissions)
+    if not text or (toolset == "full" and enabled >= frozenset(PERMISSION_CLASSES)):
         return text
-    names = frozenset(name for name, spec in _TOOL_SPECS.items() if spec.func.__module__.startswith("intervals_mcp_server."))
-    pattern = _outside_pattern(toolset, names)
-    return pattern.sub(r"\1 (full tool set)", text) if pattern else text
+    pattern, marks = _unavailable_marks(toolset, enabled, _package_tools())
+    if pattern is None:
+        return text
+    return pattern.sub(lambda match: match.group(1) + match.group(2) + marks[match.group(1)], text)
+
+
+def _mark_descriptions(schema: Any, mark: Callable[[str], str]) -> Any:
+    """*schema* with *mark* applied to every ``description`` text (parameters, nested models)."""
+    if isinstance(schema, list):
+        return [_mark_descriptions(item, mark) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    return {
+        key: mark(value) if key == "description" and isinstance(value, str) else _mark_descriptions(value, mark)
+        for key, value in schema.items()
+    }
 
 
 def tool_permissions() -> dict[str, str]:

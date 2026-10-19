@@ -289,17 +289,15 @@ async def get_coach_context(  # pylint: disable=too-many-locals,too-many-argumen
     )] = None,
     threshold_as: ThresholdAs = "moderate",
 ) -> str:
-    """Use first for a weekly or general training review: load, intensity, recovery, durability and plan for one end date in one compact call (read-only, about 2-3k characters).
+    """Use first for a weekly or general training review: load, intensity, recovery, durability and plan for one end date in one compact call (read-only, about 2-3k characters). For period totals use get_training_summary; for load detail get_training_load; for future fitness get_load_projection; for one day's recovery get_recovery_snapshot.
 
-    Combines 7/28-day Intervals.icu load with acute:chronic ratio, monotony, strain and
-    CTL/ATL/form; the three-zone intensity of 7 and 28 days; recovery markers (HRV, resting HR,
-    sleep) against personal baselines with a z-score; durability; recorded SICK/INJURED
-    entries; top sessions; and, when the end date is today, planned workouts of the next 7 days
-    and the next race. For today it names wellness fields not yet recorded (not yet available,
-    not normal). A method line states windows and rules; small samples are flagged; missing
-    values are never 0; no verdict. Details: get_training_load, get_intensity_distribution,
-    get_durability, get_recovery_snapshot, get_load_projection. Method:
-    intervals://methods/load (get_guide).
+    7/28-day Intervals.icu load, ACWR, monotony, strain, CTL/ATL/form; three-zone intensity of 7
+    and 28 days; HRV, resting HR and sleep vs personal baselines (z-score); durability;
+    SICK/INJURED entries; top sessions; for today's end date the workouts of the next 7 days, the
+    next race and the wellness fields not yet recorded (not yet available, not normal). A method
+    line states windows and rules; small samples flagged; missing values never 0; no verdict.
+    Detail: get_intensity_distribution, get_durability. Method: intervals://methods/load
+    (get_guide).
     """
     level = detail_level or "standard"
     athlete_id_to_use, error_msg = resolve_request(athlete_id, level)

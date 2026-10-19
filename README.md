@@ -237,7 +237,10 @@ transports serve the icon without authentication at `/favicon.ico`, `/favicon.pn
 | Writes (`write` class) | `add_or_update_event` ✎, `update_wellness` ✎, `update_activity` ✎ |
 
 `get_server_status` and `--doctor` show the active tool set and how many tools it leaves out; tool
-descriptions, prompts and guides mark the tools outside the set "(full tool set)".
+and parameter descriptions, prompts, guides and the server instructions mark the tools outside the
+set "(full tool set)" and the tools of a permission class that is not enabled "(needs
+MCP_PERMISSIONS write)" (or `destructive`, `admin`; both reasons in one mark when both apply), so
+that no text points to a tool the client cannot see.
 After a server update that changes tools or tool sets, refresh the tool list in the client
 (ChatGPT: the connector's refresh in the app settings; Claude: reconnect the connector).
 
