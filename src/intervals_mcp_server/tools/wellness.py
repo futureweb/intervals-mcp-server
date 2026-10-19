@@ -47,16 +47,14 @@ async def get_wellness_data(  # pylint: disable=too-many-locals,too-many-branche
         bool, Field(description="Also list every other field, custom wellness fields with name and units")
     ] = False,
 ) -> str:
-    """Use for the raw daily wellness records of a date range (default the last 30 days; read-only).
+    """Use for the raw daily wellness records of a date range as stored (default the last 30 days; read-only). For one day in context with baselines, load and plan use get_recovery_snapshot; for trends vs the athlete's baseline get_wellness_trends; for food intake and calorie balance get_nutrition_summary.
 
     Per day as stored: CTL/ATL and eFTP per sport, vitals (weight, resting HR, HRV, SpO2 ...),
     sleep, subjective scores, nutrition, steps and comments; include_all_fields adds every other
     field, custom wellness fields labelled with name and units. When the range includes today, a
     line names the usual fields not yet in today's record, grouped by when they usually arrive:
     not yet available, not normal. Long ranges are paged by day: a note gives the start_date to
-    continue with. Baselines and trends: get_recovery_snapshot, get_wellness_trends,
-    get_nutrition_summary.
-    Method: intervals://methods/wellness (get_guide).
+    continue with. Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:

@@ -307,17 +307,15 @@ async def get_recovery_snapshot(  # pylint: disable=too-many-locals,too-many-arg
         Field(description="compact = no custom fields; standard = up to 20 custom fields per day; full = all"),
     ] = "standard",
 ) -> str:
-    """Use for the recovery and readiness context of one day in one call (default today; read-only, numbers only, no readiness verdict).
+    """Use for the recovery and readiness context of one day in one call (default today; read-only, numbers only, no readiness verdict). For multi-day trends use get_wellness_trends; for raw records of a range get_wellness_data.
 
     For the day and days_back days before: native wellness values, CTL/ATL/form/ramp rate,
-    subjective scores, custom wellness fields with a value (e.g. Body Battery from a sync
-    bridge), missing values and the record's update time; recorded SICK/INJURED entries; personal
-    baselines of baseline_metrics (7-day and 42-day mean, median, SD, latest value vs baseline
-    with z-score; small samples flagged); the activities of those days with loads and device
-    fields; the planned events of the day. Today is flagged preliminary and a line (JSON
-    today_completeness) names the usual fields not yet in today's record, grouped by when they
-    usually arrive: not yet available, not normal. Trends: get_wellness_trends.
-    Method: intervals://methods/wellness (get_guide).
+    subjective scores, custom wellness fields with a value (e.g. Body Battery), missing values
+    and the record's update time; recorded SICK/INJURED entries; personal baselines of
+    baseline_metrics (7/42-day mean, median, SD, latest value vs baseline, z-score; small
+    samples flagged); the activities of those days with loads and device fields; the planned
+    events of the day. Today is flagged preliminary; a line (JSON today_completeness) names the
+    usual fields not yet in today's record, grouped by arrival: not yet available, not normal. Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -448,16 +446,15 @@ async def get_wellness_trends(  # pylint: disable=too-many-arguments,too-many-po
     athlete_id: AthleteId = None,
     output_format: OutputFormat = "text",
 ) -> str:
-    """Use for multi-day wellness trends against the athlete's own baseline (default the 42 days ending today; read-only, statistics only).
+    """Use for multi-day wellness trends against the athlete's own baseline (default the 42 days ending today; read-only, statistics only). For one day in context use get_recovery_snapshot; for raw daily records get_wellness_data; for food and calorie balance get_nutrition_summary.
 
     Per metric with units: the daily values of the last 14 days with trailing means, period
     statistics, a personal baseline (the 42 days ending at end_date), the latest value vs that
     baseline (difference, %, z-score), rolling means, the last 7 days vs the 7 before and
     outliers (|z| >= 2.5). Missing days are never filled in; for physiological metrics a stored 0
-    counts as missing. Small samples are flagged (baseline under 14 values, correlation under 30
-    paired days). Weight adds a 7/14/28-day slope in kg per week. Optional correlations
-    (Pearson, Spearman, with lag) are associations, not causes. One day in context:
-    get_recovery_snapshot. Method: intervals://methods/wellness (get_guide).
+    counts as missing. Small samples are flagged (baseline < 14 values, correlation < 30 paired
+    days). Weight adds a 7/14/28-day slope in kg/week. Correlations (Pearson, Spearman, lag) are
+    associations, not causes. Method: intervals://methods/wellness (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_athlete_id(athlete_id, config.athlete_id)
     if error_msg:
@@ -544,7 +541,7 @@ async def get_nutrition_summary(  # pylint: disable=too-many-arguments,too-many-
     athlete_id: AthleteId = None,
     output_format: OutputFormat = "text",
 ) -> str:
-    """Use for food intake, calorie balance and weight trend over a period (default the 28 days ending today; read-only).
+    """Use for food intake, calorie balance and weight trend over a period (default the 28 days ending today; read-only). For other wellness metrics use get_wellness_trends (trends vs baseline) or get_recovery_snapshot (one day).
 
     Per day: logged kcal, carbohydrates, protein and fat, the device's total and active burn and
     balance (custom wellness fields, codes configurable) and weight. Per window (default 7/14/28

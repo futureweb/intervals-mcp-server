@@ -30,7 +30,7 @@ from mcp.types import TextContent  # pylint: disable=wrong-import-position
 
 from intervals_mcp_server import server  # noqa: F401  # pylint: disable=wrong-import-position,unused-import
 from intervals_mcp_server.guides import GUIDE_TOPICS, SERVER_INSTRUCTIONS, guide_text, guide_uri  # pylint: disable=wrong-import-position
-from intervals_mcp_server.mcp_instance import catalogue, compact_schema, mark_outside_toolset, mcp, tool_permissions  # pylint: disable=wrong-import-position
+from intervals_mcp_server.mcp_instance import catalogue, compact_schema, mark_unavailable_tools, mcp, tool_permissions  # pylint: disable=wrong-import-position
 from intervals_mcp_server.tools import guide as guide_module  # pylint: disable=wrong-import-position
 from intervals_mcp_server.toolsets import CORE_TOOLS, parse_toolset  # pylint: disable=wrong-import-position
 
@@ -161,29 +161,174 @@ def test_core_toolset():
         parse_toolset("tiny")
 
 
+# A mention of a tool of this package: name, call arguments, closing backtick, then its mark if any.
+_MENTION = re.compile(
+    r"\b(" + "|".join(sorted(tool_permissions(), key=len, reverse=True)) + r")\b(?:\([^()\n]*\))?`?"
+    r"( \((?:full tool set|needs MCP_PERMISSIONS \w+)(?:, needs MCP_PERMISSIONS \w+)?\))?"
+)
+
+
+def _mark_errors(text: str, toolset: str, permissions: frozenset[str]) -> list[tuple[str, str | None, str | None]]:
+    """Mentions whose mark differs from the expected one: none for an exposed tool, else the reasons."""
+    package = {name: permission for name, permission in tool_permissions().items() if not name.startswith("_")}
+    errors = []
+    for match in _MENTION.finditer(text):
+        name, mark = match.group(1), match.group(2)
+        if name not in package:
+            continue
+        reasons = [] if name in CORE_TOOLS or toolset == "full" else ["full tool set"]
+        if package[name] not in permissions:
+            reasons.append(f"needs MCP_PERMISSIONS {package[name]}")
+        expected = f" ({', '.join(reasons)})" if reasons else None
+        if mark != expected:
+            errors.append((name, mark, expected))
+    return errors
+
+
+def _catalogue_texts(permissions: str, toolset: str) -> dict[str, str]:
+    """Tool descriptions and every parameter description of a catalogue, by tool name."""
+    texts = {}
+    for item in _tools(permissions, toolset):
+        found = re.findall(r'"description": ("(?:[^"\\]|\\.)*")', json.dumps(item["inputSchema"]))
+        texts[item["name"]] = "\n".join([item["description"], *(json.loads(text) for text in found)])
+    return texts
+
+
 def test_core_toolset_marks_tools_outside_the_set():
     """In the core set every mention of a tool outside it is marked; the instructions use core tools only."""
-    pattern = re.compile(r"\b(" + "|".join(sorted(tool_permissions(), key=len, reverse=True)) + r")\b( \(full tool set\))?")
-    defined = {item["name"] for item in _tools("all")}
-
-    def unmarked(text: str) -> list[str]:
-        return [m.group(1) for m in pattern.finditer(text) if m.group(1) in defined and m.group(1) not in CORE_TOOLS and not m.group(2)]
-
-    for item in _tools("read,write", "core"):
-        assert not unmarked(item["description"]), (item["name"], unmarked(item["description"]))
-    assert "get_training_load (full tool set)" in next(t for t in _tools("read,write", "core") if t["name"] == "get_coach_context")["description"]
-    assert not unmarked(SERVER_INSTRUCTIONS)
+    rw = frozenset({"read", "write"})
+    for name, text in _catalogue_texts("read,write", "core").items():
+        assert not _mark_errors(text, "core", rw), (name, _mark_errors(text, "core", rw))
+    texts = _catalogue_texts("read,write", "core")
+    assert "get_training_load (full tool set)" in texts["get_coach_context"]
+    assert "`get_gear_list` (full tool set)" in texts["get_activities"] or "get_gear_list (full tool set)" in texts["get_activities"]
+    assert not _mark_errors(SERVER_INSTRUCTIONS, "core", PERMISSION_SETS["all"])
     for topic in GUIDE_TOPICS:
-        assert not unmarked(mark_outside_toolset(guide_text(topic), "core")), topic
-    assert mark_outside_toolset("see get_durability", "full") == "see get_durability"
-    assert mark_outside_toolset(mark_outside_toolset("get_durability", "core"), "core") == "get_durability (full tool set)"
-    original = mcp.toolset
+        assert not _mark_errors(mark_unavailable_tools(guide_text(topic), "core"), "core", PERMISSION_SETS["all"]), topic
+    assert mark_unavailable_tools("see get_durability", "full") == "see get_durability"
+    assert mark_unavailable_tools(mark_unavailable_tools("get_durability", "core"), "core") == "get_durability (full tool set)"
+    original = mcp.toolset, mcp.permissions
     try:
-        mcp.toolset = "core"
+        mcp.toolset, mcp.permissions = "core", PERMISSION_SETS["all"]
         text = asyncio.run(mcp.get_prompt("performance_progression", {})).messages[0].content.text
-        assert "get_fatigue_resistance (full tool set)" in text and not unmarked(text)
+        assert "get_fatigue_resistance (full tool set)" in text and not _mark_errors(text, "core", PERMISSION_SETS["all"])
     finally:
-        mcp.toolset = original
+        mcp.toolset, mcp.permissions = original
+
+
+def test_unavailable_tool_marks_placement_and_combination():
+    """Marks follow the name, call arguments and closing backtick; both reasons combine; marking twice changes nothing."""
+    read = frozenset({"read"})
+    cases = {
+        ("before add_or_update_event; then", "full", read): "before add_or_update_event (needs MCP_PERMISSIONS write); then",
+        ("`delete_event` and `add_events_bulk`", "full", read):
+            "`delete_event` (needs MCP_PERMISSIONS destructive) and `add_events_bulk` (needs MCP_PERMISSIONS admin)",
+        ("create_library_workout", "core", read): "create_library_workout (full tool set, needs MCP_PERMISSIONS write)",
+        ("add_or_update_event", "core", read): "add_or_update_event (needs MCP_PERMISSIONS write)",
+        ("add_or_update_event", "core", PERMISSION_SETS["read,write"]): "add_or_update_event",
+        ("get_durability(end_date='2026-10-01') here", "core", read): "get_durability(end_date='2026-10-01') (full tool set) here",
+        ("`get_durability(x)`.", "core", read): "`get_durability(x)` (full tool set).",
+        ("update_sport_settings", "full", PERMISSION_SETS["read,write"]): "update_sport_settings (needs MCP_PERMISSIONS admin)",
+        ("get_events, get_events_x, update_wellness_x", "full", read): "get_events, get_events_x, update_wellness_x",
+    }
+    for (text, toolset, permissions), expected in cases.items():
+        marked = mark_unavailable_tools(text, toolset, permissions)
+        assert marked == expected, (text, marked)
+        assert mark_unavailable_tools(marked, toolset, permissions) == marked, marked
+    assert mark_unavailable_tools("add_or_update_event", "full", PERMISSION_SETS["all"]) == "add_or_update_event"
+
+
+# Runs in a fresh process with the MCP_PERMISSIONS under test: initialize, tools/list, every prompt,
+# every guide resource and get_guide through a real MCP session; prints the texts as JSON.
+_TEXTS_SCRIPT = """
+import asyncio, json, socket
+_real_getaddrinfo, network = socket.getaddrinfo, []
+def _local_only(host, *args, **kwargs):  # like tests/conftest.py: no request leaves the machine
+    name = host.decode() if isinstance(host, bytes) else str(host)
+    if name not in ("localhost", "127.0.0.1", "::1"):
+        network.append(name)
+        raise OSError("network access is blocked in tests")
+    return _real_getaddrinfo(host, *args, **kwargs)
+socket.getaddrinfo = _local_only
+from mcp.shared.memory import create_connected_server_and_client_session
+from intervals_mcp_server import server
+from intervals_mcp_server.guides import GUIDE_TOPICS, guide_uri
+from intervals_mcp_server.mcp_instance import mcp
+
+async def run():
+    texts = {}
+    async with create_connected_server_and_client_session(mcp) as session:
+        texts["instructions"] = (await session.initialize()).instructions
+        for item in (await session.list_tools()).tools:
+            texts["tool " + item.name] = item.description
+            texts["schema " + item.name] = json.dumps(item.inputSchema)
+        for prompt in (await session.list_prompts()).prompts:
+            args = {a.name: ("2026-10-20" if "date" in a.name else "i1") for a in prompt.arguments or [] if a.required}
+            result = await session.get_prompt(prompt.name, args)
+            texts["prompt " + prompt.name] = " ".join(m.content.text for m in result.messages)
+        for topic in GUIDE_TOPICS:
+            texts["resource " + topic] = (await session.read_resource(guide_uri(topic))).contents[0].text
+            texts["get_guide " + topic] = (await session.call_tool("get_guide", {"topic": topic})).content[0].text
+    print(json.dumps({"network": network, "texts": texts}))
+
+asyncio.run(run())
+"""
+
+
+@pytest.mark.parametrize("permissions", ["read", "read,write"])
+def test_unregistered_tools_are_marked_everywhere_in_a_fresh_process(permissions):
+    """No instruction, tool or parameter description, prompt or guide names a tool the server hides without its mark."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("MCP_", "FASTMCP_", "OAUTH_"))}
+    env.update({"MCP_PERMISSIONS": permissions, "API_KEY": "test", "ATHLETE_ID": "i1", "ATHLETE_TIMEZONE": "server",
+                "PYTHONPATH": str(ROOT / "src")})
+    result = subprocess.run([sys.executable, "-c", _TEXTS_SCRIPT], capture_output=True, text=True, env=env, timeout=120,
+                            check=False, cwd=ROOT / "tests")
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    assert not out["network"], out["network"]
+    texts: dict[str, str] = out["texts"]
+    enabled = PERMISSION_SETS[permissions]
+    assert len([key for key in texts if key.startswith("prompt ")]) >= 10 and len(texts) > 80
+    for key, text in texts.items():
+        if key.startswith("schema "):
+            text = "\n".join(json.loads(part) for part in re.findall(r'"description": ("(?:[^"\\]|\\.)*")', text))
+        assert not _mark_errors(text, "full", enabled), (key, _mark_errors(text, "full", enabled))
+    assert len(texts["instructions"]) <= 1500 + len(" (needs MCP_PERMISSIONS write)")
+    marked_write = "add_or_update_event (needs MCP_PERMISSIONS write)"
+    if permissions == "read":
+        for key in ("instructions", "tool validate_workout", "schema preview_workout", "prompt workout_planning_validation"):
+            assert marked_write in texts[key], key
+        assert "`create_library_workout` (needs MCP_PERMISSIONS write)" in texts["get_guide workout-syntax"]
+        assert texts["get_guide usage"] == texts["resource usage"] and "(needs MCP_PERMISSIONS destructive)" in texts["get_guide usage"]
+    else:
+        assert not any(re.search(r"[\w`)] \(needs MCP_PERMISSIONS write\)", text) for text in texts.values())
+        assert "add_or_update_event;" in texts["instructions"] and marked_write not in texts["instructions"]
+        assert "update_sport_settings (needs MCP_PERMISSIONS admin)" in texts["tool get_sport_settings"]
+
+
+# Overlapping tools: the first paragraph of each description says when to use it and which sibling
+# to use for the other cases.
+SIBLINGS = {
+    "get_training_summary": ("get_weekly_summary", "get_coach_context", "get_training_load"),
+    "get_weekly_summary": ("get_training_summary", "get_coach_context"),
+    "get_coach_context": ("get_training_summary", "get_training_load", "get_load_projection", "get_recovery_snapshot"),
+    "get_training_load": ("get_coach_context", "get_load_projection", "get_training_summary"),
+    "get_load_projection": ("get_training_load",),
+    "get_wellness_data": ("get_recovery_snapshot", "get_wellness_trends", "get_nutrition_summary"),
+    "get_recovery_snapshot": ("get_wellness_trends", "get_wellness_data"),
+    "get_wellness_trends": ("get_recovery_snapshot", "get_wellness_data", "get_nutrition_summary"),
+    "get_nutrition_summary": ("get_wellness_trends", "get_recovery_snapshot"),
+}
+
+
+def test_overlapping_tools_name_the_sibling_for_the_other_cases(full_catalogue):
+    """Summary/load and wellness tools: the first paragraph names the sibling to use instead ("for X use Y")."""
+    descriptions = {item["name"]: item["description"] for item in full_catalogue}
+    for name, siblings in SIBLINGS.items():
+        first = descriptions[name].split("\n\n", 1)[0]
+        assert re.search(r"\. For [^.]+ use get_", first), (name, first)
+        for sibling in siblings:
+            assert sibling in first, (name, sibling)
 
 
 def test_core_toolset_registration_and_status_in_a_fresh_process():
@@ -212,7 +357,7 @@ def test_core_toolset_registration_and_status_in_a_fresh_process():
 
 def test_instructions_are_compact_and_name_the_rules():
     """The initialize instructions are short and carry the usage rules."""
-    assert mcp.instructions == SERVER_INSTRUCTIONS
+    assert mcp.instructions == mark_unavailable_tools(SERVER_INSTRUCTIONS, mcp.toolset, mcp.permissions)
     assert len(SERVER_INSTRUCTIONS) <= 1500
     for fragment in ("get_coach_context", "get_activity_report", "compact", "not yet", "explicitly asks",
                      "validate_workout", "dry_run", "intervals://workout-syntax",
@@ -335,10 +480,10 @@ def test_wire_format_round_trip():
     assert tool.outputSchema is None and tool.inputSchema["properties"]["topic"]["enum"][0] == "usage"
     called = out["called"]
     assert called.isError is False and called.structuredContent is None
-    assert len(called.content) == 1 and called.content[0].text == guide_text("workout-syntax")
+    assert len(called.content) == 1 and called.content[0].text == mcp.mark_unavailable(guide_text("workout-syntax"))
     assert out["bad"].isError is True
     prompt_names = {p.name for p in out["prompts"].prompts}
     assert {"race_week", "fueling_review", "plan_health_check", "coach_handoff", "weekly_training_review"} <= prompt_names
     uris = {str(r.uri) for r in out["resources"].resources}
     assert {guide_uri(topic) for topic in GUIDE_TOPICS} <= uris and "intervals://custom-items" in uris
-    assert out["read"].contents[0].text == guide_text("load")
+    assert out["read"].contents[0].text == mcp.mark_unavailable(guide_text("load"))

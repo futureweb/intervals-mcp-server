@@ -404,14 +404,13 @@ async def get_training_load(  # pylint: disable=too-many-arguments,too-many-posi
         "device loads; full adds daily loads and definitions"
     )] = "standard",
 ) -> str:
-    """Use for acute and chronic training load in detail: acute (default 7 d) and chronic (28 d) Intervals.icu load, acute:chronic ratio (coupled daily means), Foster monotony and strain, deload-like weeks, per sport family with the primary sport, ISO weeks, and CTL/ATL/form/ramp at the end date (read-only).
+    """Use for past and current training load in detail: acute (default 7 d) and chronic (28 d) Intervals.icu load, acute:chronic ratio (coupled daily means), Foster monotony and strain, deload-like weeks, per sport family with the primary sport, ISO weeks, and CTL/ATL/form/ramp at the end date (read-only). For the overview use get_coach_context; for planned load get_load_projection; for time and distance totals get_training_summary.
 
     Rest days count as 0; sessions without a load are counted, not added. Device loads (custom
     fields such as a Garmin training load) are listed apart on their own scale, never added. With
     the default end date and nothing recorded today yet, the windows end yesterday. Reference
     ranges (ACWR 0.8-1.3, monotony > 2.0) are shown with sources as context; small samples are
-    flagged; no verdict. Overview: get_coach_context; planned load: get_load_projection.
-    Method: intervals://methods/load (get_guide).
+    flagged; no verdict. Method: intervals://methods/load (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:
@@ -1043,16 +1042,16 @@ async def get_load_projection(  # pylint: disable=too-many-arguments,too-many-po
     )] = None,
     taper_days: Annotated[int, Field(description="Days before the target varied by the search, 1-42")] = 7,
 ) -> str:
-    """Use for future fitness: CTL, ATL and form projected over the planned workouts in the calendar, or a what-if scenario (sessions or weekly templates not in the calendar) against the calendar plan (read-only, nothing is written).
+    """Use for future fitness: CTL, ATL and form over the planned workouts in the calendar, or a what-if scenario of sessions or weekly templates against the calendar plan (read-only, nothing is written). For past and current load use get_training_load.
 
     Starts from Intervals.icu's CTL/ATL at the end of yesterday plus today's completed load;
     planned workouts without a load are reported, not guessed. Returns end values, lowest form,
     highest ramp, ISO weeks with plan statistics, race days, Intervals.icu's own projection, a
-    model check and weeks outside commonly cited ranges (ramp 5-8 CTL/week, monotony > 2.0, no rest
-    day). With target_date, target_form or a scenario: the target day (default the next RACE_A)
-    at the start of the day; target_form adds a search for the load of the last taper_days that
-    reaches it. Arithmetic, not a forecast; no verdict. Method and scenario format:
-    intervals://methods/load (get_guide).
+    model check and weeks outside cited ranges (ramp 5-8 CTL/week, monotony > 2.0, no rest day).
+    With target_date, target_form or a scenario: the target day (default the next RACE_A) at the
+    start of the day; target_form searches the load of the last taper_days that reaches it.
+    Arithmetic, not a forecast; no verdict. Method, scenario format: intervals://methods/load
+    (get_guide).
     """
     athlete_id_to_use, error_msg = resolve_request(athlete_id, detail_level)
     if error_msg:

@@ -8,7 +8,8 @@ planning tools plus the writes a coach needs most and the reads that go with the
 event, plan phases, preview a workout, wellness trends). MCP_PERMISSIONS still applies inside a
 set: the write tools of ``core`` exist only when ``write`` is enabled. The other tools stay
 importable and are listed by get_server_status as outside the tool set; descriptions, prompts and
-guides mark them "(full tool set)".
+guides mark them "(full tool set)" (mcp_instance.mark_unavailable_tools, which also marks the tools
+of permission classes that are not enabled).
 """
 
 TOOLSETS: tuple[str, ...] = ("full", "core")

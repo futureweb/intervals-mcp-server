@@ -8,7 +8,9 @@ workout format: `intervals://workout-syntax`.
 - `get_server_status`: version, enabled permission classes, tool set (MCP_TOOLSET), hidden
   tools, API check, custom item counts.
 - With `MCP_TOOLSET=core` only the core tools exist; tools outside the set are marked
-  "(full tool set)" in descriptions, prompts and guides.
+  "(full tool set)" in descriptions, prompts and guides. Tools of a permission class the server
+  does not enable are marked "(needs MCP_PERMISSIONS write)" (or destructive, admin): they are not
+  available on this server until the operator enables that class.
 - For a weekly analysis the recommended first call is `get_coach_context` (load, intensity,
   recovery, durability, plan and method in about 2-3k characters). Go to the detail tools below
   only where needed, and ask for `detail_level="compact"` first.
@@ -65,8 +67,9 @@ workout format: `intervals://workout-syntax`.
 - `get_load_projection`: CTL/ATL/form over the planned workouts. `scenario` simulates a what-if
   plan that is never written to the calendar; `target_date` (default the next A race) and
   `target_form` give the form on race day and a taper search (method: load).
-- Totals and plan: `get_training_summary` (week, month, sport, gear; custom field aggregation:
-  method summary), `get_weekly_summary`, `get_plan_compliance`, `get_training_plan`.
+- Totals and plan: `get_training_summary` (computed from the activities: week, month, sport, gear,
+  zones; custom field aggregation: method summary), `get_weekly_summary` (quick per-week view from
+  Intervals.icu's own summary, one request), `get_plan_compliance`, `get_training_plan`.
 
 ## 5. Performance and fatigue
 - Curves: `get_athlete_power_curves`, `get_hr_curves`, `get_pace_curves`;

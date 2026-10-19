@@ -6,6 +6,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Tools that are not registered because their permission class is not enabled are marked wherever
+  they are named: "(needs MCP_PERMISSIONS write)", "(needs MCP_PERMISSIONS destructive)" or "(needs
+  MCP_PERMISSIONS admin)". The marks are applied in tool and parameter descriptions, the server
+  instructions, prompts and guides (resources and `get_guide`). With the default
+  `MCP_PERMISSIONS=read`, nothing points to `add_or_update_event`, `add_events_bulk`,
+  `create_library_workout` or `update_sport_settings` without a mark any more (Glama TDQS: "a
+  dead-end for mutations"). This builds on the "(full tool set)" mark of `MCP_TOOLSET=core`. When
+  both apply, the reasons share one mark ("(full tool set, needs MCP_PERMISSIONS write)"). Marks
+  now follow call arguments and a closing backtick, so a Markdown code span keeps the exact tool
+  name. Parameter descriptions are now marked too (the core set left e.g. `get_gear_list` unmarked
+  there). With `read,write`, no write tool is marked; only the admin tools `update_sport_settings`
+  and `add_events_bulk` keep their "needs MCP_PERMISSIONS admin" mark. The write rule in the server
+  instructions was rephrased without nested parentheses.
+- Clearer choice between overlapping tools: the first paragraph of each description says when to
+  use the tool and which sibling to use instead ("for X use Y"). This covers `get_training_summary`
+  (totals computed from the activities) vs `get_weekly_summary` (quick per-week view from
+  Intervals.icu's own summary, one request), and how they relate to `get_coach_context`,
+  `get_training_load` (past and current load) and `get_load_projection` (future fitness). It also
+  covers `get_wellness_data` (raw records), `get_recovery_snapshot` (one day in context),
+  `get_wellness_trends` (multi-day trends vs baseline) and `get_nutrition_summary` (intake and
+  calorie balance). No behaviour changes, renames or merges. `tools/list` (cl100k): read
+  19,278 -> 19,435 tokens, read,write 23,196 -> 23,309 tokens, within the catalogue budgets.
+
 ## [1.0.0b2] - 2026-10-15
 
 Second public beta: lap-press steps for route-aware outdoor workouts (confirmed on a Garmin Edge
