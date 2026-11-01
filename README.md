@@ -10,6 +10,7 @@ metrics, every custom field and stream, recovery insights and endurance performa
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 ![Status: public beta](https://img.shields.io/badge/status-1.0.0b2%20public%20beta-orange)
 [![Garmin Intervals Bridge](https://img.shields.io/badge/companion-Garmin%20Intervals%20Bridge-6f42c1)](https://github.com/futureweb/garmin-intervals-bridge)
+[![intervals-summits](https://img.shields.io/badge/companion-intervals--summits-2e7d32)](https://github.com/futureweb/intervals-summits)
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/futureweb/intervals-mcp-server)
 [![Glama MCP server score](https://glama.ai/mcp/servers/futureweb/intervals-mcp-server/badges/score.svg)](https://glama.ai/mcp/servers/futureweb/intervals-mcp-server)
 
@@ -35,6 +36,11 @@ unless you enable it.
 puts back the metrics Garmin strips from the files it sends to Intervals.icu (stamina, training
 effect, recovery time, VO₂max, running dynamics, sleep and HRV details …). This MCP is built to
 read all of it, but works just as well without the bridge.
+
+**For the mountains:** [intervals-summits](https://github.com/futureweb/intervals-summits) writes the summits, huts and
+passes of your activities into custom fields (`Summits`, `SummitCount`). This MCP reads them like
+any other field, so your assistant knows which summits a tour reached: ask which ones you climbed
+this year, or how often.
 
 ## Contents
 
