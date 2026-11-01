@@ -228,7 +228,8 @@ CALLS = [
     ("get_activities", {"start_date": "2026-09-01", "end_date": "2026-10-05"}),
     ("get_wellness_data", {"start_date": "2026-10-01", "end_date": "2026-10-01"}),
     ("get_server_status", {"output_format": "json"}),
-    ("get_activities", {"athlete_id": BRAVO}),
+    # Explicit dates: the fake activity is dated 2026-10-01, the default window ends today.
+    ("get_activities", {"athlete_id": BRAVO, "start_date": "2026-09-01", "end_date": "2026-10-05"}),
 ]
 
 
