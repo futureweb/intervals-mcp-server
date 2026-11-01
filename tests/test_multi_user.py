@@ -876,7 +876,7 @@ def test_unreadable_client_keeps_the_grant_record(tmp_path, monkeypatch):  # pyl
     assert rotated is not None
     credential = credential_of(fixed, rotated.access_token)
     assert (credential.kind, credential.athlete_id) == ("bearer", ALPHA)
-    text = call_as(fixed, rotated.access_token, "get_activities", {})
+    text = call_as(fixed, rotated.access_token, "get_activities", {"start_date": "2026-09-01", "end_date": "2026-10-05"})
     assert "ALPHADATA" in text and "OWNERDATA" not in text
 
 
