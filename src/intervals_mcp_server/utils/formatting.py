@@ -709,6 +709,8 @@ def _event_extra_lines(event: dict[str, Any]) -> list[str]:
         lines.append(f"Paired Activity: {event['paired_activity_id']}")
     if event.get("indoor"):
         lines.append("Indoor: yes")
+    if event.get("for_week") and event.get("category") == "NOTE":
+        lines.append("Week note: yes (for the whole week from its date)")
     return lines
 
 

@@ -88,6 +88,24 @@ def test_note_update_is_partial_and_create_has_defaults(monkeypatch):
     }
 
 
+
+def test_week_note_is_written_and_read(monkeypatch):
+    """A week note (for_week) is sent only when passed and shows up in the event output."""
+    from intervals_mcp_server.tools.events import _event_json  # pylint: disable=import-outside-toplevel
+    from intervals_mcp_server.utils.formatting import format_event_summary  # pylint: disable=import-outside-toplevel
+
+    calls = _capture(monkeypatch, existing={"id": 88, "category": "NOTE"})
+    asyncio.run(add_or_update_note(name="Recovery week", start_date="2026-11-16", for_week=True))
+    assert calls[0]["data"]["for_week"] is True
+    asyncio.run(add_or_update_note(event_id="88", for_week=False))
+    assert calls[1]["data"] == {"for_week": False}
+    asyncio.run(add_or_update_note(event_id="88", name="Renamed"))
+    assert "for_week" not in calls[2]["data"]
+    note = {"id": 88, "category": "NOTE", "name": "Recovery week", "start_date_local": "2026-11-16T00:00:00", "for_week": True}
+    assert _event_json(note)["for_week"] is True
+    assert "Week note: yes" in format_event_summary(note)
+    assert "Week note" not in format_event_summary({**note, "for_week": False})
+
 @pytest.mark.parametrize(
     "value,expected",
     [

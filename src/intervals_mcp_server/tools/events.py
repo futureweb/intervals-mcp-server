@@ -108,8 +108,9 @@ def _prepare_event_data(  # pylint: disable=too-many-arguments,too-many-position
     return {key: value for key, value in event_data.items() if value is not None}
 
 
-def _prepare_note_data(
-    name: str | None, description: str | None, start_date: str | None, color: str | None, *, is_update: bool = False
+def _prepare_note_data(  # pylint: disable=too-many-arguments
+    name: str | None, description: str | None, start_date: str | None, color: str | None, *,
+    for_week: bool | None = None, is_update: bool = False,
 ) -> dict[str, Any]:
     """Prepare note (category NOTE) data; fields that are not set are not sent.
 
@@ -121,6 +122,7 @@ def _prepare_note_data(
         "description": description,
         "start_date_local": start_date + "T00:00:00" if start_date else None,
         "color": color,
+        "for_week": for_week,
     }
     return {key: value for key, value in note.items() if value is not None}
 
@@ -173,6 +175,7 @@ EVENT_JSON_FIELDS = (
     "color",
     "plan_name",
     "updated",
+    "for_week",
 )
 
 
@@ -602,6 +605,7 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
     description: Annotated[str | None, Field(description="Plain text of the note; replaces the text on update (empty is ignored)")] = None,
     start_date: Annotated[str | None, Field(description="Day YYYY-MM-DD; default today when creating, unchanged when updating")] = None,
     color: Annotated[str | None, Field(description="Colour name, e.g. green, orange, red, blue; default green when creating")] = None,
+    for_week: Annotated[bool | None, Field(description="true = week note (whole week from start_date, the week's first day), false = day note; default day note when creating, unchanged when updating")] = None,
     athlete_id: AthleteId = None,
     event_id: Annotated[str | None, Field(description="NOTE event to update; omit to create")] = None,
     clear_description: Annotated[bool, Field(description="Empty the note's text on update")] = False,
@@ -637,7 +641,7 @@ async def add_or_update_note(  # pylint: disable=too-many-arguments,too-many-pos
         validated_date = validate_date(start_date) if start_date else None
     except ValueError as e:
         return f"Error: {e}"
-    event_data = _prepare_note_data(name, description, validated_date, color, is_update=is_update)
+    event_data = _prepare_note_data(name, description, validated_date, color, for_week=for_week, is_update=is_update)
     if is_update:
         if not event_data:
             return "Error: nothing to update; pass at least one field to change."
