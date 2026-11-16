@@ -54,6 +54,13 @@ def test_update_keeps_category_and_type_unless_passed(monkeypatch):
     assert calls[1]["data"] == {"type": "VirtualRide", "category": "RACE_B"}
 
 
+def test_update_changes_only_the_color(monkeypatch):
+    calls = _capture(monkeypatch)
+    asyncio.run(add_or_update_event(event_id="77", color=" #FF8800 "))
+    assert calls == [{"url": "/athlete/i1/events/77", "method": "PUT", "data": {"color": "#FF8800"}}]
+    assert asyncio.run(add_or_update_event(event_id="77", color=" ")).startswith("Error: nothing to update")
+
+
 def test_update_without_fields_is_refused(monkeypatch):
     calls = _capture(monkeypatch)
     assert asyncio.run(add_or_update_event(event_id="77")).startswith("Error: nothing to update")
