@@ -93,6 +93,7 @@ def _prepare_event_data(  # pylint: disable=too-many-arguments,too-many-position
     distance: int | None,
     indoor: bool | None = None,
     category: str | None = None,
+    color: str | None = None,
 ) -> dict[str, Any]:
     """The event payload; only fields that are set are sent (an update changes nothing else)."""
     event_data: dict[str, Any] = {
@@ -104,6 +105,7 @@ def _prepare_event_data(  # pylint: disable=too-many-arguments,too-many-position
         "moving_time": moving_time,
         "distance": distance,
         "indoor": indoor,
+        "color": color,
     }
     return {key: value for key, value in event_data.items() if value is not None}
 
@@ -514,6 +516,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     ] = None,
     description: Annotated[str | None, Field(description="Text instead of workout_doc: an exercise list or native Intervals.icu workout text, sent as-is; replaces the text")] = None,
     replace_workout: Annotated[bool, Field(description="Allow text or a workout without timed steps to replace a structured workout")] = False,
+    color: Annotated[str | None, Field(description='Calendar colour as hex RGB, e.g. "#FF8800"; omit to leave unchanged')] = None,
     allow_duplicate: AllowDuplicate = False,
     dry_run: DryRun = False,
 ) -> str:
@@ -536,6 +539,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
     amount_error = _check_amounts(moving_time, distance)
     if amount_error:
         return f"Error: {amount_error}."
+    color = color.strip() if color and color.strip() else None  # "" from a client filling optional fields
     try:
         validated_date = validate_date(start_date) if start_date else None
     except ValueError as e:
@@ -585,7 +589,7 @@ async def add_or_update_event(  # pylint: disable=too-many-arguments,too-many-po
         start_local = validated_date + (_time_of_day(existing) if is_update else "T00:00:00")
 
     event_data = _prepare_event_data(
-        name, event_type, start_local, text, moving_time, distance, indoor, category=category_name
+        name, event_type, start_local, text, moving_time, distance, indoor, category=category_name, color=color
     )
     if is_update and not event_data:
         return "Error: nothing to update; pass at least one field to change."
